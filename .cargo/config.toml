@@ -1,0 +1,21 @@
+[build]
+target-dir = "build/cargo"
+
+[term]
+color = "auto"
+
+[target.riscv64imac-unknown-none-elf]
+linker = "rust-lld"
+
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "force-frame-pointers=yes",
+]
+
+[target.loongarch64-unknown-none-softfloat]
+linker = "rust-lld"
+
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "force-frame-pointers=yes",
+]

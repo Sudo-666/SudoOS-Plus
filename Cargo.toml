@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "kernel",
+    "arch/riscv64",
+    "arch/loongarch64",
+    "runtime",
+    "boot",
+    "firmware/fdt",
+    "mm",
+]
+
+exclude = [
+    "vendor/fdt-reader",
+    "vendor/virtio-drivers",
+]
+
+default-members = [
+    "kernel",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Mingyang Chen"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# 开发模式仍然保留一定优化。
+# 裸机代码在完全不优化时，有时会产生很难看的汇编。
+[profile.dev]
+panic = "abort"
+opt-level = 1
+debug = 2
+overflow-checks = true
+lto = false
+codegen-units = 8
+strip = false
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = 1
+overflow-checks = true
+lto = "thin"
+codegen-units = 1
+strip = false

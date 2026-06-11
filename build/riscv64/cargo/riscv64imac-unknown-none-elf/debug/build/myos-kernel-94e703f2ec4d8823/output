@@ -1,0 +1,3 @@
+cargo:rerun-if-changed=/Users/mychen/Desktop/Code/os/sudoos/arch/riscv64/linker.ld
+cargo:rustc-link-arg-bin=myos-kernel=-T/Users/mychen/Desktop/Code/os/sudoos/arch/riscv64/linker.ld
+cargo:rustc-link-arg-bin=myos-kernel=--gc-sections

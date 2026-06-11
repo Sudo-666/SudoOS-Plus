@@ -1,0 +1,43 @@
+[package]
+name = "myos-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "myos-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+myos-boot = {
+    path = "../boot",
+}
+
+myos-runtime = {
+    path = "../runtime",
+}
+
+myos-fdt = {
+    path = "../firmware/fdt",
+}
+
+myos-mm = {
+    path = "../mm",
+}
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+arch-riscv64 = {
+    path = "../arch/riscv64",
+}
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+arch-loongarch64 = {
+    path = "../arch/loongarch64",
+}
+
+[lints]
+workspace = true
