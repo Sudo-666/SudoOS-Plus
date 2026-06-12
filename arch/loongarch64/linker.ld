@@ -63,6 +63,14 @@ SECTIONS
     {
         __text_start = .;
 
+        /*
+         * TLB refill executes in direct-address mode.  Keep it in a dedicated
+         * physical 4 KiB page and never let ordinary text share that page.
+         */
+        KEEP(*(.text.tlb_refill))
+        ASSERT(. - __text_start <= 4K, "LoongArch TLB refill exceeds one page")
+        . = __text_start + 4K;
+
         *(.text .text.*)
 
         . = ALIGN(4K);

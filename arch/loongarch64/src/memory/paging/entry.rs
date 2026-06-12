@@ -1,8 +1,4 @@
-use myos_mm::{
-    MappingOptions, MappingOptionsError, MemoryType, PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr,
-};
-
-use crate::memory::layout;
+use myos_mm::{MappingOptions, MappingOptionsError, MemoryType, PAGE_SIZE, PhysAddr, PhysFrame};
 
 const VALID: u64 = 1 << 0;
 const DIRTY: u64 = 1 << 1;
@@ -45,7 +41,7 @@ pub enum PageTableEntryError {
 
     PhysicalAddressOutOfRange { address: PhysAddr },
 
-    TableNotDirectMappable { address: PhysAddr },
+    NullTablePointer,
 }
 
 impl From<MappingOptionsError> for PageTableEntryError {
@@ -171,7 +167,8 @@ impl LeafPageTableEntry {
 
 /// LoongArch 上级目录项。
 ///
-/// 与叶 PTE 不同，这里保存下一级页表的 cached DMW 地址。
+/// 目录项必须保存下一级页表的物理地址。TLB refill 期间处理器会切换
+/// 到 direct-address mode，`LDDIR`/`LDPTE` 不能依赖 cached DMW 虚拟地址。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
 pub struct TablePointerEntry(u64);
@@ -192,30 +189,23 @@ impl TablePointerEntry {
     pub fn new(next_table: PhysFrame) -> Result<Self, PageTableEntryError> {
         let physical = next_table.start_address();
 
-        let virtual_address = layout::phys_to_cached(physical)
-            .ok_or(PageTableEntryError::TableNotDirectMappable { address: physical })?;
-
-        if !virtual_address.is_aligned(PAGE_SIZE) {
-            return Err(PageTableEntryError::TableNotDirectMappable { address: physical });
+        if physical.get() == 0 {
+            return Err(PageTableEntryError::NullTablePointer);
         }
 
-        Ok(Self(virtual_address.get() as u64))
+        Ok(Self(encode_physical_address(physical)?))
     }
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
-    pub fn next_table_frame(self) -> Option<PhysFrame> {
-        if self.is_empty() {
+    pub const fn next_table_frame(self) -> Option<PhysFrame> {
+        if self.is_empty() || self.0 & !PHYSICAL_PAGE_MASK != 0 {
             return None;
         }
 
-        let virtual_address = VirtAddr::new(self.0 as usize);
-
-        let physical = layout::cached_to_phys(virtual_address)?;
-
-        PhysFrame::from_start_address(physical)
+        PhysFrame::from_start_address(PhysAddr::new(self.0 as usize))
     }
 }
 

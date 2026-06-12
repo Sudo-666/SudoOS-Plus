@@ -112,7 +112,15 @@ pub fn initialize(memory: crate::memory::KernelMemoryState) {
         );
     }
 
-    *page_table_slot = Some(RuntimePageTable::from_boot(memory.into_boot_page_table()));
+    let runtime_page_table = RuntimePageTable::from_boot(memory.into_boot_page_table())
+        .unwrap_or_else(|error| {
+            panic!("unable to activate runtime page table: {error:?}");
+        });
+
+    #[cfg(target_arch = "loongarch64")]
+    let hardware = runtime_page_table.hardware_state();
+
+    *page_table_slot = Some(runtime_page_table);
 
     let arena = crate::arch::memory::layout::VMALLOC;
 
@@ -128,7 +136,19 @@ pub fn initialize(memory: crate::memory::KernelMemoryState) {
     crate::println!("  runtime pgtbl  : active hardware root");
 
     #[cfg(target_arch = "loongarch64")]
-    crate::println!("  runtime pgtbl  : software-only until TLB refill");
+    {
+        crate::println!("  runtime pgtbl  : active hardware root");
+        crate::println!(
+            "  root physical  : {:#018x}",
+            hardware.root().start_address().get(),
+        );
+        crate::println!("  refill entry   : {:#018x}", hardware.refill_entry().get(),);
+        crate::println!(
+            "  address bits   : VA={} PA={}",
+            hardware.virtual_address_bits(),
+            hardware.physical_address_bits(),
+        );
+    }
 }
 
 pub fn reserve_vmalloc(
@@ -320,17 +340,22 @@ pub fn iounmap(mapping: KernelIoMapping) -> Result<(), KernelVmError> {
 
 #[cfg(debug_assertions)]
 pub fn verify() {
-    let before = reservation_count().expect("kernel vm allocator unavailable");
+    let reservations_before = reservation_count().expect("kernel vm allocator unavailable");
+    let tables_before = runtime_table_count();
 
-    let allocation = vmalloc(PAGE_SIZE, PAGE_SIZE).expect("unable to allocate test vmalloc range");
+    /*
+     * LoongArch TLB entries contain an even/odd page pair.  A two-page,
+     * two-page-aligned test exercises both TLBRELO0 and TLBRELO1 in one refill.
+     */
+    let allocation = vmalloc(PAGE_SIZE * 2, PAGE_SIZE * 2)
+        .expect("unable to allocate paired test vmalloc range");
 
-    assert_eq!(allocation.usable_range().size(), PAGE_SIZE);
-    assert_eq!(allocation.page_count(), 1);
+    assert_eq!(allocation.usable_range().size(), PAGE_SIZE * 2);
+    assert_eq!(allocation.page_count(), 2);
 
-    let virtual_page = VirtPage::from_start_address(allocation.usable_range().start())
+    let first_virtual_page = VirtPage::from_start_address(allocation.usable_range().start())
         .expect("vmalloc usable range is not page-aligned");
 
-    #[cfg(target_arch = "riscv64")]
     verify_vmalloc_hardware_access(&allocation);
 
     {
@@ -340,15 +365,29 @@ pub fn verify() {
             .expect("kernel runtime page table unavailable");
 
         page_table
-            .protect_page(virtual_page, MappingOptions::kernel_rodata())
+            .protect_page(first_virtual_page, MappingOptions::kernel_rodata())
             .expect("unable to protect test vmalloc page");
 
+        /* A read must remain valid after the permission/TLB update. */
+        let pointer = allocation.usable_range().start().get() as *const u64;
+
+        // SAFETY: the first page remains mapped read-only and allocation owns
+        // the physical backing page for the entire access.
+        let _ = unsafe { core::ptr::read_volatile(pointer) };
+
         page_table
-            .protect_page(virtual_page, MappingOptions::kernel_data())
+            .protect_page(first_virtual_page, MappingOptions::kernel_data())
             .expect("unable to restore test vmalloc page permissions");
     }
 
+    verify_vmalloc_hardware_access(&allocation);
     vfree(allocation).expect("unable to free test vmalloc range");
+
+    assert_eq!(
+        runtime_table_count(),
+        tables_before,
+        "vfree leaked intermediate page-table pages",
+    );
 
     let io_page =
         crate::page_alloc::allocate(0, crate::page_alloc::PageAllocationOptions::kernel_zeroed())
@@ -377,51 +416,81 @@ pub fn verify() {
         );
     }
 
+    verify_ioremap_hardware_access(&io_mapping);
     iounmap(io_mapping).expect("unable to iounmap test page");
     crate::page_alloc::free(io_page).expect("unable to free test ioremap backing page");
 
     assert_eq!(
         reservation_count().expect("kernel vm allocator unavailable"),
-        before,
+        reservations_before,
+    );
+    assert_eq!(
+        runtime_table_count(),
+        tables_before,
+        "iounmap leaked intermediate page-table pages",
     );
 
-    let runtime_tables =
-        with_kernel_page_table(|page_table| Ok(page_table.allocated_runtime_tables()))
-            .expect("kernel runtime page table unavailable");
-
     crate::println!("kernel vm test:");
-    crate::println!("  vmalloc/vfree   : software lifecycle verified");
-    crate::println!("  ioremap/iounmap : software lifecycle verified");
-    crate::println!("  protect/unmap   : page-table update verified");
+    crate::println!("  vmalloc/vfree   : hardware lifecycle verified");
+    crate::println!("  ioremap/iounmap : hardware lifecycle verified");
+    crate::println!("  protect/unmap   : hardware TLB update verified");
     crate::println!("  guard gap       : reservation verified");
-
-    #[cfg(target_arch = "riscv64")]
     crate::println!("  hardware access : verified");
-
-    #[cfg(target_arch = "loongarch64")]
-    crate::println!("  hardware access : deferred until TLB refill");
-
-    crate::println!("  runtime tables  : {}", runtime_tables);
+    crate::println!("  table reclaim   : verified");
+    crate::println!("  runtime tables  : {}", runtime_table_count());
 }
 
-#[cfg(all(debug_assertions, target_arch = "riscv64"))]
+#[cfg(debug_assertions)]
 fn verify_vmalloc_hardware_access(allocation: &KernelVmAllocation) {
-    const PATTERN: u64 = 0x5355_444f_4f53_4d4d;
+    const PATTERNS: [u64; 2] = [0x5355_444f_4f53_4d30, 0x5355_444f_4f53_4d31];
 
-    let address = allocation.usable_range().start().get();
-    let pointer = address as *mut u64;
+    assert!(allocation.usable_range().size() >= PAGE_SIZE * PATTERNS.len());
 
-    // SAFETY:
-    // vmalloc() 已将该页以 kernel_data 权限写入当前活动 Sv39 根页表，
-    // allocation token 在整个读写期间保持映射和物理页所有权。
+    for (page_index, pattern) in PATTERNS.into_iter().enumerate() {
+        let address = allocation
+            .usable_range()
+            .start()
+            .get()
+            .checked_add(page_index * PAGE_SIZE)
+            .expect("vmalloc hardware-test address overflow");
+        let pointer = address as *mut u64;
+
+        // SAFETY:
+        // vmalloc() mapped this page writable in the current active root and
+        // allocation retains ownership of both the mapping and backing page.
+        unsafe {
+            core::ptr::write_volatile(pointer, pattern);
+            assert_eq!(
+                core::ptr::read_volatile(pointer),
+                pattern,
+                "CPU could not access vmalloc page {page_index}",
+            );
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn verify_ioremap_hardware_access(mapping: &KernelIoMapping) {
+    const PATTERN: u64 = 0x5355_444f_4f53_494f;
+
+    let pointer = mapping.virtual_address().get() as *mut u64;
+
+    // SAFETY: ioremap() installed a writable device mapping for at least one
+    // full page.  The test backing object is ordinary RAM owned by the caller.
     unsafe {
         core::ptr::write_volatile(pointer, PATTERN);
         assert_eq!(
             core::ptr::read_volatile(pointer),
             PATTERN,
-            "RISC-V CPU could not access the vmalloc mapping",
+            "CPU could not access ioremap mapping",
         );
     }
+}
+
+#[cfg(debug_assertions)]
+fn runtime_table_count() -> usize {
+    with_kernel_page_table(|page_table| Ok(page_table.allocated_runtime_tables()))
+        .expect("kernel runtime page table unavailable")
 }
 
 fn reservation_count() -> Result<usize, KernelVmError> {
