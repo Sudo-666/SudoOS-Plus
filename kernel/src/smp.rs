@@ -209,6 +209,7 @@ pub fn handle_ipi() {
     );
     fence(Ordering::Acquire);
     IPI_COUNTS[cpu.get()].fetch_add(1, Ordering::AcqRel);
+    crate::task::request_reschedule_local();
 }
 
 pub fn ipi_count(cpu: CpuId) -> u64 {

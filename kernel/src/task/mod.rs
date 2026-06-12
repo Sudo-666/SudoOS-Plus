@@ -1,4 +1,9 @@
+#[cfg(debug_assertions)]
+mod m4c_verify;
 mod stack;
+mod wait_queue;
+
+pub use wait_queue::WaitQueue;
 
 use alloc::{collections::VecDeque, vec::Vec};
 #[cfg(debug_assertions)]
@@ -11,10 +16,12 @@ use crate::{irq_lock::IrqSpinLock, smp::CpuId};
 use stack::KernelStack;
 
 const MAX_TASKS: usize = 128;
+const DEFAULT_TIME_SLICE_TICKS: u32 = 4;
 const MAX_CPUS: usize = crate::smp::MAX_CPUS;
 #[cfg(debug_assertions)]
+const SINGLE_CPU_VERIFY_ITERATIONS: usize = 50_000;
 #[cfg(debug_assertions)]
-const WORKER_ITERATIONS: usize = 50_000;
+const SMP_VERIFY_ITERATIONS: usize = 25_000;
 #[cfg(debug_assertions)]
 const STEAL_TASK_COUNT: usize = 16;
 #[cfg(debug_assertions)]
@@ -35,6 +42,7 @@ enum TaskState {
     Runnable,
     Running(CpuId),
     SwitchingOut(CpuId),
+    Blocked,
     Idle(CpuId),
     Exited,
 }
@@ -61,6 +69,8 @@ struct Task {
     affinity: Option<CpuId>,
     queued_on: Option<CpuId>,
     has_run: bool,
+    wait_channel: Option<usize>,
+    wake_pending: bool,
 }
 
 impl Task {
@@ -75,6 +85,8 @@ impl Task {
             affinity: Some(CpuId::BOOT),
             queued_on: None,
             has_run: true,
+            wait_channel: None,
+            wake_pending: false,
         }
     }
 
@@ -89,6 +101,8 @@ impl Task {
             affinity: Some(cpu),
             queued_on: None,
             has_run: false,
+            wait_channel: None,
+            wake_pending: false,
         }
     }
 
@@ -108,6 +122,8 @@ impl Task {
             affinity,
             queued_on: None,
             has_run: false,
+            wait_channel: None,
+            wake_pending: false,
         }
     }
 
@@ -122,6 +138,7 @@ impl Task {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SwitchDisposition {
     Yield,
+    Block,
     Exit,
 }
 
@@ -138,6 +155,11 @@ struct CpuScheduler {
     run_queue: VecDeque<TaskId>,
     pending: Option<PendingSwitch>,
     context_switches: u64,
+    preemptions: u64,
+    irq_depth: usize,
+    preempt_count: usize,
+    need_resched: bool,
+    timeslice_remaining: u32,
 }
 
 impl CpuScheduler {
@@ -149,6 +171,11 @@ impl CpuScheduler {
             run_queue: VecDeque::with_capacity(MAX_TASKS),
             pending: None,
             context_switches: 0,
+            preemptions: 0,
+            irq_depth: 0,
+            preempt_count: 0,
+            need_resched: false,
+            timeslice_remaining: DEFAULT_TIME_SLICE_TICKS,
         }
     }
 }
@@ -276,6 +303,7 @@ impl Scheduler {
         }
 
         self.enqueue(id, target);
+        self.cpus[target.get()].need_resched = true;
         self.live_kernel_threads += 1;
         (id, target)
     }
@@ -357,6 +385,9 @@ impl Scheduler {
 
         assert!(task.queued_on.is_none());
         task.state = TaskState::Running(cpu);
+
+        self.cpus[cpu.get()].timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+        self.cpus[cpu.get()].need_resched = false;
     }
 
     fn prepare_yield(&mut self, cpu: CpuId) -> Option<ContextSwitch> {
@@ -379,6 +410,7 @@ impl Scheduler {
         };
 
         assert_ne!(previous, next, "CPU selected its current task as next");
+        self.cpus[cpu.get()].need_resched = false;
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
         self.cpus[cpu.get()].current = Some(next);
@@ -392,6 +424,104 @@ impl Scheduler {
             .expect("context switch counter overflowed");
 
         Some(self.context_pair(previous, next))
+    }
+
+    fn prepare_preempt(&mut self, cpu: CpuId) -> Option<ContextSwitch> {
+        let cpu_state = &self.cpus[cpu.get()];
+        assert!(cpu_state.online, "offline CPU attempted to preempt");
+        assert_eq!(
+            cpu_state.irq_depth, 0,
+            "preemption attempted inside IRQ context"
+        );
+        assert_eq!(
+            cpu_state.preempt_count, 0,
+            "preemption attempted while disabled",
+        );
+        assert!(
+            cpu_state.pending.is_none(),
+            "nested context switch attempted"
+        );
+
+        if !cpu_state.need_resched {
+            return None;
+        }
+
+        let previous = self.current(cpu);
+        assert_eq!(self.task(previous).state, TaskState::Running(cpu));
+
+        let Some(next) = self.dequeue_next(cpu) else {
+            self.cpus[cpu.get()].need_resched = false;
+            self.cpus[cpu.get()].timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+            return None;
+        };
+
+        assert_ne!(previous, next, "CPU selected its current task as next");
+        self.cpus[cpu.get()].need_resched = false;
+        self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
+        self.activate_next(next, cpu);
+        self.cpus[cpu.get()].current = Some(next);
+        self.cpus[cpu.get()].pending = Some(PendingSwitch {
+            previous,
+            disposition: SwitchDisposition::Yield,
+        });
+        self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
+            .context_switches
+            .checked_add(1)
+            .expect("context switch counter overflowed");
+        self.cpus[cpu.get()].preemptions = self.cpus[cpu.get()]
+            .preemptions
+            .checked_add(1)
+            .expect("preemption counter overflowed");
+
+        Some(self.context_pair(previous, next))
+    }
+
+    fn prepare_block(&mut self, cpu: CpuId, channel: usize) -> ContextSwitch {
+        assert_ne!(channel, 0, "wait channel zero is reserved");
+        assert!(
+            self.cpus[cpu.get()].pending.is_none(),
+            "nested switch attempted"
+        );
+        assert_eq!(
+            self.cpus[cpu.get()].irq_depth,
+            0,
+            "IRQ context attempted to block"
+        );
+        assert_eq!(
+            self.cpus[cpu.get()].preempt_count,
+            0,
+            "preemption-disabled task attempted to block",
+        );
+
+        let previous = self.current(cpu);
+        let previous_task = self.task(previous);
+        assert_eq!(previous_task.state, TaskState::Running(cpu));
+        assert!(
+            !previous_task.kind.is_idle(),
+            "idle task attempted to block on a wait queue",
+        );
+
+        let next = self.dequeue_next(cpu).unwrap_or_else(|| self.idle(cpu));
+        assert_ne!(previous, next);
+
+        {
+            let task = self.task_mut(previous);
+            task.state = TaskState::SwitchingOut(cpu);
+            task.wait_channel = Some(channel);
+            task.wake_pending = false;
+        }
+        self.activate_next(next, cpu);
+        self.cpus[cpu.get()].current = Some(next);
+        self.cpus[cpu.get()].pending = Some(PendingSwitch {
+            previous,
+            disposition: SwitchDisposition::Block,
+        });
+        self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
+            .context_switches
+            .checked_add(1)
+            .expect("context switch counter overflowed");
+
+        self.context_pair(previous, next)
     }
 
     fn prepare_exit(&mut self, cpu: CpuId) -> ContextSwitch {
@@ -454,6 +584,24 @@ impl Scheduler {
                     self.task_mut(pending.previous).state = TaskState::Runnable;
                     self.enqueue(pending.previous, cpu);
                 }
+                None
+            }
+            SwitchDisposition::Block => {
+                let wake_pending = self.task(pending.previous).wake_pending;
+
+                if wake_pending {
+                    {
+                        let task = self.task_mut(pending.previous);
+                        task.wake_pending = false;
+                        task.wait_channel = None;
+                        task.state = TaskState::Runnable;
+                    }
+                    self.enqueue(pending.previous, cpu);
+                    self.cpus[cpu.get()].need_resched = true;
+                } else {
+                    self.task_mut(pending.previous).state = TaskState::Blocked;
+                }
+
                 None
             }
             SwitchDisposition::Exit => {
@@ -522,11 +670,150 @@ impl Scheduler {
         })
     }
 
+    fn wake_channel(&mut self, channel: usize, maximum: usize) -> (usize, usize) {
+        assert_ne!(channel, 0, "wait channel zero is reserved");
+        assert!(maximum != 0, "wake limit must be non-zero");
+
+        let mut matches: [Option<TaskId>; MAX_TASKS] = [None; MAX_TASKS];
+        let mut count = 0;
+
+        for task in self.tasks.iter().flatten() {
+            if task.wait_channel == Some(channel)
+                && matches!(task.state, TaskState::Blocked | TaskState::SwitchingOut(_))
+            {
+                matches[count] = Some(task.id);
+                count += 1;
+                if count == maximum {
+                    break;
+                }
+            }
+        }
+
+        let mut target_mask = 0;
+
+        for id in matches.into_iter().take(count).flatten() {
+            match self.task(id).state {
+                TaskState::Blocked => {
+                    let target = self
+                        .task(id)
+                        .affinity
+                        .unwrap_or_else(|| self.choose_target_cpu());
+                    {
+                        let task = self.task_mut(id);
+                        task.wait_channel = None;
+                        task.wake_pending = false;
+                        task.state = TaskState::Runnable;
+                    }
+                    self.enqueue(id, target);
+                    self.cpus[target.get()].need_resched = true;
+                    target_mask |= 1_usize << target.get();
+                }
+                TaskState::SwitchingOut(_) => {
+                    self.task_mut(id).wake_pending = true;
+                }
+                state => panic!("invalid waiter state during wakeup: {state:?}"),
+            }
+        }
+
+        (count, target_mask)
+    }
+
+    fn waiter_count(&self, channel: usize) -> usize {
+        self.tasks
+            .iter()
+            .flatten()
+            .filter(|task| {
+                task.wait_channel == Some(channel)
+                    && matches!(task.state, TaskState::Blocked | TaskState::SwitchingOut(_))
+            })
+            .count()
+    }
+
+    fn irq_enter(&mut self, cpu: CpuId) {
+        let state = &mut self.cpus[cpu.get()];
+        assert!(state.online, "offline CPU entered IRQ context");
+        state.irq_depth = state
+            .irq_depth
+            .checked_add(1)
+            .expect("IRQ nesting counter overflowed");
+    }
+
+    fn irq_exit(&mut self, cpu: CpuId) -> bool {
+        let state = &mut self.cpus[cpu.get()];
+        state.irq_depth = state
+            .irq_depth
+            .checked_sub(1)
+            .expect("IRQ nesting counter underflowed");
+        state.irq_depth == 0 && state.preempt_count == 0 && state.need_resched
+    }
+
+    fn timer_tick(&mut self, cpu: CpuId) {
+        let current = self.current(cpu);
+        if self.task(current).kind.is_idle() {
+            return;
+        }
+
+        let state = &mut self.cpus[cpu.get()];
+        if state.timeslice_remaining > 1 {
+            state.timeslice_remaining -= 1;
+        } else {
+            state.timeslice_remaining = 0;
+            state.need_resched = true;
+        }
+    }
+
+    fn request_reschedule(&mut self, cpu: CpuId) {
+        if self.cpus[cpu.get()].online {
+            self.cpus[cpu.get()].need_resched = true;
+        }
+    }
+
+    fn preempt_disable(&mut self, cpu: CpuId) {
+        let state = &mut self.cpus[cpu.get()];
+        state.preempt_count = state
+            .preempt_count
+            .checked_add(1)
+            .expect("preempt counter overflowed");
+    }
+
+    fn preempt_enable(&mut self, cpu: CpuId) -> bool {
+        let state = &mut self.cpus[cpu.get()];
+        state.preempt_count = state
+            .preempt_count
+            .checked_sub(1)
+            .expect("preempt counter underflowed");
+        state.preempt_count == 0 && state.irq_depth == 0 && state.need_resched
+    }
+
+    fn assert_schedulable(&self, cpu: CpuId) {
+        let state = &self.cpus[cpu.get()];
+        assert_eq!(
+            state.irq_depth, 0,
+            "task attempted to schedule in IRQ context"
+        );
+        assert_eq!(
+            state.preempt_count, 0,
+            "task attempted to schedule with preemption disabled",
+        );
+    }
+
+    fn preempt_count(&self, cpu: CpuId) -> usize {
+        self.cpus[cpu.get()].preempt_count
+    }
+
     fn context_switches_total(&self) -> u64 {
         self.cpus
             .iter()
             .take(self.discovered_cpus)
             .map(|cpu| cpu.context_switches)
+            .sum()
+    }
+
+    fn preemptions_total(&self) -> u64 {
+        self.cpus
+            .iter()
+            .take(self.discovered_cpus)
+            .map(|cpu| cpu.preemptions)
             .sum()
     }
 }
@@ -542,11 +829,152 @@ pub fn initialize() {
     *slot = Some(scheduler);
 
     crate::println!("kernel scheduler:");
-    crate::println!("  policy          : per-CPU FIFO round-robin");
+    crate::println!("  policy          : preemptive per-CPU FIFO round-robin");
     crate::println!("  kernel stack    : 16 KiB plus guard pages");
     crate::println!("  active CPUs     : 1");
     crate::println!("  configured CPUs : {}", discovered);
+    crate::println!(
+        "  timeslice       : {} timer ticks",
+        DEFAULT_TIME_SLICE_TICKS
+    );
+    crate::println!("  wait queues     : blocking wakeup enabled");
     crate::println!("  migration       : unstarted tasks only until TLB shootdown");
+}
+
+pub fn irq_enter() {
+    let cpu = crate::smp::current_cpu_id();
+    let mut slot = SCHEDULER.lock();
+    if let Some(scheduler) = slot.as_mut() {
+        scheduler.irq_enter(cpu);
+    }
+}
+
+pub fn irq_exit() {
+    let cpu = crate::smp::current_cpu_id();
+    let should_preempt = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .is_some_and(|scheduler| scheduler.irq_exit(cpu))
+    };
+
+    if should_preempt {
+        preempt_schedule_irq();
+    }
+}
+
+pub fn on_timer_tick() {
+    let cpu = crate::smp::current_cpu_id();
+    let mut slot = SCHEDULER.lock();
+    if let Some(scheduler) = slot.as_mut() {
+        scheduler.timer_tick(cpu);
+    }
+}
+
+pub fn request_reschedule_local() {
+    let cpu = crate::smp::current_cpu_id();
+    let mut slot = SCHEDULER.lock();
+    if let Some(scheduler) = slot.as_mut() {
+        scheduler.request_reschedule(cpu);
+    }
+}
+
+pub fn preempt_disable() {
+    let cpu = crate::smp::current_cpu_id();
+    let mut slot = SCHEDULER.lock();
+    slot.as_mut()
+        .expect("preemption used before scheduler initialization")
+        .preempt_disable(cpu);
+}
+
+pub fn preempt_enable() {
+    let cpu = crate::smp::current_cpu_id();
+    let should_schedule = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("preemption used before scheduler initialization")
+            .preempt_enable(cpu)
+    };
+
+    if should_schedule && crate::arch::interrupt::are_enabled() {
+        preempt_schedule();
+    }
+}
+
+pub fn preempt_count() -> usize {
+    let cpu = crate::smp::current_cpu_id();
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("preemption queried before scheduler initialization")
+        .preempt_count(cpu)
+}
+
+pub(super) fn block_current_on_if<F>(channel: usize, should_block: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    assert!(
+        crate::arch::interrupt::are_enabled(),
+        "wait-queue blocking requires local interrupts enabled",
+    );
+
+    let interrupt_state = crate::arch::interrupt::save_and_disable();
+    let cpu = crate::smp::current_cpu_id();
+    let switch = {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.assert_schedulable(cpu);
+
+        if should_block() {
+            Some(scheduler.prepare_block(cpu, channel))
+        } else {
+            None
+        }
+    };
+
+    let Some((previous, next)) = switch else {
+        crate::arch::interrupt::restore(interrupt_state);
+        return false;
+    };
+
+    // SAFETY: the outgoing task is held in SwitchingOut until the incoming
+    // context completes the switch. The wait channel remains attached to it,
+    // so a concurrent wakeup becomes wake_pending instead of being lost.
+    unsafe { crate::arch::task::switch(previous, next) };
+
+    finish_switch();
+    crate::arch::interrupt::restore(interrupt_state);
+    true
+}
+
+pub(super) fn wake_channel(channel: usize, maximum: usize) -> usize {
+    let (woken, targets) = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("kernel scheduler is not initialized")
+            .wake_channel(channel, maximum)
+    };
+
+    let current = crate::smp::current_cpu_id();
+    for index in 0..crate::smp::discovered_cpu_count() {
+        let bit = 1_usize << index;
+        if targets & bit == 0 {
+            continue;
+        }
+
+        let cpu = CpuId::new(index).expect("wakeup target exceeds MAX_CPUS");
+        if cpu != current {
+            crate::smp::send_ipi(cpu);
+        }
+    }
+
+    woken
+}
+
+pub(super) fn waiter_count(channel: usize) -> usize {
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("kernel scheduler is not initialized")
+        .waiter_count(channel)
 }
 
 pub fn register_secondary_cpu(cpu: CpuId) {
@@ -615,9 +1043,9 @@ pub fn yield_now() {
     let cpu = crate::smp::current_cpu_id();
     let switch = {
         let mut slot = SCHEDULER.lock();
-        slot.as_mut()
-            .expect("kernel scheduler is not initialized")
-            .prepare_yield(cpu)
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.assert_schedulable(cpu);
+        scheduler.prepare_yield(cpu)
     };
 
     let Some((previous, next)) = switch else {
@@ -634,6 +1062,41 @@ pub fn yield_now() {
     crate::arch::interrupt::restore(interrupt_state);
 }
 
+fn preempt_schedule() {
+    assert!(crate::arch::interrupt::are_enabled());
+    let interrupt_state = crate::arch::interrupt::save_and_disable();
+    preempt_schedule_disabled();
+    crate::arch::interrupt::restore(interrupt_state);
+}
+
+fn preempt_schedule_irq() {
+    assert!(
+        crate::arch::interrupt::are_disabled(),
+        "IRQ-return preemption requires local interrupts disabled",
+    );
+    preempt_schedule_disabled();
+}
+
+fn preempt_schedule_disabled() {
+    let cpu = crate::smp::current_cpu_id();
+    let switch = {
+        let mut slot = SCHEDULER.lock();
+        let Some(scheduler) = slot.as_mut() else {
+            return;
+        };
+        scheduler.prepare_preempt(cpu)
+    };
+
+    let Some((previous, next)) = switch else {
+        return;
+    };
+
+    // SAFETY: the timer/IPI exit path has dropped IRQ depth to zero and the
+    // scheduler has exclusively assigned the incoming context to this CPU.
+    unsafe { crate::arch::task::switch(previous, next) };
+    finish_switch();
+}
+
 fn exit_current() -> ! {
     assert!(
         crate::arch::interrupt::are_enabled(),
@@ -644,9 +1107,9 @@ fn exit_current() -> ! {
     let cpu = crate::smp::current_cpu_id();
     let (previous, next) = {
         let mut slot = SCHEDULER.lock();
-        slot.as_mut()
-            .expect("kernel scheduler is not initialized")
-            .prepare_exit(cpu)
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.assert_schedulable(cpu);
+        scheduler.prepare_exit(cpu)
     };
 
     // SAFETY: the exiting task remains allocated and marked SwitchingOut
@@ -709,6 +1172,14 @@ fn context_switches() -> u64 {
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .context_switches_total()
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn preemptions() -> u64 {
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("kernel scheduler is not initialized")
+        .preemptions_total()
 }
 
 unsafe extern "C" fn kernel_thread_bootstrap() -> ! {
@@ -1024,21 +1495,22 @@ pub fn verify() {
 
     let cpu_count = crate::smp::online_cpu_count();
     assert_eq!(cpu_count, crate::smp::discovered_cpu_count());
-    let spawned_workers = if cpu_count == 1 { 2 } else { cpu_count };
+    let worker_count = if cpu_count == 1 { 2 } else { cpu_count };
+    let iterations = if cpu_count == 1 {
+        SINGLE_CPU_VERIFY_ITERATIONS
+    } else {
+        SMP_VERIFY_ITERATIONS
+    };
 
-    let expected_yields = WORKER_ITERATIONS
-        .checked_mul(spawned_workers)
-        .expect("scheduler yield count overflowed");
-
-    VERIFY_ITERATIONS.store(WORKER_ITERATIONS, Ordering::Release);
+    VERIFY_ITERATIONS.store(iterations, Ordering::Release);
     USE_CONCURRENT_BARRIER.store(cpu_count > 1, Ordering::Release);
-    EXPECTED_WORKER_MASK.store((1_usize << spawned_workers) - 1, Ordering::Release);
+    EXPECTED_WORKER_MASK.store((1_usize << worker_count) - 1, Ordering::Release);
 
     let pages_before = crate::page_alloc::total_free_pages()
         .expect("page allocator unavailable before scheduler verification");
     let switches_before = context_switches();
 
-    for index in 0..spawned_workers {
+    for index in 0..worker_count {
         let cpu = if cpu_count == 1 {
             CpuId::BOOT
         } else {
@@ -1046,28 +1518,29 @@ pub fn verify() {
         };
         EXPECTED_CPUS[index].store(cpu.get(), Ordering::Release);
         if cpu_count == 1 {
+            // Exercise the public unbound kernel-thread API on the UP path.
             spawn_kernel_thread(WORKER_ENTRIES[index]);
         } else {
             spawn_internal(WORKER_ENTRIES[index], Some(cpu), Some(cpu));
         }
     }
 
-    wait_for_workers(spawned_workers);
+    wait_for_workers(worker_count);
     verify_ipi_delivery(cpu_count);
     verify_work_stealing(cpu_count);
     crate::heap::shrink();
 
-    let actual_switches = context_switches()
+    let switches = context_switches()
         .checked_sub(switches_before)
         .expect("context switch counter moved backwards");
+    let minimum_switches = (iterations as u64)
+        .checked_mul(worker_count as u64)
+        .expect("scheduler switch threshold overflowed");
     let pages_after = crate::page_alloc::total_free_pages()
         .expect("page allocator unavailable after scheduler verification");
 
-    for index in 0..spawned_workers {
-        assert_eq!(
-            WORKER_PROGRESS[index].load(Ordering::Acquire),
-            WORKER_ITERATIONS
-        );
+    for index in 0..worker_count {
+        assert_eq!(WORKER_PROGRESS[index].load(Ordering::Acquire), iterations);
         assert_ne!(WORKER_STACKS[index].load(Ordering::Acquire), 0);
         assert_eq!(
             WORKER_CPUS[index].load(Ordering::Acquire),
@@ -1084,19 +1557,18 @@ pub fn verify() {
     }
 
     assert!(
-        actual_switches >= expected_yields as u64,
-        "too few context switches: actual={actual_switches} minimum={expected_yields}",
+        switches >= minimum_switches,
+        "too few context switches: actual={switches} minimum={minimum_switches}",
     );
     assert_eq!(pages_before, pages_after, "kernel task resources leaked");
     assert!(crate::arch::interrupt::are_enabled());
 
+    m4c_verify::verify();
+
     crate::println!("kernel scheduler test:");
-    crate::println!("  kernel threads  : verified ({})", spawned_workers);
+    crate::println!("  kernel threads  : verified ({})", worker_count);
     crate::println!("  private stacks  : verified");
-    crate::println!(
-        "  context switch  : verified ({} switches)",
-        actual_switches
-    );
+    crate::println!("  context switch  : verified ({} switches)", switches);
     crate::println!("  cooperative     : verified");
     crate::println!("  timer coexistence: verified");
     crate::println!("  task exit       : verified");

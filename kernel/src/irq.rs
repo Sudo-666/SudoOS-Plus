@@ -23,8 +23,17 @@ pub fn initialize_secondary() {
     crate::arch::interrupt::mask_all_sources();
 }
 
+pub fn enter() {
+    crate::task::irq_enter();
+}
+
+pub fn exit() {
+    crate::task::irq_exit();
+}
+
 pub fn handle_timer_interrupt() {
     crate::time::handle_timer_interrupt();
+    crate::task::on_timer_tick();
 }
 
 pub fn handle_software_interrupt() {

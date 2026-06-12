@@ -45,6 +45,13 @@ COMMON_REQUIRED_MARKERS = (
     b"timer coexistence: verified",
     b"task exit       : verified",
     b"resource reclaim: verified",
+    b"non-yielding task : preempted",
+    b"timer reschedule  : verified",
+    b"preempt count     : verified",
+    b"block current     : verified",
+    b"no lost wakeup    : verified",
+    b"wake one/all      : verified",
+    b"M4C_SCHED_TEST: PASS",
     b"SMP_TEST: PASS",
 )
 ARCH_REQUIRED_MARKERS = {
