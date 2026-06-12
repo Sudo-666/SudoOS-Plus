@@ -16,6 +16,7 @@ KERNEL_PHYS_BASE = 0x0000000000400000;
 KERNEL_VIRT_BASE = 0x9000000000400000;
 
 BOOT_STACK_SIZE = 64K;
+SMP_BOOT_STACKS_SIZE = 512K;
 
 SECTIONS
 {
@@ -29,6 +30,7 @@ SECTIONS
         __boot_virt_start = .;
 
         KEEP(*(.text.entry))
+        KEEP(*(.text.secondary_entry))
 
         . = ALIGN(4K);
         __boot_virt_end = .;
@@ -180,6 +182,19 @@ SECTIONS
         __boot_stack_top = .;
     }
 
+    .smp_boot_stacks (NOLOAD) : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.smp_boot_stacks) - KERNEL_VIRT_BASE)
+    )
+    {
+        __smp_boot_stack_bottom = .;
+
+        . += SMP_BOOT_STACKS_SIZE;
+
+        . = ALIGN(4K);
+        __smp_boot_stack_top = .;
+    }
+
     . = ALIGN(4K);
     __kernel_end = .;
 
@@ -196,8 +211,8 @@ SECTIONS
 
     __rw_phys_start = LOADADDR(.data);
     __rw_phys_end =
-        LOADADDR(.boot_stack)
-        + SIZEOF(.boot_stack);
+        LOADADDR(.smp_boot_stacks)
+        + SIZEOF(.smp_boot_stacks);
 
     /*
      * 整个内核物理占用范围包含：

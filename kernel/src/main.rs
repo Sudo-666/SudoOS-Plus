@@ -11,6 +11,7 @@ mod memory;
 mod page_alloc;
 mod panic;
 mod runtime_page_table;
+mod smp;
 mod task;
 mod time;
 mod trap;
@@ -32,11 +33,23 @@ compile_error!("unsupported target architecture");
 /// 所有架构最终进入的公共 Rust 入口。
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_entry(arg0: usize, arg1: usize, arg2: usize) -> ! {
+    arch::smp::set_current_cpu_id(smp::CpuId::BOOT.get());
     let boot = arch::boot::from_raw(arg0, arg1, arg2).into_boot_info();
 
     print_boot_info(&boot);
 
     kernel_main(boot)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn boot_hardware_cpu_id(boot: &BootInfo) -> usize {
+    boot.boot_cpu_id()
+        .expect("RISC-V boot protocol did not provide the boot hart ID")
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn boot_hardware_cpu_id(_boot: &BootInfo) -> usize {
+    arch::smp::hardware_cpu_id()
 }
 
 fn print_boot_info(boot: &BootInfo) {
@@ -135,6 +148,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         });
 
         inspect_device_tree(&boot, &blob, &tree);
+        smp::initialize(&tree, boot_hardware_cpu_id(&boot));
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
         let memory_layout = memory::build_boot_memory_layout(fdt_address, &blob, &tree)
@@ -166,6 +180,8 @@ fn kernel_main(boot: BootInfo) -> ! {
          */
 
         memory::prepare_riscv_direct_map(&mut early_memory, memory_layout.ram());
+
+        memory::prepare_riscv_smp_trampoline(&mut early_memory);
 
         memory::prepare_riscv_early_uart_mapping(&mut early_memory);
 
@@ -220,6 +236,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     time::verify_periodic();
 
     task::initialize();
+    smp::start_secondaries();
 
     #[cfg(debug_assertions)]
     task::verify();
@@ -227,9 +244,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");
 
-    loop {
-        arch::cpu::wait_for_interrupt();
-    }
+    task::boot_idle_loop()
 }
 
 fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_>) {

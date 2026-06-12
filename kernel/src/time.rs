@@ -5,9 +5,36 @@ const VERIFY_TICKS: u64 = 8;
 
 static CLOCK_FREQUENCY_HZ: AtomicU64 = AtomicU64::new(0);
 static TICK_PERIOD_CYCLES: AtomicU64 = AtomicU64::new(0);
-static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(0);
-static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
-static TIMER_RUNNING: AtomicBool = AtomicBool::new(false);
+static NEXT_DEADLINES: [AtomicU64; crate::smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static TIMER_TICKS: [AtomicU64; crate::smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static TIMER_RUNNING: [AtomicBool; crate::smp::MAX_CPUS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
 pub fn initialize(firmware_frequency: Option<u64>) {
     assert!(
@@ -22,8 +49,9 @@ pub fn initialize(firmware_frequency: Option<u64>) {
         .filter(|period| *period != 0)
         .expect("clocksource frequency is too small for the configured tick rate");
 
-    crate::arch::time::shutdown()
-        .unwrap_or_else(|error| panic!("unable to shut down the boot timer state: {error:?}"));
+    CLOCK_FREQUENCY_HZ.store(frequency, Ordering::Release);
+    TICK_PERIOD_CYCLES.store(period, Ordering::Release);
+    reset_current_clockevent();
 
     let first = crate::arch::time::counter();
     let second = crate::arch::time::counter();
@@ -33,12 +61,6 @@ pub fn initialize(firmware_frequency: Option<u64>) {
         "clocksource moved backwards during initialization: first={first} second={second}",
     );
 
-    CLOCK_FREQUENCY_HZ.store(frequency, Ordering::Release);
-    TICK_PERIOD_CYCLES.store(period, Ordering::Release);
-    NEXT_DEADLINE.store(0, Ordering::Release);
-    TIMER_TICKS.store(0, Ordering::Release);
-    TIMER_RUNNING.store(false, Ordering::Release);
-
     crate::println!("time subsystem:");
     crate::println!("  clocksource      : ready");
     crate::println!("  frequency        : {} Hz", frequency);
@@ -47,22 +69,54 @@ pub fn initialize(firmware_frequency: Option<u64>) {
     crate::println!("  periodic timer   : not armed");
 }
 
+pub fn initialize_secondary() {
+    assert!(
+        crate::arch::interrupt::are_disabled(),
+        "secondary time initialization requires local interrupts disabled",
+    );
+    assert!(
+        CLOCK_FREQUENCY_HZ.load(Ordering::Acquire) != 0,
+        "boot CPU did not publish the clocksource frequency",
+    );
+
+    reset_current_clockevent();
+}
+
 pub fn start_periodic() {
+    arm_periodic_local();
+
+    // SAFETY: trap entry, a kernel stack, timer acknowledgement, and all
+    // currently enabled local sources are installed at this point.
+    unsafe { crate::arch::interrupt::enable() };
+
+    assert!(
+        crate::arch::interrupt::are_enabled(),
+        "local interrupts did not become enabled",
+    );
+}
+
+pub fn arm_periodic_secondary() {
+    arm_periodic_local();
+}
+
+fn arm_periodic_local() {
     assert!(
         crate::arch::interrupt::are_disabled(),
         "periodic timer must be published before enabling local interrupts",
     );
+
+    let cpu = current_cpu_index();
     assert!(
-        !TIMER_RUNNING.swap(true, Ordering::AcqRel),
-        "periodic timer was started more than once",
+        !TIMER_RUNNING[cpu].swap(true, Ordering::AcqRel),
+        "periodic timer was started more than once on CPU {cpu}",
     );
 
     let period = tick_period_cycles();
     let now = crate::arch::time::counter();
     let deadline = now.wrapping_add(period);
 
-    TIMER_TICKS.store(0, Ordering::Release);
-    NEXT_DEADLINE.store(deadline, Ordering::Release);
+    TIMER_TICKS[cpu].store(0, Ordering::Release);
+    NEXT_DEADLINES[cpu].store(deadline, Ordering::Release);
 
     crate::arch::time::acknowledge();
     crate::arch::time::program_deadline(deadline)
@@ -73,26 +127,19 @@ pub fn start_periodic() {
         crate::arch::time::interrupt_source_enabled(),
         "timer interrupt source did not become enabled",
     );
-
-    // SAFETY: trap entry, a kernel stack, timer acknowledgement, and the only
-    // unmasked local interrupt source are all installed at this point.
-    unsafe { crate::arch::interrupt::enable() };
-
-    assert!(
-        crate::arch::interrupt::are_enabled(),
-        "local interrupts did not become enabled",
-    );
 }
 
 pub fn handle_timer_interrupt() {
+    let cpu = current_cpu_index();
+
     assert!(
-        TIMER_RUNNING.load(Ordering::Acquire),
-        "timer interrupt arrived while the clockevent was stopped",
+        TIMER_RUNNING[cpu].load(Ordering::Acquire),
+        "timer interrupt arrived while CPU {cpu} clockevent was stopped",
     );
 
     let period = tick_period_cycles();
     let now = crate::arch::time::counter();
-    let mut next = NEXT_DEADLINE.load(Ordering::Acquire);
+    let mut next = NEXT_DEADLINES[cpu].load(Ordering::Acquire);
 
     if !deadline_is_after(next, now) {
         let overdue = now.wrapping_sub(next);
@@ -104,8 +151,8 @@ pub fn handle_timer_interrupt() {
     crate::arch::time::program_deadline(next)
         .unwrap_or_else(|error| panic!("unable to rearm timer interrupt: {error:?}"));
 
-    NEXT_DEADLINE.store(next, Ordering::Release);
-    TIMER_TICKS.fetch_add(1, Ordering::Release);
+    NEXT_DEADLINES[cpu].store(next, Ordering::Release);
+    TIMER_TICKS[cpu].fetch_add(1, Ordering::Release);
 }
 
 #[cfg(debug_assertions)]
@@ -150,13 +197,31 @@ pub fn verify_periodic() {
 }
 
 pub fn timer_ticks() -> u64 {
-    TIMER_TICKS.load(Ordering::Acquire)
+    timer_ticks_for(crate::smp::current_cpu_id())
 }
 
-fn clock_frequency_hz() -> u64 {
+pub fn timer_ticks_for(cpu: crate::smp::CpuId) -> u64 {
+    TIMER_TICKS[cpu.get()].load(Ordering::Acquire)
+}
+
+pub fn clock_frequency_hz() -> u64 {
     let frequency = CLOCK_FREQUENCY_HZ.load(Ordering::Acquire);
     assert!(frequency != 0, "clocksource has not been initialized");
     frequency
+}
+
+fn reset_current_clockevent() {
+    crate::arch::time::shutdown()
+        .unwrap_or_else(|error| panic!("unable to shut down local timer state: {error:?}"));
+
+    let cpu = current_cpu_index();
+    NEXT_DEADLINES[cpu].store(0, Ordering::Release);
+    TIMER_TICKS[cpu].store(0, Ordering::Release);
+    TIMER_RUNNING[cpu].store(false, Ordering::Release);
+}
+
+fn current_cpu_index() -> usize {
+    crate::smp::current_cpu_id().get()
 }
 
 fn tick_period_cycles() -> u64 {

@@ -4,6 +4,7 @@ PROFILE ?= debug
 SMP ?= 1
 MEM ?= 256M
 SMOKE_TIMEOUT ?= 30
+SMP_SMOKE_TIMEOUT ?= 75
 
 KERNEL_PACKAGE ?= myos-kernel
 KERNEL_BINARY ?= myos-kernel
@@ -63,6 +64,17 @@ smoke-loongarch64:
 
 .PHONY: smoke-all
 smoke-all: smoke-riscv64 smoke-loongarch64
+
+.PHONY: smoke-smp-riscv64
+smoke-smp-riscv64:
+	@SMP=4 ./scripts/smoke.py --arch riscv64 --profile "$(PROFILE)" --timeout "$(SMP_SMOKE_TIMEOUT)"
+
+.PHONY: smoke-smp-loongarch64
+smoke-smp-loongarch64:
+	@SMP=4 ./scripts/smoke.py --arch loongarch64 --profile "$(PROFILE)" --timeout "$(SMP_SMOKE_TIMEOUT)"
+
+.PHONY: smoke-smp-all
+smoke-smp-all: smoke-smp-riscv64 smoke-smp-loongarch64
 
 .PHONY: fmt
 fmt:
@@ -125,7 +137,7 @@ source-tree-check:
 check: source-tree-check fmt-check test build-riscv64 build-loongarch64 clippy
 
 .PHONY: verify
-verify: check smoke-all
+verify: check smoke-all smoke-smp-all
 
 .PHONY: clean
 clean:
@@ -174,6 +186,7 @@ help:
 	@echo ""
 	@echo "  make smoke ARCH=riscv64"
 	@echo "  make smoke-all"
+	@echo "  make smoke-smp-all"
 	@echo "  make check"
 	@echo "  make verify"
 	@echo ""
@@ -186,4 +199,5 @@ help:
 	@echo "  SMP=<cpu count>"
 	@echo "  MEM=<memory size>"
 	@echo "  SMOKE_TIMEOUT=<seconds>"
+	@echo "  SMP_SMOKE_TIMEOUT=<seconds>"
 	@echo "  QEMU_ARGS='<additional arguments>'"

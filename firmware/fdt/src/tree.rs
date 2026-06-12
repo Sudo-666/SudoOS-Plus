@@ -47,7 +47,22 @@ impl<'a> DeviceTree<'a> {
     }
 
     pub fn cpu_count(&self) -> usize {
-        self.inner.root().cpus().iter().count()
+        self.cpu_hardware_ids().count()
+    }
+
+    /// Hardware CPU/thread identifiers from available `/cpus/cpu@*` nodes.
+    ///
+    /// CPUs marked `disabled` are retained because the operating system may
+    /// start them through an architecture-specific enable mechanism. Nodes
+    /// marked `fail` are never exposed to the SMP layer.
+    pub fn cpu_hardware_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inner.root().cpus().iter().filter_map(|cpu| {
+            if cpu.status().is_some_and(|status| status.is_failed()) {
+                return None;
+            }
+
+            cpu.reg::<usize>().first().ok()
+        })
     }
 
     /// `/cpus/timebase-frequency` declared by platforms such as RISC-V.

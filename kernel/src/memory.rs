@@ -457,6 +457,60 @@ fn map_riscv_segment(
 }
 
 #[cfg(target_arch = "riscv64")]
+pub fn prepare_riscv_smp_trampoline(state: &mut EarlyMemoryState) {
+    unsafe extern "C" {
+        static __riscv_smp_trampoline_start_phys: usize;
+        static __riscv_smp_trampoline_end_phys: usize;
+    }
+
+    use myos_mm::{MappingOptions, PhysAddr, PhysFrame, VirtAddr, VirtPage};
+
+    // SAFETY: secondary.S emits two aligned, immutable XLEN-sized objects in
+    // high-half kernel read-only memory. Their contents are the link-time physical
+    // start and end addresses of the low RISC-V SMP trampoline.
+    let (start, end) = unsafe {
+        (
+            core::ptr::addr_of!(__riscv_smp_trampoline_start_phys).read(),
+            core::ptr::addr_of!(__riscv_smp_trampoline_end_phys).read(),
+        )
+    };
+
+    assert_ne!(start, 0, "RISC-V SMP trampoline start is null");
+    assert!(
+        end > start,
+        "invalid RISC-V SMP trampoline range: {start:#x}..{end:#x}"
+    );
+    assert_eq!(
+        start & (myos_mm::PAGE_SIZE - 1),
+        0,
+        "RISC-V SMP trampoline start is not page-aligned"
+    );
+
+    let trampoline_size = end
+        .checked_sub(start)
+        .expect("RISC-V SMP trampoline range underflow");
+
+    assert!(
+        trampoline_size <= myos_mm::PAGE_SIZE,
+        "RISC-V SMP trampoline exceeds one page: {trampoline_size:#x}"
+    );
+
+    let frame = PhysFrame::from_start_address(PhysAddr::new(start))
+        .expect("RISC-V SMP trampoline physical address is unaligned");
+    let page = VirtPage::from_start_address(VirtAddr::new(start))
+        .expect("RISC-V SMP trampoline virtual address is unaligned");
+    let (allocator, page_table) = state.parts_mut();
+
+    page_table
+        .map_page(allocator, page, frame, MappingOptions::kernel_code())
+        .unwrap_or_else(|error| panic!("unable to map RISC-V SMP trampoline: {error:?}"));
+
+    crate::println!("RISC-V SMP trampoline:");
+    crate::println!("  identity page : [{:#018x}, {:#018x})", start, end);
+    crate::println!("  privilege     : supervisor RX");
+}
+
+#[cfg(target_arch = "riscv64")]
 pub fn prepare_riscv_early_uart_mapping(state: &mut EarlyMemoryState) {
     use myos_mm::{MappingOptions, PhysAddr, PhysFrame, VirtAddr, VirtPage};
 

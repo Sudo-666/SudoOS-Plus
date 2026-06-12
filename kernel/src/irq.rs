@@ -18,8 +18,17 @@ pub fn initialize() {
     crate::println!("  dispatch policy : fail-fast on unhandled irq");
 }
 
+pub fn initialize_secondary() {
+    crate::arch::interrupt::disable();
+    crate::arch::interrupt::mask_all_sources();
+}
+
 pub fn handle_timer_interrupt() {
     crate::time::handle_timer_interrupt();
+}
+
+pub fn handle_software_interrupt() {
+    crate::smp::handle_ipi();
 }
 
 pub fn handle_unhandled(source: InterruptSource, raw: usize) -> ! {

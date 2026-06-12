@@ -38,13 +38,14 @@ COMMON_REQUIRED_MARKERS = (
     b"idle wakeup      : verified",
     b"local interrupts : enabled",
     b"periodic timer   : armed at 100 Hz",
-    b"kernel threads  : verified (2)",
+    b"kernel threads  : verified (",
     b"private stacks  : verified",
     b"context switch  : verified",
     b"cooperative     : verified",
     b"timer coexistence: verified",
     b"task exit       : verified",
     b"resource reclaim: verified",
+    b"SMP_TEST: PASS",
 )
 ARCH_REQUIRED_MARKERS = {
     "riscv64": (
@@ -174,7 +175,40 @@ def main() -> int:
     scan_buffer = b""
     success = False
     failure_reason: str | None = None
-    required_markers = set(COMMON_REQUIRED_MARKERS + ARCH_REQUIRED_MARKERS[args.arch])
+    cpu_count = int(os.environ.get("SMP", "1"))
+    if cpu_count <= 0:
+        raise RuntimeError("SMP must be greater than zero")
+
+    smp_markers = (
+        f"discovered CPUs : {cpu_count}".encode(),
+        f"online CPUs     : {cpu_count}".encode(),
+        f"participating CPUs : {cpu_count}".encode(),
+        b"per-CPU stacks  : verified",
+        b"per-CPU traps   : verified",
+        b"per-CPU timers  : armed",
+        b"per-CPU current     : verified",
+        b"task affinity       : verified",
+        b"idle fallback       : verified",
+    )
+    if cpu_count > 1:
+        smp_markers += (
+            b"secondary CPUs  : verified",
+            b"concurrent threads : verified",
+            b"remote wakeup       : verified",
+            b"IPI delivery        : verified",
+            b"work stealing       : verified (unstarted tasks)",
+        )
+    else:
+        smp_markers += (
+            b"secondary CPUs  : single-CPU fallback",
+            b"remote wakeup       : single-CPU fallback",
+            b"IPI delivery        : single-CPU fallback",
+            b"work stealing       : single-CPU fallback",
+        )
+
+    required_markers = set(
+        COMMON_REQUIRED_MARKERS + ARCH_REQUIRED_MARKERS[args.arch] + smp_markers
+    )
 
     try:
         with log_path.open("wb") as log_file:

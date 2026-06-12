@@ -9,7 +9,7 @@ unsafe extern "C" {
     static __rodata_end: u8;
 
     static __data_start: u8;
-    static __boot_stack_top: u8;
+    static __smp_boot_stack_top: u8;
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -21,7 +21,7 @@ unsafe extern "C" {
     static __rodata_end: u8;
 
     static __data_start: u8;
-    static __boot_stack_top: u8;
+    static __smp_boot_stack_top: u8;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -77,8 +77,8 @@ pub fn kernel_image_layout() -> KernelImageLayout {
 
     let read_write = riscv_kernel_symbol_range(
         core::ptr::addr_of!(__data_start),
-        core::ptr::addr_of!(__boot_stack_top),
-        "data/bss/stack",
+        core::ptr::addr_of!(__smp_boot_stack_top),
+        "data/bss/boot-stacks",
     );
 
     {
@@ -162,8 +162,8 @@ pub fn kernel_image_layout() -> KernelImageLayout {
      */
     let read_write = cached_symbol_range(
         core::ptr::addr_of!(__data_start),
-        core::ptr::addr_of!(__boot_stack_top),
-        "data/bss/stack",
+        core::ptr::addr_of!(__smp_boot_stack_top),
+        "data/bss/boot-stacks",
     );
 
     assert_eq!(
@@ -177,7 +177,7 @@ pub fn kernel_image_layout() -> KernelImageLayout {
      *
      * .boot @ 0x0020_0000
      * 启动段到主内核间的保留间隙
-     * 正式内核直到 boot stack 末尾
+     * 正式内核直到 SMP bootstrap stacks 末尾
      */
     let physical = PhysRange::new(
         crate::arch::memory::layout::BOOT_PHYS_BASE,
@@ -210,7 +210,7 @@ fn make_segments(text: PhysRange, rodata: PhysRange, read_write: PhysRange) -> [
             options: MappingOptions::kernel_rodata(),
         },
         KernelSegment {
-            name: "data/bss/stack",
+            name: "data/bss/boot-stacks",
             physical: read_write,
             options: MappingOptions::kernel_data(),
         },

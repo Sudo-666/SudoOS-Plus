@@ -151,6 +151,37 @@ pub fn initialize(memory: crate::memory::KernelMemoryState) {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
+pub fn activate_secondary_cpu() {
+    assert!(
+        crate::arch::memory::paging::translation_is_enabled(),
+        "secondary RISC-V CPU entered Rust without Sv39 enabled",
+    );
+}
+
+#[cfg(target_arch = "loongarch64")]
+pub fn activate_secondary_cpu() {
+    let hardware = {
+        let slot = KERNEL_PAGE_TABLE.lock();
+        slot.as_ref()
+            .expect("kernel page table is not initialized")
+            .hardware_state()
+    };
+
+    // SAFETY: the boot CPU owns the root permanently through
+    // KERNEL_PAGE_TABLE. This secondary CPU has not accessed paged kernel
+    // virtual addresses yet, and page-table mutation remains serialized by
+    // the same global lock.
+    let installed = unsafe { crate::arch::memory::paging::activate(hardware.root()) }
+        .unwrap_or_else(|error| panic!("unable to activate secondary CPU paging: {error:?}"));
+
+    assert_eq!(
+        installed.root(),
+        hardware.root(),
+        "secondary CPU installed a different kernel page-table root",
+    );
+}
+
 pub fn reserve_vmalloc(
     size: usize,
     alignment: usize,
