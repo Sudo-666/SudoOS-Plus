@@ -119,10 +119,8 @@ fn initialize_directory_table(frame: PhysFrame, child_pointer: u64) {
 }
 
 fn initialize_filled_table(frame: PhysFrame, value: u64) {
-    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("allocated page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
+        .expect("allocated page-table frame is not accessible");
 
     /*
      * SAFETY:

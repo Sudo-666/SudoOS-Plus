@@ -48,6 +48,14 @@ SECTIONS
 
     __kernel_start = .;
 
+    /*
+     * ============================================================
+     * Text: RX
+     * ============================================================
+     */
+
+    . = ALIGN(4K);
+
     .text : AT(
         KERNEL_PHYS_BASE
         + (ADDR(.text) - KERNEL_VIRT_BASE)
@@ -61,6 +69,14 @@ SECTIONS
         __text_end = .;
     }
 
+    /*
+     * ============================================================
+     * Read-only data: R
+     * ============================================================
+     */
+
+    . = ALIGN(4K);
+
     .rodata : AT(
         KERNEL_PHYS_BASE
         + (ADDR(.rodata) - KERNEL_VIRT_BASE)
@@ -69,10 +85,24 @@ SECTIONS
         __rodata_start = .;
 
         *(.rodata .rodata.*)
+        *(.srodata .srodata.*)
+
+        *(.rodata.cst4)
+        *(.rodata.cst8)
+        *(.rodata.cst16)
+        *(.rodata.cst32)
 
         . = ALIGN(4K);
         __rodata_end = .;
     }
+
+    /*
+     * ============================================================
+     * Writable initialized data: RW
+     * ============================================================
+     */
+
+    . = ALIGN(4K);
 
     .data : AT(
         KERNEL_PHYS_BASE
@@ -82,12 +112,29 @@ SECTIONS
         __data_start = .;
 
         *(.data .data.*)
+
+        *(.data.rel.ro.local .data.rel.ro.local.*)
+        *(.data.rel.ro .data.rel.ro.*)
+
         *(.sdata .sdata.*)
+
         *(.got .got.*)
+        *(.got.plt)
+
+        *(.init_array .init_array.*)
+        *(.fini_array .fini_array.*)
 
         . = ALIGN(4K);
         __data_end = .;
     }
+
+    /*
+     * ============================================================
+     * Zero-initialized data: RW, NOBITS
+     * ============================================================
+     */
+
+    . = ALIGN(4K);
 
     .bss (NOLOAD) : AT(
         KERNEL_PHYS_BASE
@@ -104,6 +151,14 @@ SECTIONS
         __bss_end = .;
     }
 
+    /*
+     * ============================================================
+     * Boot stack: RW, NOBITS
+     * ============================================================
+     */
+
+    . = ALIGN(4K);
+
     .boot_stack (NOLOAD) : AT(
         KERNEL_PHYS_BASE
         + (ADDR(.boot_stack) - KERNEL_VIRT_BASE)
@@ -118,7 +173,6 @@ SECTIONS
     }
 
     . = ALIGN(4K);
-
     __kernel_end = .;
 
     /*

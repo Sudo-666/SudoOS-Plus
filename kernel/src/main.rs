@@ -2,9 +2,19 @@
 #![no_main]
 
 mod console;
+mod fault;
+mod heap;
+mod irq;
+mod irq_lock;
 mod linker;
 mod memory;
+mod page_alloc;
 mod panic;
+mod runtime_page_table;
+mod time;
+mod trap;
+mod vm;
+extern crate alloc;
 
 use myos_boot::BootInfo;
 use myos_fdt::{DeviceTree, FdtBlob};
@@ -107,35 +117,38 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
 
-    let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
-        panic!(
-            "failed to validate FDT at \
-         {fdt_address:#x}: {error}",
-        );
-    });
-
-    let tree = DeviceTree::from_blob(&blob).unwrap_or_else(|error| {
-        panic!(
-            "failed to parse FDT at \
-                     {fdt_address:#x}: {error}",
-        );
-    });
-
-    inspect_device_tree(&boot, &blob, &tree);
-
-    let memory_map =
-        memory::build_boot_memory_map(fdt_address, &blob, &tree).unwrap_or_else(|error| {
+    let memory_layout = {
+        // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
+        let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
-                "failed to construct physical memory map: \
-                 {error:?}",
+                "failed to validate FDT at \
+             {fdt_address:#x}: {error}",
             );
         });
 
-    memory::print_boot_memory_map(&memory_map);
+        let tree = DeviceTree::from_blob(&blob).unwrap_or_else(|error| {
+            panic!(
+                "failed to parse FDT at \
+                         {fdt_address:#x}: {error}",
+            );
+        });
+
+        inspect_device_tree(&boot, &blob, &tree);
+
+        memory::build_boot_memory_layout(fdt_address, &blob, &tree).unwrap_or_else(|error| {
+            panic!(
+                "failed to construct physical memory layout: \
+                 {error:?}",
+            );
+        })
+    };
+
+    memory::print_boot_memory_map(memory_layout.free());
     memory::print_virtual_layout();
     memory::validate_paging_policy();
+    memory::verify_early_frame_allocator(memory_layout.free());
 
-    let mut early_memory = memory::initialize_early_memory(&memory_map);
+    let mut early_memory = memory::initialize_early_memory(memory_layout.free());
 
     memory::map_boot_fdt_page(&mut early_memory, fdt_address);
 
@@ -147,32 +160,57 @@ fn kernel_main(boot: BootInfo) -> ! {
          * Rust 此时已经通过静态临时 Sv39 在高半地址执行。
          */
 
-        memory::prepare_riscv_direct_map(
-            &mut early_memory,
-            &tree,
-        );
+        memory::prepare_riscv_direct_map(&mut early_memory, memory_layout.ram());
 
-        memory::prepare_riscv_early_uart_mapping(
-            &mut early_memory,
-        );
+        memory::prepare_riscv_early_uart_mapping(&mut early_memory);
 
         /*
-         * tree/blob 当前仍持有低地址引用，
-         * 切换 SATP 前必须结束它们的生命周期。
-         */
-        drop(tree);
-        drop(blob);
-
-        /*
+         * FDT 低地址引用已在 memory_layout 构造作用域内结束；
          * 高半 kernel image 之前已经由
          * prepare_kernel_image() 写入正式页表。
          */
-        memory::install_riscv_final_page_table(
-            &early_memory,
-        );
+        memory::install_riscv_final_page_table(&early_memory);
     }
 
+    /*
+     * 从此处开始，不再允许使用 EarlyFrameAllocator。
+     */
+    let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory);
+
+    #[cfg(debug_assertions)]
+    page_alloc::verify();
+
+    /*
+     * 必须在全局页分配器安装后启用 heap。
+     */
+    heap::initialize();
+
+    #[cfg(debug_assertions)]
+    heap::verify();
+
+    #[cfg(debug_assertions)]
+    irq_lock::verify();
+
+    /*
+     * 此时仍保持本地中断关闭。
+     */
+    trap::initialize();
+    irq::initialize();
+    time::initialize();
+    vm::initialize(kernel_memory);
+    fault::initialize();
+
+    #[cfg(debug_assertions)]
+    vm::verify();
+
+    #[cfg(debug_assertions)]
+    fault::verify();
+
+    #[cfg(debug_assertions)]
+    trap::verify_breakpoint();
+
     println!("kernel_main: initialization completed");
+    println!("SMOKE_TEST: PASS");
 
     loop {
         arch::cpu::wait_for_interrupt();

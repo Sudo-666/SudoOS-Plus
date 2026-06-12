@@ -29,6 +29,10 @@ myos-mm = {
     path = "../mm",
 }
 
+myos-sync = {
+    path = "../sync",
+}
+
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 arch-riscv64 = {
     path = "../arch/riscv64",

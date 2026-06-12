@@ -22,9 +22,5 @@ pub fn validate() {
 }
 
 pub use activate::{
-    current_mode,
-    current_satp,
-    switch_sv39_root,
-    translation_is_enabled,
-    ActivateError,
+    ActivateError, current_mode, current_satp, switch_sv39_root, translation_is_enabled,
 };

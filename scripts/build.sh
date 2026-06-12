@@ -130,7 +130,7 @@ build_kernel() {
     --package "${KERNEL_PACKAGE}" \
     --bin "${KERNEL_BINARY}" \
     --target "${TARGET}" \
-    -Z build-std=core \
+    -Z build-std=core,alloc \
     -Z build-std-features=compiler-builtins-mem \
     ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
 

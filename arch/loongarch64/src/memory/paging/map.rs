@@ -127,14 +127,14 @@ impl BootPageTable {
 
         let mut tables: [Option<PhysFrame>; 3] = [None; 3];
 
-        for index in 0..required {
+        for (index, slot) in tables.iter_mut().enumerate().take(required) {
             let frame = allocator.allocate_frame()?;
 
             let table_level = missing_level + 1 + index;
 
             initialize_table_for_level(frame, table_level, self)?;
 
-            tables[index] = Some(frame);
+            *slot = Some(frame);
         }
 
         let leaf_table = tables[required - 1].expect("leaf table is missing");
@@ -173,8 +173,8 @@ impl BootPageTable {
 
         let mut current = self.root;
 
-        for level in 0..LEVELS - 1 {
-            let raw = read_entry(current, page_indices[level].get())?;
+        for (level, page_index) in page_indices.iter().enumerate().take(LEVELS - 1) {
+            let raw = read_entry(current, page_index.get())?;
 
             let pointer = TablePointerEntry::from_raw(raw);
 
@@ -223,10 +223,8 @@ fn initialize_table_for_level(
         }
     };
 
-    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("allocated page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
+        .expect("allocated page-table frame is not accessible");
 
     // SAFETY:
     // 页面来自独占启动分配器，尚未发布。
@@ -239,20 +237,16 @@ fn initialize_table_for_level(
 }
 
 fn read_entry(frame: PhysFrame, index: usize) -> Result<u64, PageTableAccessError> {
-    let pointer = crate::memory::phys_access::ram_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_ptr::<PageTable>(frame.start_address())
+        .expect("page-table frame is not accessible");
 
     // SAFETY: 页表页面当前可由启动地址空间直接访问。
     unsafe { (&*pointer).entry(index) }
 }
 
 fn write_entry(frame: PhysFrame, index: usize, value: u64) -> Result<(), PageTableAccessError> {
-    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("allocated page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
+        .expect("allocated page-table frame is not accessible");
 
     // SAFETY: 页表尚未发布，不存在并发硬件 walker。
     unsafe { (&mut *pointer).set_entry(index, value) }

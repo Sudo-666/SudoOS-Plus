@@ -59,10 +59,8 @@ impl BootPageTable {
 }
 
 fn initialize_zero_table(frame: PhysFrame) {
-    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("allocated page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
+        .expect("allocated page-table frame is not accessible");
 
     /*
      * SAFETY:

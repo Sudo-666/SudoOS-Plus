@@ -115,11 +115,7 @@ pub fn assert_configured() {
 
     assert_eq!(dmw1(), CACHED_DMW_VALUE, "unexpected LoongArch DMW1",);
 
-    assert_eq!(
-        dmw2(),
-        0,
-        "unused LoongArch DMW2 must be disabled",
-    );
+    assert_eq!(dmw2(), 0, "unused LoongArch DMW2 must be disabled",);
 
     assert_eq!(dmw3(), 0, "unused LoongArch DMW3 must be disabled",);
 }

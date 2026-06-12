@@ -213,7 +213,7 @@ fn validate_header(header: &FdtHeader) -> Result<(), FdtError> {
 
     let reservation_end = header.structure_offset();
 
-    if reservation_offset % 8 != 0
+    if !reservation_offset.is_multiple_of(8)
         || reservation_offset >= reservation_end
         || reservation_end > header.total_size()
         || reservation_end - reservation_offset < 16

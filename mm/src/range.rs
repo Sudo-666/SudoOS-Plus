@@ -104,7 +104,7 @@ impl PhysRange {
     }
 
     pub const fn is_page_aligned(self) -> bool {
-        self.start.get() % PAGE_SIZE == 0 && self.end.get() % PAGE_SIZE == 0
+        self.start.get().is_multiple_of(PAGE_SIZE) && self.end.get().is_multiple_of(PAGE_SIZE)
     }
 
     pub const fn contains_range(self, other: Self) -> bool {

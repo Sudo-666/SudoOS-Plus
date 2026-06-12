@@ -119,4 +119,3 @@ pub fn uncached_to_phys(virtual_address: VirtAddr) -> Option<PhysAddr> {
 
     Some(PhysAddr::new(virtual_address.get() & DMW_PHYS_MASK))
 }
-

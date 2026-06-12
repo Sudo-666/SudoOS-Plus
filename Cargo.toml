@@ -9,6 +9,7 @@ members = [
     "boot",
     "firmware/fdt",
     "mm",
+    "sync",
 ]
 
 exclude = [

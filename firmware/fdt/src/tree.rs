@@ -241,7 +241,7 @@ fn parse_reg_property(
         .checked_mul(4)
         .ok_or(FdtError::AddressOverflow)?;
 
-    if entry_size == 0 || bytes.is_empty() || bytes.len() % entry_size != 0 {
+    if entry_size == 0 || bytes.is_empty() || !bytes.len().is_multiple_of(entry_size) {
         return Err(FdtError::InvalidRegLength);
     }
 

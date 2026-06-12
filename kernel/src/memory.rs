@@ -1,12 +1,24 @@
 use myos_fdt::{DeviceTree, FdtBlob, FdtError, MemoryRegion};
 
-use myos_mm::{MemoryMap, MemoryMapError, PhysAddr, PhysRange};
+use myos_mm::{BuddyAllocator, MemoryMap, MemoryMapError, PhysAddr, PhysRange, ZoneKind};
 
 use myos_mm::EarlyFrameAllocator;
 
 const MEMORY_MAP_CAPACITY: usize = 64;
 
 pub type BootMemoryMap = MemoryMap<MEMORY_MAP_CAPACITY>;
+
+pub struct KernelMemoryState {
+    boot_page_table: crate::arch::memory::paging::BootPageTable,
+
+    _metadata_range: PhysRange,
+}
+
+impl KernelMemoryState {
+    pub fn into_boot_page_table(self) -> crate::arch::memory::paging::BootPageTable {
+        self.boot_page_table
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BootMemoryError {
@@ -29,30 +41,29 @@ impl From<MemoryMapError> for BootMemoryError {
     }
 }
 
-pub fn build_boot_memory_map(
+pub fn build_boot_memory_layout(
     fdt_address: usize,
     blob: &FdtBlob<'_>,
     tree: &DeviceTree<'_>,
-) -> Result<BootMemoryMap, BootMemoryError> {
-    let mut map = BootMemoryMap::new();
+) -> Result<BootMemoryLayout, BootMemoryError> {
+    let mut ram = BootMemoryMap::new();
 
     /*
-     * 1. 加入固件声明的普通 RAM。
+     * FDT 声明的全部普通 RAM。
      */
     for region in tree.memory_regions() {
-        map.add_usable(to_phys_range(region)?)?;
+        ram.add_usable(to_phys_range(region)?)?;
     }
 
     /*
-     * 2. 排除 FDT memory reservation block。
+     * free 从完整 RAM 复制出来，然后逐步排除保留区。
      */
+    let mut free = ram;
+
     for reservation in blob.memory_reservations() {
-        map.reserve(to_phys_range(reservation?)?)?;
+        free.reserve(to_phys_range(reservation?)?)?;
     }
 
-    /*
-     * 3. 排除 /reserved-memory 静态区域。
-     */
     let mut reserve_error = None;
 
     tree.for_each_reserved_memory_region(|_name, region| {
@@ -60,54 +71,39 @@ pub fn build_boot_memory_map(
             return;
         }
 
-        reserve_error = map
-            .reserve(match to_phys_range(region) {
-                Ok(range) => range,
+        let range = match to_phys_range(region) {
+            Ok(range) => range,
 
-                Err(error) => {
-                    reserve_error = Some(error);
-                    return;
-                }
-            })
-            .err()
-            .map(BootMemoryError::from);
+            Err(error) => {
+                reserve_error = Some(error);
+                return;
+            }
+        };
+
+        if let Err(error) = free.reserve(range) {
+            reserve_error = Some(BootMemoryError::from(error));
+        }
     })?;
 
     if let Some(error) = reserve_error {
         return Err(error);
     }
 
-    /*
-     * 4. 排除架构/平台启动协议占用的内存。
-     *
-     * 例如：
-     *
-     * - LoongArch QEMU 的低端 1 MiB 启动表；
-     * - 某些开发板的固件共享区；
-     * - 未通过 FDT 描述的启动器保留区。
-     */
-    crate::arch::memory::reserve_early_platform_memory(&mut map)?;
+    crate::arch::memory::reserve_early_platform_memory(&mut free)?;
 
-    /*
-     * 5. 排除内核镜像自身。
-     */
-    map.reserve(crate::linker::kernel_image_range())?;
+    free.reserve(crate::linker::kernel_image_range())?;
 
-    /*
-     * 6. 排除 FDT blob 自身。
-     */
     let fdt_range = PhysRange::from_start_size(PhysAddr::new(fdt_address), blob.total_size())
         .ok_or(BootMemoryError::InvalidPhysicalRange)?;
 
-    map.reserve(fdt_range)?;
+    free.reserve(fdt_range)?;
 
-    if map.is_empty() {
+    if free.is_empty() {
         return Err(BootMemoryError::NoUsableMemory);
     }
 
-    Ok(map)
+    Ok(BootMemoryLayout { ram, free })
 }
-
 pub fn print_boot_memory_map(map: &BootMemoryMap) {
     crate::println!("physical memory:");
 
@@ -241,14 +237,6 @@ pub struct EarlyMemoryState {
 }
 
 impl EarlyMemoryState {
-    pub const fn frame_allocator(&self) -> &EarlyFrameAllocator<MEMORY_MAP_CAPACITY> {
-        &self.frame_allocator
-    }
-
-    pub const fn boot_page_table(&self) -> &crate::arch::memory::paging::BootPageTable {
-        &self.boot_page_table
-    }
-
     pub fn parts_mut(
         &mut self,
     ) -> (
@@ -341,11 +329,8 @@ pub fn map_boot_fdt_page(state: &mut EarlyMemoryState, fdt_address: usize) {
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn prepare_kernel_image(
-    state: &mut EarlyMemoryState,
-) {
-    let image =
-        crate::linker::kernel_image_layout();
+pub fn prepare_kernel_image(state: &mut EarlyMemoryState) {
+    let image = crate::linker::kernel_image_layout();
 
     crate::println!("kernel image mapping:");
 
@@ -353,10 +338,7 @@ pub fn prepare_kernel_image(
         let physical = segment.physical();
 
         let virtual_start =
-            crate::arch::memory::layout::
-                kernel_image_virtual_address(
-                    physical.start(),
-                )
+            crate::arch::memory::layout::kernel_image_virtual_address(physical.start())
                 .unwrap_or_else(|| {
                     panic!(
                         "unable to calculate virtual address \
@@ -374,30 +356,20 @@ pub fn prepare_kernel_image(
             virtual_start.get(),
         );
 
-        map_riscv_segment(
-            state,
-            *segment,
-            virtual_start,
-        );
+        map_riscv_segment(state, *segment, virtual_start);
     }
 }
 
 #[cfg(target_arch = "loongarch64")]
-pub fn prepare_kernel_image(
-    _state: &mut EarlyMemoryState,
-) {
-    let image =
-        crate::linker::kernel_image_layout();
+pub fn prepare_kernel_image(_state: &mut EarlyMemoryState) {
+    let image = crate::linker::kernel_image_layout();
 
     crate::println!("kernel image mapping:");
 
     for segment in image.segments() {
         let physical = segment.physical();
 
-        let virtual_start =
-            crate::arch::memory::layout::phys_to_cached(
-                physical.start(),
-            )
+        let virtual_start = crate::arch::memory::layout::phys_to_cached(physical.start())
             .unwrap_or_else(|| {
                 panic!(
                     "kernel segment {} is outside \
@@ -411,27 +383,23 @@ pub fn prepare_kernel_image(
             .checked_sub(1)
             .expect("kernel segment is empty");
 
-        let virtual_last =
-            crate::arch::memory::layout::phys_to_cached(
-                physical_last,
-            )
-            .expect(
-                "kernel segment end is outside cached DMW",
-            );
+        let virtual_last = crate::arch::memory::layout::phys_to_cached(physical_last)
+            .expect("kernel segment end is outside cached DMW");
 
         assert_eq!(
-            crate::arch::memory::layout::cached_to_phys(
-                virtual_start,
-            ),
+            crate::arch::memory::layout::cached_to_phys(virtual_start,),
             Some(physical.start()),
         );
 
         assert_eq!(
-            crate::arch::memory::layout::cached_to_phys(
-                virtual_last,
-            ),
+            crate::arch::memory::layout::cached_to_phys(virtual_last,),
             Some(physical_last),
         );
+
+        segment
+            .options()
+            .validate()
+            .expect("invalid kernel segment mapping policy");
 
         crate::println!(
             "  {:<16} phys [{:#018x}, {:#018x}) \
@@ -488,72 +456,21 @@ fn map_riscv_segment(
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
-fn prepare_kernel_segment(
-    _state: &mut EarlyMemoryState,
-    segment: crate::linker::KernelSegment,
-    virtual_start: myos_mm::VirtAddr,
-) {
-    let physical = segment.physical();
-
-    let expected_start = crate::arch::memory::layout::phys_to_cached(physical.start())
-        .expect("kernel segment is outside cached DMW");
-
-    assert_eq!(virtual_start, expected_start,);
-
-    let physical_last = physical.end().checked_sub(1).expect("empty kernel segment");
-
-    let virtual_last = crate::arch::memory::layout::phys_to_cached(physical_last)
-        .expect("kernel segment end is outside cached DMW");
-
-    let translated_last = crate::arch::memory::layout::cached_to_phys(virtual_last)
-        .expect("cached DMW reverse translation failed");
-
-    assert_eq!(translated_last, physical_last,);
-
-    /*
-     * LoongArch 内核镜像通过 cached DMW 访问，
-     * 不消耗页表页面。
-     */
-}
-
 #[cfg(target_arch = "riscv64")]
-pub fn prepare_riscv_early_uart_mapping(
-    state: &mut EarlyMemoryState,
-) {
-    use myos_mm::{
-        MappingOptions,
-        PhysAddr,
-        PhysFrame,
-        VirtAddr,
-        VirtPage,
-    };
+pub fn prepare_riscv_early_uart_mapping(state: &mut EarlyMemoryState) {
+    use myos_mm::{MappingOptions, PhysAddr, PhysFrame, VirtAddr, VirtPage};
 
-    let physical =
-        PhysAddr::new(
-            crate::arch::early_console::MMIO_BASE,
-        );
+    let physical = PhysAddr::new(crate::arch::early_console::MMIO_BASE);
 
-    let frame =
-        PhysFrame::from_start_address(physical)
-            .expect("RISC-V UART base is unaligned");
+    let frame = PhysFrame::from_start_address(physical).expect("RISC-V UART base is unaligned");
 
-    let page =
-        VirtPage::from_start_address(
-            VirtAddr::new(physical.get()),
-        )
+    let page = VirtPage::from_start_address(VirtAddr::new(physical.get()))
         .expect("RISC-V UART VA is unaligned");
 
-    let (allocator, page_table) =
-        state.parts_mut();
+    let (allocator, page_table) = state.parts_mut();
 
     page_table
-        .map_page(
-            allocator,
-            page,
-            frame,
-            MappingOptions::kernel_device(),
-        )
+        .map_page(allocator, page, frame, MappingOptions::kernel_device())
         .unwrap_or_else(|error| {
             panic!(
                 "unable to map early RISC-V UART: \
@@ -565,38 +482,23 @@ pub fn prepare_riscv_early_uart_mapping(
     crate::println!(
         "  uart identity: [{:#018x}, {:#018x})",
         physical.get(),
-        physical.get()
-            + crate::arch::early_console::MMIO_SIZE,
+        physical.get() + crate::arch::early_console::MMIO_SIZE,
     );
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn install_riscv_final_page_table(
-    state: &EarlyMemoryState,
-) {
-    use core::{
-        arch::asm,
-        ptr::read_volatile,
-    };
+pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
+    use core::{arch::asm, ptr::read_volatile};
 
-    let root =
-        state
-            .boot_page_table()
-            .root_frame();
+    let root = state.boot_page_table.root_frame();
 
     /*
      * 进入 Rust 前静态 Sv39 已经开启。
      */
-    assert!(
-        crate::arch::memory::paging::
-            translation_is_enabled(),
-    );
+    assert!(crate::arch::memory::paging::translation_is_enabled(),);
 
-    unsafe {
-        crate::arch::memory::paging::
-            switch_sv39_root(root)
-    }
-    .unwrap_or_else(|error| {
+    // SAFETY: root 是刚构造完成的正式页表，当前高半执行地址在新旧页表中均有效。
+    unsafe { crate::arch::memory::paging::switch_sv39_root(root) }.unwrap_or_else(|error| {
         panic!(
             "failed to install final RISC-V page table: \
              {error:?}",
@@ -605,6 +507,7 @@ pub fn install_riscv_final_page_table(
 
     let current_pc: usize;
 
+    // SAFETY: auipc 只读取当前 PC，不访问内存或栈。
     unsafe {
         asm!(
             "auipc {pc}, 0",
@@ -613,85 +516,51 @@ pub fn install_riscv_final_page_table(
         );
     }
 
-    let current_pc =
-        myos_mm::VirtAddr::new(current_pc);
+    let current_pc = myos_mm::VirtAddr::new(current_pc);
 
     assert!(
-        crate::arch::memory::layout::
-            KERNEL_IMAGE.contains(current_pc),
+        crate::arch::memory::layout::KERNEL_IMAGE.contains(current_pc),
         "RISC-V is not executing in the high kernel image",
     );
 
-    let image =
-        crate::linker::kernel_image_layout();
+    let image = crate::linker::kernel_image_layout();
 
-    let text =
-        image.segments()[0];
+    let text = image.segments()[0];
 
     let high_address =
-        crate::arch::memory::layout::
-            kernel_image_virtual_address(
-                text.physical().start(),
-            )
+        crate::arch::memory::layout::kernel_image_virtual_address(text.physical().start())
             .expect("unable to calculate high text address");
 
-    let direct_pointer =
-        crate::arch::memory::phys_access::
-            ram_ptr::<u8>(
-                text.physical().start(),
-            )
-            .expect("kernel text is absent from direct map");
+    let direct_pointer = crate::arch::memory::phys_access::ram_ptr::<u8>(text.physical().start())
+        .expect("kernel text is absent from direct map");
 
-    let high_byte = unsafe {
-        read_volatile(
-            high_address.get() as *const u8,
-        )
-    };
+    // SAFETY: high_address 位于已验证的高半 text 映射中。
+    let high_byte = unsafe { read_volatile(high_address.get() as *const u8) };
 
-    let direct_byte = unsafe {
-        read_volatile(direct_pointer)
-    };
+    // SAFETY: direct_pointer 位于已验证的 direct-map text 别名中。
+    let direct_byte = unsafe { read_volatile(direct_pointer) };
 
-    assert_eq!(
-        high_byte,
-        direct_byte,
-    );
+    assert_eq!(high_byte, direct_byte,);
 
     /*
      * 正式页表不应再包含低地址内核映射。
      */
-    let low_boot =
-        myos_mm::VirtAddr::new(
-            crate::arch::memory::layout::
-                BOOT_PHYS_BASE.get(),
-        );
+    let low_boot = myos_mm::VirtAddr::new(crate::arch::memory::layout::BOOT_PHYS_BASE.get());
 
     assert_eq!(
         state
-            .boot_page_table()
+            .boot_page_table
             .translate(low_boot)
-            .expect(
-                "failed to inspect low boot mapping",
-            ),
+            .expect("failed to inspect low boot mapping",),
         None,
         "final page table still maps the low boot image",
     );
 
     crate::println!("RISC-V final address space:");
-    crate::println!(
-        "  current PC      : {:#018x}",
-        current_pc.get(),
-    );
-    crate::println!(
-        "  high text       : {:#018x}",
-        high_address.get(),
-    );
-    crate::println!(
-        "  direct map      : verified",
-    );
-    crate::println!(
-        "  low boot mapping: removed",
-    );
+    crate::println!("  current PC      : {:#018x}", current_pc.get(),);
+    crate::println!("  high text       : {:#018x}", high_address.get(),);
+    crate::println!("  direct map      : verified",);
+    crate::println!("  low boot mapping: removed",);
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -712,8 +581,10 @@ pub fn verify_loongarch_high_mapping() {
      * 同一物理代码字节分别通过 cached 和 uncached
      * 高地址别名读取。
      */
+    // SAFETY: cached_pc 是当前执行地址，必然可读。
     let cached_byte = unsafe { read_volatile(cached_pc.get() as *const u8) };
 
+    // SAFETY: uncached_alias 是同一物理地址的 DMW 别名，已通过布局转换验证。
     let uncached_byte = unsafe { read_volatile(uncached_alias.get() as *const u8) };
 
     assert_eq!(
@@ -737,55 +608,20 @@ pub fn verify_loongarch_high_mapping() {
 }
 
 #[cfg(target_arch = "riscv64")]
-pub fn prepare_riscv_direct_map(
-    state: &mut EarlyMemoryState,
-    tree: &DeviceTree<'_>,
-) {
-    use myos_mm::{
-        MappingOptions,
-        MemoryMap,
-        PhysAddr,
-        PhysFrame,
-        PhysRange,
-        VirtPage,
-        PAGE_SIZE,
-    };
+pub fn prepare_riscv_direct_map(state: &mut EarlyMemoryState, ram: &BootMemoryMap) {
+    use myos_mm::{PAGE_SIZE, PhysFrame, VirtPage};
 
-    /*
-     * direct map 应覆盖固件报告的全部普通 RAM，而不是只覆盖
-     * 当前 free list。内核、FDT 和固件保留区仍属于 RAM，
-     * 只是不能交给页分配器。
-     */
-    let mut ram =
-        MemoryMap::<MEMORY_MAP_CAPACITY>::new();
-
-    for region in tree.memory_regions() {
-        let range = PhysRange::from_start_size(
-            PhysAddr::new(region.start()),
-            region.size(),
-        )
-        .expect("invalid FDT RAM range");
-
-        ram.add_usable(range)
-            .expect("too many physical RAM ranges");
-    }
-
-    let image =
-        crate::linker::kernel_image_layout();
+    let image = crate::linker::kernel_image_layout();
 
     let mut mapped_pages = 0_usize;
 
-    let (allocator, page_table) =
-        state.parts_mut();
+    let (allocator, page_table) = state.parts_mut();
 
     for range in ram.iter() {
         let mut physical = range.start();
 
         while physical < range.end() {
-            let virtual_address =
-                crate::arch::memory::layout::phys_to_direct(
-                    physical,
-                )
+            let virtual_address = crate::arch::memory::layout::phys_to_direct(physical)
                 .unwrap_or_else(|| {
                     panic!(
                         "RAM address is outside RISC-V \
@@ -795,30 +631,14 @@ pub fn prepare_riscv_direct_map(
                 });
 
             let page =
-                VirtPage::from_start_address(
-                    virtual_address,
-                )
-                .expect("direct-map VA is unaligned");
+                VirtPage::from_start_address(virtual_address).expect("direct-map VA is unaligned");
 
-            let frame =
-                PhysFrame::from_start_address(
-                    physical,
-                )
-                .expect("RAM frame is unaligned");
+            let frame = PhysFrame::from_start_address(physical).expect("RAM frame is unaligned");
 
-            let options =
-                direct_map_options(
-                    physical,
-                    &image,
-                );
+            let options = direct_map_options(physical, &image);
 
             page_table
-                .map_page(
-                    allocator,
-                    page,
-                    frame,
-                    options,
-                )
+                .map_page(allocator, page, frame, options)
                 .unwrap_or_else(|error| {
                     panic!(
                         "unable to map direct-map page \
@@ -836,14 +656,8 @@ pub fn prepare_riscv_direct_map(
     }
 
     crate::println!("RISC-V direct map:");
-    crate::println!(
-        "  mapped pages : {}",
-        mapped_pages,
-    );
-    crate::println!(
-        "  table pages  : {}",
-        page_table.allocated_table_pages(),
-    );
+    crate::println!("  mapped pages : {}", mapped_pages,);
+    crate::println!("  table pages  : {}", page_table.allocated_table_pages(),);
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -861,13 +675,8 @@ fn direct_map_options(
          *
          * 正式高半映像仍然是 RX，避免出现额外的可执行别名。
          */
-        if segment
-            .options()
-            .permissions()
-            .is_executable()
-        {
-            return myos_mm::MappingOptions::
-                kernel_rodata();
+        if segment.options().permissions().is_executable() {
+            return myos_mm::MappingOptions::kernel_rodata();
         }
 
         return segment.options();
@@ -876,3 +685,184 @@ fn direct_map_options(
     myos_mm::MappingOptions::kernel_data()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BootMemoryLayout {
+    ram: BootMemoryMap,
+    free: BootMemoryMap,
+}
+
+impl BootMemoryLayout {
+    pub const fn ram(&self) -> &BootMemoryMap {
+        &self.ram
+    }
+
+    pub const fn free(&self) -> &BootMemoryMap {
+        &self.free
+    }
+}
+
+impl EarlyMemoryState {
+    pub fn into_parts(
+        self,
+    ) -> (
+        EarlyFrameAllocator<MEMORY_MAP_CAPACITY>,
+        crate::arch::memory::paging::BootPageTable,
+    ) {
+        (self.frame_allocator, self.boot_page_table)
+    }
+}
+
+pub fn initialize_page_allocator(
+    layout: &BootMemoryLayout,
+    early_memory: EarlyMemoryState,
+) -> KernelMemoryState {
+    let managed = managed_physical_span(layout.ram());
+
+    let required_bytes =
+        BuddyAllocator::required_metadata_bytes(managed).expect("invalid managed physical range");
+
+    let metadata_pages = required_bytes
+        .checked_add(myos_mm::PAGE_SIZE - 1)
+        .expect("page metadata size overflow")
+        / myos_mm::PAGE_SIZE;
+
+    let (mut early_allocator, boot_page_table) = early_memory.into_parts();
+
+    /*
+     * 元数据本身从 early allocator 分配，因此不会再被交给
+     * buddy。
+     */
+    let metadata_block = early_allocator
+        .allocate_contiguous(metadata_pages)
+        .unwrap_or_else(|error| {
+            panic!(
+                "unable to allocate page metadata: \
+                     {error:?}",
+            );
+        });
+
+    let metadata_range = metadata_block.range();
+
+    let metadata_virtual = crate::arch::memory::phys_access::ram_virtual_address(
+        metadata_range.start(),
+        metadata_range.size(),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "page metadata is not direct-mapped: \
+                     {error:?}",
+        );
+    });
+
+    /*
+     * SAFETY:
+     *
+     * - metadata_block 由 early allocator 独占分配；
+     * - 它已经从 early free ranges 中扣除；
+     * - direct map/DMW 在内核存活期间永久有效；
+     * - metadata_range 足够容纳全部 Page 元数据。
+     */
+    let mut page_allocator = unsafe {
+        BuddyAllocator::new(
+            metadata_virtual.get() as *mut u8,
+            metadata_range.size(),
+            managed,
+        )
+    }
+    .unwrap_or_else(|error| {
+        panic!(
+            "unable to initialize buddy metadata: \
+             {error:?}",
+        );
+    });
+
+    /*
+     * 全部普通 RAM 先标记为 Reserved。
+     *
+     * 这样内核、固件、FDT、页表和 metadata 默认都不会被释放。
+     */
+    for range in layout.ram().iter() {
+        page_allocator
+            .mark_present_range(range)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unable to mark RAM present: \
+                     {error:?}",
+                );
+            });
+    }
+
+    let expected_free_pages = early_allocator
+        .remaining_frames()
+        .expect("early frame count overflow");
+
+    /*
+     * 只有 EarlyFrameAllocator 剩余的页面才进入 buddy。
+     */
+    for range in early_allocator.free_ranges() {
+        page_allocator.release_range(range).unwrap_or_else(|error| {
+            panic!(
+                "unable to release early memory \
+                     to buddy: {error:?}",
+            );
+        });
+    }
+
+    assert_eq!(
+        page_allocator.total_free_pages(),
+        expected_free_pages,
+        "early-to-buddy handoff lost or duplicated pages",
+    );
+
+    crate::println!("physical page allocator:");
+    crate::println!(
+        "  managed span : [{:#018x}, {:#018x})",
+        managed.start().get(),
+        managed.end().get(),
+    );
+    crate::println!(
+        "  page metadata: [{:#018x}, {:#018x})  {} KiB",
+        metadata_range.start().get(),
+        metadata_range.end().get(),
+        metadata_range.size() / 1024,
+    );
+    crate::println!(
+        "  DMA32 present: {} pages",
+        page_allocator.zone_present_pages(ZoneKind::Dma32,),
+    );
+    crate::println!(
+        "  DMA32 free   : {} pages",
+        page_allocator.zone_free_pages(ZoneKind::Dma32,),
+    );
+    crate::println!(
+        "  Normal free  : {} pages",
+        page_allocator.zone_free_pages(ZoneKind::Normal,),
+    );
+    crate::println!(
+        "  total free   : {} pages",
+        page_allocator.total_free_pages(),
+    );
+    crate::println!("  early handoff: complete",);
+
+    crate::page_alloc::install(page_allocator).unwrap_or_else(|error| {
+        panic!(
+            "unable to install global page allocator: \
+             {error:?}",
+        );
+    });
+
+    assert!(crate::page_alloc::is_initialized(),);
+
+    KernelMemoryState {
+        boot_page_table,
+        _metadata_range: metadata_range,
+    }
+}
+
+fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
+    let first = ram.iter().next().expect("firmware reported no RAM");
+
+    let last = ram.iter().last().expect("firmware reported no RAM");
+
+    PhysRange::new(first.start(), last.end()).expect("invalid managed RAM span")
+}

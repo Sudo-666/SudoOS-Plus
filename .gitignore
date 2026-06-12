@@ -1,2 +1,28 @@
+# Rust / kernel build output
+/build/
+/target/
+**/target/
+
+# Runtime logs and crash artifacts
+*.log
+*.pid
+*.core
+core
+
+# Editor / IDE state
 .claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS metadata
 .DS_Store
+._*
+__MACOSX/
+
+# Local environment overrides
+.env
+.env.*
+!.env.example

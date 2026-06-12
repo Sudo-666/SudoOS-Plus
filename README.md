@@ -2,7 +2,7 @@
 
 一个使用 **Rust** 编写的业余操作系统内核，目标平台为 **RISC-V 64** 和 **LoongArch 64**。
 
-启动期内存管理已完成，两个架构均已启用 MMU 并运行于高半内核地址空间。
+启动期内存管理基础已经成形：RISC-V 使用 Sv39 高半页表，LoongArch 当前使用 DMW 高地址执行；LoongArch 普通分页虚拟地址的硬件访问闭环仍在施工。
 
 ## 运行效果
 
@@ -122,13 +122,16 @@ RISC-V:                               LoongArch:
                  ├─ 内核镜像映射 (高半)
                  ├─ direct-map 构造
                  ├─ switch_sv39_root / DMW 验证
+                 ├─ trap vector 安装
+                 ├─ IRQ dispatch 初始化
+                 ├─ time/tick 计数初始化
                  └─ wfi / idle 0
 ```
 
 ## 单元测试
 
 ```bash
-cargo test -p myos-mm    # 14 tests
+cargo test -p myos-mm    # 22 tests
 ```
 
 ## 构建 & 运行
@@ -140,15 +143,18 @@ make run-riscv64           # 快捷命令
 make run-loongarch64
 
 make debug ARCH=riscv64    # GDB (端口 1234)
-cargo test -p myos-mm      # 单元测试
-make fmt && make clippy && make clean
+cargo test -p myos-mm      # 单元测试 (22 tests)
+make check                 # source tree + fmt + host tests + 双架构 build/clippy
+make smoke-all             # 双架构 QEMU 串口 smoke
+make verify                # check + smoke-all
+make clean
 ```
 
 ## 当前进度
 
 | 子系统 | 状态 | 说明 |
 |--------|------|------|
-| 构建系统 | ✅ | Cargo workspace (7 crates + 2 vendor) |
+| 构建系统 | 🟡 | Cargo workspace（8 crates），双架构 build/clippy 与串口 smoke harness 已接入，等待本机 verify |
 | RISC-V 两阶段启动 | ✅ | 低物理 entry.S → 临时 Sv39 → 高半内核 |
 | LoongArch DMW 启动 | ✅ | DMW0/1 窗口 → cached high execution |
 | FDT 设备枚举 | ✅ | model/compatible/cpu/memory/virtio-mmio |
@@ -159,21 +165,218 @@ make fmt && make clippy && make clean
 | 启动页表构造 | ✅ | BootPageTable + map_page + translate |
 | 内核镜像映射 | ✅ | 高半 text/rodata/data |
 | RAM direct-map | ✅ | Sv39 页表 / DMW 窗口 |
-| MMU 启用 | ✅ | SATP + DMW, 硬件 walk 验证 |
+| MMU 启用 | 🟡 | RISC-V SATP/Sv39 已硬件验证；LoongArch 当前依赖 DMW，普通分页 walk 尚未接入 |
 | 低地址映射撤销 | ✅ | RISC-V: removed / LoongArch: DMW2=0 |
-| 中断/异常 | ⬜ | trap handler, PLIC / EIOINTC |
-| 物理页分配器 | ⬜ | buddy allocator |
+| trap 分发 | 🟡 | 双架构 TrapFrame、frame guard、连续异常与寄存器恢复自检已接入；RISC-V sscratch 修复等待双架构 smoke 验收 |
+| IRQ 子系统 | 🟡 | 本地中断关闭，统一 InterruptSource，未处理 IRQ fail-fast |
+| time/tick | 🟡 | monotonic tick 计数已就绪；周期 timer 尚未 armed |
+| 物理页分配器 | ✅ | buddy allocator, DMA32/Normal zone, page refcount, early handoff 校验 |
+| 内核堆 | ✅ | global allocator, slab 小对象, buddy-backed large allocation |
+| VMA/address space | 🟡 | VmAreaSet、固定容量 AddressSpace、brk metadata、mmap gap search；尚不是进程地址空间 |
+| page fault policy | 🟡 | anonymous/file/device/COW/protection/segv 分类模型；执行路径尚未接入 |
+| page fault handler | 🟡 | RISC-V/LoongArch fault trap 解码、统一 PageFault pipeline、kernel fail-fast；user demand paging 待 P4 |
+| runtime page table | 🟡 | RISC-V 写入活动页表；LoongArch 目前只有软件 map/protect/unmap/translate |
+| kernel vmalloc | 🟡 | API、guard page 与失败回滚已完成；RISC-V 可硬件访问，LoongArch 仍仅软件 translate 自检 |
+| TLB 模型 | 🟡 | RISC-V local sfence.vma 已接入；LoongArch 硬件 invtlb/TLB refill 待接入；SMP shootdown 待做 |
+| IRQ-safe 锁 | ✅ | IrqSpinLock 保存/恢复本地中断状态 |
 | 进程/调度 | ⬜ | task, fork, exec, scheduler |
 | 系统调用 | ⬜ | syscall 表, U-mode |
 | 设备驱动 | ⬜ | virtio-blk, virtio-net |
-| 文件系统 | ⬜ | VFS, ext2, tmpfs |
+| 文件系统 | ⬜ | VFS、tmpfs/initramfs、ext4（lwext4 窄适配层） |
 
 ## 下一步
 
-1. **中断处理** — `stvec` / `eentry`，trap handler，时钟中断
-2. **物理页分配器** — buddy allocator
-3. **进程管理** — task_struct, 上下文切换, 调度器
-4. **系统调用** — syscall 表, U-mode 切换
+1. **LoongArch paged kernel mapping** — 页表寄存器、TLB refill、invtlb，使 vmalloc 地址可硬件访问（当前最高优先级）
+2. **时钟中断闭环** — RISC-V SBI timer / LoongArch timer, interrupt enable/ack, tick frequency policy
+3. **中断控制器** — RISC-V PLIC/IMSIC 路线选择，LoongArch EIOINTC，IRQ domain + handler table
+4. **内核线程/调度器** — task struct, context switch, idle task, cooperative yield
+5. **用户态入口** — per-process AddressSpace, U-mode trap return, syscall ABI, user demand paging
+6. **设备与 VFS** — virtio-mmio transport, console/blk, tmpfs/devfs, file-backed mmap
+
+## MM 完成路线图
+
+本节用于跨 agent 交接。继续开发时请优先更新这里，不要只把进度留在聊天记录里。
+
+### 当前 MM 边界
+
+已完成：
+- boot memory layout：FDT RAM + reserved-memory + kernel image + FDT 排除。
+- early frame allocator：checkpoint/restore，启动期页表用。
+- boot page table：RISC-V Sv39 / LoongArch LA64 map_page + translate。
+- physical page allocator：buddy，DMA32/Normal zone，poisoning，自检。
+- page refcount：物理页引用计数 inc/dec/get，refcount 归零后单页释放接口。
+- kernel heap：slab 小对象 + buddy-backed large allocation，global allocator。
+- MM object model：VMA、AddressSpace、brk metadata、mmap gap search。
+- fault policy model：anonymous、file-backed、device、COW、protection、segv 分类。
+- kernel vmalloc：`vmalloc/vfree/ioremap/iounmap` API，虚拟地址保留，guard page，runtime page table map/unmap。
+- runtime page table：从 boot page table handoff，buddy-backed table pages，map/protect/unmap/translate。
+- page fault handler：RISC-V instruction/load/store page fault 与 LoongArch page invalid/modified/protection 异常进入统一 `PageFault` pipeline。
+- TLB model：RISC-V local `sfence.vma` 已执行；LoongArch 当前仍是软件页表自检，硬件 TLB refill/invtlb 待接。
+
+未完成：
+- LoongArch paged kernel virtual mapping：需要页表寄存器/TLB refill/invtlb 接入。
+- user demand paging：需要 per-process AddressSpace 后才能执行 anonymous/heap/stack fault map。
+- user page table：每进程根页表、内核高半共享映射、地址空间切换。
+- brk/mmap/munmap/mprotect syscall 后端：需要用户态和 syscall 层接入。
+- COW 执行路径：fork 时 write-protect，fault 时复制页，更新引用计数。
+- file-backed mmap：需要 VFS/page cache。
+- SMP TLB shootdown：需要 SMP、IPI、中断控制器。
+
+### P1: Runtime Page Table
+
+目标：把启动期 `BootPageTable` 后面的页表 walker 抽象成可复用的运行期页表对象。
+
+状态：核心完成。
+
+任务：
+- [x] 从 `KernelMemoryState` handoff boot page table 到 runtime page table。
+- [x] 中间页表由 buddy 分配，失败时回滚未发布页表页。
+- [x] 提供 `map_page` / `protect_page` / `unmap_page` / `translate`。
+- [x] RISC-V 对当前活动根页表执行写入，并在修改后 `sfence.vma`。
+- [x] LoongArch 保留 DMW 边界，当前完成软件页表 map/protect/unmap/translate 自检。
+- [ ] LoongArch 接入硬件页表寄存器、TLB refill 与 `invtlb`。
+- [ ] 空页表回收。当前 unmap 不回收空中间页表，生命周期随 runtime page table。
+
+验收：
+- [x] `cargo test -p myos-mm`
+- [x] `make clippy`
+- [x] `make build ARCH=riscv64`
+- [x] `make build ARCH=loongarch64`
+- [x] RISC-V/LoongArch QEMU 启动到 `kernel_main: initialization completed`
+- [x] kernel vm 自检打印 `runtime map/protect/unmap verified`
+
+### P2: Kernel Vmalloc / Ioremap
+
+目标：让 `kernel/src/vm.rs` 从 reservation 变成真实内核虚拟映射管理器。
+
+状态：核心完成。RISC-V 当前活动页表可用；LoongArch 通过软件页表自检，硬件访问仍依赖后续 TLB refill/页表寄存器接入。
+
+任务：
+- [x] `vmalloc(size, align)`：reserve VA，分配物理页，写入 runtime kernel page table，返回可用虚拟范围。
+- [x] `vfree()`：unmap，flush，本地释放物理页，释放 VA reservation。
+- [x] `ioremap(phys, size)`：reserve VA，映射 device/uncached memory，不拥有物理页。
+- [x] `iounmap()`：unmap device mapping，释放 VA reservation。
+- [x] 保留前后 guard page。
+- [x] 多步操作失败回滚：释放已分配物理页、已映射 PTE、VA reservation。
+- [ ] 越界访问触发 page fault 后进入统一 fault handler。
+- 优先把 RISC-V early UART identity mapping 逐步迁移到 ioremap/fixmap 策略。
+
+验收：
+- [x] kernel vm 自检打印 `vmalloc/vfree` verified。
+- [x] kernel vm 自检打印 `ioremap/iounmap` verified。
+- [x] kernel vm 自检打印 `protect/unmap` verified。
+- [x] QEMU 两架构启动通过。
+- [x] `make clippy` 无 warning。
+
+### P3: Page Fault Handler
+
+目标：缺页不再只是 panic，而是进入统一 fault pipeline。
+
+状态：内核入口完成。用户态 demand paging 待 P4 per-process AddressSpace。
+
+任务：
+- [x] 在 RISC-V trap 中识别 instruction/load/store page fault。
+- [x] 在 LoongArch trap 中识别 page invalid/page modified/page protection 类异常。
+- [x] 构造 `PageFault { address, access, source, present }`。
+- [x] kernel fault handler 记录 counters 并 fail-fast。
+- [x] 启动日志打印 page fault subsystem。
+- [x] debug 自检确认 fault counters 初始为 0。
+- [ ] anonymous/heap/stack：分配 zero page 并 map。依赖 P4 user AddressSpace。
+- [ ] COW：复制页并恢复 writable。依赖 P5 fork/COW。
+- [ ] file-backed：接 page cache 后读取。依赖 P6 VFS/page cache。
+- [ ] protection/segv：用户态 kill。依赖 task/signal 或进程退出机制。
+
+依赖：
+- P1 runtime page table。
+- P2 vmalloc 可用于 kernel fault 验证。
+
+验收：
+- [x] `make clippy`
+- [x] `cargo test -p myos-mm`
+- [x] `make build ARCH=riscv64`
+- [x] `make build ARCH=loongarch64`
+- [x] RISC-V/LoongArch QEMU 启动到 `kernel_main: initialization completed`
+- [x] 启动日志出现 `page fault subsystem` 与 `page fault test`
+
+### P4: User Address Space
+
+目标：每个进程拥有独立用户页表，同时共享内核高半映射。
+
+任务：
+- `AddressSpace` 绑定 arch runtime page table root。
+- clone kernel mappings 到用户页表或共享高半根项。
+- activate/switch address space，预留 ASID/PCID 接口。
+- 实现 brk/mmap/munmap/mprotect 的内核后端。
+- 增加 copy_from_user/copy_to_user，必须处理跨页和 fault。
+
+依赖：
+- task/process 基础结构。
+- syscall ABI。
+
+### P5: Copy-On-Write
+
+目标：fork 后共享物理页，写时复制。
+
+任务：
+- [x] buddy metadata 增加 page refcount 操作接口：inc/dec/get。
+- [x] 增加 `free_unreferenced_frame`，支持 refcount 归零后释放单页。
+- [x] 全局 page allocator 包装 refcount API，启动自检打印 `refcount: verified`。
+- fork AddressSpace 时复制 VMA，PTE 清 writable，设置 COW 标志。
+- COW fault 分配新页、复制旧页、替换 PTE、flush。
+- refcount 归零才释放物理页。
+
+依赖：
+- P4 user address space。
+- scheduler/task fork 语义。
+
+### P6: File-Backed Mmap
+
+目标：支持文件页映射和页缓存。
+
+任务：
+- 设计 page cache key：inode + file offset。
+- fault 时从 page cache 命中或发起读盘。
+- dirty/writeback 策略先保守实现。
+- 支持 private file mapping 与 shared file mapping 的不同语义。
+
+依赖：
+- VFS。
+- block device driver。
+
+### P7: SMP TLB Shootdown
+
+目标：多核地址空间修改后所有相关 CPU 的 TLB 都一致。
+
+任务：
+- 每个 AddressSpace 记录 active CPU mask。
+- 修改 PTE 后生成 `TlbShootdown`。
+- 本地 flush 立即执行，远端通过 IPI 执行。
+- 加 generation/ack，避免释放页早于远端 flush。
+
+依赖：
+- SMP bring-up。
+- IPI。
+- 中断控制器。
+
+### 推荐施工顺序
+
+1. LoongArch paged kernel mapping：页表寄存器、TLB refill、invtlb。
+2. timer/IRQ/scheduler。
+3. P4 user address space + syscall memory API + user demand paging。
+4. P5 COW。
+5. VFS/page cache 后做 P6。
+6. SMP 后做 P7。
+
+### 交接注意
+
+- `build/` 已加入 `.gitignore`，之前清理缓存时有大量 tracked build artifacts staged for deletion；不要把这些当成源码删除事故。
+- 当前 `myos-mm` 单测数是 22。
+- `kernel vmalloc` 已有稳定 token API：`vmalloc/vfree/ioremap/iounmap`。释放函数消费 token，避免双重释放。
+- RISC-V vmalloc 映射写入当前活动页表；LoongArch 仍是软件页表路径，不能假定 vmalloc VA 已可硬件解引用。
+- page fault trap 入口已经接入；当前 kernel fault fail-fast，user demand paging 不能在 P4 前假装完成。
+- 现在的 `FaultOutcome` 是策略分类；anonymous/COW/file-backed 的执行路径分别依赖 P4/P5/P6。
+- LoongArch runtime page table 当前通过软件 translate 自检；硬件页表/TLB refill 接入仍未完成。
+- 不要为了快速完成把用户态、VFS、SMP 依赖伪造成 stub 成品；这些必须按依赖顺序接入。
 
 ## License
 

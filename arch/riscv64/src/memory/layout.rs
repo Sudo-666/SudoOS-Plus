@@ -81,15 +81,10 @@ pub fn direct_to_phys(virtual_address: VirtAddr) -> Option<PhysAddr> {
     ))
 }
 
-pub fn kernel_image_virtual_address(
-    physical: PhysAddr,
-) -> Option<VirtAddr> {
-    let offset = physical
-        .get()
-        .checked_sub(KERNEL_PHYS_BASE.get())?;
+pub fn kernel_image_virtual_address(physical: PhysAddr) -> Option<VirtAddr> {
+    let offset = physical.get().checked_sub(KERNEL_PHYS_BASE.get())?;
 
-    let virtual_address =
-        KERNEL_LINK_BASE.checked_add(offset)?;
+    let virtual_address = KERNEL_LINK_BASE.checked_add(offset)?;
 
     if !KERNEL_IMAGE.contains(virtual_address) {
         return None;
@@ -98,16 +93,12 @@ pub fn kernel_image_virtual_address(
     Some(virtual_address)
 }
 
-pub fn kernel_image_physical_address(
-    virtual_address: VirtAddr,
-) -> Option<PhysAddr> {
+pub fn kernel_image_physical_address(virtual_address: VirtAddr) -> Option<PhysAddr> {
     if !KERNEL_IMAGE.contains(virtual_address) {
         return None;
     }
 
-    let offset = virtual_address
-        .get()
-        .checked_sub(KERNEL_LINK_BASE.get())?;
+    let offset = virtual_address.get().checked_sub(KERNEL_LINK_BASE.get())?;
 
     KERNEL_PHYS_BASE.checked_add(offset)
 }

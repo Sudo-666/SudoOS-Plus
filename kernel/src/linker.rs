@@ -1,4 +1,4 @@
-use myos_mm::{MappingOptions, PhysAddr, PhysRange};
+use myos_mm::{MappingOptions, PhysRange};
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
@@ -82,16 +82,12 @@ pub fn kernel_image_layout() -> KernelImageLayout {
     );
 
     {
-        const TEMPORARY_KERNEL_WINDOW_SIZE: usize =
-            64 * 1024 * 1024;
+        const TEMPORARY_KERNEL_WINDOW_SIZE: usize = 64 * 1024 * 1024;
 
-        let main_kernel_size =
-            read_write.end().get()
-                - text.start().get();
+        let main_kernel_size = read_write.end().get() - text.start().get();
 
         assert!(
-            main_kernel_size
-                <= TEMPORARY_KERNEL_WINDOW_SIZE,
+            main_kernel_size <= TEMPORARY_KERNEL_WINDOW_SIZE,
             "RISC-V high kernel exceeds the temporary \
              64 MiB startup mapping",
         );
@@ -115,51 +111,31 @@ pub fn kernel_image_layout() -> KernelImageLayout {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn riscv_kernel_symbol_range(
-    start: *const u8,
-    end: *const u8,
-    name: &'static str,
-) -> PhysRange {
-    let virtual_start =
-        myos_mm::VirtAddr::new(start as usize);
+fn riscv_kernel_symbol_range(start: *const u8, end: *const u8, name: &'static str) -> PhysRange {
+    let virtual_start = myos_mm::VirtAddr::new(start as usize);
 
-    let virtual_end =
-        myos_mm::VirtAddr::new(end as usize);
+    let virtual_end = myos_mm::VirtAddr::new(end as usize);
 
-    let physical_start =
-        crate::arch::memory::layout::
-            kernel_image_physical_address(
-                virtual_start,
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "RISC-V {name} start is outside \
+    let physical_start = crate::arch::memory::layout::kernel_image_physical_address(virtual_start)
+        .unwrap_or_else(|| {
+            panic!(
+                "RISC-V {name} start is outside \
                      the high kernel image: {:#018x}",
-                    virtual_start.get(),
-                );
-            });
+                virtual_start.get(),
+            );
+        });
 
-    let physical_end =
-        crate::arch::memory::layout::
-            kernel_image_physical_address(
-                virtual_end,
-            )
-            .unwrap_or_else(|| {
-                panic!(
-                    "RISC-V {name} end is outside \
+    let physical_end = crate::arch::memory::layout::kernel_image_physical_address(virtual_end)
+        .unwrap_or_else(|| {
+            panic!(
+                "RISC-V {name} end is outside \
                      the high kernel image: {:#018x}",
-                    virtual_end.get(),
-                );
-            });
+                virtual_end.get(),
+            );
+        });
 
-    PhysRange::new(
-        physical_start,
-        physical_end,
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "invalid RISC-V physical range for {name}",
-        );
+    PhysRange::new(physical_start, physical_end).unwrap_or_else(|| {
+        panic!("invalid RISC-V physical range for {name}",);
     })
 }
 
@@ -221,11 +197,6 @@ pub fn kernel_image_range() -> PhysRange {
     kernel_image_layout().physical()
 }
 
-fn symbol_range(start: *const u8, end: *const u8) -> PhysRange {
-    PhysRange::new(PhysAddr::new(start as usize), PhysAddr::new(end as usize))
-        .expect("linker produced an invalid physical range")
-}
-
 fn make_segments(text: PhysRange, rodata: PhysRange, read_write: PhysRange) -> [KernelSegment; 3] {
     [
         KernelSegment {
@@ -249,7 +220,17 @@ fn make_segments(text: PhysRange, rodata: PhysRange, read_write: PhysRange) -> [
 fn validate_layout(text: PhysRange, rodata: PhysRange, read_write: PhysRange, physical: PhysRange) {
     assert!(text.is_page_aligned());
     assert!(rodata.is_page_aligned());
-    assert!(read_write.is_page_aligned());
+    assert!(
+        read_write.start().is_aligned(myos_mm::PAGE_SIZE),
+        "RW segment start is not page aligned: {:#018x}",
+        read_write.start().get(),
+    );
+
+    assert!(
+        read_write.end().is_aligned(myos_mm::PAGE_SIZE),
+        "RW segment end is not page aligned: {:#018x}",
+        read_write.end().get(),
+    );
     assert!(physical.is_page_aligned());
 
     assert!(!text.is_empty());

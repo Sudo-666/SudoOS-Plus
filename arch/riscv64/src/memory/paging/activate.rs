@@ -51,33 +51,24 @@ pub fn translation_is_enabled() -> bool {
 /// - early UART；
 /// - 页表自身所需的 RAM direct map。
 #[inline(never)]
-pub unsafe fn switch_sv39_root(
-    root: PhysFrame,
-) -> Result<(), ActivateError> {
+pub unsafe fn switch_sv39_root(root: PhysFrame) -> Result<(), ActivateError> {
     if current_mode() != SATP_MODE_SV39 {
-        return Err(
-            ActivateError::ModeRejected {
-                actual_mode: current_mode(),
-            },
-        );
+        return Err(ActivateError::ModeRejected {
+            actual_mode: current_mode(),
+        });
     }
 
-    let root_address =
-        root.start_address().get();
+    let root_address = root.start_address().get();
 
-    let root_ppn =
-        root_address >> PAGE_SHIFT;
+    let root_ppn = root_address >> PAGE_SHIFT;
 
     if root_ppn >= (1_usize << 44) {
-        return Err(
-            ActivateError::RootAddressOutOfRange,
-        );
+        return Err(ActivateError::RootAddressOutOfRange);
     }
 
-    let satp =
-        (SATP_MODE_SV39 << SATP_MODE_SHIFT)
-            | root_ppn;
+    let satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | root_ppn;
 
+    // SAFETY: 新页表映射当前执行地址和 trap landing，root 已经通过范围校验。
     unsafe {
         asm!(
             /*

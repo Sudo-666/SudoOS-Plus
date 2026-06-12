@@ -170,8 +170,8 @@ impl BootPageTable {
 
         let mut current = self.root;
 
-        for level in 0..LEVELS {
-            let raw = read_entry(current, page_indices[level].get())?;
+        for (level, page_index) in page_indices.iter().enumerate().take(LEVELS) {
+            let raw = read_entry(current, page_index.get())?;
 
             if raw == 0 {
                 return Ok(None);
@@ -212,10 +212,8 @@ impl BootPageTable {
 }
 
 fn initialize_zero_table(frame: PhysFrame) {
-    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("allocated page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
+        .expect("allocated page-table frame is not accessible");
 
     // SAFETY:
     // 页面来自独占的启动页帧分配器，尚未发布。
@@ -225,10 +223,8 @@ fn initialize_zero_table(frame: PhysFrame) {
 }
 
 fn read_entry(frame: PhysFrame, index: usize) -> Result<u64, PageTableAccessError> {
-    let pointer = crate::memory::phys_access::ram_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_ptr::<PageTable>(frame.start_address())
+        .expect("page-table frame is not accessible");
 
     // SAFETY:
     // 页表页面由 BootPageTable 独占，并在当前地址模式下可访问。
@@ -236,10 +232,8 @@ fn read_entry(frame: PhysFrame, index: usize) -> Result<u64, PageTableAccessErro
 }
 
 fn write_entry(frame: PhysFrame, index: usize, value: u64) -> Result<(), PageTableAccessError> {
-    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(
-        frame.start_address(),
-    )
-    .expect("allocated page-table frame is not accessible");
+    let pointer = crate::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
+        .expect("allocated page-table frame is not accessible");
 
     // SAFETY:
     // 页表尚未发布给硬件 walker，不存在并发访问。
