@@ -1,6 +1,8 @@
 use core::arch::asm;
 
 const CRMD_IE: usize = 1 << 2;
+const CSR_ECFG: usize = 0x4;
+const ECFG_INTERRUPT_MASK: usize = 0x1fff;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "saved interrupt state should be restored"]
@@ -53,6 +55,22 @@ pub fn disable() {
 /// 调用者必须保证异常入口、栈以及中断控制器已经正确配置。
 pub unsafe fn enable() {
     exchange_interrupt_enable(CRMD_IE);
+}
+
+pub fn mask_all_sources() {
+    let value: usize = 0;
+
+    // SAFETY: clear only ECFG.LIE[12:0], preserving vector-spacing and all
+    // reserved fields.  r12 is used only as the CSRXCHG mask operand.
+    unsafe {
+        asm!(
+            "csrxchg {value}, $r12, {csr}",
+            value = inout(reg) value => _,
+            in("$r12") ECFG_INTERRUPT_MASK,
+            csr = const CSR_ECFG,
+            options(nomem, nostack),
+        );
+    }
 }
 
 pub fn are_enabled() -> bool {

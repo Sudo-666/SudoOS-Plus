@@ -10,15 +10,16 @@ pub enum InterruptSource {
 
 pub fn initialize() {
     crate::arch::interrupt::disable();
+    crate::arch::interrupt::mask_all_sources();
 
     crate::println!("irq subsystem:");
     crate::println!("  local interrupts: disabled");
-    crate::println!("  dispatch policy  : fail-fast on unhandled irq");
+    crate::println!("  local sources   : masked");
+    crate::println!("  dispatch policy : fail-fast on unhandled irq");
 }
 
 pub fn handle_timer_interrupt() {
-    let _source = InterruptSource::Timer;
-    crate::time::record_timer_tick();
+    crate::time::handle_timer_interrupt();
 }
 
 pub fn handle_unhandled(source: InterruptSource, raw: usize) -> ! {

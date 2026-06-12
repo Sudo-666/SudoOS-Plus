@@ -50,6 +50,20 @@ impl<'a> DeviceTree<'a> {
         self.inner.root().cpus().iter().count()
     }
 
+    /// `/cpus/timebase-frequency` declared by platforms such as RISC-V.
+    ///
+    /// Both one-cell and two-cell encodings are accepted.  A zero value is
+    /// rejected because it cannot define a usable clocksource frequency.
+    pub fn timebase_frequency_hz(&self) -> Option<u64> {
+        let property = self
+            .inner
+            .find_node("/cpus")?
+            .raw_property("timebase-frequency")?;
+        let frequency = property_u64(property.value)?;
+
+        (frequency != 0).then_some(frequency)
+    }
+
     /// `/chosen/bootargs` (panic-free)。
     pub fn bootargs(&self) -> Option<&'a str> {
         self.inner
@@ -184,6 +198,14 @@ fn node_is_available(node: UnalignedInfallibleNode<'_>) -> bool {
     }
 }
 
+fn property_u64(bytes: &[u8]) -> Option<u64> {
+    match bytes {
+        [a, b, c, d] => Some(u64::from(u32::from_be_bytes([*a, *b, *c, *d]))),
+        [a, b, c, d, e, f, g, h] => Some(u64::from_be_bytes([*a, *b, *c, *d, *e, *f, *g, *h])),
+        _ => None,
+    }
+}
+
 fn property_string(bytes: &[u8]) -> Option<&str> {
     let end = bytes
         .iter()
@@ -284,4 +306,30 @@ fn read_cells(bytes: &[u8]) -> Result<u64, FdtError> {
     }
 
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::property_u64;
+
+    #[test]
+    fn parses_one_cell_frequency() {
+        assert_eq!(
+            property_u64(&10_000_000_u32.to_be_bytes()),
+            Some(10_000_000)
+        );
+    }
+
+    #[test]
+    fn parses_two_cell_frequency() {
+        assert_eq!(
+            property_u64(&4_000_000_000_u64.to_be_bytes()),
+            Some(4_000_000_000),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_frequency_width() {
+        assert_eq!(property_u64(&[0, 1]), None);
+    }
 }

@@ -136,6 +136,10 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
 #[global_allocator]
 static GLOBAL_HEAP: KernelGlobalAllocator = KernelGlobalAllocator::new();
 
+pub fn shrink() {
+    GLOBAL_HEAP.shrink();
+}
+
 pub fn initialize() {
     GLOBAL_HEAP.install().unwrap_or_else(|error| {
         panic!(

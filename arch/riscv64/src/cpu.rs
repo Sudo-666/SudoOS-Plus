@@ -2,7 +2,7 @@ use core::arch::asm;
 
 /// 让 CPU 等待下一次中断。
 ///
-/// 目前中断尚未初始化，因此它主要用于内核最终停机循环。
+/// 定时器和本地中断启用后，它用于 idle 循环以及唤醒自检。
 #[inline]
 pub fn wait_for_interrupt() {
     // SAFETY:

@@ -79,6 +79,14 @@ pub unsafe fn enable() {
     }
 }
 
+pub fn mask_all_sources() {
+    // SAFETY: this masks every supervisor-local interrupt source on the
+    // current hart without changing global interrupt state.
+    unsafe {
+        asm!("csrw sie, zero", options(nostack));
+    }
+}
+
 pub fn are_enabled() -> bool {
     let status: usize;
 

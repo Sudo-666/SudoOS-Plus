@@ -11,6 +11,7 @@ mod memory;
 mod page_alloc;
 mod panic;
 mod runtime_page_table;
+mod task;
 mod time;
 mod trap;
 mod vm;
@@ -117,7 +118,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
 
-    let memory_layout = {
+    let (memory_layout, firmware_timer_frequency) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
@@ -135,12 +136,16 @@ fn kernel_main(boot: BootInfo) -> ! {
 
         inspect_device_tree(&boot, &blob, &tree);
 
-        memory::build_boot_memory_layout(fdt_address, &blob, &tree).unwrap_or_else(|error| {
-            panic!(
-                "failed to construct physical memory layout: \
-                 {error:?}",
-            );
-        })
+        let firmware_timer_frequency = tree.timebase_frequency_hz();
+        let memory_layout = memory::build_boot_memory_layout(fdt_address, &blob, &tree)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to construct physical memory layout: \
+                     {error:?}",
+                );
+            });
+
+        (memory_layout, firmware_timer_frequency)
     };
 
     memory::print_boot_memory_map(memory_layout.free());
@@ -196,7 +201,7 @@ fn kernel_main(boot: BootInfo) -> ! {
      */
     trap::initialize();
     irq::initialize();
-    time::initialize();
+    time::initialize(firmware_timer_frequency);
     vm::initialize(kernel_memory);
     fault::initialize();
 
@@ -208,6 +213,16 @@ fn kernel_main(boot: BootInfo) -> ! {
 
     #[cfg(debug_assertions)]
     trap::verify_breakpoint();
+
+    time::start_periodic();
+
+    #[cfg(debug_assertions)]
+    time::verify_periodic();
+
+    task::initialize();
+
+    #[cfg(debug_assertions)]
+    task::verify();
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");
@@ -243,6 +258,15 @@ fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_
         }
     }
     println!("  cpu count     : {}", tree.cpu_count(),);
+
+    match tree.timebase_frequency_hz() {
+        Some(frequency) => {
+            println!("  timer frequency: {} Hz", frequency);
+        }
+        None => {
+            println!("  timer frequency: architecture-defined");
+        }
+    }
 
     match tree.bootargs() {
         Some(arguments) => {

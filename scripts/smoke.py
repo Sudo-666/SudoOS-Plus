@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build SudoOS, boot it in QEMU, and validate the serial smoke marker."""
+"""Build SudoOS, boot it in QEMU, and validate serial smoke evidence."""
 
 from __future__ import annotations
 
@@ -25,7 +25,38 @@ FAILURE_MARKERS = (
     b"unexpected RISC-V exception",
     b"unexpected LoongArch exception",
 )
-MAX_SCAN_BUFFER = 16 * 1024
+COMMON_REQUIRED_MARKERS = (
+    b"repeated entry   : verified (3 traps)",
+    b"frame guard      : verified",
+    b"register restore : verified",
+    b"runtime pgtbl  : active hardware root",
+    b"hardware access : verified",
+    b"table reclaim   : verified",
+    b"timer interrupt  : verified",
+    b"acknowledge      : verified",
+    b"rearm            : verified",
+    b"idle wakeup      : verified",
+    b"local interrupts : enabled",
+    b"periodic timer   : armed at 100 Hz",
+    b"kernel threads  : verified (2)",
+    b"private stacks  : verified",
+    b"context switch  : verified",
+    b"cooperative     : verified",
+    b"timer coexistence: verified",
+    b"task exit       : verified",
+    b"resource reclaim: verified",
+)
+ARCH_REQUIRED_MARKERS = {
+    "riscv64": (
+        b"direct map      : verified",
+        b"low boot mapping: removed",
+    ),
+    "loongarch64": (
+        b"refill entry   :",
+        b"address bits   : VA=48 PA=48",
+    ),
+}
+MAX_SCAN_BUFFER = 64 * 1024
 
 
 def parse_args() -> argparse.Namespace:
@@ -143,6 +174,7 @@ def main() -> int:
     scan_buffer = b""
     success = False
     failure_reason: str | None = None
+    required_markers = set(COMMON_REQUIRED_MARKERS + ARCH_REQUIRED_MARKERS[args.arch])
 
     try:
         with log_path.open("wb") as log_file:
@@ -162,9 +194,21 @@ def main() -> int:
                     sys.stdout.flush()
 
                     scan_buffer = (scan_buffer + chunk)[-MAX_SCAN_BUFFER:]
+                    required_markers = {
+                        marker for marker in required_markers if marker not in scan_buffer
+                    }
 
                     if SUCCESS_MARKER in scan_buffer:
-                        success = True
+                        if required_markers:
+                            missing = ", ".join(
+                                repr(marker.decode("ascii", errors="replace"))
+                                for marker in sorted(required_markers)
+                            )
+                            failure_reason = (
+                                "success marker arrived before required evidence: " + missing
+                            )
+                        else:
+                            success = True
                         break
 
                     matched = next(
