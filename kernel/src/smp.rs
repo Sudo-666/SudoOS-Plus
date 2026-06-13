@@ -466,6 +466,8 @@ pub fn start_secondaries() {
 
     #[cfg(debug_assertions)]
     crate::ipi::verify();
+    #[cfg(debug_assertions)]
+    crate::call_function::verify();
 
     crate::println!("SMP subsystem:");
     crate::println!("  discovered CPUs : {}", discovered);
@@ -493,6 +495,22 @@ pub fn send_ipi(cpu: CpuId) {
 
 pub fn send_tlb_shootdown(cpu: CpuId) {
     crate::ipi::send(cpu, crate::ipi::IpiMessage::TlbShootdown);
+}
+
+pub fn call_function_single(
+    cpu: CpuId,
+    function: crate::call_function::CallFunction,
+    argument: usize,
+) {
+    crate::call_function::call_single(cpu, function, argument);
+}
+
+pub fn call_function_many(
+    targets: usize,
+    function: crate::call_function::CallFunction,
+    argument: usize,
+) {
+    crate::call_function::call_many(targets, function, argument);
 }
 
 pub fn broadcast_ipi_except_current() {

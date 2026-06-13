@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod call_function;
 mod console;
 mod context;
 mod fault;

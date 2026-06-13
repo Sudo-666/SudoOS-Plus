@@ -4,12 +4,14 @@ use crate::smp::{CpuId, MAX_CPUS};
 
 const IPI_RESCHEDULE: usize = 1 << 0;
 const IPI_TLB_SHOOTDOWN: usize = 1 << 1;
-const IPI_KNOWN_MASK: usize = IPI_RESCHEDULE | IPI_TLB_SHOOTDOWN;
+const IPI_CALL_FUNCTION: usize = 1 << 2;
+const IPI_KNOWN_MASK: usize = IPI_RESCHEDULE | IPI_TLB_SHOOTDOWN | IPI_CALL_FUNCTION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IpiMessage {
     Reschedule,
     TlbShootdown,
+    CallFunction,
 }
 
 impl IpiMessage {
@@ -17,6 +19,7 @@ impl IpiMessage {
         match self {
             Self::Reschedule => IPI_RESCHEDULE,
             Self::TlbShootdown => IPI_TLB_SHOOTDOWN,
+            Self::CallFunction => IPI_CALL_FUNCTION,
         }
     }
 }
@@ -82,6 +85,7 @@ pub fn initialize() {
     for mailbox in &MAILBOXES {
         mailbox.reset();
     }
+    crate::call_function::initialize();
 }
 
 /// Publishes a message to one CPU and rings its hardware doorbell only when
@@ -156,6 +160,9 @@ pub fn handle_current() {
         if messages & IPI_TLB_SHOOTDOWN != 0 {
             crate::tlb::handle_shootdown_ipi();
         }
+        if messages & IPI_CALL_FUNCTION != 0 {
+            crate::call_function::handle_current();
+        }
         if messages & IPI_RESCHEDULE != 0 {
             crate::task::request_reschedule_local();
         }
@@ -194,6 +201,7 @@ pub fn dump() {
             "non-ready CPU has pending IPI messages: cpu={logical}",
         );
     }
+    crate::call_function::dump();
 }
 
 #[cfg(debug_assertions)]
@@ -203,13 +211,14 @@ pub fn verify() {
     assert!(mailbox.publish(IpiMessage::Reschedule));
     assert!(!mailbox.publish(IpiMessage::Reschedule));
     assert!(!mailbox.publish(IpiMessage::TlbShootdown));
+    assert!(!mailbox.publish(IpiMessage::CallFunction));
     assert_eq!(mailbox.doorbells.load(Ordering::Acquire), 1);
-    assert_eq!(mailbox.coalesced.load(Ordering::Acquire), 2);
+    assert_eq!(mailbox.coalesced.load(Ordering::Acquire), 3);
 
     let messages = mailbox.take_pending();
     assert_eq!(
         messages,
-        IPI_RESCHEDULE | IPI_TLB_SHOOTDOWN,
+        IPI_RESCHEDULE | IPI_TLB_SHOOTDOWN | IPI_CALL_FUNCTION,
         "IPI mailbox failed to coalesce independent messages",
     );
     assert_eq!(mailbox.take_pending(), 0);
@@ -221,5 +230,6 @@ pub fn verify() {
     crate::println!("IPI mailbox test:");
     crate::println!("  empty -> doorbell : verified");
     crate::println!("  pending coalescing: verified");
+    crate::println!("  payload message   : verified");
     crate::println!("  drain and re-arm  : verified");
 }
