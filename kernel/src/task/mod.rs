@@ -1690,7 +1690,8 @@ fn active_cpu_mask() -> usize {
         .active_cpu_mask()
 }
 
-#[cfg(debug_assertions)]
+// This counter is part of the runtime reaper/idle protocol, not a verifier-only
+// diagnostic. Keep it available in release builds as well.
 fn retired_task_backlog() -> usize {
     RETIRED_BACKLOG.load(Ordering::Acquire)
 }
