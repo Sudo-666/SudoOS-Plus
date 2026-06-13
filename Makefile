@@ -5,6 +5,12 @@ SMP ?= 1
 MEM ?= 256M
 SMOKE_TIMEOUT ?= 30
 SMP_SMOKE_TIMEOUT ?= 75
+STRESS_ARCHES ?= $(ARCH)
+STRESS_SMPS ?= $(SMP)
+STRESS_MEMS ?= $(MEM)
+STRESS_PROFILES ?= $(PROFILE)
+STRESS_LOOPS ?= 1
+STRESS_TIMEOUT ?= $(SMP_SMOKE_TIMEOUT)
 
 KERNEL_PACKAGE ?= myos-kernel
 KERNEL_BINARY ?= myos-kernel
@@ -18,6 +24,12 @@ export MEM
 export KERNEL_PACKAGE
 export KERNEL_BINARY
 export QEMU_ARGS
+export STRESS_ARCHES
+export STRESS_SMPS
+export STRESS_MEMS
+export STRESS_PROFILES
+export STRESS_LOOPS
+export STRESS_TIMEOUT
 
 .PHONY: all
 all: build
@@ -75,6 +87,10 @@ smoke-smp-loongarch64:
 
 .PHONY: smoke-smp-all
 smoke-smp-all: smoke-smp-riscv64 smoke-smp-loongarch64
+
+.PHONY: stress-smp
+stress-smp:
+	@./scripts/stress-smp.sh
 
 .PHONY: fmt
 fmt:
@@ -169,6 +185,8 @@ doctor:
 		echo "warning: scripts/run-qemu.sh is not executable"
 	@test -x scripts/smoke.py || \
 		echo "warning: scripts/smoke.py is not executable"
+	@test -x scripts/stress-smp.sh || \
+		echo "warning: scripts/stress-smp.sh is not executable"
 	@test -x scripts/check-source-tree.sh || \
 		echo "warning: scripts/check-source-tree.sh is not executable"
 
@@ -187,6 +205,7 @@ help:
 	@echo "  make smoke ARCH=riscv64"
 	@echo "  make smoke-all"
 	@echo "  make smoke-smp-all"
+	@echo "  make stress-smp"
 	@echo "  make check"
 	@echo "  make verify"
 	@echo ""
@@ -200,4 +219,10 @@ help:
 	@echo "  MEM=<memory size>"
 	@echo "  SMOKE_TIMEOUT=<seconds>"
 	@echo "  SMP_SMOKE_TIMEOUT=<seconds>"
+	@echo "  STRESS_ARCHES='<arch list>'"
+	@echo "  STRESS_SMPS='<cpu count list>'"
+	@echo "  STRESS_MEMS='<memory size list>'"
+	@echo "  STRESS_PROFILES='<profile list>'"
+	@echo "  STRESS_LOOPS=<count>"
+	@echo "  STRESS_TIMEOUT=<seconds>"
 	@echo "  QEMU_ARGS='<additional arguments>'"

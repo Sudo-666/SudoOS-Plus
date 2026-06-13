@@ -24,3 +24,25 @@ pub fn validate() {
 pub use activate::{
     ActivateError, current_mode, current_satp, switch_sv39_root, translation_is_enabled,
 };
+
+#[inline]
+pub fn flush_page(address: myos_mm::VirtAddr) {
+    // SAFETY: SFENCE.VMA invalidates only the current hart's translation
+    // caches and does not dereference the supplied virtual address.
+    unsafe {
+        core::arch::asm!(
+            "sfence.vma {address}, zero",
+            address = in(reg) address.get(),
+            options(nostack),
+        );
+    }
+}
+
+#[inline]
+pub fn flush_all() {
+    // SAFETY: SFENCE.VMA with zero operands invalidates only the current
+    // hart's translation caches.
+    unsafe {
+        core::arch::asm!("sfence.vma zero, zero", options(nostack));
+    }
+}

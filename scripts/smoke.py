@@ -50,8 +50,15 @@ COMMON_REQUIRED_MARKERS = (
     b"preempt count     : verified",
     b"block current     : verified",
     b"no lost wakeup    : verified",
+    b"switching-out race: verified",
     b"wake one/all      : verified",
     b"M4C_SCHED_TEST: PASS",
+    b"local invalidate  : verified",
+    b"remap visibility  : verified",
+    b"page reclaim      : verified",
+    b"affinity release  : verified",
+    b"stack/TLB safety  : verified",
+    b"M4C_TLB_TEST: PASS",
     b"SMP_TEST: PASS",
 )
 ARCH_REQUIRED_MARKERS = {
@@ -65,6 +72,7 @@ ARCH_REQUIRED_MARKERS = {
     ),
 }
 MAX_SCAN_BUFFER = 64 * 1024
+FAILURE_DRAIN_SECONDS = 1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,6 +190,7 @@ def main() -> int:
     scan_buffer = b""
     success = False
     failure_reason: str | None = None
+    failure_drain_deadline: float | None = None
     cpu_count = int(os.environ.get("SMP", "1"))
     if cpu_count <= 0:
         raise RuntimeError("SMP must be greater than zero")
@@ -203,7 +212,10 @@ def main() -> int:
             b"concurrent threads : verified",
             b"remote wakeup       : verified",
             b"IPI delivery        : verified",
-            b"work stealing       : verified (unstarted tasks)",
+            b"work stealing       : verified (runnable task migration)",
+            b"remote invalidate : verified",
+            b"remote ack        : verified",
+            b"started task      : migrated CPU0 -> CPU1",
         )
     else:
         smp_markers += (
@@ -211,6 +223,9 @@ def main() -> int:
             b"remote wakeup       : single-CPU fallback",
             b"IPI delivery        : single-CPU fallback",
             b"work stealing       : single-CPU fallback",
+            b"remote invalidate : single-CPU fallback",
+            b"remote ack        : single-CPU fallback",
+            b"started task      : single-CPU fallback",
         )
 
     required_markers = set(
@@ -239,7 +254,7 @@ def main() -> int:
                         marker for marker in required_markers if marker not in scan_buffer
                     }
 
-                    if SUCCESS_MARKER in scan_buffer:
+                    if SUCCESS_MARKER in scan_buffer and failure_reason is None:
                         if required_markers:
                             missing = ", ".join(
                                 repr(marker.decode("ascii", errors="replace"))
@@ -247,6 +262,9 @@ def main() -> int:
                             )
                             failure_reason = (
                                 "success marker arrived before required evidence: " + missing
+                            )
+                            failure_drain_deadline = min(
+                                deadline, time.monotonic() + FAILURE_DRAIN_SECONDS
                             )
                         else:
                             success = True
@@ -256,14 +274,26 @@ def main() -> int:
                         (marker for marker in FAILURE_MARKERS if marker in scan_buffer),
                         None,
                     )
-                    if matched is not None:
+                    if matched is not None and failure_reason is None:
                         marker_text = matched.decode("ascii", errors="replace")
                         failure_reason = (
                             "serial output contained failure marker: " f"{marker_text}"
                         )
-                        break
+                        # Keep QEMU alive briefly so the complete panic message
+                        # reaches the log. Stopping at the banner hid the exact
+                        # task/CPU state that caused SMP failures.
+                        failure_drain_deadline = min(
+                            deadline, time.monotonic() + FAILURE_DRAIN_SECONDS
+                        )
 
-                if success or failure_reason is not None:
+                if success:
+                    break
+
+                if (
+                    failure_reason is not None
+                    and failure_drain_deadline is not None
+                    and time.monotonic() >= failure_drain_deadline
+                ):
                     break
 
                 return_code = process.poll()

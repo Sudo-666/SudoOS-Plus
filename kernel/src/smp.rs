@@ -1,11 +1,20 @@
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+use core::{
+    hint::spin_loop,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence},
+};
 
 use myos_fdt::DeviceTree;
 
-use crate::irq_lock::IrqSpinLock;
+use crate::{
+    irq_lock::IrqSpinLock,
+    lockdep::{LockClass, LockRank},
+};
 
 pub const MAX_CPUS: usize = crate::arch::smp::MAX_CPUS;
 const SECONDARY_START_TIMEOUT_SECONDS: u64 = 5;
+const IPI_RESCHEDULE: usize = 1 << 0;
+const IPI_TLB_SHOOTDOWN: usize = 1 << 1;
+const IPI_KNOWN_MASK: usize = IPI_RESCHEDULE | IPI_TLB_SHOOTDOWN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuId(usize);
@@ -44,9 +53,13 @@ impl CpuTopology {
     }
 }
 
-static TOPOLOGY: IrqSpinLock<CpuTopology> = IrqSpinLock::new(CpuTopology::EMPTY);
+static TOPOLOGY: IrqSpinLock<CpuTopology> = IrqSpinLock::new_with_class(
+    CpuTopology::EMPTY,
+    LockClass::new("cpu_topology", LockRank::CpuLifecycle, 1),
+);
 static ONLINE_MASK: AtomicUsize = AtomicUsize::new(0);
 static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static IPI_READY_MASK: AtomicUsize = AtomicUsize::new(0);
 static IPI_COUNTS: [AtomicU64; MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -56,6 +69,16 @@ static IPI_COUNTS: [AtomicU64; MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+];
+static PENDING_IPI_REASONS: [AtomicUsize; MAX_CPUS] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
 ];
 
 pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
@@ -88,9 +111,13 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
     *TOPOLOGY.lock() = topology;
     ONLINE_MASK.store(1, Ordering::Release);
     ONLINE_COUNT.store(1, Ordering::Release);
+    IPI_READY_MASK.store(0, Ordering::Release);
 
     for counter in &IPI_COUNTS {
         counter.store(0, Ordering::Release);
+    }
+    for pending in &PENDING_IPI_REASONS {
+        pending.store(0, Ordering::Release);
     }
 }
 
@@ -102,8 +129,35 @@ pub fn online_cpu_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
 }
 
+pub fn online_cpu_mask() -> usize {
+    ONLINE_MASK.load(Ordering::Acquire)
+}
+
 pub fn is_online(cpu: CpuId) -> bool {
     ONLINE_MASK.load(Ordering::Acquire) & (1_usize << cpu.get()) != 0
+}
+
+pub fn ipi_ready_cpu_mask() -> usize {
+    IPI_READY_MASK.load(Ordering::Acquire)
+}
+
+pub fn is_ipi_ready(cpu: CpuId) -> bool {
+    ipi_ready_cpu_mask() & (1_usize << cpu.get()) != 0
+}
+
+pub(crate) fn mark_current_ipi_ready() {
+    crate::context::assert_interrupts_enabled();
+
+    let cpu = current_cpu_id();
+    let bit = 1_usize << cpu.get();
+    let previous = IPI_READY_MASK.fetch_or(bit, Ordering::AcqRel);
+
+    assert_eq!(
+        previous & bit,
+        0,
+        "CPU {} became IPI-ready more than once",
+        cpu.get(),
+    );
 }
 
 pub fn current_cpu_id() -> CpuId {
@@ -121,9 +175,13 @@ fn hardware_id_for(cpu: CpuId) -> usize {
 
 pub fn start_secondaries() {
     assert_eq!(current_cpu_id(), CpuId::BOOT);
-    assert!(crate::arch::interrupt::are_enabled());
+    crate::context::assert_interrupts_enabled();
 
     crate::arch::smp::enable_ipi_source();
+
+    if !is_ipi_ready(CpuId::BOOT) {
+        mark_current_ipi_ready();
+    }
 
     let discovered = discovered_cpu_count();
     let high_entry = kernel_secondary_entry as *const () as usize;
@@ -154,12 +212,39 @@ pub fn start_secondaries() {
             );
         }
 
-        crate::arch::cpu::wait_for_interrupt();
+        // Secondary publication is only an atomic store; it is not required
+        // to generate an interrupt on the boot CPU. Do not make bring-up depend
+        // on an unrelated periodic timer waking WFI.
+        spin_loop();
+    }
+
+    let expected_mask = if discovered == usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1_usize << discovered) - 1
+    };
+
+    while ipi_ready_cpu_mask() & expected_mask != expected_mask {
+        if deadline_reached(crate::arch::time::counter(), deadline) {
+            panic!(
+                "secondary CPU IPI readiness timed out: \
+                 discovered={} online_mask={:#x} ready_mask={:#x} expected={:#x}",
+                discovered,
+                online_cpu_mask(),
+                ipi_ready_cpu_mask(),
+                expected_mask,
+            );
+        }
+
+        // See the online wait above: readiness publication itself carries no
+        // architectural wake event.
+        spin_loop();
     }
 
     crate::println!("SMP subsystem:");
     crate::println!("  discovered CPUs : {}", discovered);
     crate::println!("  online CPUs     : {}", online_cpu_count());
+    crate::println!("  IPI-ready CPUs  : {}", ipi_ready_cpu_mask().count_ones());
     crate::println!(
         "  boot CPU        : 0 (hardware {})",
         hardware_id(CpuId::BOOT)
@@ -175,7 +260,25 @@ pub fn start_secondaries() {
 }
 
 pub fn send_ipi(cpu: CpuId) {
+    queue_ipi(cpu, IPI_RESCHEDULE);
+}
+
+pub fn send_tlb_shootdown(cpu: CpuId) {
+    queue_ipi(cpu, IPI_TLB_SHOOTDOWN);
+}
+
+fn queue_ipi(cpu: CpuId, reason: usize) {
     assert!(is_online(cpu), "attempted to send an IPI to an offline CPU");
+    assert!(
+        is_ipi_ready(cpu),
+        "attempted to send an IPI to an online CPU that is not IPI-ready: cpu={}",
+        cpu.get(),
+    );
+    assert_ne!(reason, 0, "IPI reason must not be empty");
+    assert_eq!(reason & !IPI_KNOWN_MASK, 0, "unknown IPI reason");
+
+    PENDING_IPI_REASONS[cpu.get()].fetch_or(reason, Ordering::Release);
+    fence(Ordering::SeqCst);
 
     let hardware = hardware_id(cpu);
     crate::arch::smp::send_ipi(hardware).unwrap_or_else(|error| {
@@ -189,27 +292,45 @@ pub fn send_ipi(cpu: CpuId) {
 
 pub fn broadcast_ipi_except_current() {
     let current = current_cpu_id();
+    let targets = online_cpu_mask() & ipi_ready_cpu_mask() & !(1_usize << current.get());
 
     for logical in 0..discovered_cpu_count() {
-        let cpu = CpuId::new(logical).expect("discovered CPU ID exceeded MAX_CPUS");
-
-        if cpu != current && is_online(cpu) {
-            send_ipi(cpu);
+        let bit = 1_usize << logical;
+        if targets & bit == 0 {
+            continue;
         }
+
+        let cpu = CpuId::new(logical).expect("discovered CPU ID exceeded MAX_CPUS");
+        send_ipi(cpu);
     }
 }
 
 pub fn handle_ipi() {
     let cpu = current_cpu_id();
-    let action = crate::arch::smp::acknowledge_ipi();
+    let hardware_action = crate::arch::smp::acknowledge_ipi();
 
     assert!(
-        action != 0,
-        "IPI exception arrived without a pending action"
+        hardware_action != 0,
+        "IPI exception arrived without a hardware pending action",
     );
     fence(Ordering::Acquire);
     IPI_COUNTS[cpu.get()].fetch_add(1, Ordering::AcqRel);
-    crate::task::request_reschedule_local();
+
+    loop {
+        let reasons = PENDING_IPI_REASONS[cpu.get()].swap(0, Ordering::AcqRel);
+        if reasons == 0 {
+            break;
+        }
+
+        assert_eq!(reasons & !IPI_KNOWN_MASK, 0, "unknown pending IPI reason");
+
+        if reasons & IPI_TLB_SHOOTDOWN != 0 {
+            crate::tlb::handle_shootdown_ipi();
+        }
+        if reasons & IPI_RESCHEDULE != 0 {
+            crate::task::request_reschedule_local();
+        }
+    }
 }
 
 pub fn ipi_count(cpu: CpuId) -> u64 {

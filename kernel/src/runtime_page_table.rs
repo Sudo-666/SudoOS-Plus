@@ -62,8 +62,25 @@ impl RuntimePageTable {
         self.inner.protect_page(page, options)
     }
 
+    pub fn replace_page(
+        &mut self,
+        page: VirtPage,
+        frame: PhysFrame,
+        options: MappingOptions,
+    ) -> Result<PhysFrame, RuntimePageTableError> {
+        self.inner.replace_page(page, frame, options)
+    }
+
     pub fn unmap_page(&mut self, page: VirtPage) -> Result<PhysFrame, RuntimePageTableError> {
         self.inner.unmap_page(page)
+    }
+
+    pub fn reclaim_empty_tables(
+        &mut self,
+        page: VirtPage,
+        retired: &mut Vec<myos_mm::PageAllocation>,
+    ) -> Result<(), RuntimePageTableError> {
+        self.inner.reclaim_empty_tables(page, retired)
     }
 
     pub fn translate(&self, address: VirtAddr) -> Result<Option<PhysAddr>, RuntimePageTableError> {
@@ -163,7 +180,6 @@ mod imp {
             }
 
             write_entry(current, leaf_index, leaf.raw())?;
-            flush_page(page.start_address());
 
             Ok(())
         }
@@ -231,8 +247,6 @@ mod imp {
                 self.runtime_tables.push(allocation);
             }
 
-            flush_all();
-
             Ok(())
         }
 
@@ -251,9 +265,25 @@ mod imp {
                 .map_err(|_| RuntimePageTableError::PageTableEntry)?;
 
             write_entry(leaf_table, leaf_index, new.raw())?;
-            flush_page(page.start_address());
 
             Ok(())
+        }
+
+        pub fn replace_page(
+            &mut self,
+            page: VirtPage,
+            frame: PhysFrame,
+            options: MappingOptions,
+        ) -> Result<PhysFrame, RuntimePageTableError> {
+            let (leaf_table, leaf_index, old) = self.leaf_entry(page)?;
+            let old_frame = old
+                .frame()
+                .ok_or(RuntimePageTableError::InvalidTableEntry { level: LEVELS - 1 })?;
+            let new = PageTableEntry::leaf(frame, options)
+                .map_err(|_| RuntimePageTableError::PageTableEntry)?;
+
+            write_entry(leaf_table, leaf_index, new.raw())?;
+            Ok(old_frame)
         }
 
         pub fn unmap_page(&mut self, page: VirtPage) -> Result<PhysFrame, RuntimePageTableError> {
@@ -264,13 +294,15 @@ mod imp {
                 .ok_or(RuntimePageTableError::InvalidTableEntry { level: LEVELS - 1 })?;
 
             write_entry(leaf_table, leaf_index, 0)?;
-            flush_page(page.start_address());
-            self.reclaim_empty_tables(page)?;
 
             Ok(frame)
         }
 
-        fn reclaim_empty_tables(&mut self, page: VirtPage) -> Result<(), RuntimePageTableError> {
+        pub fn reclaim_empty_tables(
+            &mut self,
+            page: VirtPage,
+            retired: &mut Vec<myos_mm::PageAllocation>,
+        ) -> Result<(), RuntimePageTableError> {
             let page_indices = indices(page.start_address())
                 .ok_or(RuntimePageTableError::InvalidVirtualAddress)?;
             let mut tables = [self.root; LEVELS];
@@ -278,6 +310,9 @@ mod imp {
 
             for level in 0..LEVELS - 1 {
                 let raw = read_entry(current, page_indices[level].get())?;
+                if raw == 0 {
+                    return Ok(());
+                }
                 let entry = PageTableEntry::from_raw(raw);
 
                 if !entry.is_table() || entry.is_leaf() {
@@ -316,10 +351,9 @@ mod imp {
                 }
 
                 write_entry(parent, parent_index, 0)?;
-                flush_all();
 
                 let allocation = self.runtime_tables.swap_remove(position);
-                free_table(allocation);
+                retired.push(allocation);
             }
 
             Ok(())
@@ -457,24 +491,6 @@ mod imp {
             .map_err(|_| RuntimePageTableError::PageTableAccess)
     }
 
-    fn flush_page(address: VirtAddr) {
-        // SAFETY: sfence.vma 只刷新本 hart TLB，不访问 Rust 管理内存。
-        unsafe {
-            core::arch::asm!(
-                "sfence.vma {address}, zero",
-                address = in(reg) address.get(),
-                options(nostack),
-            );
-        }
-    }
-
-    fn flush_all() {
-        // SAFETY: sfence.vma 只刷新本 hart TLB，不访问 Rust 管理内存。
-        unsafe {
-            core::arch::asm!("sfence.vma zero, zero", options(nostack));
-        }
-    }
-
     impl From<PageTableEntryError> for RuntimePageTableError {
         fn from(_: PageTableEntryError) -> Self {
             Self::PageTableEntry
@@ -566,7 +582,6 @@ mod imp {
             }
 
             write_entry(current, leaf_index, leaf.raw())?;
-            flush_page(page.start_address());
 
             Ok(())
         }
@@ -646,8 +661,6 @@ mod imp {
                 self.runtime_tables.push(allocation);
             }
 
-            flush_all();
-
             Ok(())
         }
 
@@ -675,9 +688,25 @@ mod imp {
                 .map_err(|_| RuntimePageTableError::PageTableEntry)?;
 
             write_entry(leaf_table, leaf_index, new.raw())?;
-            flush_page(page.start_address());
 
             Ok(())
+        }
+
+        pub fn replace_page(
+            &mut self,
+            page: VirtPage,
+            frame: PhysFrame,
+            options: MappingOptions,
+        ) -> Result<PhysFrame, RuntimePageTableError> {
+            let (leaf_table, leaf_index, old) = self.leaf_entry(page)?;
+            let old_frame = old
+                .frame()
+                .ok_or(RuntimePageTableError::InvalidTableEntry { level: LEVELS - 1 })?;
+            let new = LeafPageTableEntry::new(frame, options)
+                .map_err(|_| RuntimePageTableError::PageTableEntry)?;
+
+            write_entry(leaf_table, leaf_index, new.raw())?;
+            Ok(old_frame)
         }
 
         pub fn unmap_page(&mut self, page: VirtPage) -> Result<PhysFrame, RuntimePageTableError> {
@@ -692,13 +721,15 @@ mod imp {
                 leaf_index,
                 LeafPageTableEntry::invalid_global().raw(),
             )?;
-            flush_page(page.start_address());
-            self.reclaim_empty_tables(page)?;
 
             Ok(frame)
         }
 
-        fn reclaim_empty_tables(&mut self, page: VirtPage) -> Result<(), RuntimePageTableError> {
+        pub fn reclaim_empty_tables(
+            &mut self,
+            page: VirtPage,
+            retired: &mut Vec<myos_mm::PageAllocation>,
+        ) -> Result<(), RuntimePageTableError> {
             let page_indices = indices(page.start_address())
                 .ok_or(RuntimePageTableError::InvalidVirtualAddress)?;
             let mut tables = [self.root; LEVELS];
@@ -712,7 +743,7 @@ mod imp {
                     .ok_or(RuntimePageTableError::InvalidTableEntry { level })?;
 
                 if next == self.invalid_child_for_level(level) {
-                    return Err(RuntimePageTableError::NotMapped);
+                    return Ok(());
                 }
 
                 current = next;
@@ -752,10 +783,9 @@ mod imp {
                         .map_err(|_| RuntimePageTableError::PageTableEntry)?;
 
                 write_entry(parent, parent_index, invalid_pointer.raw())?;
-                flush_all();
 
                 let allocation = self.runtime_tables.swap_remove(position);
-                free_table(allocation);
+                retired.push(allocation);
             }
 
             Ok(())
@@ -911,13 +941,5 @@ mod imp {
         // SAFETY: 调用者通过 runtime page-table lock 串行化页表修改。
         unsafe { (&mut *pointer).set_entry(index, value) }
             .map_err(|_| RuntimePageTableError::PageTableAccess)
-    }
-
-    fn flush_page(address: VirtAddr) {
-        crate::arch::memory::paging::flush_page(address);
-    }
-
-    fn flush_all() {
-        crate::arch::memory::paging::flush_all();
     }
 }

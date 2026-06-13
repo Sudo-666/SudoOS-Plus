@@ -12,3 +12,19 @@ pub fn wait_for_interrupt() {
         asm!("wfi", options(nomem, nostack),);
     }
 }
+
+/// Enable local interrupts and enter the architectural wait state.
+///
+/// # Safety
+///
+/// The caller must have installed a valid trap entry and must enter with local
+/// interrupts disabled after checking for pending work.
+#[inline]
+pub unsafe fn enable_and_wait_for_interrupt() {
+    // SAFETY: upheld by the caller; enabling interrupts immediately before WFI
+    // closes the scheduler idle check/sleep window for pending timer/IPI work.
+    unsafe {
+        crate::interrupt::enable();
+        asm!("wfi", options(nomem, nostack),);
+    }
+}

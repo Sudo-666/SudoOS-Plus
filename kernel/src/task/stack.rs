@@ -30,16 +30,22 @@ impl KernelStack {
     pub const fn contains(&self, address: usize) -> bool {
         self.usable.contains(myos_mm::VirtAddr::new(address))
     }
+
+    pub fn destroy(mut self) -> Result<(), crate::vm::KernelVmError> {
+        let allocation = self
+            .allocation
+            .take()
+            .expect("kernel stack allocation disappeared before destroy");
+
+        crate::vm::vfree(allocation)
+    }
 }
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
-        let allocation = self
-            .allocation
-            .take()
-            .expect("kernel stack allocation disappeared before drop");
-
-        crate::vm::vfree(allocation)
-            .unwrap_or_else(|error| panic!("unable to release kernel stack: {error:?}"));
+        assert!(
+            self.allocation.is_none(),
+            "kernel stack dropped without explicit destroy",
+        );
     }
 }

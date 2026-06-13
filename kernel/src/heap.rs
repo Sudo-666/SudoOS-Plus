@@ -5,7 +5,10 @@ use core::{
 
 use myos_mm::{HeapAllocator, HeapStats, PageAllocation, PageProvider};
 
-use crate::irq_lock::IrqSpinLock;
+use crate::{
+    irq_lock::IrqSpinLock,
+    lockdep::{LockClass, LockRank},
+};
 
 use crate::page_alloc::{self, GlobalPageAllocatorError, PageAllocationOptions};
 
@@ -43,7 +46,10 @@ pub struct KernelGlobalAllocator {
 impl KernelGlobalAllocator {
     pub const fn new() -> Self {
         Self {
-            heap: IrqSpinLock::new(None),
+            heap: IrqSpinLock::new_with_class(
+                None,
+                LockClass::new("kernel_heap", LockRank::Heap, 1),
+            ),
         }
     }
 

@@ -2,11 +2,13 @@
 #![no_main]
 
 mod console;
+mod context;
 mod fault;
 mod heap;
 mod irq;
 mod irq_lock;
 mod linker;
+mod lockdep;
 mod memory;
 mod page_alloc;
 mod panic;
@@ -14,6 +16,7 @@ mod runtime_page_table;
 mod smp;
 mod task;
 mod time;
+mod tlb;
 mod trap;
 mod vm;
 extern crate alloc;
@@ -237,6 +240,7 @@ fn kernel_main(boot: BootInfo) -> ! {
 
     task::initialize();
     smp::start_secondaries();
+    task::finalize_cpu_bringup();
 
     #[cfg(debug_assertions)]
     task::verify();
