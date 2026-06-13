@@ -1,65 +1,59 @@
 # CPU Lifecycle
 
-The current lifecycle is implemented with topology data plus online, IPI-ready
-and scheduler-active masks. M5 PR 8 will turn this into a single explicit state
-machine.
+CPU identity and CPU runtime state are deliberately separate.
 
-## Current States
+The logical-to-hardware identity map is constructed once from firmware and
+published as an immutable lockless snapshot. Runtime readiness is represented
+by one authoritative atomic state per logical CPU.
+
+## States
 
 ```text
-Discovered
+Absent
+  -> Present
   -> Starting
-  -> Online
   -> SchedulerRegistered
-  -> SchedulerActive
+  -> Active
   -> IpiReady
+
+Starting -> Failed
+
+IpiReady -> Dying -> Dead        (reserved for future hotplug)
 ```
 
-The implementation currently publishes `SchedulerActive` before `IpiReady`, but
-CPU 0 waits for both before leaving bring-up. Normal work therefore cannot target
-a secondary CPU until it can also receive the wakeup kick.
+Every transition uses an exact-state atomic compare/exchange. Skipping a state,
+publishing twice, or publishing from the wrong context panics.
 
-## State Responsibilities
+## Derived Masks
 
-| State | Owner | Meaning |
-|-------|-------|---------|
-| Discovered | CPU 0 | FDT exposed a hardware CPU ID and the logical mapping is known. |
-| Starting | CPU 0 | Architecture start protocol or mailbox has been issued. |
-| Online | secondary | The CPU reached Rust, installed trap/timer/VM state and registered with SMP. |
-| SchedulerRegistered | secondary | The scheduler owns a permanent idle context for the CPU. |
-| SchedulerActive | secondary | The idle task is running with local interrupts enabled. |
-| IpiReady | same CPU | The CPU can receive software interrupts used for reschedule/TLB work. |
+There are no independently writable online, active or IPI-ready masks.
 
-## Current Validation
+`online_cpu_mask()`, `scheduler_active_cpu_mask()` and
+`ipi_ready_cpu_mask()` scan the authoritative state array and derive snapshots.
 
-- CPU 0 waits for `online_cpu_count() == discovered_cpu_count()`.
-- CPU 0 waits for the expected IPI-ready mask.
-- `task::finalize_cpu_bringup()` checks scheduler online/active state against
-  SMP online/IPI-ready masks.
-- Smoke tests require discovered, online and participating CPU counts to match
-  the QEMU `SMP` setting.
+## Boot CPU
 
-## Not Yet Supported
+```text
+smp::initialize                 Present
+task::initialize                SchedulerRegistered -> Active
+smp::start_secondaries          IpiReady
+```
 
-- CPU hotplug.
-- Partial startup rollback.
-- Disabling a discovered CPU and continuing with a smaller active mask.
-- Panic stop IPI and frozen CPU confirmation mask.
+## Secondary CPU
 
-## Immutable CPU identity map
+```text
+boot start request              Present -> Starting
+scheduler context installed     Starting -> SchedulerRegistered
+idle stack + IRQ enabled        SchedulerRegistered -> Active
+software interrupt usable       Active -> IpiReady
+```
 
-Firmware discovery constructs the logical-to-hardware CPU identity map once on
-the boot CPU. The map is immutable after publication:
+The scheduler no longer stores its own `online` or `active` booleans.
+Scheduler-local state remains limited to current task, idle task, run queue,
+pending switch and IRQ/preemption counters.
 
-1. hardware-ID entries are stored;
-2. the discovered count is published with `Release`;
-3. readers load the count with `Acquire`;
-4. IPI and TLB paths read the corresponding hardware ID without taking a lock.
+A start API error records `Failed`. Timeout diagnostics print every logical
+CPU's hardware ID and exact lifecycle state.
 
-CPU lifecycle state (`online`, interrupt-ready, scheduler-active, dying, dead)
-is separate from CPU identity. Future hotplug transitions may change lifecycle
-state, but they must not rewrite the logical-to-hardware identity map.
-
-This separation prevents runtime cross-CPU paths from acquiring the
-`CpuLifecycle` lock while holding a TLB, scheduler, VM, or other later-ranked
-lock.
+Runtime hotplug and degraded boot after a failed secondary remain future work;
+they must extend this state machine rather than introduce new masks.

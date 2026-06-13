@@ -250,11 +250,6 @@ pub(super) struct WaiterDebugState {
 }
 
 struct CpuScheduler {
-    /// The CPU has installed its scheduler-owned idle context.
-    online: bool,
-    /// The CPU has entered the idle task with local interrupts enabled and may
-    /// be selected as a normal scheduling or migration target.
-    active: bool,
     current: Option<TaskId>,
     idle: Option<TaskId>,
     run_queue: VecDeque<TaskId>,
@@ -270,8 +265,6 @@ struct CpuScheduler {
 impl CpuScheduler {
     fn new() -> Self {
         Self {
-            online: false,
-            active: false,
             current: None,
             idle: None,
             run_queue: VecDeque::with_capacity(MAX_TASKS),
@@ -303,8 +296,6 @@ impl Scheduler {
         assert!(tasks.capacity() >= MAX_TASKS);
 
         let mut cpus = core::array::from_fn(|_| CpuScheduler::new());
-        cpus[CpuId::BOOT.get()].online = true;
-        cpus[CpuId::BOOT.get()].active = true;
         cpus[CpuId::BOOT.get()].current = Some(TaskId(0));
         cpus[CpuId::BOOT.get()].idle = Some(TaskId(0));
 
@@ -380,7 +371,7 @@ impl Scheduler {
     fn choose_target_cpu(&self) -> CpuId {
         (0..self.discovered_cpus)
             .filter_map(CpuId::new)
-            .filter(|cpu| self.cpus[cpu.get()].active)
+            .filter(|cpu| crate::smp::is_scheduler_active(*cpu))
             .min_by_key(|cpu| self.cpus[cpu.get()].run_queue.len())
             .expect("scheduler has no active CPU")
     }
@@ -400,9 +391,9 @@ impl Scheduler {
                     cpu.get() < self.discovered_cpus,
                     "task target CPU was not discovered",
                 );
-                assert!(self.cpus[cpu.get()].online, "task target CPU is offline");
+                assert!(crate::smp::is_online(cpu), "task target CPU is offline");
                 assert!(
-                    self.cpus[cpu.get()].active,
+                    crate::smp::is_scheduler_active(cpu),
                     "task target CPU is not scheduler-active",
                 );
                 cpu
@@ -457,7 +448,7 @@ impl Scheduler {
     fn steal_runnable(&mut self, cpu: CpuId) -> Option<TaskId> {
         for donor_index in 0..self.discovered_cpus {
             let donor = CpuId::new(donor_index).expect("invalid donor CPU");
-            if donor == cpu || !self.cpus[donor.get()].active {
+            if donor == cpu || !crate::smp::is_scheduler_active(donor) {
                 continue;
             }
 
@@ -513,7 +504,7 @@ impl Scheduler {
 
     fn prepare_yield(&mut self, cpu: CpuId) -> Option<ContextSwitch> {
         assert!(
-            self.cpus[cpu.get()].active,
+            crate::smp::is_scheduler_active(cpu),
             "inactive CPU attempted to schedule"
         );
         assert!(
@@ -548,8 +539,11 @@ impl Scheduler {
     }
 
     fn prepare_preempt(&mut self, cpu: CpuId) -> Option<ContextSwitch> {
+        assert!(
+            crate::smp::is_scheduler_active(cpu),
+            "inactive CPU attempted to preempt",
+        );
         let cpu_state = &self.cpus[cpu.get()];
-        assert!(cpu_state.active, "inactive CPU attempted to preempt");
         if cpu_state.irq_depth != 0 || cpu_state.preempt_count != 0 {
             return None;
         }
@@ -808,7 +802,7 @@ impl Scheduler {
     #[cfg(debug_assertions)]
     fn migrate_runnable_task(&mut self, id: TaskId, target: CpuId) -> CpuId {
         assert!(
-            self.cpus[target.get()].active,
+            crate::smp::is_scheduler_active(target),
             "migration target CPU is not scheduler-active"
         );
 
@@ -859,9 +853,14 @@ impl Scheduler {
     fn register_secondary(&mut self, cpu: CpuId) {
         assert_ne!(cpu, CpuId::BOOT);
         assert!(cpu.get() < self.discovered_cpus);
+        assert_eq!(
+            crate::smp::cpu_state(cpu),
+            crate::smp::CpuState::Starting,
+            "secondary scheduler registration occurred in the wrong lifecycle state",
+        );
         assert!(
-            !self.cpus[cpu.get()].online,
-            "secondary CPU registered twice"
+            self.cpus[cpu.get()].current.is_none(),
+            "secondary CPU registered twice",
         );
 
         let idle = self.idle(cpu);
@@ -869,62 +868,33 @@ impl Scheduler {
         self.task_mut(idle).state = TaskState::Running(cpu);
         self.task_mut(idle).has_run = true;
         self.cpus[cpu.get()].current = Some(idle);
-        self.cpus[cpu.get()].online = true;
-        self.cpus[cpu.get()].active = false;
     }
 
     fn activate_secondary(&mut self, cpu: CpuId) {
         assert_ne!(cpu, CpuId::BOOT);
         assert!(cpu.get() < self.discovered_cpus);
+        assert_eq!(
+            crate::smp::cpu_state(cpu),
+            crate::smp::CpuState::SchedulerRegistered,
+            "secondary activation occurred in the wrong lifecycle state",
+        );
 
         let idle = self.idle(cpu);
         assert_eq!(self.current(cpu), idle);
         assert_eq!(self.task(idle).state, TaskState::Running(cpu));
-
-        let state = &mut self.cpus[cpu.get()];
-        assert!(state.online, "offline CPU attempted to become active");
-        assert!(!state.active, "secondary CPU became active twice");
-        assert!(state.pending.is_none(), "CPU became active during a switch");
-        state.active = true;
+        assert!(
+            self.cpus[cpu.get()].pending.is_none(),
+            "CPU became active during a switch",
+        );
     }
 
-    fn online_cpu_count(&self) -> usize {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .filter(|cpu| cpu.online)
-            .count()
-    }
-
-    fn online_cpu_mask(&self) -> usize {
+    fn registered_cpu_mask(&self) -> usize {
         self.cpus
             .iter()
             .take(self.discovered_cpus)
             .enumerate()
             .fold(0_usize, |mask, (index, cpu)| {
-                if cpu.online {
-                    mask | (1_usize << index)
-                } else {
-                    mask
-                }
-            })
-    }
-
-    fn active_cpu_count(&self) -> usize {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .filter(|cpu| cpu.active)
-            .count()
-    }
-
-    fn active_cpu_mask(&self) -> usize {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .enumerate()
-            .fold(0_usize, |mask, (index, cpu)| {
-                if cpu.active {
+                if cpu.current.is_some() && cpu.idle.is_some() {
                     mask | (1_usize << index)
                 } else {
                     mask
@@ -961,7 +931,7 @@ impl Scheduler {
         (0..self.discovered_cpus).any(|donor_index| {
             let donor = CpuId::new(donor_index).expect("invalid donor CPU");
             donor != cpu
-                && self.cpus[donor.get()].active
+                && crate::smp::is_scheduler_active(donor)
                 && self.cpus[donor.get()].run_queue.iter().any(|id| {
                     let task = self.task(*id);
                     task.state == TaskState::Runnable && task.affinity.is_none()
@@ -1045,7 +1015,10 @@ impl Scheduler {
 
     fn irq_enter(&mut self, cpu: CpuId) {
         let state = &mut self.cpus[cpu.get()];
-        assert!(state.online, "offline CPU entered IRQ context");
+        assert!(
+            crate::smp::is_online(cpu),
+            "offline CPU entered IRQ context"
+        );
         state.irq_depth = state
             .irq_depth
             .checked_add(1)
@@ -1077,7 +1050,7 @@ impl Scheduler {
     }
 
     fn request_reschedule(&mut self, cpu: CpuId) {
-        if self.cpus[cpu.get()].active {
+        if crate::smp::is_scheduler_active(cpu) {
             self.cpus[cpu.get()].need_resched = true;
         }
     }
@@ -1159,6 +1132,9 @@ pub fn initialize() {
         assert!(slot.is_none(), "kernel scheduler was initialized twice");
         *slot = Some(scheduler);
     }
+
+    crate::smp::mark_boot_scheduler_registered();
+    crate::smp::mark_current_scheduler_active();
 
     spawn_system_thread(task_reaper_main, Some(CpuId::BOOT), Some(CpuId::BOOT));
 
@@ -1380,11 +1356,19 @@ pub(super) fn migrate_runnable_task(id: TaskId, target: CpuId) {
 
 pub fn register_secondary_cpu(cpu: CpuId) {
     assert!(crate::arch::interrupt::are_disabled());
+    assert_eq!(
+        cpu,
+        crate::smp::current_cpu_id(),
+        "CPU attempted to register another CPU's scheduler context",
+    );
 
-    let mut slot = SCHEDULER.lock();
-    slot.as_mut()
-        .expect("kernel scheduler is not initialized")
-        .register_secondary(cpu);
+    {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("kernel scheduler is not initialized")
+            .register_secondary(cpu);
+    }
+    crate::smp::mark_current_scheduler_registered();
 }
 
 fn mark_current_active() {
@@ -1392,50 +1376,48 @@ fn mark_current_active() {
         crate::arch::interrupt::are_enabled(),
         "CPU became scheduler-active with local interrupts disabled",
     );
-
     let cpu = crate::smp::current_cpu_id();
-    let mut slot = SCHEDULER.lock();
-    slot.as_mut()
-        .expect("kernel scheduler is not initialized")
-        .activate_secondary(cpu);
+
+    {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("kernel scheduler is not initialized")
+            .activate_secondary(cpu);
+    }
+    crate::smp::mark_current_scheduler_active();
 }
 
 pub fn finalize_cpu_bringup() {
     assert_eq!(crate::smp::current_cpu_id(), CpuId::BOOT);
     assert!(crate::arch::interrupt::are_enabled());
 
-    let (registered, registered_mask, active, active_mask) = {
+    let registered_mask = {
         let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        (
-            scheduler.online_cpu_count(),
-            scheduler.online_cpu_mask(),
-            scheduler.active_cpu_count(),
-            scheduler.active_cpu_mask(),
-        )
+        slot.as_ref()
+            .expect("kernel scheduler is not initialized")
+            .registered_cpu_mask()
     };
 
-    let smp_online = crate::smp::online_cpu_count();
-    let smp_online_mask = crate::smp::online_cpu_mask();
-    let smp_ready_mask = crate::smp::ipi_ready_cpu_mask();
-    assert_eq!(registered, smp_online, "scheduler/SMP online CPU mismatch");
+    crate::smp::assert_bringup_complete();
+
+    let online_mask = crate::smp::online_cpu_mask();
+    let active_mask = crate::smp::scheduler_active_cpu_mask();
+    let ready_mask = crate::smp::ipi_ready_cpu_mask();
+
     assert_eq!(
-        registered_mask, smp_online_mask,
-        "scheduler/SMP online CPU masks diverged",
+        registered_mask, online_mask,
+        "scheduler contexts and lifecycle-online CPUs diverged",
     );
     assert_eq!(
-        active, smp_online,
-        "not every online CPU became scheduler-active"
-    );
-    assert_eq!(
-        active_mask, smp_ready_mask,
+        active_mask, ready_mask,
         "scheduler-active and IPI-ready CPU masks diverged",
     );
 
     crate::println!("kernel scheduler CPUs:");
-    crate::println!("  registered CPUs : {}", registered);
-    crate::println!("  active CPUs     : {}", active);
+    crate::println!("  registered CPUs : {}", registered_mask.count_ones());
+    crate::println!("  active CPUs     : {}", active_mask.count_ones());
     crate::println!("  active mask     : {:#x}", active_mask);
+    crate::println!("  lifecycle source: smp::CpuState");
 }
 
 pub fn enter_secondary_idle() -> ! {
@@ -1717,18 +1699,12 @@ fn current_stack_contains(address: usize) -> bool {
 
 #[cfg(debug_assertions)]
 fn active_cpu_count() -> usize {
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .active_cpu_count()
+    crate::smp::scheduler_active_cpu_count()
 }
 
 #[cfg(debug_assertions)]
 fn active_cpu_mask() -> usize {
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .active_cpu_mask()
+    crate::smp::scheduler_active_cpu_mask()
 }
 
 // This counter is part of the runtime reaper/idle protocol, not a verifier-only

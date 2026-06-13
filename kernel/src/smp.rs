@@ -1,6 +1,6 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence},
+    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
 };
 
 use myos_fdt::DeviceTree;
@@ -30,6 +30,70 @@ impl CpuId {
     }
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CpuState {
+    Absent = 0,
+    Present = 1,
+    Starting = 2,
+    SchedulerRegistered = 3,
+    Active = 4,
+    IpiReady = 5,
+    Failed = 6,
+    Dying = 7,
+    Dead = 8,
+}
+
+impl CpuState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Absent,
+            1 => Self::Present,
+            2 => Self::Starting,
+            3 => Self::SchedulerRegistered,
+            4 => Self::Active,
+            5 => Self::IpiReady,
+            6 => Self::Failed,
+            7 => Self::Dying,
+            8 => Self::Dead,
+            _ => panic!("invalid CPU lifecycle state value: {raw}"),
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Present => "present",
+            Self::Starting => "starting",
+            Self::SchedulerRegistered => "scheduler-registered",
+            Self::Active => "active",
+            Self::IpiReady => "ipi-ready",
+            Self::Failed => "failed",
+            Self::Dying => "dying",
+            Self::Dead => "dead",
+        }
+    }
+
+    const fn is_present(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+
+    const fn is_online(self) -> bool {
+        matches!(
+            self,
+            Self::SchedulerRegistered | Self::Active | Self::IpiReady | Self::Dying
+        )
+    }
+
+    const fn is_scheduler_active(self) -> bool {
+        matches!(self, Self::Active | Self::IpiReady)
+    }
+
+    const fn accepts_ipi(self) -> bool {
+        matches!(self, Self::IpiReady)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CpuTopology {
     hardware_ids: [usize; MAX_CPUS],
@@ -49,9 +113,8 @@ impl CpuTopology {
 // need the CPU-lifecycle lock.
 static DISCOVERED_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 static HARDWARE_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
-static ONLINE_MASK: AtomicUsize = AtomicUsize::new(0);
-static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
-static IPI_READY_MASK: AtomicUsize = AtomicUsize::new(0);
+static CPU_STATES: [AtomicU8; MAX_CPUS] =
+    [const { AtomicU8::new(CpuState::Absent as u8) }; MAX_CPUS];
 static IPI_COUNTS: [AtomicU64; MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -116,9 +179,19 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
 
     #[cfg(debug_assertions)]
     verify_topology_snapshot(topology);
-    ONLINE_MASK.store(1, Ordering::Release);
-    ONLINE_COUNT.store(1, Ordering::Release);
-    IPI_READY_MASK.store(0, Ordering::Release);
+    for logical in 0..MAX_CPUS {
+        let next = if logical < topology.discovered {
+            CpuState::Present
+        } else {
+            CpuState::Absent
+        };
+        let previous = CPU_STATES[logical].swap(next as u8, Ordering::AcqRel);
+        assert_eq!(
+            CpuState::from_raw(previous),
+            CpuState::Absent,
+            "CPU lifecycle was initialized more than once: cpu={logical}",
+        );
+    }
 
     for counter in &IPI_COUNTS {
         counter.store(0, Ordering::Release);
@@ -132,39 +205,182 @@ pub fn discovered_cpu_count() -> usize {
     DISCOVERED_CPU_COUNT.load(Ordering::Acquire)
 }
 
+pub fn cpu_state(cpu: CpuId) -> CpuState {
+    CpuState::from_raw(CPU_STATES[cpu.get()].load(Ordering::Acquire))
+}
+
+fn state_mask(mut predicate: impl FnMut(CpuState) -> bool) -> usize {
+    let mut mask = 0_usize;
+    for logical in 0..discovered_cpu_count() {
+        let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+        if predicate(cpu_state(cpu)) {
+            mask |= 1_usize << logical;
+        }
+    }
+    mask
+}
+
+pub fn present_cpu_mask() -> usize {
+    state_mask(CpuState::is_present)
+}
+
 pub fn online_cpu_count() -> usize {
-    ONLINE_COUNT.load(Ordering::Acquire)
+    online_cpu_mask().count_ones() as usize
 }
 
 pub fn online_cpu_mask() -> usize {
-    ONLINE_MASK.load(Ordering::Acquire)
+    state_mask(CpuState::is_online)
 }
 
 pub fn is_online(cpu: CpuId) -> bool {
-    ONLINE_MASK.load(Ordering::Acquire) & (1_usize << cpu.get()) != 0
+    cpu_state(cpu).is_online()
+}
+
+pub fn scheduler_active_cpu_count() -> usize {
+    scheduler_active_cpu_mask().count_ones() as usize
+}
+
+pub fn scheduler_active_cpu_mask() -> usize {
+    state_mask(CpuState::is_scheduler_active)
+}
+
+pub fn is_scheduler_active(cpu: CpuId) -> bool {
+    cpu_state(cpu).is_scheduler_active()
 }
 
 pub fn ipi_ready_cpu_mask() -> usize {
-    IPI_READY_MASK.load(Ordering::Acquire)
+    state_mask(CpuState::accepts_ipi)
 }
 
 pub fn is_ipi_ready(cpu: CpuId) -> bool {
-    ipi_ready_cpu_mask() & (1_usize << cpu.get()) != 0
+    cpu_state(cpu).accepts_ipi()
+}
+
+fn transition_cpu(cpu: CpuId, expected: CpuState, next: CpuState, owner: &'static str) {
+    match CPU_STATES[cpu.get()].compare_exchange(
+        expected as u8,
+        next as u8,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(actual) => {
+            let actual = CpuState::from_raw(actual);
+            panic!(
+                "invalid CPU lifecycle transition: cpu={} owner={} expected={} actual={} next={}",
+                cpu.get(),
+                owner,
+                expected.name(),
+                actual.name(),
+                next.name(),
+            );
+        }
+    }
+}
+
+fn mark_cpu_starting(cpu: CpuId) {
+    assert_ne!(cpu, CpuId::BOOT, "boot CPU cannot enter secondary start");
+    transition_cpu(cpu, CpuState::Present, CpuState::Starting, "boot/start");
+}
+
+fn mark_cpu_start_failed(cpu: CpuId) {
+    transition_cpu(
+        cpu,
+        CpuState::Starting,
+        CpuState::Failed,
+        "boot/start-failure",
+    );
+}
+
+pub(crate) fn mark_boot_scheduler_registered() {
+    assert_eq!(current_cpu_id(), CpuId::BOOT);
+    transition_cpu(
+        CpuId::BOOT,
+        CpuState::Present,
+        CpuState::SchedulerRegistered,
+        "boot/scheduler-register",
+    );
+}
+
+pub(crate) fn mark_current_scheduler_registered() {
+    crate::context::assert_interrupts_disabled();
+    let cpu = current_cpu_id();
+    assert_ne!(cpu, CpuId::BOOT);
+    transition_cpu(
+        cpu,
+        CpuState::Starting,
+        CpuState::SchedulerRegistered,
+        "secondary/scheduler-register",
+    );
+}
+
+pub(crate) fn mark_current_scheduler_active() {
+    crate::context::assert_interrupts_enabled();
+    let cpu = current_cpu_id();
+    transition_cpu(
+        cpu,
+        CpuState::SchedulerRegistered,
+        CpuState::Active,
+        "scheduler/activate",
+    );
 }
 
 pub(crate) fn mark_current_ipi_ready() {
     crate::context::assert_interrupts_enabled();
-
     let cpu = current_cpu_id();
-    let bit = 1_usize << cpu.get();
-    let previous = IPI_READY_MASK.fetch_or(bit, Ordering::AcqRel);
+    transition_cpu(cpu, CpuState::Active, CpuState::IpiReady, "arch/ipi-ready");
+}
+
+pub fn dump_cpu_states() {
+    crate::println!("CPU lifecycle:");
+    for logical in 0..discovered_cpu_count() {
+        let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+        crate::println!(
+            "  cpu{} hardware={} state={}",
+            logical,
+            hardware_id(cpu),
+            cpu_state(cpu).name(),
+        );
+    }
+}
+
+pub fn assert_bringup_complete() {
+    let discovered = discovered_cpu_count();
+    let expected = if discovered == usize::BITS as usize {
+        usize::MAX
+    } else {
+        (1_usize << discovered) - 1
+    };
 
     assert_eq!(
-        previous & bit,
-        0,
-        "CPU {} became IPI-ready more than once",
-        cpu.get(),
+        present_cpu_mask(),
+        expected,
+        "not every discovered CPU has a lifecycle entry",
     );
+    assert_eq!(
+        online_cpu_mask(),
+        expected,
+        "not every discovered CPU reached an online lifecycle state",
+    );
+    assert_eq!(
+        scheduler_active_cpu_mask(),
+        expected,
+        "not every online CPU became scheduler-active",
+    );
+    assert_eq!(
+        ipi_ready_cpu_mask(),
+        expected,
+        "not every scheduler-active CPU became IPI-ready",
+    );
+
+    for logical in 0..discovered {
+        let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+        assert_eq!(
+            cpu_state(cpu),
+            CpuState::IpiReady,
+            "CPU did not finish bring-up: cpu={logical}",
+        );
+    }
 }
 
 pub fn current_cpu_id() -> CpuId {
@@ -210,25 +426,29 @@ fn verify_topology_snapshot(expected: CpuTopology) {
 pub fn start_secondaries() {
     assert_eq!(current_cpu_id(), CpuId::BOOT);
     crate::context::assert_interrupts_enabled();
+    assert_eq!(
+        cpu_state(CpuId::BOOT),
+        CpuState::Active,
+        "boot CPU scheduler must be active before enabling IPIs",
+    );
 
     crate::arch::smp::enable_ipi_source();
-
-    if !is_ipi_ready(CpuId::BOOT) {
-        mark_current_ipi_ready();
-    }
+    mark_current_ipi_ready();
 
     let discovered = discovered_cpu_count();
     let high_entry = kernel_secondary_entry as *const () as usize;
-
     for logical in 1..discovered {
         let cpu = CpuId::new(logical).expect("discovered CPU ID exceeded MAX_CPUS");
         let hardware = hardware_id(cpu);
-
-        crate::arch::smp::start_secondary(logical, hardware, high_entry).unwrap_or_else(|error| {
+        mark_cpu_starting(cpu);
+        if let Err(error) = crate::arch::smp::start_secondary(logical, hardware, high_entry) {
+            mark_cpu_start_failed(cpu);
+            dump_cpu_states();
             panic!(
-                "unable to start secondary CPU: logical={logical} hardware={hardware} error={error:?}",
+                "unable to start secondary CPU: logical={logical} hardware={hardware} \
+                 error={error:?}",
             );
-        });
+        }
     }
 
     let frequency = crate::time::clock_frequency_hz();
@@ -239,16 +459,15 @@ pub fn start_secondaries() {
 
     while online_cpu_count() < discovered {
         if deadline_reached(crate::arch::time::counter(), deadline) {
+            dump_cpu_states();
             panic!(
-                "secondary CPU startup timed out: discovered={} online={}",
+                "secondary CPU scheduler registration timed out: \
+                 discovered={} online={} online_mask={:#x}",
                 discovered,
                 online_cpu_count(),
+                online_cpu_mask(),
             );
         }
-
-        // Secondary publication is only an atomic store; it is not required
-        // to generate an interrupt on the boot CPU. Do not make bring-up depend
-        // on an unrelated periodic timer waking WFI.
         spin_loop();
     }
 
@@ -257,37 +476,39 @@ pub fn start_secondaries() {
     } else {
         (1_usize << discovered) - 1
     };
-
     while ipi_ready_cpu_mask() & expected_mask != expected_mask {
         if deadline_reached(crate::arch::time::counter(), deadline) {
+            dump_cpu_states();
             panic!(
-                "secondary CPU IPI readiness timed out: \
-                 discovered={} online_mask={:#x} ready_mask={:#x} expected={:#x}",
+                "secondary CPU IPI readiness timed out: discovered={} \
+                 online_mask={:#x} active_mask={:#x} ready_mask={:#x} expected={:#x}",
                 discovered,
                 online_cpu_mask(),
+                scheduler_active_cpu_mask(),
                 ipi_ready_cpu_mask(),
                 expected_mask,
             );
         }
-
-        // See the online wait above: readiness publication itself carries no
-        // architectural wake event.
         spin_loop();
     }
+
+    assert_bringup_complete();
 
     crate::println!("SMP subsystem:");
     crate::println!("  discovered CPUs : {}", discovered);
     crate::println!("  online CPUs     : {}", online_cpu_count());
+    crate::println!("  active CPUs     : {}", scheduler_active_cpu_count());
     crate::println!("  IPI-ready CPUs  : {}", ipi_ready_cpu_mask().count_ones());
     crate::println!(
         "  boot CPU        : 0 (hardware {})",
-        hardware_id(CpuId::BOOT)
+        hardware_id(CpuId::BOOT),
     );
     if discovered > 1 {
         crate::println!("  secondary CPUs  : verified");
     } else {
         crate::println!("  secondary CPUs  : single-CPU fallback");
     }
+    crate::println!("  lifecycle       : explicit state machine");
     crate::println!("  per-CPU stacks  : verified");
     crate::println!("  per-CPU traps   : verified");
     crate::println!("  per-CPU timers  : armed");
@@ -371,19 +592,6 @@ pub fn ipi_count(cpu: CpuId) -> u64 {
     IPI_COUNTS[cpu.get()].load(Ordering::Acquire)
 }
 
-fn mark_current_online() {
-    let cpu = current_cpu_id();
-    let bit = 1_usize << cpu.get();
-    let previous = ONLINE_MASK.fetch_or(bit, Ordering::AcqRel);
-
-    assert_eq!(
-        previous & bit,
-        0,
-        "secondary CPU was marked online more than once",
-    );
-    ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
-}
-
 #[unsafe(no_mangle)]
 extern "C" fn kernel_secondary_entry(logical_id: usize, hardware_id: usize) -> ! {
     crate::arch::smp::set_current_cpu_id(logical_id);
@@ -407,7 +615,6 @@ extern "C" fn kernel_secondary_entry(logical_id: usize, hardware_id: usize) -> !
     crate::arch::smp::enable_ipi_source();
     crate::time::arm_periodic_secondary();
 
-    mark_current_online();
     crate::task::enter_secondary_idle()
 }
 
