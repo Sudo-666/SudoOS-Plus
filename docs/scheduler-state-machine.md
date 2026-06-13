@@ -87,3 +87,30 @@ It does not prove:
   `KernelStack::Drop` only verifies that explicit teardown already happened.
 - Idle uses a disable/recheck/enable-and-wait protocol and reports aggregate
   enter/exit counters in the scheduler verifier log.
+
+## Deterministic idle / IPI proof
+
+The debug scheduler verifier includes a target-local timer-off test for the
+check-to-sleep boundary.
+
+The test deliberately avoids allocating a task in the measured interval.
+Kernel-stack allocation uses vmalloc and may perform a TLB shootdown, which
+would add an unrelated IPI or deadlock against a target held at the idle gate.
+Instead, both test tasks are created and blocked first.
+
+Sequence:
+
+1. a pinned wake worker is created and blocked;
+2. a pinned stopper worker disables the target CPU's periodic clockevent;
+3. the stopper blocks and the target enters its idle task;
+4. with local interrupts disabled, idle performs its final work/backlog check;
+5. a debug gate records that this check has completed;
+6. CPU0 wakes the already-blocked worker, producing exactly one reschedule IPI;
+7. only after the IPI is pending is the target allowed to execute the
+   architecture enable-and-wait operation;
+8. the target must handle that IPI, schedule the worker, and restore its local
+   periodic timer.
+
+The workers remain alive until CPU0 samples the target IPI counter. This keeps
+task-stack reclamation and its possible TLB shootdown outside the exact-one-IPI
+measurement window.

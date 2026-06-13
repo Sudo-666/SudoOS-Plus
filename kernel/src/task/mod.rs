@@ -1,4 +1,7 @@
 #[cfg(debug_assertions)]
+mod idle_verify;
+
+#[cfg(debug_assertions)]
 mod m4c2_verify;
 #[cfg(debug_assertions)]
 mod m4c_verify;
@@ -1818,6 +1821,9 @@ fn idle_until_interrupt() {
     }
 
     let cpu = crate::smp::current_cpu_id();
+    #[cfg(debug_assertions)]
+    idle_verify::before_arch_wait(cpu);
+
     IDLE_ENTERS[cpu.get()].fetch_add(1, Ordering::AcqRel);
 
     // SAFETY: the idle task has a valid trap frame, local interrupt sources are
@@ -2185,6 +2191,7 @@ pub fn verify() {
 
     wait_for_workers(worker_count);
     verify_ipi_delivery(cpu_count);
+    idle_verify::verify(cpu_count);
     verify_work_stealing(cpu_count);
     synchronize_retired_tasks();
     crate::heap::shrink();

@@ -210,6 +210,62 @@ pub fn clock_frequency_hz() -> u64 {
     frequency
 }
 
+#[cfg(debug_assertions)]
+pub fn periodic_running_for(cpu: crate::smp::CpuId) -> bool {
+    TIMER_RUNNING[cpu.get()].load(Ordering::Acquire)
+}
+
+#[cfg(debug_assertions)]
+pub fn pause_periodic_for_idle_test() {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+
+    let _interrupt_guard = crate::context::IrqSaveGuard::new();
+    let cpu = current_cpu_index();
+    assert!(
+        TIMER_RUNNING[cpu].load(Ordering::Acquire),
+        "idle verification attempted to pause a stopped timer on CPU {cpu}",
+    );
+
+    crate::arch::time::shutdown()
+        .unwrap_or_else(|error| panic!("unable to pause local timer for idle test: {error:?}"));
+    NEXT_DEADLINES[cpu].store(0, Ordering::Release);
+    TIMER_RUNNING[cpu].store(false, Ordering::Release);
+
+    assert!(
+        !crate::arch::time::interrupt_source_enabled(),
+        "timer source remained enabled after idle-test pause",
+    );
+}
+
+#[cfg(debug_assertions)]
+pub fn resume_periodic_for_idle_test() {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+
+    let _interrupt_guard = crate::context::IrqSaveGuard::new();
+    let cpu = current_cpu_index();
+    assert!(
+        !TIMER_RUNNING[cpu].load(Ordering::Acquire),
+        "idle verification attempted to resume a running timer on CPU {cpu}",
+    );
+
+    let now = crate::arch::time::counter();
+    let deadline = now.wrapping_add(tick_period_cycles());
+    crate::arch::time::acknowledge();
+    crate::arch::time::program_deadline(deadline)
+        .unwrap_or_else(|error| panic!("unable to resume local timer after idle test: {error:?}"));
+    NEXT_DEADLINES[cpu].store(deadline, Ordering::Release);
+
+    // An immediately delivered interrupt must observe valid software state.
+    TIMER_RUNNING[cpu].store(true, Ordering::Release);
+    crate::arch::time::enable_interrupt_source();
+    assert!(
+        crate::arch::time::interrupt_source_enabled(),
+        "timer source did not re-enable after idle verification",
+    );
+}
+
 fn reset_current_clockevent() {
     crate::arch::time::shutdown()
         .unwrap_or_else(|error| panic!("unable to shut down local timer state: {error:?}"));
