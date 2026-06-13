@@ -468,6 +468,8 @@ pub fn start_secondaries() {
     crate::ipi::verify();
     #[cfg(debug_assertions)]
     crate::call_function::verify();
+    #[cfg(debug_assertions)]
+    crate::tlb::verify_request_model();
 
     crate::println!("SMP subsystem:");
     crate::println!("  discovered CPUs : {}", discovered);
