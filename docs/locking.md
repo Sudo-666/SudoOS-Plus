@@ -59,3 +59,23 @@ including lock name, rank, order, and hold time in architecture counter cycles.
   paths.
 - Lockdep coverage for plain `SpinLock`.
 - Console serialization across CPUs.
+
+## IRQ-enabled tracked spin locks
+
+`TrackedSpinLock` is for task-context cross-CPU protocols that must service
+interrupts while serialized. Its guard pins migration but keeps IRQs enabled;
+only lockdep metadata updates use short IRQ-save windows.
+
+Recursion compares `LockInstanceId`, while rank/order belong to `LockClass`.
+This permits distinct locks of the same class to nest without false recursive
+lock reports.
+
+Current order:
+
+1. `RETIRED_REAPER` (`CrossCpu/#1`)
+2. `SHOOTDOWN_SERIALIZER` (`CrossCpu/#2`)
+3. scheduler and later ranks
+
+Do not silence an order panic by changing a rank without auditing the call
+chain. A cross-CPU serializer acquired under VM/page-table/heap state is a
+real lifetime/order problem.

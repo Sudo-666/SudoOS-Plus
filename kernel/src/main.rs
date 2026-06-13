@@ -17,6 +17,7 @@ mod smp;
 mod task;
 mod time;
 mod tlb;
+mod tracked_spin;
 mod trap;
 mod vm;
 extern crate alloc;
@@ -241,6 +242,8 @@ fn kernel_main(boot: BootInfo) -> ! {
     task::initialize();
     smp::start_secondaries();
     task::finalize_cpu_bringup();
+    #[cfg(debug_assertions)]
+    tracked_spin::verify();
 
     #[cfg(debug_assertions)]
     task::verify();

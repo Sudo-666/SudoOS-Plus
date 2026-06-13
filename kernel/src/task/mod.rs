@@ -201,6 +201,22 @@ impl Task {
     }
 
     fn destroy_resources(mut self) {
+        assert!(
+            self.queued_on.is_none(),
+            "destroying task still linked to a run queue: {:?}",
+            self.id,
+        );
+        assert!(
+            self.wait_channel.is_none(),
+            "destroying task still linked to wait channel {:?}: {:?}",
+            self.wait_channel,
+            self.id,
+        );
+        assert!(
+            !self.wake_after_switch,
+            "destroying task with a pending wake claim: {:?}",
+            self.id,
+        );
         if let Some(stack) = self.stack.take() {
             stack
                 .destroy()
@@ -598,6 +614,15 @@ impl Scheduler {
             "idle task attempted to block on a wait queue",
         );
 
+        assert!(
+            previous_task.wait_channel.is_none(),
+            "task attempted to join a second wait queue: task={previous:?} channel={:?}",
+            previous_task.wait_channel,
+        );
+        assert!(
+            !previous_task.wake_after_switch,
+            "running task retained a stale wake claim: task={previous:?}",
+        );
         let next = self.dequeue_next(cpu).unwrap_or_else(|| self.idle(cpu));
         assert_ne!(previous, next);
 
@@ -634,6 +659,18 @@ impl Scheduler {
             "idle task attempted to exit",
         );
 
+        {
+            let previous_task = self.task(previous);
+            assert!(
+                previous_task.wait_channel.is_none(),
+                "exiting task retained wait-channel ownership: task={previous:?} channel={:?}",
+                previous_task.wait_channel,
+            );
+            assert!(
+                !previous_task.wake_after_switch,
+                "exiting task retained a pending wake claim: task={previous:?}",
+            );
+        }
         let next = self.dequeue_next(cpu).unwrap_or_else(|| self.idle(cpu));
         assert_ne!(previous, next);
 
@@ -1122,6 +1159,8 @@ pub fn initialize() {
 
     spawn_system_thread(task_reaper_main, Some(CpuId::BOOT), Some(CpuId::BOOT));
 
+    #[cfg(debug_assertions)]
+    wait_queue::verify_local();
     crate::println!("kernel scheduler:");
     crate::println!("  policy          : preemptive per-CPU FIFO round-robin");
     crate::println!("  kernel stack    : 16 KiB plus guard pages");

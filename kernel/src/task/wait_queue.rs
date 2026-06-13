@@ -199,6 +199,22 @@ impl WaitQueue {
     fn waiter_count_inner(&self) -> usize {
         self.waiters.lock().waiter_count()
     }
+
+    fn assert_empty(&self, operation: &str) {
+        let waiters = self.waiter_count_inner();
+        assert_eq!(
+            waiters,
+            0,
+            "{operation} with waiters still queued: channel={} waiters={waiters}",
+            self.channel.load(Ordering::Acquire),
+        );
+    }
+}
+
+impl Drop for WaitQueue {
+    fn drop(&mut self) {
+        self.assert_empty("wait queue dropped");
+    }
 }
 
 impl Default for WaitQueue {
@@ -222,21 +238,34 @@ impl Completion {
 
     pub fn wait(&self) {
         loop {
-            let done = self.done.load(Ordering::Acquire);
-            if done == COMPLETION_ALL {
+            if self.try_wait() {
                 return;
             }
-            if done != 0
-                && self
-                    .done
-                    .compare_exchange(done, done - 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                return;
-            }
-
             self.waiters
                 .wait_until(|| self.done.load(Ordering::Acquire) != 0);
+        }
+    }
+
+    /// Consumes one completion token without blocking.
+    ///
+    /// `complete_all()` leaves the completion permanently signalled until an
+    /// externally quiescent caller invokes `reinit()`.
+    pub fn try_wait(&self) -> bool {
+        loop {
+            let done = self.done.load(Ordering::Acquire);
+            if done == 0 {
+                return false;
+            }
+            if done == COMPLETION_ALL {
+                return true;
+            }
+            if self
+                .done
+                .compare_exchange_weak(done, done - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
         }
     }
 
@@ -257,10 +286,49 @@ impl Completion {
         self.done.store(COMPLETION_ALL, Ordering::Release);
         self.waiters.wake_all();
     }
+
+    /// Resets a completion after all users of the previous generation have
+    /// quiesced. Reinitialising concurrently with wait/complete is invalid.
+    pub fn reinit(&self) {
+        self.waiters.assert_empty("completion reinitialised");
+        self.done.store(0, Ordering::Release);
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire) != 0
+    }
 }
 
 impl Default for Completion {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(debug_assertions)]
+pub(super) fn verify_local() {
+    let completion = Completion::new();
+
+    assert!(!completion.is_done());
+    assert!(!completion.try_wait());
+
+    completion.complete();
+    assert!(completion.is_done());
+    assert!(completion.try_wait());
+    assert!(!completion.is_done());
+    assert!(!completion.try_wait());
+
+    completion.complete_all();
+    assert!(completion.try_wait());
+    assert!(completion.try_wait());
+    assert!(completion.is_done());
+
+    completion.reinit();
+    assert!(!completion.is_done());
+    assert!(!completion.try_wait());
+
+    crate::println!("wait queue/completion invariant test:");
+    crate::println!("  counted completion token : verified");
+    crate::println!("  complete-all generation  : verified");
+    crate::println!("  quiescent reinitialise   : verified");
 }

@@ -13,6 +13,9 @@ const RANK_COUNT: usize = LockRank::Console as usize + 1;
 pub enum LockRank {
     Unknown = 0,
     CpuLifecycle = 10,
+    /// IRQ-enabled cross-CPU serializers. This rank precedes the
+    /// scheduler because an IPI handler may acquire scheduler state.
+    CrossCpu = 15,
     Scheduler = 20,
     WaitQueue = 30,
     Vm = 40,
@@ -43,15 +46,32 @@ impl LockClass {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LockInstanceId(usize);
+
+impl LockInstanceId {
+    pub const INVALID: Self = Self(0);
+
+    pub fn of<T: ?Sized>(value: &T) -> Self {
+        Self(value as *const T as *const () as usize)
+    }
+
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HeldLock {
     class: LockClass,
+    instance: LockInstanceId,
     acquired_at: u64,
 }
 
 impl HeldLock {
     const EMPTY: Self = Self {
         class: LockClass::unknown(),
+        instance: LockInstanceId::INVALID,
         acquired_at: 0,
     };
 }
@@ -78,7 +98,7 @@ static HELD_LOCKS: [CpuHeldLocks; MAX_CPUS] = [const { CpuHeldLocks::new() }; MA
 static MAX_HOLD_CYCLES: [AtomicU64; RANK_COUNT] = [const { AtomicU64::new(0) }; RANK_COUNT];
 static MAX_IRQ_OFF_CYCLES: AtomicU64 = AtomicU64::new(0);
 
-pub fn before_lock(class: LockClass, owner: usize, current: CpuId) {
+pub fn before_lock(class: LockClass, instance: LockInstanceId, owner: usize, current: CpuId) {
     if owner == current.get() {
         panic!(
             "recursive lock acquisition: lock={} cpu={}",
@@ -96,10 +116,11 @@ pub fn before_lock(class: LockClass, owner: usize, current: CpuId) {
     let entries = unsafe { &*state.entries.get() };
 
     for held in entries.iter().take(depth) {
-        if held.class.name == class.name {
+        if held.instance == instance {
             panic!(
-                "recursive lock acquisition through lockdep stack: lock={} cpu={}",
+                "recursive lock acquisition through lockdep stack: lock={} instance={:#x} cpu={}",
                 class.name,
+                instance.raw(),
                 current.get(),
             );
         }
@@ -121,7 +142,7 @@ pub fn before_lock(class: LockClass, owner: usize, current: CpuId) {
     }
 }
 
-pub fn after_lock(class: LockClass, current: CpuId) {
+pub fn after_lock(class: LockClass, instance: LockInstanceId, current: CpuId) {
     let state = &HELD_LOCKS[current.get()];
     let depth = state.depth.load(Ordering::Relaxed);
     assert!(depth < MAX_HELD_LOCKS, "held-lock stack overflow");
@@ -131,12 +152,13 @@ pub fn after_lock(class: LockClass, current: CpuId) {
     let entries = unsafe { &mut *state.entries.get() };
     entries[depth] = HeldLock {
         class,
+        instance,
         acquired_at: crate::arch::time::counter(),
     };
     state.depth.store(depth + 1, Ordering::Relaxed);
 }
 
-pub fn before_unlock(class: LockClass, current: CpuId) {
+pub fn before_unlock(class: LockClass, instance: LockInstanceId, current: CpuId) {
     let state = &HELD_LOCKS[current.get()];
     let depth = state.depth.load(Ordering::Relaxed);
     assert!(depth != 0, "unlock with empty held-lock stack");
@@ -146,6 +168,16 @@ pub fn before_unlock(class: LockClass, current: CpuId) {
     let index = depth - 1;
     let held = entries[index];
 
+    assert_eq!(
+        held.instance,
+        instance,
+        "lock release instance violation: top={}@{:#x} releasing={}@{:#x} cpu={}",
+        held.class.name,
+        held.instance.raw(),
+        class.name,
+        instance.raw(),
+        current.get(),
+    );
     assert_eq!(
         held.class.name,
         class.name,

@@ -3,13 +3,18 @@ use core::{
     sync::atomic::{AtomicU64, Ordering, fence},
 };
 
-use myos_sync::SpinLock;
-
-use crate::smp::{CpuId, MAX_CPUS};
+use crate::{
+    lockdep::{LockClass, LockRank},
+    smp::{CpuId, MAX_CPUS},
+    tracked_spin::TrackedSpinLock,
+};
 
 const SHOOTDOWN_TIMEOUT_SECONDS: u64 = 5;
 
-static SHOOTDOWN_SERIALIZER: SpinLock<()> = SpinLock::new(());
+static SHOOTDOWN_SERIALIZER: TrackedSpinLock<()> = TrackedSpinLock::new_with_class(
+    (),
+    LockClass::new("tlb_shootdown_serializer", LockRank::CrossCpu, 2),
+);
 static REQUEST_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ACK_GENERATIONS: [AtomicU64; MAX_CPUS] = [
     AtomicU64::new(0),
