@@ -45,3 +45,21 @@ a secondary CPU until it can also receive the wakeup kick.
 - Partial startup rollback.
 - Disabling a discovered CPU and continuing with a smaller active mask.
 - Panic stop IPI and frozen CPU confirmation mask.
+
+## Immutable CPU identity map
+
+Firmware discovery constructs the logical-to-hardware CPU identity map once on
+the boot CPU. The map is immutable after publication:
+
+1. hardware-ID entries are stored;
+2. the discovered count is published with `Release`;
+3. readers load the count with `Acquire`;
+4. IPI and TLB paths read the corresponding hardware ID without taking a lock.
+
+CPU lifecycle state (`online`, interrupt-ready, scheduler-active, dying, dead)
+is separate from CPU identity. Future hotplug transitions may change lifecycle
+state, but they must not rewrite the logical-to-hardware identity map.
+
+This separation prevents runtime cross-CPU paths from acquiring the
+`CpuLifecycle` lock while holding a TLB, scheduler, VM, or other later-ranked
+lock.

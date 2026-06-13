@@ -5,11 +5,6 @@ use core::{
 
 use myos_fdt::DeviceTree;
 
-use crate::{
-    irq_lock::IrqSpinLock,
-    lockdep::{LockClass, LockRank},
-};
-
 pub const MAX_CPUS: usize = crate::arch::smp::MAX_CPUS;
 const SECONDARY_START_TIMEOUT_SECONDS: u64 = 5;
 const IPI_RESCHEDULE: usize = 1 << 0;
@@ -46,17 +41,14 @@ impl CpuTopology {
         hardware_ids: [usize::MAX; MAX_CPUS],
         discovered: 0,
     };
-
-    fn hardware_id(self, cpu: CpuId) -> usize {
-        assert!(cpu.get() < self.discovered, "logical CPU is not discovered");
-        self.hardware_ids[cpu.get()]
-    }
 }
 
-static TOPOLOGY: IrqSpinLock<CpuTopology> = IrqSpinLock::new_with_class(
-    CpuTopology::EMPTY,
-    LockClass::new("cpu_topology", LockRank::CpuLifecycle, 1),
-);
+// Logical CPU identities and their hardware IDs are immutable after boot-time
+// discovery. Publish every entry first, then publish the count with Release.
+// Readers acquire the count before loading an entry, so runtime IPI paths never
+// need the CPU-lifecycle lock.
+static DISCOVERED_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+static HARDWARE_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 static ONLINE_MASK: AtomicUsize = AtomicUsize::new(0);
 static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static IPI_READY_MASK: AtomicUsize = AtomicUsize::new(0);
@@ -108,7 +100,22 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
 
     assert!(topology.discovered != 0);
 
-    *TOPOLOGY.lock() = topology;
+    assert_eq!(
+        DISCOVERED_CPU_COUNT.load(Ordering::Acquire),
+        0,
+        "CPU topology was initialized more than once",
+    );
+    for (logical, hardware_id) in topology.hardware_ids[..topology.discovered]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        HARDWARE_IDS[logical].store(hardware_id, Ordering::Relaxed);
+    }
+    DISCOVERED_CPU_COUNT.store(topology.discovered, Ordering::Release);
+
+    #[cfg(debug_assertions)]
+    verify_topology_snapshot(topology);
     ONLINE_MASK.store(1, Ordering::Release);
     ONLINE_COUNT.store(1, Ordering::Release);
     IPI_READY_MASK.store(0, Ordering::Release);
@@ -122,7 +129,7 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
 }
 
 pub fn discovered_cpu_count() -> usize {
-    TOPOLOGY.lock().discovered
+    DISCOVERED_CPU_COUNT.load(Ordering::Acquire)
 }
 
 pub fn online_cpu_count() -> usize {
@@ -170,7 +177,34 @@ pub fn hardware_id(cpu: CpuId) -> usize {
 }
 
 fn hardware_id_for(cpu: CpuId) -> usize {
-    TOPOLOGY.lock().hardware_id(cpu)
+    let discovered = discovered_cpu_count();
+    assert!(
+        cpu.get() < discovered,
+        "logical CPU is not discovered: cpu={} discovered={discovered}",
+        cpu.get(),
+    );
+
+    // The Acquire load of DISCOVERED_CPU_COUNT above observes all hardware-ID
+    // stores that preceded the boot CPU's Release publication.
+    HARDWARE_IDS[cpu.get()].load(Ordering::Relaxed)
+}
+
+#[cfg(debug_assertions)]
+fn verify_topology_snapshot(expected: CpuTopology) {
+    assert_eq!(
+        discovered_cpu_count(),
+        expected.discovered,
+        "published CPU topology count does not match firmware discovery",
+    );
+
+    for logical in 0..expected.discovered {
+        let cpu = CpuId::new(logical).expect("published logical CPU exceeds MAX_CPUS");
+        assert_eq!(
+            hardware_id_for(cpu),
+            expected.hardware_ids[logical],
+            "published logical/hardware CPU mapping mismatch: logical={logical}",
+        );
+    }
 }
 
 pub fn start_secondaries() {
