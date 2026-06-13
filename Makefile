@@ -3,7 +3,16 @@ PROFILE ?= debug
 
 SMP ?= 1
 MEM ?= 256M
-SMOKE_TIMEOUT ?= 30
+SMOKE_TIMEOUT ?= 120
+SMP_SMOKE_TIMEOUT ?= 240
+STRESS_ARCHES ?= $(ARCH)
+STRESS_SMPS ?= $(SMP)
+STRESS_MEMS ?= $(MEM)
+STRESS_PROFILES ?= $(PROFILE)
+STRESS_LOOPS ?= 1
+STRESS_TIMEOUT ?= $(SMP_SMOKE_TIMEOUT)
+M5_SOAK_LOOPS ?= 200
+M5_RELEASE_SOAK_LOOPS ?= 20
 
 KERNEL_PACKAGE ?= myos-kernel
 KERNEL_BINARY ?= myos-kernel
@@ -17,6 +26,14 @@ export MEM
 export KERNEL_PACKAGE
 export KERNEL_BINARY
 export QEMU_ARGS
+export STRESS_ARCHES
+export STRESS_SMPS
+export STRESS_MEMS
+export STRESS_PROFILES
+export STRESS_LOOPS
+export STRESS_TIMEOUT
+export M5_SOAK_LOOPS
+export M5_RELEASE_SOAK_LOOPS
 
 .PHONY: all
 all: build
@@ -63,6 +80,21 @@ smoke-loongarch64:
 
 .PHONY: smoke-all
 smoke-all: smoke-riscv64 smoke-loongarch64
+
+.PHONY: smoke-smp-riscv64
+smoke-smp-riscv64:
+	@SMP=4 ./scripts/smoke.py --arch riscv64 --profile "$(PROFILE)" --timeout "$(SMP_SMOKE_TIMEOUT)"
+
+.PHONY: smoke-smp-loongarch64
+smoke-smp-loongarch64:
+	@SMP=4 ./scripts/smoke.py --arch loongarch64 --profile "$(PROFILE)" --timeout "$(SMP_SMOKE_TIMEOUT)"
+
+.PHONY: smoke-smp-all
+smoke-smp-all: smoke-smp-riscv64 smoke-smp-loongarch64
+
+.PHONY: stress-smp
+stress-smp:
+	@./scripts/stress-smp.sh
 
 .PHONY: fmt
 fmt:
@@ -122,10 +154,30 @@ source-tree-check:
 	@./scripts/check-source-tree.sh
 
 .PHONY: check
-check: source-tree-check fmt-check test build-riscv64 build-loongarch64 clippy
+check: source-tree-check fmt-check test harness-test build-riscv64 build-loongarch64 clippy
 
 .PHONY: verify
-verify: check smoke-all
+verify: check smoke-all smoke-smp-all
+
+.PHONY: harness-test
+harness-test:
+	@python3 scripts/test-smoke-harness.py
+
+.PHONY: m5-quick
+m5-quick:
+	@python3 scripts/m5-verify.py --level quick
+
+.PHONY: m5-full
+m5-full:
+	@python3 scripts/m5-verify.py --level full
+
+.PHONY: m5-release
+m5-release:
+	@M5_SOAK_LOOPS="$(M5_SOAK_LOOPS)" M5_RELEASE_SOAK_LOOPS="$(M5_RELEASE_SOAK_LOOPS)" python3 scripts/m5-verify.py --level soak --require-clean
+
+.PHONY: m5-tag
+m5-tag:
+	@./scripts/m5-tag.sh
 
 .PHONY: clean
 clean:
@@ -157,6 +209,8 @@ doctor:
 		echo "warning: scripts/run-qemu.sh is not executable"
 	@test -x scripts/smoke.py || \
 		echo "warning: scripts/smoke.py is not executable"
+	@test -x scripts/stress-smp.sh || \
+		echo "warning: scripts/stress-smp.sh is not executable"
 	@test -x scripts/check-source-tree.sh || \
 		echo "warning: scripts/check-source-tree.sh is not executable"
 
@@ -174,6 +228,8 @@ help:
 	@echo ""
 	@echo "  make smoke ARCH=riscv64"
 	@echo "  make smoke-all"
+	@echo "  make smoke-smp-all"
+	@echo "  make stress-smp"
 	@echo "  make check"
 	@echo "  make verify"
 	@echo ""
@@ -186,4 +242,11 @@ help:
 	@echo "  SMP=<cpu count>"
 	@echo "  MEM=<memory size>"
 	@echo "  SMOKE_TIMEOUT=<seconds>"
+	@echo "  SMP_SMOKE_TIMEOUT=<seconds>"
+	@echo "  STRESS_ARCHES='<arch list>'"
+	@echo "  STRESS_SMPS='<cpu count list>'"
+	@echo "  STRESS_MEMS='<memory size list>'"
+	@echo "  STRESS_PROFILES='<profile list>'"
+	@echo "  STRESS_LOOPS=<count>"
+	@echo "  STRESS_TIMEOUT=<seconds>"
 	@echo "  QEMU_ARGS='<additional arguments>'"

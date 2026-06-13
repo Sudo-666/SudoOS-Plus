@@ -6,6 +6,7 @@ KERNEL_PHYS_BASE = 0x80400000;
 KERNEL_VIRT_BASE = 0xffffffff80000000;
 
 BOOT_STACK_SIZE = 64K;
+SMP_BOOT_STACKS_SIZE = 512K;
 
 SECTIONS
 {
@@ -45,6 +46,24 @@ SECTIONS
 }
 
     __boot_phys_end = .;
+
+    /*
+     * Secondary harts enter with satp=0.  Keep a single supervisor-only
+     * identity-mapped trampoline page separate from the discarded boot map,
+     * so the instruction immediately following the satp write remains valid.
+     */
+    ASSERT(__boot_phys_end <= 0x80300000, "RISC-V boot image overlaps SMP trampoline")
+    . = 0x80300000;
+
+    .smp_trampoline : ALIGN(4K)
+    {
+        __smp_trampoline_start = .;
+        KEEP(*(.smp.trampoline))
+        . = ALIGN(4K);
+        __smp_trampoline_end = .;
+        ASSERT(__smp_trampoline_end - __smp_trampoline_start <= 4K,
+               "RISC-V SMP trampoline exceeds one page")
+    }
 
     /*
      * 正式高半内核。
@@ -134,6 +153,19 @@ SECTIONS
         __boot_stack_top = .;
     }
 
+    .smp_boot_stacks (NOLOAD) : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.smp_boot_stacks) - KERNEL_VIRT_BASE)
+    )
+    {
+        __smp_boot_stack_bottom = .;
+
+        . += SMP_BOOT_STACKS_SIZE;
+
+        . = ALIGN(4K);
+        __smp_boot_stack_top = .;
+    }
+
     . = ALIGN(4K);
 
     __kernel_end = .;
@@ -151,8 +183,8 @@ SECTIONS
 
     __rw_phys_start = LOADADDR(.data);
     __rw_phys_end =
-        LOADADDR(.boot_stack)
-        + SIZEOF(.boot_stack);
+        LOADADDR(.smp_boot_stacks)
+        + SIZEOF(.smp_boot_stacks);
 
     /*
      * 内存分配器必须保留完整范围：

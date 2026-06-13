@@ -18,6 +18,9 @@ pub enum PageState {
     /// 已从 buddy 分配。
     Allocated,
 
+    /// 正在释放，尚未重新暴露给 buddy 空闲链表。
+    Freeing,
+
     /// buddy 空闲块的第一页。
     FreeHead,
 

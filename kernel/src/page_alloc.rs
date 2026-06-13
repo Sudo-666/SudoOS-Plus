@@ -2,9 +2,15 @@ use core::ptr::write_bytes;
 
 use myos_mm::{AllocationClass, BuddyAllocator, BuddyError, PageAllocation, PhysFrame};
 
-use crate::irq_lock::IrqSpinLock;
+use crate::{
+    irq_lock::IrqSpinLock,
+    lockdep::{LockClass, LockRank},
+};
 
-static PAGE_ALLOCATOR: IrqSpinLock<Option<BuddyAllocator>> = IrqSpinLock::new(None);
+static PAGE_ALLOCATOR: IrqSpinLock<Option<BuddyAllocator>> = IrqSpinLock::new_with_class(
+    None,
+    LockClass::new("page_allocator", LockRank::PageAllocator, 1),
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GlobalPageAllocatorError {
@@ -72,42 +78,73 @@ pub fn allocate(
     order: usize,
     options: PageAllocationOptions,
 ) -> Result<PageAllocation, GlobalPageAllocatorError> {
-    let mut slot = PAGE_ALLOCATOR.lock();
+    let allocation = {
+        let mut slot = PAGE_ALLOCATOR.lock();
 
-    let allocator = slot
-        .as_mut()
-        .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
 
-    let allocation = allocator.allocate(order, options.class())?;
+        allocator.allocate(order, options.class())?
+    };
 
-    if options.is_zeroed() {
-        if zero_allocation(&allocation).is_err() {
-            /*
-             * 地址转换失败时，不允许泄漏已分配页。
-             */
-            allocator.free(allocation)?;
-
-            return Err(GlobalPageAllocatorError::PhysicalMemoryNotAccessible);
-        }
+    let prepare_result = if options.is_zeroed() {
+        zero_allocation(&allocation)
     } else {
         #[cfg(debug_assertions)]
-        poison_allocation(&allocation, ALLOCATED_POISON)?;
-    }
+        {
+            poison_allocation(&allocation, ALLOCATED_POISON)
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            Ok(())
+        }
+    };
+
+    if let Err(error) = prepare_result {
+        let mut slot = PAGE_ALLOCATOR.lock();
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        allocator.free(allocation)?;
+
+        return Err(error);
+    };
 
     Ok(allocation)
 }
 
 pub fn free(allocation: PageAllocation) -> Result<(), GlobalPageAllocatorError> {
+    {
+        let mut slot = PAGE_ALLOCATOR.lock();
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        allocator.begin_free(&allocation)?;
+    }
+
+    #[cfg(debug_assertions)]
+    if let Err(error) = poison_allocation(&allocation, FREED_POISON) {
+        let mut slot = PAGE_ALLOCATOR.lock();
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        allocator.cancel_free(&allocation)?;
+
+        return Err(error);
+    }
+
     let mut slot = PAGE_ALLOCATOR.lock();
 
     let allocator = slot
         .as_mut()
         .ok_or(GlobalPageAllocatorError::NotInitialized)?;
 
-    #[cfg(debug_assertions)]
-    poison_allocation(&allocation, FREED_POISON)?;
-
-    allocator.free(allocation)?;
+    allocator.finish_free(&allocation)?;
 
     Ok(())
 }
@@ -143,13 +180,35 @@ pub fn decrement_reference(frame: PhysFrame) -> Result<u32, GlobalPageAllocatorE
 }
 
 pub fn free_unreferenced_frame(frame: PhysFrame) -> Result<(), GlobalPageAllocatorError> {
+    let allocation = {
+        let mut slot = PAGE_ALLOCATOR.lock();
+
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        allocator.begin_free_unreferenced_frame(frame)?
+    };
+
+    #[cfg(debug_assertions)]
+    if let Err(error) = poison_allocation(&allocation, FREED_POISON) {
+        let mut slot = PAGE_ALLOCATOR.lock();
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        allocator.cancel_free(&allocation)?;
+
+        return Err(error);
+    }
+
     let mut slot = PAGE_ALLOCATOR.lock();
 
     let allocator = slot
         .as_mut()
         .ok_or(GlobalPageAllocatorError::NotInitialized)?;
 
-    allocator.free_unreferenced_frame(frame)?;
+    allocator.finish_free(&allocation)?;
 
     Ok(())
 }

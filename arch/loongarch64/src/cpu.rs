@@ -9,3 +9,19 @@ pub fn wait_for_interrupt() {
         asm!("idle 0", options(nomem, nostack),);
     }
 }
+
+/// Enable local interrupts and enter the architectural wait state.
+///
+/// # Safety
+///
+/// The caller must have installed a valid exception entry and must enter with
+/// local interrupts disabled after checking for pending work.
+#[inline]
+pub unsafe fn enable_and_wait_for_interrupt() {
+    // SAFETY: upheld by the caller; enabling interrupts immediately before
+    // IDLE lets a pending timer/IPI abort the idle sleep.
+    unsafe {
+        crate::interrupt::enable();
+        asm!("idle 0", options(nomem, nostack),);
+    }
+}

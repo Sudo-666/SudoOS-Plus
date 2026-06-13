@@ -1,17 +1,25 @@
 #![no_std]
 #![no_main]
 
+mod call_function;
 mod console;
+mod context;
 mod fault;
 mod heap;
+mod ipi;
 mod irq;
 mod irq_lock;
 mod linker;
+mod lockdep;
 mod memory;
 mod page_alloc;
 mod panic;
 mod runtime_page_table;
+mod smp;
+mod task;
 mod time;
+mod tlb;
+mod tracked_spin;
 mod trap;
 mod vm;
 extern crate alloc;
@@ -31,11 +39,23 @@ compile_error!("unsupported target architecture");
 /// 所有架构最终进入的公共 Rust 入口。
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_entry(arg0: usize, arg1: usize, arg2: usize) -> ! {
+    arch::smp::set_current_cpu_id(smp::CpuId::BOOT.get());
     let boot = arch::boot::from_raw(arg0, arg1, arg2).into_boot_info();
 
     print_boot_info(&boot);
 
     kernel_main(boot)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn boot_hardware_cpu_id(boot: &BootInfo) -> usize {
+    boot.boot_cpu_id()
+        .expect("RISC-V boot protocol did not provide the boot hart ID")
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn boot_hardware_cpu_id(_boot: &BootInfo) -> usize {
+    arch::smp::hardware_cpu_id()
 }
 
 fn print_boot_info(boot: &BootInfo) {
@@ -117,7 +137,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
 
-    let memory_layout = {
+    let (memory_layout, firmware_timer_frequency) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
@@ -134,13 +154,18 @@ fn kernel_main(boot: BootInfo) -> ! {
         });
 
         inspect_device_tree(&boot, &blob, &tree);
+        smp::initialize(&tree, boot_hardware_cpu_id(&boot));
 
-        memory::build_boot_memory_layout(fdt_address, &blob, &tree).unwrap_or_else(|error| {
-            panic!(
-                "failed to construct physical memory layout: \
-                 {error:?}",
-            );
-        })
+        let firmware_timer_frequency = tree.timebase_frequency_hz();
+        let memory_layout = memory::build_boot_memory_layout(fdt_address, &blob, &tree)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to construct physical memory layout: \
+                     {error:?}",
+                );
+            });
+
+        (memory_layout, firmware_timer_frequency)
     };
 
     memory::print_boot_memory_map(memory_layout.free());
@@ -161,6 +186,8 @@ fn kernel_main(boot: BootInfo) -> ! {
          */
 
         memory::prepare_riscv_direct_map(&mut early_memory, memory_layout.ram());
+
+        memory::prepare_riscv_smp_trampoline(&mut early_memory);
 
         memory::prepare_riscv_early_uart_mapping(&mut early_memory);
 
@@ -196,7 +223,7 @@ fn kernel_main(boot: BootInfo) -> ! {
      */
     trap::initialize();
     irq::initialize();
-    time::initialize();
+    time::initialize(firmware_timer_frequency);
     vm::initialize(kernel_memory);
     fault::initialize();
 
@@ -209,12 +236,24 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(debug_assertions)]
     trap::verify_breakpoint();
 
+    time::start_periodic();
+
+    #[cfg(debug_assertions)]
+    time::verify_periodic();
+
+    task::initialize();
+    smp::start_secondaries();
+    task::finalize_cpu_bringup();
+    #[cfg(debug_assertions)]
+    tracked_spin::verify();
+
+    #[cfg(debug_assertions)]
+    task::verify();
+
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");
 
-    loop {
-        arch::cpu::wait_for_interrupt();
-    }
+    task::boot_idle_loop()
 }
 
 fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_>) {
@@ -243,6 +282,15 @@ fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_
         }
     }
     println!("  cpu count     : {}", tree.cpu_count(),);
+
+    match tree.timebase_frequency_hz() {
+        Some(frequency) => {
+            println!("  timer frequency: {} Hz", frequency);
+        }
+        None => {
+            println!("  timer frequency: architecture-defined");
+        }
+    }
 
     match tree.bootargs() {
         Some(arguments) => {

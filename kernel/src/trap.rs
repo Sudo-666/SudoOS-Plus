@@ -67,24 +67,29 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
 
     validate_trap_frame(frame);
 
-    match (frame.is_interrupt(), frame.cause_code()) {
-        (false, BREAKPOINT) => handle_breakpoint(frame),
-        (false, INSTRUCTION_PAGE_FAULT) => {
-            handle_riscv_page_fault(frame, myos_mm::FaultAccess::Execute)
+    if frame.is_interrupt() {
+        crate::irq::enter();
+        match frame.cause_code() {
+            SUPERVISOR_SOFTWARE => crate::irq::handle_software_interrupt(),
+            SUPERVISOR_TIMER => crate::irq::handle_timer_interrupt(),
+            SUPERVISOR_EXTERNAL => {
+                crate::irq::handle_unhandled(crate::irq::InterruptSource::External, frame.scause)
+            }
+            code => crate::irq::handle_unhandled(
+                crate::irq::InterruptSource::Unknown(code),
+                frame.scause,
+            ),
         }
-        (false, LOAD_PAGE_FAULT) => handle_riscv_page_fault(frame, myos_mm::FaultAccess::Read),
-        (false, STORE_PAGE_FAULT) => handle_riscv_page_fault(frame, myos_mm::FaultAccess::Write),
-        (true, SUPERVISOR_SOFTWARE) => {
-            crate::irq::handle_unhandled(crate::irq::InterruptSource::Software, frame.scause)
-        }
-        (true, SUPERVISOR_TIMER) => crate::irq::handle_timer_interrupt(),
-        (true, SUPERVISOR_EXTERNAL) => {
-            crate::irq::handle_unhandled(crate::irq::InterruptSource::External, frame.scause)
-        }
-        (true, code) => {
-            crate::irq::handle_unhandled(crate::irq::InterruptSource::Unknown(code), frame.scause)
-        }
-        (false, code) => panic!(
+        crate::irq::exit();
+        return;
+    }
+
+    match frame.cause_code() {
+        BREAKPOINT => handle_breakpoint(frame),
+        INSTRUCTION_PAGE_FAULT => handle_riscv_page_fault(frame, myos_mm::FaultAccess::Execute),
+        LOAD_PAGE_FAULT => handle_riscv_page_fault(frame, myos_mm::FaultAccess::Read),
+        STORE_PAGE_FAULT => handle_riscv_page_fault(frame, myos_mm::FaultAccess::Write),
+        code => panic!(
             "unexpected RISC-V exception: sepc={:#x} scause={:#x} code={:#x} stval={:#x}",
             frame.sepc, frame.scause, code, frame.stval,
         ),
@@ -104,6 +109,8 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
     const ECODE_PAGE_PRIVILEGE: usize = 0x07;
     const ECODE_BREAKPOINT: usize = 0x0c;
     const TIMER_INTERRUPT_BIT: usize = 1 << 11;
+    const IPI_INTERRUPT_BIT: usize = 1 << 12;
+    const SUPPORTED_INTERRUPT_BITS: usize = TIMER_INTERRUPT_BIT | IPI_INTERRUPT_BIT;
 
     validate_trap_frame(frame);
 
@@ -135,13 +142,26 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
         ECODE_PAGE_PRIVILEGE => {
             handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Read, true)
         }
-        ECODE_INTERRUPT if frame.pending_interrupts() & TIMER_INTERRUPT_BIT != 0 => {
-            crate::irq::handle_timer_interrupt()
+        ECODE_INTERRUPT => {
+            crate::irq::enter();
+            let pending = frame.pending_interrupts();
+            let unknown = pending & !SUPPORTED_INTERRUPT_BITS;
+
+            if unknown != 0 {
+                crate::irq::handle_unhandled(
+                    crate::irq::InterruptSource::Platform(unknown),
+                    frame.estat,
+                );
+            }
+
+            if pending & IPI_INTERRUPT_BIT != 0 {
+                crate::irq::handle_software_interrupt();
+            }
+            if pending & TIMER_INTERRUPT_BIT != 0 {
+                crate::irq::handle_timer_interrupt();
+            }
+            crate::irq::exit();
         }
-        ECODE_INTERRUPT => crate::irq::handle_unhandled(
-            crate::irq::InterruptSource::Platform(frame.pending_interrupts()),
-            frame.estat,
-        ),
         code => panic!(
             "unexpected LoongArch exception: era={:#x} ecode={:#x} esubcode={:#x} badv={:#x} badi={:#x}",
             frame.era,

@@ -297,38 +297,28 @@ impl BuddyAllocator {
     }
 
     pub fn free(&mut self, allocation: PageAllocation) -> Result<(), BuddyError> {
-        let order = allocation.order as usize;
+        self.begin_free(&allocation)?;
+        self.finish_free(&allocation)
+    }
 
-        if order >= MAX_ORDER {
-            return Err(BuddyError::InvalidAllocation);
-        }
+    pub fn begin_free(&mut self, allocation: &PageAllocation) -> Result<(), BuddyError> {
+        let (start_pfn, order, kind) =
+            self.validate_allocated_block(allocation, Some(1), PageState::Allocated)?;
 
-        let start_pfn = allocation.start.start_address().get() / PAGE_SIZE;
+        self.mark_freeing_block(start_pfn, order, kind)
+    }
 
-        let kind = self.zone_kind_for_pfn(start_pfn)?;
+    pub fn cancel_free(&mut self, allocation: &PageAllocation) -> Result<(), BuddyError> {
+        let (start_pfn, order, kind) =
+            self.validate_allocated_block(allocation, None, PageState::Freeing)?;
 
-        if kind != allocation.zone || !self.zones[kind.index()].contains_block(start_pfn, order) {
-            return Err(BuddyError::InvalidAllocation);
-        }
+        self.mark_allocated_block_preserving_refs(start_pfn, order, kind)
+    }
 
+    pub fn finish_free(&mut self, allocation: &PageAllocation) -> Result<(), BuddyError> {
+        let (start_pfn, order, kind) =
+            self.validate_allocated_block(allocation, None, PageState::Freeing)?;
         let page_count = 1_usize << order;
-
-        /*
-         * 完整验证后才修改状态。
-         */
-        for offset in 0..page_count {
-            let page = self.page(start_pfn + offset)?;
-
-            if !matches!(page.state, PageState::Allocated)
-                || page.reference_count.load(Ordering::Relaxed) != 1
-            {
-                return Err(BuddyError::InvalidAllocation);
-            }
-
-            if offset == 0 && page.order as usize != order {
-                return Err(BuddyError::InvalidAllocation);
-            }
-        }
 
         self.coalesce_and_insert(start_pfn, order, kind)?;
 
@@ -394,6 +384,15 @@ impl BuddyAllocator {
     }
 
     pub fn free_unreferenced_frame(&mut self, frame: PhysFrame) -> Result<(), BuddyError> {
+        let allocation = self.begin_free_unreferenced_frame(frame)?;
+
+        self.finish_free(&allocation)
+    }
+
+    pub fn begin_free_unreferenced_frame(
+        &mut self,
+        frame: PhysFrame,
+    ) -> Result<PageAllocation, BuddyError> {
         let pfn = frame.start_address().get() / PAGE_SIZE;
         let kind = self.zone_kind_for_pfn(pfn)?;
 
@@ -413,14 +412,15 @@ impl BuddyAllocator {
             return Err(BuddyError::PageStillReferenced { frame, count });
         }
 
-        self.coalesce_and_insert(pfn, 0, kind)?;
+        let allocation = PageAllocation {
+            start: frame,
+            order: 0,
+            zone: kind,
+        };
 
-        self.zones[kind.index()].free_pages = self.zones[kind.index()]
-            .free_pages
-            .checked_add(1)
-            .ok_or(BuddyError::AddressOverflow)?;
+        self.mark_freeing_block(pfn, 0, kind)?;
 
-        Ok(())
+        Ok(allocation)
     }
 
     pub fn total_free_pages(&self) -> usize {
@@ -597,6 +597,103 @@ impl BuddyAllocator {
         }
 
         Ok(())
+    }
+
+    fn mark_allocated_block_preserving_refs(
+        &mut self,
+        pfn: usize,
+        order: usize,
+        kind: ZoneKind,
+    ) -> Result<(), BuddyError> {
+        let page_count = 1_usize << order;
+
+        for offset in 0..page_count {
+            let page = self.page_mut(pfn + offset)?;
+
+            page.state = PageState::Allocated;
+
+            page.order = if offset == 0 {
+                order as u8
+            } else {
+                INVALID_ORDER
+            };
+
+            page.zone = kind as u8;
+            page.next = INVALID_PFN;
+            page.previous = INVALID_PFN;
+        }
+
+        Ok(())
+    }
+
+    fn mark_freeing_block(
+        &mut self,
+        pfn: usize,
+        order: usize,
+        kind: ZoneKind,
+    ) -> Result<(), BuddyError> {
+        let page_count = 1_usize << order;
+
+        for offset in 0..page_count {
+            let page = self.page_mut(pfn + offset)?;
+
+            page.state = PageState::Freeing;
+
+            page.order = if offset == 0 {
+                order as u8
+            } else {
+                INVALID_ORDER
+            };
+
+            page.zone = kind as u8;
+            page.next = INVALID_PFN;
+            page.previous = INVALID_PFN;
+        }
+
+        Ok(())
+    }
+
+    fn validate_allocated_block(
+        &self,
+        allocation: &PageAllocation,
+        expected_reference_count: Option<u32>,
+        expected_state: PageState,
+    ) -> Result<(usize, usize, ZoneKind), BuddyError> {
+        let order = allocation.order as usize;
+
+        if order >= MAX_ORDER {
+            return Err(BuddyError::InvalidAllocation);
+        }
+
+        let start_pfn = allocation.start.start_address().get() / PAGE_SIZE;
+        let kind = self.zone_kind_for_pfn(start_pfn)?;
+
+        if kind != allocation.zone || !self.zones[kind.index()].contains_block(start_pfn, order) {
+            return Err(BuddyError::InvalidAllocation);
+        }
+
+        let page_count = 1_usize << order;
+
+        for offset in 0..page_count {
+            let page = self.page(start_pfn + offset)?;
+
+            if page.state != expected_state {
+                return Err(BuddyError::InvalidAllocation);
+            }
+
+            if let Some(expected) = expected_reference_count {
+                let count = page.reference_count.load(Ordering::Relaxed);
+                if count != expected {
+                    return Err(BuddyError::InvalidAllocation);
+                }
+            }
+
+            if offset == 0 && page.order as usize != order {
+                return Err(BuddyError::InvalidAllocation);
+            }
+        }
+
+        Ok((start_pfn, order, kind))
     }
 
     fn insert_free_block(

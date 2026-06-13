@@ -1,63 +1,95 @@
 use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use myos_sync::{SpinLock, SpinLockGuard};
 
-pub struct IrqSpinLock<T: ?Sized> {
+use crate::lockdep::{LockClass, LockInstanceId, LockRank};
+
+const NO_OWNER: usize = usize::MAX;
+
+pub struct IrqSpinLock<T> {
     inner: SpinLock<T>,
+    class: LockClass,
+    owner: AtomicUsize,
 }
 
 impl<T> IrqSpinLock<T> {
-    pub const fn new(value: T) -> Self {
+    pub const fn new_with_class(value: T, class: LockClass) -> Self {
         Self {
             inner: SpinLock::new(value),
+            class,
+            owner: AtomicUsize::new(NO_OWNER),
         }
     }
 }
 
-impl<T: ?Sized> IrqSpinLock<T> {
+impl<T> IrqSpinLock<T> {
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
-        let interrupt_state = crate::arch::interrupt::save_and_disable();
+        let interrupt_guard = crate::context::IrqSaveGuard::new();
+        let cpu = crate::smp::current_cpu_id();
+        crate::lockdep::before_lock(
+            self.class,
+            LockInstanceId::of(self),
+            self.owner.load(Ordering::Acquire),
+            cpu,
+        );
 
         let guard = self.inner.lock();
+        self.owner.store(cpu.get(), Ordering::Release);
+        crate::lockdep::after_lock(self.class, LockInstanceId::of(self), cpu);
 
         IrqSpinLockGuard {
+            lock: self,
             guard: Some(guard),
-            interrupt_state,
+            _interrupt_guard: interrupt_guard,
             _not_send: PhantomData,
         }
     }
 
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
-        let interrupt_state = crate::arch::interrupt::save_and_disable();
+        let interrupt_guard = crate::context::IrqSaveGuard::new();
+        let cpu = crate::smp::current_cpu_id();
+        if self.owner.load(Ordering::Acquire) == cpu.get() {
+            return None;
+        }
+        crate::lockdep::before_lock(
+            self.class,
+            LockInstanceId::of(self),
+            self.owner.load(Ordering::Acquire),
+            cpu,
+        );
 
         match self.inner.try_lock() {
-            Some(guard) => Some(IrqSpinLockGuard {
-                guard: Some(guard),
-                interrupt_state,
-                _not_send: PhantomData,
-            }),
-
-            None => {
-                crate::arch::interrupt::restore(interrupt_state);
-                None
+            Some(guard) => {
+                self.owner.store(cpu.get(), Ordering::Release);
+                crate::lockdep::after_lock(self.class, LockInstanceId::of(self), cpu);
+                Some(IrqSpinLockGuard {
+                    lock: self,
+                    guard: Some(guard),
+                    _interrupt_guard: interrupt_guard,
+                    _not_send: PhantomData,
+                })
             }
+
+            None => None,
         }
     }
 }
 
 #[must_use = "dropping the guard immediately releases the lock"]
-pub struct IrqSpinLockGuard<'a, T: ?Sized> {
+pub struct IrqSpinLockGuard<'a, T> {
+    lock: &'a IrqSpinLock<T>,
     guard: Option<SpinLockGuard<'a, T>>,
 
-    interrupt_state: crate::arch::interrupt::InterruptState,
+    _interrupt_guard: crate::context::IrqSaveGuard,
 
     _not_send: PhantomData<*mut ()>,
 }
 
-impl<T: ?Sized> Deref for IrqSpinLockGuard<'_, T> {
+impl<T> Deref for IrqSpinLockGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -68,7 +100,7 @@ impl<T: ?Sized> Deref for IrqSpinLockGuard<'_, T> {
     }
 }
 
-impl<T: ?Sized> DerefMut for IrqSpinLockGuard<'_, T> {
+impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.guard
             .as_mut()
@@ -77,17 +109,25 @@ impl<T: ?Sized> DerefMut for IrqSpinLockGuard<'_, T> {
     }
 }
 
-impl<T: ?Sized> Drop for IrqSpinLockGuard<'_, T> {
+impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        let cpu = crate::smp::current_cpu_id();
+        crate::lockdep::before_unlock(self.lock.class, LockInstanceId::of(self.lock), cpu);
+        self.lock.owner.store(NO_OWNER, Ordering::Release);
         drop(self.guard.take());
-        crate::arch::interrupt::restore(self.interrupt_state);
     }
 }
 
 #[cfg(debug_assertions)]
 pub fn verify() {
-    static FIRST: IrqSpinLock<usize> = IrqSpinLock::new(0);
-    static SECOND: IrqSpinLock<usize> = IrqSpinLock::new(0);
+    static FIRST: IrqSpinLock<usize> = IrqSpinLock::new_with_class(
+        0,
+        LockClass::new("irq_lock.verify.first", LockRank::Scheduler, 1),
+    );
+    static SECOND: IrqSpinLock<usize> = IrqSpinLock::new_with_class(
+        0,
+        LockClass::new("irq_lock.verify.second", LockRank::WaitQueue, 1),
+    );
 
     let initially_enabled = crate::arch::interrupt::are_enabled();
 
@@ -123,4 +163,17 @@ pub fn verify() {
     crate::println!("  local interrupt masking : verified");
     crate::println!("  nested restore          : verified");
     crate::println!("  failed try_lock restore : verified");
+    crate::println!("  lockdep class/rank      : verified");
+    crate::println!(
+        "  max IRQ-off cycles      : {}",
+        crate::lockdep::max_irq_off_cycles(),
+    );
+    crate::println!(
+        "  scheduler hold cycles   : {}",
+        crate::lockdep::max_hold_cycles(LockRank::Scheduler),
+    );
+    crate::println!(
+        "  console hold cycles     : {}",
+        crate::lockdep::max_hold_cycles(LockRank::Console),
+    );
 }
