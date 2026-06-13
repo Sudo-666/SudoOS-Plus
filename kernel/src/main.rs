@@ -5,6 +5,7 @@ mod console;
 mod context;
 mod fault;
 mod heap;
+mod ipi;
 mod irq;
 mod irq_lock;
 mod linker;

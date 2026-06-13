@@ -1,15 +1,12 @@
 use core::{
     hint::spin_loop,
-    sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 use myos_fdt::DeviceTree;
 
 pub const MAX_CPUS: usize = crate::arch::smp::MAX_CPUS;
 const SECONDARY_START_TIMEOUT_SECONDS: u64 = 5;
-const IPI_RESCHEDULE: usize = 1 << 0;
-const IPI_TLB_SHOOTDOWN: usize = 1 << 1;
-const IPI_KNOWN_MASK: usize = IPI_RESCHEDULE | IPI_TLB_SHOOTDOWN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuId(usize);
@@ -115,27 +112,6 @@ static DISCOVERED_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 static HARDWARE_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 static CPU_STATES: [AtomicU8; MAX_CPUS] =
     [const { AtomicU8::new(CpuState::Absent as u8) }; MAX_CPUS];
-static IPI_COUNTS: [AtomicU64; MAX_CPUS] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-static PENDING_IPI_REASONS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
-
 pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
     crate::arch::smp::set_current_cpu_id(CpuId::BOOT.get());
 
@@ -192,13 +168,7 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
             "CPU lifecycle was initialized more than once: cpu={logical}",
         );
     }
-
-    for counter in &IPI_COUNTS {
-        counter.store(0, Ordering::Release);
-    }
-    for pending in &PENDING_IPI_REASONS {
-        pending.store(0, Ordering::Release);
-    }
+    crate::ipi::initialize();
 }
 
 pub fn discovered_cpu_count() -> usize {
@@ -494,6 +464,9 @@ pub fn start_secondaries() {
 
     assert_bringup_complete();
 
+    #[cfg(debug_assertions)]
+    crate::ipi::verify();
+
     crate::println!("SMP subsystem:");
     crate::println!("  discovered CPUs : {}", discovered);
     crate::println!("  online CPUs     : {}", online_cpu_count());
@@ -515,34 +488,11 @@ pub fn start_secondaries() {
 }
 
 pub fn send_ipi(cpu: CpuId) {
-    queue_ipi(cpu, IPI_RESCHEDULE);
+    crate::ipi::send(cpu, crate::ipi::IpiMessage::Reschedule);
 }
 
 pub fn send_tlb_shootdown(cpu: CpuId) {
-    queue_ipi(cpu, IPI_TLB_SHOOTDOWN);
-}
-
-fn queue_ipi(cpu: CpuId, reason: usize) {
-    assert!(is_online(cpu), "attempted to send an IPI to an offline CPU");
-    assert!(
-        is_ipi_ready(cpu),
-        "attempted to send an IPI to an online CPU that is not IPI-ready: cpu={}",
-        cpu.get(),
-    );
-    assert_ne!(reason, 0, "IPI reason must not be empty");
-    assert_eq!(reason & !IPI_KNOWN_MASK, 0, "unknown IPI reason");
-
-    PENDING_IPI_REASONS[cpu.get()].fetch_or(reason, Ordering::Release);
-    fence(Ordering::SeqCst);
-
-    let hardware = hardware_id(cpu);
-    crate::arch::smp::send_ipi(hardware).unwrap_or_else(|error| {
-        panic!(
-            "unable to send IPI: logical={} hardware={} error={error:?}",
-            cpu.get(),
-            hardware,
-        );
-    });
+    crate::ipi::send(cpu, crate::ipi::IpiMessage::TlbShootdown);
 }
 
 pub fn broadcast_ipi_except_current() {
@@ -561,35 +511,11 @@ pub fn broadcast_ipi_except_current() {
 }
 
 pub fn handle_ipi() {
-    let cpu = current_cpu_id();
-    let hardware_action = crate::arch::smp::acknowledge_ipi();
-
-    assert!(
-        hardware_action != 0,
-        "IPI exception arrived without a hardware pending action",
-    );
-    fence(Ordering::Acquire);
-    IPI_COUNTS[cpu.get()].fetch_add(1, Ordering::AcqRel);
-
-    loop {
-        let reasons = PENDING_IPI_REASONS[cpu.get()].swap(0, Ordering::AcqRel);
-        if reasons == 0 {
-            break;
-        }
-
-        assert_eq!(reasons & !IPI_KNOWN_MASK, 0, "unknown pending IPI reason");
-
-        if reasons & IPI_TLB_SHOOTDOWN != 0 {
-            crate::tlb::handle_shootdown_ipi();
-        }
-        if reasons & IPI_RESCHEDULE != 0 {
-            crate::task::request_reschedule_local();
-        }
-    }
+    crate::ipi::handle_current();
 }
 
 pub fn ipi_count(cpu: CpuId) -> u64 {
-    IPI_COUNTS[cpu.get()].load(Ordering::Acquire)
+    crate::ipi::interrupt_count(cpu)
 }
 
 #[unsafe(no_mangle)]

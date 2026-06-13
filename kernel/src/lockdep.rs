@@ -12,7 +12,6 @@ const RANK_COUNT: usize = LockRank::Console as usize + 1;
 #[repr(usize)]
 pub enum LockRank {
     Unknown = 0,
-    CpuLifecycle = 10,
     /// IRQ-enabled cross-CPU serializers. This rank precedes the
     /// scheduler because an IPI handler may acquire scheduler state.
     CrossCpu = 15,
