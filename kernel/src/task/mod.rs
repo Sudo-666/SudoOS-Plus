@@ -17,12 +17,12 @@ use core::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
-use myos_sync::SpinLock;
 
 use crate::{
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
     smp::CpuId,
+    tracked_spin::TrackedSpinLock,
 };
 use stack::KernelStack;
 
@@ -1102,7 +1102,8 @@ impl Scheduler {
 
 static SCHEDULER: IrqSpinLock<Option<Scheduler>> =
     IrqSpinLock::new_with_class(None, LockClass::new("scheduler", LockRank::Scheduler, 1));
-static RETIRED_REAPER: SpinLock<()> = SpinLock::new(());
+static RETIRED_REAPER: TrackedSpinLock<()> =
+    TrackedSpinLock::new_with_class((), LockClass::new("retired_reaper", LockRank::CrossCpu, 1));
 static TASK_REAPER_QUEUE: WaitQueue = WaitQueue::new();
 static RETIRED_BACKLOG: AtomicUsize = AtomicUsize::new(0);
 static IDLE_ENTERS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
@@ -1613,11 +1614,9 @@ fn task_reaper_main() {
     loop {
         TASK_REAPER_QUEUE.wait_until(|| retired_task_backlog() != 0);
 
-        let preempt_guard = PreemptGuard::new();
         let reaper = RETIRED_REAPER.lock();
         drain_retired_queue();
         drop(reaper);
-        drop(preempt_guard);
     }
 }
 
