@@ -1,0 +1,16 @@
+name: m5-static
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  static-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install repository Rust toolchain
+        run: rustup show
+      - name: Static and host tests
+        run: make source-tree-check fmt-check test harness-test
+      - name: Dual architecture builds
+        run: make build-riscv64 build-loongarch64
