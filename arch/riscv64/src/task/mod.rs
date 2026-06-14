@@ -2,6 +2,19 @@ mod context;
 
 pub use context::Context;
 
+pub fn current_stack_pointer() -> usize {
+    let stack_pointer: usize;
+    // SAFETY: reading SP has no side effects and does not access memory.
+    unsafe {
+        core::arch::asm!(
+            "mv {stack_pointer}, sp",
+            stack_pointer = out(reg) stack_pointer,
+            options(nomem, nostack),
+        );
+    }
+    stack_pointer
+}
+
 /// Switch from `previous` to `next` using the ordinary kernel-thread context.
 ///
 /// # Safety

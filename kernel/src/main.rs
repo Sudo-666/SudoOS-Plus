@@ -18,6 +18,7 @@ mod runtime_page_table;
 mod smp;
 mod task;
 mod time;
+mod timer;
 mod tlb;
 mod tracked_spin;
 mod trap;
@@ -224,6 +225,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     trap::initialize();
     irq::initialize();
     time::initialize(firmware_timer_frequency);
+    timer::initialize();
     vm::initialize(kernel_memory);
     fault::initialize();
 
@@ -244,6 +246,8 @@ fn kernel_main(boot: BootInfo) -> ! {
     task::initialize();
     smp::start_secondaries();
     task::finalize_cpu_bringup();
+    #[cfg(debug_assertions)]
+    timer::verify();
     #[cfg(debug_assertions)]
     tracked_spin::verify();
 

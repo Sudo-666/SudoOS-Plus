@@ -32,8 +32,10 @@ pub fn exit() {
 }
 
 pub fn handle_timer_interrupt() {
-    crate::time::handle_timer_interrupt();
-    crate::task::on_timer_tick();
+    let event = crate::time::begin_timer_interrupt();
+    let next_software_deadline = crate::timer::handle_interrupt(event.now());
+    crate::time::reprogram_local(next_software_deadline);
+    crate::task::on_timer_ticks(event.elapsed_ticks());
 }
 
 pub fn handle_software_interrupt() {

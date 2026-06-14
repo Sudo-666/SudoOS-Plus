@@ -37,6 +37,7 @@ impl<T> TrackedSpinLock<T> {
     pub fn lock(&self) -> TrackedSpinLockGuard<'_, T> {
         crate::context::assert_task_context();
         crate::context::assert_interrupts_enabled();
+        crate::lockdep::assert_irq_enabled_outer_lock(self.class);
 
         let migration_guard = MigrationGuard::new();
         let cpu = crate::smp::current_cpu_id();
@@ -71,6 +72,7 @@ impl<T> TrackedSpinLock<T> {
     pub fn try_lock(&self) -> Option<TrackedSpinLockGuard<'_, T>> {
         crate::context::assert_task_context();
         crate::context::assert_interrupts_enabled();
+        crate::lockdep::assert_irq_enabled_outer_lock(self.class);
 
         let migration_guard = MigrationGuard::new();
         let cpu = crate::smp::current_cpu_id();

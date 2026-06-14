@@ -13,7 +13,6 @@ are explicit. Correctness comes before scalability.
 | `KERNEL_PAGE_TABLE` | `IrqSpinLock` | runtime kernel page table object | local IRQs disabled |
 | kernel heap lock | `IrqSpinLock` | slab and large allocation state | local IRQs disabled |
 | `PAGE_ALLOCATOR` | `IrqSpinLock` | buddy/refcount metadata | local IRQs disabled |
-| `RETIRED_REAPER` | `SpinLock` | serialized retired task draining | interrupts remain enabled |
 | `SHOOTDOWN_SERIALIZER` | `SpinLock` | one synchronous TLB shootdown request at a time | interrupts remain enabled |
 
 ## Lockdep Order
@@ -72,10 +71,35 @@ lock reports.
 
 Current order:
 
-1. `RETIRED_REAPER` (`CrossCpu/#1`)
 2. `SHOOTDOWN_SERIALIZER` (`CrossCpu/#2`)
 3. scheduler and later ranks
 
 Do not silence an order panic by changing a rank without auditing the call
 chain. A cross-CPU serializer acquired under VM/page-table/heap state is a
 real lifetime/order problem.
+
+## M6 IRQ nesting and lock graph
+
+`TrackedSpinLock` protects cross-CPU protocols while local IRQs remain enabled.
+A timer interrupt may therefore arrive while `tlb_shootdown_serializer` is on
+the interrupted task's lockdep stack. The global dependency order is:
+
+1. IRQ-enabled cross-CPU serializers (`CrossCpu`)
+2. hardirq-safe timer bases (`Timer`)
+3. scheduler/run queues (`Scheduler`)
+4. wait queues, VM/page tables, heap, page allocator, and console
+
+This edge is **interrupt nesting**, not a call from TLB shootdown into the
+software timer API. TLB shootdown continues to use the architecture counter for
+its bounded busy-wait timeout and must keep IRQs enabled so remote TLB/IPI
+requests can make progress.
+
+Consequences:
+
+- `CrossCpu -> Timer` is valid and required by hardirq preemption.
+- `Timer -> CrossCpu` is forbidden and remains a lockdep violation.
+- timer callbacks execute only after releasing `timer_base`.
+- do not fix an order report by disabling interrupts around an entire TLB
+  shootdown; that can prevent the acknowledgements the protocol is waiting for.
+- every lock held with IRQs enabled must use `TrackedSpinLock`, whose runtime
+  contract now verifies that its rank precedes `Timer`.

@@ -83,6 +83,7 @@ DEBUG_M5_MARKERS = (
     ("ipi", b"IPI mailbox test:"),
     ("ipi", b"call-function IPI test:"),
     ("tlb", b"TLB request v2 test:"),
+    ("timer", b"timer runtime test:"),
 )
 
 ARCH_REQUIRED_MARKERS = {

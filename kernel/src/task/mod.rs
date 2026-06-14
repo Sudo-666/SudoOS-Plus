@@ -8,7 +8,7 @@ mod m4c_verify;
 mod stack;
 mod wait_queue;
 
-pub use wait_queue::{Completion, WaitQueue};
+pub use wait_queue::{Completion, WaitOutcome, WaitQueue};
 
 use alloc::{collections::VecDeque, vec::Vec};
 #[cfg(debug_assertions)]
@@ -25,7 +25,6 @@ use crate::{
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
     smp::CpuId,
-    tracked_spin::TrackedSpinLock,
 };
 use stack::KernelStack;
 
@@ -238,6 +237,7 @@ enum SwitchDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingSwitch {
     previous: TaskId,
+    next: TaskId,
     disposition: SwitchDisposition,
 }
 
@@ -525,9 +525,9 @@ impl Scheduler {
         self.cpus[cpu.get()].need_resched = false;
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
-        self.cpus[cpu.get()].current = Some(next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
+            next,
             disposition: SwitchDisposition::Yield,
         });
         self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
@@ -569,9 +569,9 @@ impl Scheduler {
         self.cpus[cpu.get()].need_resched = false;
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
-        self.cpus[cpu.get()].current = Some(next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
+            next,
             disposition: SwitchDisposition::Yield,
         });
         self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
@@ -630,9 +630,9 @@ impl Scheduler {
             task.wake_after_switch = false;
         }
         self.activate_next(next, cpu);
-        self.cpus[cpu.get()].current = Some(next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
+            next,
             disposition: SwitchDisposition::Block,
         });
         self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
@@ -673,9 +673,9 @@ impl Scheduler {
 
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
-        self.cpus[cpu.get()].current = Some(next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
+            next,
             disposition: SwitchDisposition::Exit,
         });
         self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
@@ -699,11 +699,31 @@ impl Scheduler {
         (previous_pointer, next_pointer)
     }
 
-    fn complete_switch(&mut self, cpu: CpuId) -> bool {
+    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> bool {
         let Some(pending) = self.cpus[cpu.get()].pending.take() else {
             return false;
         };
 
+        assert_eq!(
+            self.current(cpu),
+            pending.previous,
+            "scheduler current changed before the hardware stack switch committed",
+        );
+        assert_eq!(
+            self.task(pending.next).state,
+            TaskState::Running(cpu),
+            "incoming task was not Running before switch commit",
+        );
+        #[cfg(not(debug_assertions))]
+        let _ = running_sp;
+        #[cfg(debug_assertions)]
+        assert!(
+            self.task(pending.next).stack.is_none()
+                || self.task(pending.next).stack_contains(running_sp),
+            "incoming hardware SP is outside the selected task stack: task={:?} sp={running_sp:#x}",
+            pending.next,
+        );
+        self.cpus[cpu.get()].current = Some(pending.next);
         assert_eq!(
             self.task(pending.previous).state,
             TaskState::SwitchingOut(cpu),
@@ -766,7 +786,23 @@ impl Scheduler {
                     "retired task queue exhausted",
                 );
                 self.retired_tasks.push(task);
-                RETIRED_BACKLOG.fetch_add(1, Ordering::Release);
+                // Publish the flush/barrier lifetime before making the task
+                // visible to the reaper.  The scheduler lock prevents a consumer
+                // from detaching the task between these two publications.
+                RETIRED_OUTSTANDING
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_add(1)
+                    })
+                    .expect("retired outstanding counter overflowed");
+                let pending = RETIRED_BACKLOG
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_add(1)
+                    })
+                    .expect("retired backlog counter overflowed");
+                assert!(
+                    pending < MAX_TASKS,
+                    "retired backlog exceeded queue capacity"
+                );
                 return true;
             }
         }
@@ -776,7 +812,11 @@ impl Scheduler {
 
     fn take_retired_task(&mut self) -> Option<Task> {
         let task = self.retired_tasks.pop()?;
-        RETIRED_BACKLOG.fetch_sub(1, Ordering::AcqRel);
+        RETIRED_BACKLOG
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .expect("retired backlog counter underflowed");
         Some(task)
     }
 
@@ -1034,15 +1074,18 @@ impl Scheduler {
         state.irq_depth == 0 && state.preempt_count == 0 && state.need_resched
     }
 
-    fn timer_tick(&mut self, cpu: CpuId) {
+    fn timer_ticks(&mut self, cpu: CpuId, ticks: u64) {
+        if ticks == 0 {
+            return;
+        }
         let current = self.current(cpu);
         if self.task(current).kind.is_idle() {
             return;
         }
-
+        let elapsed = u32::try_from(ticks).unwrap_or(u32::MAX);
         let state = &mut self.cpus[cpu.get()];
-        if state.timeslice_remaining > 1 {
-            state.timeslice_remaining -= 1;
+        if elapsed < state.timeslice_remaining {
+            state.timeslice_remaining -= elapsed;
         } else {
             state.timeslice_remaining = 0;
             state.need_resched = true;
@@ -1115,10 +1158,18 @@ impl Scheduler {
 
 static SCHEDULER: IrqSpinLock<Option<Scheduler>> =
     IrqSpinLock::new_with_class(None, LockClass::new("scheduler", LockRank::Scheduler, 1));
-static RETIRED_REAPER: TrackedSpinLock<()> =
-    TrackedSpinLock::new_with_class((), LockClass::new("retired_reaper", LockRank::CrossCpu, 1));
 static TASK_REAPER_QUEUE: WaitQueue = WaitQueue::new();
+
+// Queue-empty and reclamation-complete are different states: after a task is
+// detached from Scheduler::retired_tasks its guarded stack may still be in the
+// VM/TLB destruction path.  This wait queue implements the quiescent verifier
+// barrier without holding a spin lock across resource destruction.
+static TASK_REAPER_DRAINED: WaitQueue = WaitQueue::new();
+// Number of tasks still linked in Scheduler::retired_tasks.
 static RETIRED_BACKLOG: AtomicUsize = AtomicUsize::new(0);
+// Number of retired tasks whose resources are not fully destroyed yet.  This
+// includes both queued tasks and tasks currently owned by a reaper worker.
+static RETIRED_OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 static IDLE_ENTERS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_EXITS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
@@ -1175,11 +1226,14 @@ pub fn irq_exit() {
     }
 }
 
-pub fn on_timer_tick() {
+pub fn on_timer_ticks(ticks: u64) {
+    if ticks == 0 {
+        return;
+    }
     let cpu = crate::smp::current_cpu_id();
     let mut slot = SCHEDULER.lock();
     if let Some(scheduler) = slot.as_mut() {
-        scheduler.timer_tick(cpu);
+        scheduler.timer_ticks(cpu, ticks);
     }
 }
 
@@ -1241,6 +1295,14 @@ pub fn irq_depth() -> usize {
     slot.as_ref()
         .expect("IRQ depth queried before scheduler initialization")
         .irq_depth(cpu)
+}
+
+pub(super) fn current_task_id() -> TaskId {
+    let cpu = crate::smp::current_cpu_id();
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("kernel scheduler is not initialized")
+        .current(cpu)
 }
 
 pub(super) fn block_current_on_if<F>(queue: &WaitQueue, should_block: F) -> bool
@@ -1306,6 +1368,26 @@ pub(super) fn wake_queue(queue: &WaitQueue, maximum: usize) -> usize {
     }
 
     woken
+}
+
+pub(super) fn wake_task_on_queue(queue: &WaitQueue, task: TaskId) -> bool {
+    let (woken, targets) = {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.wake_waiters(queue.claim_task(task))
+    };
+    let current = crate::smp::current_cpu_id();
+    for index in 0..crate::smp::discovered_cpu_count() {
+        if targets & (1_usize << index) == 0 {
+            continue;
+        }
+        let cpu = CpuId::new(index).expect("wakeup target exceeds MAX_CPUS");
+        if cpu != current {
+            crate::smp::send_ipi(cpu);
+        }
+    }
+    assert!(woken <= 1, "targeted wake claimed multiple tasks");
+    woken == 1
 }
 
 #[cfg(debug_assertions)]
@@ -1443,6 +1525,51 @@ pub fn enter_secondary_idle() -> ! {
 
 pub fn spawn_kernel_thread(entry: KernelThreadEntry) -> TaskId {
     spawn_internal(entry, None, None).0
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn run_verifier_thread(entry: KernelThreadEntry) {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+    assert_eq!(
+        crate::smp::current_cpu_id(),
+        CpuId::BOOT,
+        "timer verifier launcher must run on the boot CPU",
+    );
+
+    let caller_is_idle = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        let current = scheduler.current(CpuId::BOOT);
+        scheduler.task(current).kind.is_idle()
+    };
+    assert!(
+        caller_is_idle,
+        "timer verifier launcher must run from the boot idle task",
+    );
+    assert_eq!(
+        live_kernel_threads(),
+        0,
+        "timer verifier requires a quiescent counted kernel-thread set",
+    );
+
+    // Linux-style rule: code which can sleep runs in a schedulable task, not
+    // in the per-CPU idle thread.  The idle launcher only yields while the
+    // verifier worker blocks on timers/completions and is woken normally.
+    spawn_kernel_thread(entry);
+    let worker_deadline = verification_deadline();
+    while live_kernel_threads() != 0 {
+        assert!(
+            !deadline_reached(crate::arch::time::counter(), worker_deadline),
+            "timer verifier kernel thread timed out",
+        );
+        yield_now();
+        spin_loop();
+    }
+
+    // complete_switch() publishes the retired-task lifetime while holding the
+    // scheduler lock before live_kernel_threads() can be observed as zero.
+    synchronize_retired_tasks();
 }
 
 fn spawn_system_thread(
@@ -1609,7 +1736,7 @@ fn finish_switch() {
         let mut slot = SCHEDULER.lock();
         slot.as_mut()
             .expect("kernel scheduler is not initialized")
-            .complete_switch(cpu)
+            .complete_switch(cpu, crate::arch::task::current_stack_pointer())
     };
 
     if retired_task_added {
@@ -1619,28 +1746,42 @@ fn finish_switch() {
 
 fn drain_retired_queue() {
     loop {
+        // Phase 1: detach one dead task while holding only the scheduler lock.
         let retired = {
             let mut slot = SCHEDULER.lock();
             slot.as_mut()
                 .expect("kernel scheduler is not initialized")
                 .take_retired_task()
         };
-
         let Some(task) = retired else {
             break;
         };
 
+        // Phase 2: release VM mappings, page-table pages and the guarded stack
+        // with no scheduler/cross-CPU spin lock held.  Timer IRQs and TLB/IPI
+        // completion paths are therefore free to make forward progress.
         task.destroy_resources();
+        complete_retired_task_reclamation();
+    }
+}
+
+fn complete_retired_task_reclamation() {
+    // Release publishes all destruction side effects before a waiter observes
+    // the final zero through its Acquire load.
+    let outstanding = RETIRED_OUTSTANDING
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_sub(1)
+        })
+        .expect("retired outstanding counter underflowed");
+    if outstanding == 1 {
+        TASK_REAPER_DRAINED.wake_all();
     }
 }
 
 fn task_reaper_main() {
     loop {
         TASK_REAPER_QUEUE.wait_until(|| retired_task_backlog() != 0);
-
-        let reaper = RETIRED_REAPER.lock();
         drain_retired_queue();
-        drop(reaper);
     }
 }
 
@@ -1654,20 +1795,37 @@ fn reap_retired_tasks() {
 #[cfg(debug_assertions)]
 fn synchronize_retired_tasks() {
     crate::context::might_sleep();
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
     assert_eq!(
         live_kernel_threads(),
         0,
         "task reclamation barrier requires a quiescent verifier",
     );
 
+    // Boot verification runs from the per-CPU idle task.  Idle cannot join a
+    // normal WaitQueue, so this debug-only flush wakes the runtime reaper and
+    // cooperatively yields until both queued and detached destruction finish.
+    // RETIRED_OUTSTANDING closes the queue-empty-but-still-destroying race.
     TASK_REAPER_QUEUE.wake_one();
-    while retired_task_backlog() != 0 {
+    let deadline = verification_deadline();
+    while retired_task_outstanding() != 0 {
+        assert!(
+            !deadline_reached(crate::arch::time::counter(), deadline),
+            "retired task reclamation timed out: backlog={} outstanding={}",
+            retired_task_backlog(),
+            retired_task_outstanding(),
+        );
         yield_now();
+        TASK_REAPER_QUEUE.wake_one();
+        spin_loop();
     }
 
-    let reaper = RETIRED_REAPER.lock();
-    drop(reaper);
-
+    assert_eq!(
+        retired_task_backlog(),
+        0,
+        "retired task backlog remained after reclamation barrier",
+    );
     let retired = retired_task_count();
     assert_eq!(retired, 0, "retired task queue was not fully drained");
 }
@@ -1714,6 +1872,11 @@ fn retired_task_backlog() -> usize {
 }
 
 #[cfg(debug_assertions)]
+fn retired_task_outstanding() -> usize {
+    RETIRED_OUTSTANDING.load(Ordering::Acquire)
+}
+
+#[cfg(debug_assertions)]
 fn retired_task_count() -> usize {
     let slot = SCHEDULER.lock();
     slot.as_ref()
@@ -1755,6 +1918,11 @@ unsafe extern "C" fn kernel_thread_bootstrap() -> ! {
     let entry = current_entry();
     entry();
     exit_current()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kernel_fresh_context_returned() -> ! {
+    panic!("fresh task bootstrap unexpectedly returned")
 }
 
 unsafe extern "C" fn idle_thread_bootstrap() -> ! {

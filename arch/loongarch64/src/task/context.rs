@@ -15,13 +15,17 @@ pub struct Context {
     s8: usize,
 }
 
+unsafe extern "C" {
+    fn __loongarch_fresh_context_entry() -> !;
+}
+
 impl Context {
     pub fn new(stack_top: usize, entry: unsafe extern "C" fn() -> !) -> Self {
-        assert_eq!(stack_top & 0xf, 0, "kernel thread stack is not ABI aligned");
-
+        assert_eq!(stack_top & 0xf, 0, "fresh task stack is not ABI aligned");
         Self {
-            ra: entry as *const () as usize,
+            ra: __loongarch_fresh_context_entry as *const () as usize,
             sp: stack_top,
+            s0: entry as *const () as usize,
             ..Self::default()
         }
     }

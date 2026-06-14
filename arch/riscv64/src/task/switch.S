@@ -45,3 +45,17 @@ __riscv_switch_context:
     ret
 
 .size __riscv_switch_context, . - __riscv_switch_context
+
+    .section .text
+    .align 2
+    .globl __riscv_fresh_context_entry
+    .type __riscv_fresh_context_entry, @function
+__riscv_fresh_context_entry:
+    # s0 carries the Rust bootstrap entry. Build a mapped ABI caller frame.
+    addi sp, sp, -16
+    sd zero, 0(sp)
+    sd zero, 8(sp)
+    jalr ra, 0(s0)
+    call kernel_fresh_context_returned
+    .4byte 0
+    .size __riscv_fresh_context_entry, .-__riscv_fresh_context_entry

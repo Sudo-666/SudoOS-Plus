@@ -15,6 +15,10 @@ pub enum LockRank {
     /// IRQ-enabled cross-CPU serializers. This rank precedes the
     /// scheduler because an IPI handler may acquire scheduler state.
     CrossCpu = 15,
+    /// Hard-IRQ-safe timer bases. A timer interrupt may preempt a
+    /// task which holds an IRQ-enabled CrossCpu serializer, so Timer
+    /// must remain after CrossCpu and before Scheduler.
+    Timer = 16,
     Scheduler = 20,
     WaitQueue = 30,
     Vm = 40,
@@ -23,6 +27,12 @@ pub enum LockRank {
     PageAllocator = 70,
     Console = 80,
 }
+
+// hardirq timer rank must follow IRQ-enabled serializers.
+const _: () = {
+    assert!((LockRank::CrossCpu as usize) < (LockRank::Timer as usize));
+    assert!((LockRank::Timer as usize) < (LockRank::Scheduler as usize));
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LockClass {
@@ -43,6 +53,21 @@ impl LockClass {
     const fn key(self) -> usize {
         (self.rank as usize) * 1024 + self.order
     }
+}
+
+/// Validate a lock whose payload is deliberately held with local IRQs enabled.
+///
+/// Timer hardirqs can interrupt such a critical section, therefore every
+/// IRQ-enabled outer lock must precede the Timer rank. This is the small-kernel
+/// equivalent of Linux lockdep's hardirq-unsafe -> hardirq-safe dependency rule.
+pub fn assert_irq_enabled_outer_lock(class: LockClass) {
+    assert!(
+        class.rank < LockRank::Timer,
+        "IRQ-enabled tracked lock must precede hardirq timer locks: lock={} rank={:?} timer_rank={:?}",
+        class.name,
+        class.rank,
+        LockRank::Timer,
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

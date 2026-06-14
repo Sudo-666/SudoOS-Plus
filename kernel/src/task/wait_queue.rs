@@ -1,14 +1,27 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use crate::{
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
+    time::MonotonicInstant,
 };
 
 use super::{MAX_TASKS, TaskId};
 
 static NEXT_WAIT_CHANNEL: AtomicUsize = AtomicUsize::new(1);
 const COMPLETION_ALL: usize = usize::MAX / 2;
+const TIMEOUT_WAITING: u8 = 0;
+const TIMEOUT_FIRED: u8 = 1;
+const TIMEOUT_CANCELLED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitOutcome {
+    Satisfied,
+    TimedOut,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WaitEntryState {
@@ -52,13 +65,11 @@ impl WaitList {
                 .any(|entry| entry.task == Some(task) && entry.state == WaitEntryState::Queued),
             "task was queued twice on the same wait queue: {task:?}",
         );
-
         let slot = self
             .entries
             .iter_mut()
             .find(|entry| entry.state == WaitEntryState::NotQueued)
             .expect("wait queue capacity exhausted");
-
         *slot = WaitEntry {
             task: Some(task),
             state: WaitEntryState::Queued,
@@ -69,27 +80,37 @@ impl WaitList {
 
     fn claim(&mut self, maximum: usize) -> ClaimedWaiters {
         assert!(maximum != 0, "wake limit must be non-zero");
-
         let mut claimed = ClaimedWaiters::empty();
-
         for entry in &mut self.entries {
             if claimed.count == maximum {
                 break;
             }
-
             if entry.state != WaitEntryState::Queued {
                 continue;
             }
-
             let task = entry.task.expect("queued wait entry lost its task");
             claimed.tasks[claimed.count] = Some(task);
             claimed.count += 1;
-
             let _exclusive = entry.exclusive;
             *entry = WaitEntry::EMPTY;
             self.count = self.count.checked_sub(1).expect("waiter count underflowed");
         }
+        claimed
+    }
 
+    fn claim_task(&mut self, target: TaskId) -> ClaimedWaiters {
+        let mut claimed = ClaimedWaiters::empty();
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.state == WaitEntryState::Queued && entry.task == Some(target))
+        else {
+            return claimed;
+        };
+        claimed.tasks[0] = Some(target);
+        claimed.count = 1;
+        *entry = WaitEntry::EMPTY;
+        self.count = self.count.checked_sub(1).expect("waiter count underflowed");
         claimed
     }
 
@@ -112,11 +133,38 @@ impl ClaimedWaiters {
     }
 }
 
+struct TimeoutContext {
+    state: AtomicU8,
+    queue: *const WaitQueue,
+    task: TaskId,
+}
+
+fn timeout_callback(argument: usize) {
+    // SAFETY: the waiter keeps this stack object alive and calls
+    // `cancel_sync()` before returning from the timeout API.
+    let timeout = unsafe { &*(argument as *const TimeoutContext) };
+    if timeout
+        .state
+        .compare_exchange(
+            TIMEOUT_WAITING,
+            TIMEOUT_FIRED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    // SAFETY: queue lifetime is covered by the same cancel_sync contract.
+    let queue = unsafe { &*timeout.queue };
+    super::wake_task_on_queue(queue, timeout.task);
+}
+
 /// A scheduler wait queue with an explicit waiter list.
 ///
 /// The condition protected by a wait queue must be published before calling
-/// `wake_one` or `wake_all`. `wait_until` rechecks the condition while the
-/// scheduler lock is held, then queues the current task before switching out.
+/// `wake_one` or `wake_all`. Wait paths recheck the condition while the
+/// scheduler lock is held, then queue the current task before switching out.
 pub struct WaitQueue {
     channel: AtomicUsize,
     waiters: IrqSpinLock<WaitList>,
@@ -141,11 +189,84 @@ impl WaitQueue {
             if condition() {
                 return;
             }
-
             let blocked = super::block_current_on_if(self, || !condition());
             if !blocked {
                 return;
             }
+        }
+    }
+
+    pub fn wait_timeout<F>(&self, timeout: Duration, condition: F) -> WaitOutcome
+    where
+        F: Fn() -> bool,
+    {
+        self.wait_until_deadline(crate::time::deadline_after(timeout), condition)
+    }
+
+    pub fn wait_until_deadline<F>(&self, deadline: MonotonicInstant, condition: F) -> WaitOutcome
+    where
+        F: Fn() -> bool,
+    {
+        crate::context::assert_task_context();
+        crate::context::assert_interrupts_enabled();
+        if condition() {
+            return WaitOutcome::Satisfied;
+        }
+        if crate::time::deadline_reached(crate::time::now(), deadline) {
+            return if condition() {
+                WaitOutcome::Satisfied
+            } else {
+                WaitOutcome::TimedOut
+            };
+        }
+
+        let timeout = TimeoutContext {
+            state: AtomicU8::new(TIMEOUT_WAITING),
+            queue: self as *const WaitQueue,
+            task: super::current_task_id(),
+        };
+        let handle = crate::timer::arm_at(
+            deadline,
+            timeout_callback,
+            core::ptr::addr_of!(timeout) as usize,
+        )
+        .unwrap_or_else(|error| panic!("unable to allocate wait timeout: {error:?}"));
+
+        let outcome = loop {
+            if condition() {
+                break WaitOutcome::Satisfied;
+            }
+            if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
+                break if condition() {
+                    WaitOutcome::Satisfied
+                } else {
+                    WaitOutcome::TimedOut
+                };
+            }
+            let _ = super::block_current_on_if(self, || {
+                !condition() && timeout.state.load(Ordering::Acquire) == TIMEOUT_WAITING
+            });
+        };
+
+        if outcome == WaitOutcome::Satisfied {
+            let _ = timeout.state.compare_exchange(
+                TIMEOUT_WAITING,
+                TIMEOUT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        let _ = crate::timer::cancel_sync(handle);
+
+        // The protected condition wins a boundary race, matching the usual
+        // Linux wait-event timeout rule: a condition observed true at expiry is
+        // success rather than a spurious timeout.
+        if condition() {
+            WaitOutcome::Satisfied
+        } else if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
+            WaitOutcome::TimedOut
+        } else {
+            outcome
         }
     }
 
@@ -178,7 +299,6 @@ impl WaitQueue {
             allocated != 0 && allocated != usize::MAX,
             "wait-channel identifier space exhausted",
         );
-
         match self
             .channel
             .compare_exchange(0, allocated, Ordering::AcqRel, Ordering::Acquire)
@@ -194,6 +314,10 @@ impl WaitQueue {
 
     pub(super) fn claim_waiters(&self, maximum: usize) -> ClaimedWaiters {
         self.waiters.lock().claim(maximum)
+    }
+
+    pub(super) fn claim_task(&self, task: TaskId) -> ClaimedWaiters {
+        self.waiters.lock().claim_task(task)
     }
 
     fn waiter_count_inner(&self) -> usize {
@@ -246,6 +370,28 @@ impl Completion {
         }
     }
 
+    pub fn wait_timeout(&self, timeout: Duration) -> WaitOutcome {
+        let deadline = crate::time::deadline_after(timeout);
+        loop {
+            if self.try_wait() {
+                return WaitOutcome::Satisfied;
+            }
+            match self
+                .waiters
+                .wait_until_deadline(deadline, || self.done.load(Ordering::Acquire) != 0)
+            {
+                WaitOutcome::Satisfied => {}
+                WaitOutcome::TimedOut => {
+                    return if self.try_wait() {
+                        WaitOutcome::Satisfied
+                    } else {
+                        WaitOutcome::TimedOut
+                    };
+                }
+            }
+        }
+    }
+
     /// Consumes one completion token without blocking.
     ///
     /// `complete_all()` leaves the completion permanently signalled until an
@@ -259,6 +405,10 @@ impl Completion {
             if done == COMPLETION_ALL {
                 return true;
             }
+            assert!(
+                done < COMPLETION_ALL,
+                "completion counter entered the reserved complete-all range",
+            );
             if self
                 .done
                 .compare_exchange_weak(done, done - 1, Ordering::AcqRel, Ordering::Acquire)
@@ -275,7 +425,7 @@ impl Completion {
                 if done == COMPLETION_ALL {
                     Some(COMPLETION_ALL)
                 } else {
-                    done.checked_add(1)
+                    done.checked_add(1).filter(|next| *next < COMPLETION_ALL)
                 }
             })
             .expect("completion counter overflowed");
@@ -308,21 +458,17 @@ impl Default for Completion {
 #[cfg(debug_assertions)]
 pub(super) fn verify_local() {
     let completion = Completion::new();
-
     assert!(!completion.is_done());
     assert!(!completion.try_wait());
-
     completion.complete();
     assert!(completion.is_done());
     assert!(completion.try_wait());
     assert!(!completion.is_done());
     assert!(!completion.try_wait());
-
     completion.complete_all();
     assert!(completion.try_wait());
     assert!(completion.try_wait());
     assert!(completion.is_done());
-
     completion.reinit();
     assert!(!completion.is_done());
     assert!(!completion.try_wait());
