@@ -40,6 +40,8 @@ STABLE_COMMON_MARKERS = (
     ("wait", b"M4C_SCHED_TEST: PASS"),
     ("tlb", b"M4C_TLB_TEST: PASS"),
     ("final", b"SMP_TEST: PASS"),
+    ("user", b"hello user\n"),
+    ("user", b"minimal user mode test:"),
 )
 
 # Human-readable detail lines improve diagnostics, but they are not a stable
@@ -85,6 +87,8 @@ DEBUG_M5_MARKERS = (
     ("tlb", b"TLB request v2 test:"),
     ("timer", b"timer runtime test:"),
     ("timer", b"workqueue runtime test:"),
+    ("user", b"hello user\n"),
+    ("user", b"minimal user mode test:"),
 )
 
 ARCH_REQUIRED_MARKERS = {
@@ -99,7 +103,7 @@ ARCH_OPTIONAL_MARKERS = {
 
 PHASE_ORDER = (
     "boot", "mm", "trap", "timer", "smp", "locks",
-    "scheduler", "wait", "idle", "ipi", "tlb", "final",
+    "scheduler", "wait", "idle", "ipi", "tlb", "user", "final",
 )
 MAX_SCAN_BUFFER = 512 * 1024
 TAIL_BYTES = 32 * 1024

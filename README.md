@@ -529,3 +529,18 @@ make m6-tag      # 仅接受当前 commit 的通过报告
 [`docs/m6-robustness.md`](docs/m6-robustness.md) 与
 [`docs/ci.md`](docs/ci.md)。GitHub Actions 默认不启用；本地 release gate 是 M6 的
 正式门禁。
+
+## M7-B 最小用户模式封版候选
+
+M7 已完成双架构 U-mode/PLV3 入口、用户 trap stack、Linux 风格
+`write=64`/`exit=93` ABI、受检用户拷贝、未知 syscall、非法用户指针、
+RX 写保护 fault 隔离和映射重复回收。正式冻结必须在提交后通过：
+
+```bash
+make m7-release
+make m7-tag
+```
+
+封版契约见 [`docs/m7-completion.md`](docs/m7-completion.md)。M7 冻结后进入
+M8：独立 per-process AddressSpace、ASID、per-mm TLB shootdown 与用户 fault
+恢复。

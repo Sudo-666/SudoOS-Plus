@@ -16,10 +16,15 @@
  * r23..r31 = s0..s8
  *
  * TrapFrame is 304 bytes and 16-byte aligned.
- * User-mode entry is deliberately not enabled yet: a future task layer must
- * install a per-task kernel stack before PLV3 execution is allowed.
+ * SAVE0 is zero in kernel mode and owns the kernel stack pointer in PLV3.
+ * A user trap swaps the user SP into SAVE0 before allocating this frame.
  */
 __loongarch_trap_entry:
+    csrwr $r3, 0x30
+    bnez $r3, .Lloongarch_from_user
+    csrrd $r3, 0x30
+    csrwr $r0, 0x30
+.Lloongarch_from_user:
     addi.d $r3, $r3, -304
 
     st.d $r1, $r3, 1*8
@@ -53,8 +58,15 @@ __loongarch_trap_entry:
     st.d $r30, $r3, 30*8
     st.d $r31, $r3, 31*8
 
+    csrrd $r12, 0x30
+    beqz $r12, .Lloongarch_save_kernel_sp
+    st.d $r12, $r3, 3*8
+    csrwr $r0, 0x30
+    b .Lloongarch_saved_sp
+.Lloongarch_save_kernel_sp:
     addi.d $r12, $r3, 304
     st.d $r12, $r3, 3*8
+.Lloongarch_saved_sp:
 
     st.d $r0, $r3, 0*8
 
@@ -84,6 +96,15 @@ __loongarch_trap_entry:
     bne $r12, $r13, .Lloongarch_frame_corrupted
 
     ld.d $r12, $r3, 32*8
+    andi $r13, $r12, 3
+    addi.d $r14, $r0, 3
+    bne $r13, $r14, .Lloongarch_return_to_kernel
+    addi.d $r13, $r3, 304
+    csrwr $r13, 0x30
+    b .Lloongarch_restore_csrs
+.Lloongarch_return_to_kernel:
+    csrwr $r0, 0x30
+.Lloongarch_restore_csrs:
     csrwr $r12, 0x1
 
     ld.d $r12, $r3, 33*8

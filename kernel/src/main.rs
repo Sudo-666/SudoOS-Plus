@@ -22,6 +22,7 @@ mod timer;
 mod tlb;
 mod tracked_spin;
 mod trap;
+mod user;
 mod vm;
 mod workqueue;
 extern crate alloc;
@@ -257,6 +258,7 @@ fn kernel_main(boot: BootInfo) -> ! {
 
     #[cfg(debug_assertions)]
     task::verify();
+    user::verify();
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");

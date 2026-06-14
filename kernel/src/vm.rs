@@ -93,6 +93,21 @@ impl KernelIoMapping {
     }
 }
 
+/// One temporary user leaf mapping owned by the M7 verifier.
+///
+/// The mapping is installed in the current kernel page-table root only. M8
+/// replaces this object with a real per-process AddressSpace.
+pub struct UserPageMapping {
+    page: VirtPage,
+    backing: PageAllocation,
+}
+
+impl UserPageMapping {
+    pub fn physical_address(&self) -> PhysAddr {
+        self.backing.start().start_address()
+    }
+}
+
 pub fn initialize(memory: crate::memory::KernelMemoryState) {
     let mut vmalloc_slot = VMALLOC.lock();
 
@@ -361,6 +376,66 @@ pub fn iounmap(mapping: KernelIoMapping) -> Result<(), KernelVmError> {
     let page_count = pages_for_size(mapping.mapped_size)?;
     unmap_reservation_pages(mapping.reservation, page_count)?;
     release_vmalloc(mapping.reservation)
+}
+
+pub fn map_user_page(
+    address: VirtAddr,
+    options: MappingOptions,
+) -> Result<UserPageMapping, KernelVmError> {
+    if !options.is_user() {
+        return Err(KernelVmError::InvalidArgument);
+    }
+    options
+        .validate()
+        .map_err(|_| KernelVmError::InvalidArgument)?;
+    let page = VirtPage::from_start_address(address).ok_or(KernelVmError::InvalidArgument)?;
+    let backing =
+        crate::page_alloc::allocate(0, crate::page_alloc::PageAllocationOptions::kernel_zeroed())?;
+
+    let map_result = with_kernel_page_table(|page_table| {
+        page_table.map_page(page, backing.start(), options)?;
+        Ok(())
+    });
+    if let Err(error) = map_result {
+        crate::page_alloc::free(backing)?;
+        return Err(error);
+    }
+
+    crate::tlb::shootdown_kernel_all();
+    Ok(UserPageMapping { page, backing })
+}
+
+pub fn unmap_user_page(mapping: UserPageMapping) -> Result<(), KernelVmError> {
+    let table_capacity =
+        with_kernel_page_table(|page_table| Ok(page_table.allocated_runtime_tables()))?;
+    let mut retired_tables = Vec::new();
+    retired_tables
+        .try_reserve(table_capacity)
+        .map_err(|_| KernelVmError::MetadataOutOfMemory)?;
+
+    let unmapped = with_kernel_page_table(|page_table| Ok(page_table.unmap_page(mapping.page)?))?;
+    assert_eq!(
+        unmapped,
+        mapping.backing.start(),
+        "M7 user mapping returned a different physical frame",
+    );
+
+    crate::tlb::shootdown_kernel_all();
+
+    let reclaim_result = with_kernel_page_table(|page_table| {
+        page_table.reclaim_empty_tables(mapping.page, &mut retired_tables)?;
+        Ok(())
+    });
+
+    if !retired_tables.is_empty() {
+        crate::tlb::shootdown_kernel_all();
+        for table in retired_tables {
+            crate::page_alloc::free(table)?;
+        }
+    }
+
+    crate::page_alloc::free(mapping.backing)?;
+    reclaim_result
 }
 
 #[cfg(debug_assertions)]

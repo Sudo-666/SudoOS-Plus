@@ -8,11 +8,12 @@ pub fn initialize() {
 }
 
 unsafe fn install_entry() {
-    // SAFETY: 写入当前 CPU 的 EENTRY CSR，不访问 Rust 管理内存。
+    // SAFETY: 写入当前 CPU 的 EENTRY/SAVE0 CSR，不访问 Rust 管理内存。
     unsafe {
         core::arch::asm!(
             "la.pcrel $r12, __loongarch_trap_entry",
             "csrwr $r12, 0xc",
+            "csrwr $r0, 0x30",
             options(nostack),
         );
     }
@@ -25,9 +26,17 @@ pub fn trigger_breakpoint() {
     }
 }
 
-pub const fn kernel_scratch_is_clean() -> bool {
-    // LoongArch 当前只允许内核态异常；用户态换栈协议尚未启用。
-    true
+pub fn kernel_scratch_is_clean() -> bool {
+    let scratch: usize;
+    // SAFETY: 只读取当前 CPU 的 SAVE0 CSR。
+    unsafe {
+        core::arch::asm!(
+            "csrrd {scratch}, 0x30",
+            scratch = out(reg) scratch,
+            options(nomem, nostack),
+        );
+    }
+    scratch == 0
 }
 
 #[cfg(debug_assertions)]

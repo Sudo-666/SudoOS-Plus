@@ -284,3 +284,38 @@ m6-release:
 .PHONY: m6-tag
 m6-tag:
 	@./scripts/m6-tag.sh
+
+# M7-B closure: privilege, syscall, checked-copy and user-fault release gate.
+M7_SOAK_LOOPS ?= 50
+M7_RELEASE_SOAK_LOOPS ?= 10
+
+export M7_SOAK_LOOPS
+export M7_RELEASE_SOAK_LOOPS
+
+.PHONY: m7-audit
+m7-audit:
+	@python3 scripts/m7-audit.py
+
+.PHONY: m7-quick
+m7-quick:
+	@python3 scripts/m7-verify.py --level quick
+
+.PHONY: m7-full
+m7-full:
+	@python3 scripts/m7-verify.py --level full
+
+.PHONY: m7-soak
+m7-soak:
+	@M7_SOAK_LOOPS="$(M7_SOAK_LOOPS)" \
+		M7_RELEASE_SOAK_LOOPS="$(M7_RELEASE_SOAK_LOOPS)" \
+		python3 scripts/m7-verify.py --level soak
+
+.PHONY: m7-release
+m7-release:
+	@M7_SOAK_LOOPS="$(M7_SOAK_LOOPS)" \
+		M7_RELEASE_SOAK_LOOPS="$(M7_RELEASE_SOAK_LOOPS)" \
+		python3 scripts/m7-verify.py --level release
+
+.PHONY: m7-tag
+m7-tag:
+	@./scripts/m7-tag.sh
