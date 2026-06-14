@@ -314,11 +314,6 @@ pub fn timer_ticks_for(cpu: crate::smp::CpuId) -> u64 {
 }
 
 #[cfg(debug_assertions)]
-pub fn periodic_running_for(cpu: crate::smp::CpuId) -> bool {
-    SCHEDULER_TICK_ACTIVE[cpu.get()].load(Ordering::Acquire)
-}
-
-#[cfg(debug_assertions)]
 pub(crate) fn scheduler_tick_active_for(cpu: crate::smp::CpuId) -> bool {
     SCHEDULER_TICK_ACTIVE[cpu.get()].load(Ordering::Acquire)
 }

@@ -53,6 +53,10 @@ struct TlbRequestSlot {
 // REQUEST_PUBLISHING grants the serializer owner exclusive write access.
 // REQUEST_READY publishes an immutable request to IPI readers. The owner does
 // not return the slot to REQUEST_FREE until every target published completion.
+// SAFETY: REQUEST_PUBLISHING grants the serializer exclusive mutation
+// access to `request`. Publishing REQUEST_READY with Release makes the
+// initialized request immutable and visible to IPI readers; the owner
+// does not reuse the slot until every target has atomically completed.
 unsafe impl Sync for TlbRequestSlot {}
 
 impl TlbRequestSlot {
@@ -533,9 +537,13 @@ pub fn verify_request_model() {
 
     let completed_before = completed_shootdowns();
     let mut remote_before = [0_u64; MAX_CPUS];
-    for logical in 0..crate::smp::discovered_cpu_count() {
+    for (logical, before) in remote_before
+        .iter_mut()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
         let cpu = CpuId::new(logical).expect("TLB verifier CPU exceeds MAX_CPUS");
-        remote_before[logical] = remote_flush_count(cpu);
+        *before = remote_flush_count(cpu);
     }
 
     shootdown_kernel_page(VirtAddr::new(0));
@@ -548,16 +556,19 @@ pub fn verify_request_model() {
     );
 
     let targets = crate::smp::ipi_ready_cpu_mask() & !cpu_bit(crate::smp::current_cpu_id());
-    for logical in 0..crate::smp::discovered_cpu_count() {
+    for (logical, before) in remote_before
+        .iter()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
         let bit = 1_usize << logical;
         if targets & bit == 0 {
             continue;
         }
-
         let cpu = CpuId::new(logical).expect("TLB verifier target exceeds MAX_CPUS");
         assert_eq!(
             remote_flush_count(cpu),
-            remote_before[logical] + 2,
+            *before + 2,
             "remote CPU did not execute page and range TLB requests",
         );
     }

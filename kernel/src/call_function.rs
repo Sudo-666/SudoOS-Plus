@@ -36,6 +36,10 @@ struct CallRequestSlot {
 // SLOT_RESERVED gives one task exclusive write ownership. SLOT_READY publishes
 // an immutable payload to IPI readers. The slot is not reused until every
 // target has completed its callback.
+// SAFETY: `payload` is written only by the task that transitions the slot
+// from FREE to RESERVED. The Release publication of READY makes that
+// immutable payload visible to IPI readers, and the slot is not reused
+// until every target records completion. All other shared fields are atomic.
 unsafe impl Sync for CallRequestSlot {}
 
 impl CallRequestSlot {
@@ -287,8 +291,12 @@ fn wait_for_completion(slot_index: usize, generation: u64, targets: usize) {
 fn pending_target_mask(slot_index: usize) -> usize {
     let request_bit = slot_bit(slot_index);
     let mut targets = 0_usize;
-    for logical in 0..crate::smp::discovered_cpu_count() {
-        if PENDING_SLOTS[logical].load(Ordering::Acquire) & request_bit != 0 {
+    for (logical, pending) in PENDING_SLOTS
+        .iter()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
+        if pending.load(Ordering::Acquire) & request_bit != 0 {
             targets |= 1_usize << logical;
         }
     }
@@ -430,9 +438,13 @@ pub fn verify() {
             "call-function verifier leaked request slot {index}",
         );
     }
-    for logical in 0..crate::smp::discovered_cpu_count() {
+    for (logical, pending) in PENDING_SLOTS
+        .iter()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
         assert_eq!(
-            PENDING_SLOTS[logical].load(Ordering::Acquire),
+            pending.load(Ordering::Acquire),
             0,
             "call-function verifier left pending slots on CPU {logical}",
         );

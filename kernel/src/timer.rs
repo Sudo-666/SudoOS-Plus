@@ -434,6 +434,9 @@ mod verify {
         // SAFETY: the verifier synchronously cancels both handles before its
         // stack arguments leave scope.
         let argument = unsafe { &*(argument as *const OrderArgument) };
+        // SAFETY: `argument.context` points to the `OrderContext` owned by the
+        // verifier frame. That frame remains alive until both timer callbacks
+        // complete and both handles are synchronously quiesced.
         let context = unsafe { &*argument.context };
         let observed = context.sequence.fetch_add(1, Ordering::AcqRel) + 1;
         assert_eq!(observed, argument.expected, "timer deadline order violated");

@@ -265,16 +265,16 @@ pub fn initialize() {
     );
 
     let discovered = crate::smp::discovered_cpu_count();
-    for index in 0..discovered {
+    for (index, worker_slots) in WORKER_TASKS.iter().enumerate().take(discovered) {
         let cpu = CpuId::new(index).expect("workqueue CPU exceeds MAX_CPUS");
         assert!(
             crate::smp::is_scheduler_active(cpu),
             "workqueue worker target is not scheduler-active",
         );
-        for worker_index in 0..WORKERS_PER_CPU {
+        for worker_slot in worker_slots {
             let worker = crate::task::spawn_system_thread_on(worker_entry, cpu);
             assert_eq!(
-                WORKER_TASKS[index][worker_index].swap(worker.raw(), Ordering::AcqRel),
+                worker_slot.swap(worker.raw(), Ordering::AcqRel),
                 NO_WORKER_TASK,
                 "workqueue worker task was published twice",
             );

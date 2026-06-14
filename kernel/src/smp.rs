@@ -155,13 +155,13 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
 
     #[cfg(debug_assertions)]
     verify_topology_snapshot(topology);
-    for logical in 0..MAX_CPUS {
+    for (logical, state) in CPU_STATES.iter().enumerate() {
         let next = if logical < topology.discovered {
             CpuState::Present
         } else {
             CpuState::Absent
         };
-        let previous = CPU_STATES[logical].swap(next as u8, Ordering::AcqRel);
+        let previous = state.swap(next as u8, Ordering::AcqRel);
         assert_eq!(
             CpuState::from_raw(previous),
             CpuState::Absent,

@@ -11,7 +11,7 @@ const FRESH_CONTEXT_HEADROOM: usize = crate::arch::task::FRESH_TASK_STACK_RESERV
 
 const _: () = {
     assert!(FRESH_CONTEXT_HEADROOM >= 512);
-    assert!(FRESH_CONTEXT_HEADROOM % 16 == 0);
+    assert!(FRESH_CONTEXT_HEADROOM.is_multiple_of(16));
     assert!(FRESH_CONTEXT_HEADROOM < KERNEL_STACK_SIZE);
 };
 

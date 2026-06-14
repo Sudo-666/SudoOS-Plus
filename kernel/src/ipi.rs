@@ -181,9 +181,12 @@ pub fn interrupt_count(cpu: CpuId) -> u64 {
 
 pub fn dump() {
     crate::println!("IPI mailboxes:");
-    for logical in 0..crate::smp::discovered_cpu_count() {
+    for (logical, mailbox) in MAILBOXES
+        .iter()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
         let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
-        let mailbox = &MAILBOXES[logical];
         crate::println!(
             "  cpu{} pending={:#x} irq={} doorbell={} coalesced={} \
              batches={} spurious={}",
