@@ -35,13 +35,11 @@ FAILURE_MARKERS = (
 )
 
 STABLE_COMMON_MARKERS = (
-    ("mm", b"runtime pgtbl : active hardware root"),
-    ("timer", b"periodic timer : armed at 100 Hz"),
-    ("wait", b"M4C_SCHED_TEST: PASS"),
-    ("tlb", b"M4C_TLB_TEST: PASS"),
-    ("final", b"SMP_TEST: PASS"),
-    ("user", b"hello user\n"),
-    ("user", b"minimal user mode test:"),
+    ('mm', b'runtime pgtbl : active hardware root'),
+    ('user', b'hello user\n'),
+    ('user', b'minimal user mode test:'),
+    ('final', b'kernel_main: initialization completed'),
+    ('timer', b'time subsystem:'),
 )
 
 # Human-readable detail lines improve diagnostics, but they are not a stable
@@ -79,16 +77,20 @@ OPTIONAL_DETAIL_MARKERS = (
 )
 
 DEBUG_M5_MARKERS = (
-    ("locks", b"tracked spin lock test:"),
-    ("wait", b"wait queue/completion invariant test:"),
-    ("idle", b"deterministic idle/IPI test:"),
-    ("ipi", b"IPI mailbox test:"),
-    ("ipi", b"call-function IPI test:"),
-    ("tlb", b"TLB request v2 test:"),
-    ("timer", b"timer runtime test:"),
-    ("timer", b"workqueue runtime test:"),
-    ("user", b"hello user\n"),
-    ("user", b"minimal user mode test:"),
+    ('locks', b'tracked spin lock test:'),
+    ('wait', b'wait queue/completion invariant test:'),
+    ('idle', b'deterministic idle/IPI test:'),
+    ('ipi', b'IPI mailbox test:'),
+    ('ipi', b'call-function IPI test:'),
+    ('tlb', b'TLB request v2 test:'),
+    ('timer', b'timer runtime test:'),
+    ('timer', b'workqueue runtime test:'),
+    ('user', b'hello user\n'),
+    ('user', b'minimal user mode test:'),
+    ('wait', b'M4C_SCHED_TEST: PASS'),
+    ('tlb', b'M4C_TLB_TEST: PASS'),
+    ('final', b'SMP_TEST: PASS'),
+    ('timer', b'periodic timer : armed at 100 Hz'),
 )
 
 ARCH_REQUIRED_MARKERS = {
@@ -229,33 +231,13 @@ def _deduplicate_markers(
     return tuple(result)
 
 
-def required_markers(
-    arch: str,
-    profile: str,
-    cpu_count: int,
-) -> tuple[Marker, ...]:
+def required_markers(arch: str, profile: str, cpu_count: int) -> tuple[Marker, ...]:
     pairs = list(STABLE_COMMON_MARKERS)
     pairs.extend(ARCH_REQUIRED_MARKERS[arch])
-    pairs.extend(
-        (
-            ("smp", f"discovered CPUs : {cpu_count}".encode()),
-            ("smp", f"online CPUs : {cpu_count}".encode()),
-            (
-                "smp",
-                b"secondary CPUs : verified"
-                if cpu_count > 1
-                else b"secondary CPUs : single-CPU fallback",
-            ),
-        )
-    )
-    if cpu_count > 1:
-        pairs.extend(
-            (
-                ("ipi", b"IPI delivery : verified"),
-                ("tlb", b"remote invalidate : verified"),
-            )
-        )
-    if profile == "debug":
+    pairs.extend((('smp', f'discovered CPUs : {cpu_count}'.encode()), ('smp', f'online CPUs : {cpu_count}'.encode()), ('smp', b'secondary CPUs : verified' if cpu_count > 1 else b'secondary CPUs : single-CPU fallback')))
+    if profile == 'debug':
+        if cpu_count > 1:
+            pairs.extend((('ipi', b'IPI delivery : verified'), ('tlb', b'remote invalidate : verified')))
         pairs.extend(DEBUG_M5_MARKERS)
     return _deduplicate_markers(pairs)
 

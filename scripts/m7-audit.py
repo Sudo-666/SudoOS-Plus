@@ -196,6 +196,7 @@ def main() -> int:
     )
 
     stable = assignment_value(smoke, "STABLE_COMMON_MARKERS")
+    debug_markers = assignment_value(smoke, "DEBUG_M5_MARKERS")
     phases = assignment_value(smoke, "PHASE_ORDER")
     user_markers = (
         ("user", b"hello user\n"),
@@ -213,6 +214,28 @@ def main() -> int:
         and phases.index("user") + 1 == phases.index("final"),
         "user-phase-order",
         "user evidence is immediately before final success",
+        results,
+    )
+
+    debug_only = (
+        ("wait", b"M4C_SCHED_TEST: PASS"),
+        ("tlb", b"M4C_TLB_TEST: PASS"),
+        ("final", b"SMP_TEST: PASS"),
+    )
+    release_final = ("final", b"kernel_main: initialization completed")
+    check(
+        all(
+            stable.count(marker) == 0 and debug_markers.count(marker) == 1
+            for marker in debug_only
+        ),
+        "profile-evidence-split",
+        "debug-only M4/M5 verifiers are not required from Release",
+        results,
+    )
+    check(
+        stable.count(release_final) == 1,
+        "release-final-evidence",
+        "Release has an unconditional final-phase marker",
         results,
     )
 
