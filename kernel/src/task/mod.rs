@@ -1,3 +1,4 @@
+// M6-B r4 compact intrusive wait queues.
 #[cfg(debug_assertions)]
 mod idle_verify;
 
@@ -95,6 +96,12 @@ impl Default for MigrationGuard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TaskId(usize);
 
+impl TaskId {
+    pub(crate) const fn raw(self) -> usize {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TaskState {
     Runnable,
@@ -133,7 +140,35 @@ struct Task {
     queued_on: Option<CpuId>,
     has_run: bool,
     wait_channel: Option<usize>,
+    wait_prev: Option<TaskId>,
+    wait_next: Option<TaskId>,
     wake_after_switch: bool,
+}
+
+fn fresh_task_context(
+    stack: &KernelStack,
+    entry: unsafe extern "C" fn() -> !,
+) -> crate::arch::task::Context {
+    // One global constructor serves idle tasks, counted kthreads, and permanent
+    // system threads.  The saved SP is fully valid before run-queue publication.
+    let initial_sp = stack.initial_stack_pointer();
+    let context = crate::arch::task::Context::new(initial_sp, entry);
+    let saved_sp = context.saved_stack_pointer();
+
+    assert_eq!(
+        saved_sp, initial_sp,
+        "architecture context changed the validated fresh-task SP",
+    );
+    assert!(
+        stack.contains(saved_sp),
+        "fresh task context published an unmapped kernel SP",
+    );
+    assert_eq!(
+        stack.upper_headroom(saved_sp),
+        crate::arch::task::FRESH_TASK_STACK_RESERVE,
+        "fresh task context lost its architecture bootstrap reserve",
+    );
+    context
 }
 
 impl Task {
@@ -149,6 +184,8 @@ impl Task {
             queued_on: None,
             has_run: true,
             wait_channel: None,
+            wait_prev: None,
+            wait_next: None,
             wake_after_switch: false,
         }
     }
@@ -158,13 +195,15 @@ impl Task {
             id,
             kind: TaskKind::Idle(cpu),
             state: TaskState::Idle(cpu),
-            context: crate::arch::task::Context::new(stack.top(), idle_thread_bootstrap),
+            context: fresh_task_context(&stack, idle_thread_bootstrap),
             stack: Some(stack),
             entry: None,
             affinity: Some(cpu),
             queued_on: None,
             has_run: false,
             wait_channel: None,
+            wait_prev: None,
+            wait_next: None,
             wake_after_switch: false,
         }
     }
@@ -184,13 +223,15 @@ impl Task {
             id,
             kind,
             state: TaskState::Runnable,
-            context: crate::arch::task::Context::new(stack.top(), kernel_thread_bootstrap),
+            context: fresh_task_context(&stack, kernel_thread_bootstrap),
             stack: Some(stack),
             entry: Some(entry),
             affinity,
             queued_on: None,
             has_run: false,
             wait_channel: None,
+            wait_prev: None,
+            wait_next: None,
             wake_after_switch: false,
         }
     }
@@ -217,6 +258,11 @@ impl Task {
         assert!(
             !self.wake_after_switch,
             "destroying task with a pending wake claim: {:?}",
+            self.id,
+        );
+        assert!(
+            self.wait_prev.is_none() && self.wait_next.is_none(),
+            "destroying task retained intrusive wait links: {:?}",
             self.id,
         );
         if let Some(stack) = self.stack.take() {
@@ -586,7 +632,8 @@ impl Scheduler {
         Some(self.context_pair(previous, next))
     }
 
-    fn prepare_block(&mut self, cpu: CpuId, channel: usize) -> ContextSwitch {
+    fn prepare_block(&mut self, cpu: CpuId, queue: &WaitQueue) -> ContextSwitch {
+        let channel = queue.channel();
         assert_ne!(channel, 0, "wait channel zero is reserved");
         assert!(
             self.cpus[cpu.get()].pending.is_none(),
@@ -610,25 +657,28 @@ impl Scheduler {
             !previous_task.kind.is_idle(),
             "idle task attempted to block on a wait queue",
         );
-
         assert!(
             previous_task.wait_channel.is_none(),
             "task attempted to join a second wait queue: task={previous:?} channel={:?}",
             previous_task.wait_channel,
         );
         assert!(
+            previous_task.wait_prev.is_none() && previous_task.wait_next.is_none(),
+            "running task retained stale intrusive wait links: task={previous:?}",
+        );
+        assert!(
             !previous_task.wake_after_switch,
             "running task retained a stale wake claim: task={previous:?}",
         );
+
         let next = self.dequeue_next(cpu).unwrap_or_else(|| self.idle(cpu));
         assert_ne!(previous, next);
-
         {
             let task = self.task_mut(previous);
             task.state = TaskState::SwitchingOut(cpu);
-            task.wait_channel = Some(channel);
             task.wake_after_switch = false;
         }
+        self.link_waiter(queue, previous, channel);
         self.activate_next(next, cpu);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
@@ -639,7 +689,6 @@ impl Scheduler {
             .context_switches
             .checked_add(1)
             .expect("context switch counter overflowed");
-
         self.context_pair(previous, next)
     }
 
@@ -979,39 +1028,157 @@ impl Scheduler {
         })
     }
 
-    fn wake_waiters(&mut self, waiters: wait_queue::ClaimedWaiters) -> (usize, usize) {
+    fn link_waiter(&mut self, queue: &WaitQueue, id: TaskId, channel: usize) {
+        let mut list = queue.waiters.lock();
+        assert!(list.count < MAX_TASKS, "wait queue capacity exhausted");
+
+        {
+            let task = self.task(id);
+            assert!(matches!(task.state, TaskState::SwitchingOut(_)));
+            assert!(task.wait_channel.is_none());
+            assert!(task.wait_prev.is_none() && task.wait_next.is_none());
+        }
+
+        let previous_tail = list.tail;
+        if let Some(tail) = previous_tail {
+            let tail_task = self.task_mut(tail);
+            assert!(
+                tail_task.wait_next.is_none(),
+                "wait queue tail had a successor"
+            );
+            tail_task.wait_next = Some(id);
+        } else {
+            assert!(list.head.is_none(), "empty wait queue retained a head");
+            list.head = Some(id);
+        }
+
+        {
+            let task = self.task_mut(id);
+            task.wait_channel = Some(channel);
+            task.wait_prev = previous_tail;
+            task.wait_next = None;
+        }
+        list.tail = Some(id);
+        list.count = list.count.checked_add(1).expect("waiter count overflowed");
+    }
+
+    fn waiter_is_linked(&self, list: &wait_queue::WaitList, id: TaskId, channel: usize) -> bool {
+        let task = self.task(id);
+        task.wait_channel == Some(channel)
+            && (list.head == Some(id)
+                || list.tail == Some(id)
+                || task.wait_prev.is_some()
+                || task.wait_next.is_some())
+    }
+
+    fn unlink_waiter_locked(
+        &mut self,
+        list: &mut wait_queue::WaitList,
+        id: TaskId,
+        channel: usize,
+    ) {
+        assert!(
+            self.waiter_is_linked(list, id, channel),
+            "waiter was unlinked twice or belonged to another queue",
+        );
+        let (previous, next) = {
+            let task = self.task(id);
+            assert_eq!(
+                task.wait_channel,
+                Some(channel),
+                "waiter belonged to a different queue",
+            );
+            (task.wait_prev, task.wait_next)
+        };
+
+        if let Some(previous) = previous {
+            let previous_task = self.task_mut(previous);
+            assert_eq!(previous_task.wait_next, Some(id));
+            previous_task.wait_next = next;
+        } else {
+            assert_eq!(list.head, Some(id));
+            list.head = next;
+        }
+
+        if let Some(next) = next {
+            let next_task = self.task_mut(next);
+            assert_eq!(next_task.wait_prev, Some(id));
+            next_task.wait_prev = previous;
+        } else {
+            assert_eq!(list.tail, Some(id));
+            list.tail = previous;
+        }
+
+        {
+            let task = self.task_mut(id);
+            task.wait_prev = None;
+            task.wait_next = None;
+        }
+        list.count = list.count.checked_sub(1).expect("waiter count underflowed");
+        assert_eq!(list.head.is_none(), list.tail.is_none());
+        assert_eq!(list.count == 0, list.head.is_none());
+    }
+
+    fn wake_waiters(
+        &mut self,
+        queue: &WaitQueue,
+        maximum: usize,
+        target: Option<TaskId>,
+    ) -> (usize, usize) {
+        assert!((1..=MAX_TASKS).contains(&maximum));
+        let channel = queue.channel();
+        let mut list = queue.waiters.lock();
         let mut target_mask = 0;
         let mut count = 0;
 
-        for id in waiters.tasks.into_iter().take(waiters.count).flatten() {
+        while count < maximum {
+            let id = match target {
+                Some(target) => {
+                    if count != 0 || !self.waiter_is_linked(&list, target, channel) {
+                        break;
+                    }
+                    target
+                }
+                None => match list.head {
+                    Some(head) => head,
+                    None => break,
+                },
+            };
+
+            self.unlink_waiter_locked(&mut list, id, channel);
             match self.task(id).state {
                 TaskState::Blocked => {
-                    let target = self
+                    let target_cpu = self
                         .task(id)
                         .affinity
                         .unwrap_or_else(|| self.choose_target_cpu());
                     {
                         let task = self.task_mut(id);
                         assert!(!task.wake_after_switch);
+                        assert!(task.wait_prev.is_none() && task.wait_next.is_none());
                         task.wait_channel = None;
                         task.state = TaskState::Runnable;
                     }
-                    self.enqueue(id, target);
-                    self.cpus[target.get()].need_resched = true;
-                    target_mask |= 1_usize << target.get();
+                    self.enqueue(id, target_cpu);
+                    self.cpus[target_cpu.get()].need_resched = true;
+                    target_mask |= 1_usize << target_cpu.get();
                     count += 1;
                 }
                 TaskState::SwitchingOut(cpu) => {
                     let task = self.task_mut(id);
                     assert!(!task.wake_after_switch, "waiter was claimed twice");
-                    // This is the wait-queue equivalent of Linux's
-                    // try_to_wake_up(): claim the sleep transition exactly
-                    // once while the old context still owns its stack.
+                    assert!(task.wait_prev.is_none() && task.wait_next.is_none());
+                    // The queue link is already gone, but switch-tail still
+                    // owns wait_channel until the old stack is no longer live.
                     task.wake_after_switch = true;
                     target_mask |= 1_usize << cpu.get();
                     count += 1;
                 }
                 state => panic!("invalid waiter state during wakeup: {state:?}"),
+            }
+
+            if target.is_some() {
+                break;
             }
         }
 
@@ -1297,7 +1464,7 @@ pub fn irq_depth() -> usize {
         .irq_depth(cpu)
 }
 
-pub(super) fn current_task_id() -> TaskId {
+pub(crate) fn current_task_id() -> TaskId {
     let cpu = crate::smp::current_cpu_id();
     let slot = SCHEDULER.lock();
     slot.as_ref()
@@ -1310,72 +1477,33 @@ where
     F: FnOnce() -> bool,
 {
     crate::context::might_sleep();
-
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
     let switch = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
         scheduler.assert_schedulable(cpu);
-
         if should_block() {
-            let current = scheduler.current(cpu);
-            let channel = queue.channel();
-            queue.enqueue_current(current);
-            Some(scheduler.prepare_block(cpu, channel))
+            Some(scheduler.prepare_block(cpu, queue))
         } else {
             None
         }
     };
-
     let Some((previous, next)) = switch else {
         return false;
     };
-
     #[cfg(debug_assertions)]
     m4c_verify::before_block_context_switch();
-
     // SAFETY: the outgoing task is held in SwitchingOut until the incoming
-    // context completes the switch. The wait channel remains attached to it,
-    // so a concurrent wakeup becomes wake_after_switch instead of being lost.
+    // context completes the switch.
     unsafe { crate::arch::task::switch(previous, next) };
-
     finish_switch();
     drop(interrupt_guard);
     reap_retired_tasks();
     true
 }
 
-pub(super) fn wake_queue(queue: &WaitQueue, maximum: usize) -> usize {
-    let (woken, targets) = {
-        let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        let waiters = queue.claim_waiters(maximum);
-        scheduler.wake_waiters(waiters)
-    };
-
-    let current = crate::smp::current_cpu_id();
-    for index in 0..crate::smp::discovered_cpu_count() {
-        let bit = 1_usize << index;
-        if targets & bit == 0 {
-            continue;
-        }
-
-        let cpu = CpuId::new(index).expect("wakeup target exceeds MAX_CPUS");
-        if cpu != current {
-            crate::smp::send_ipi(cpu);
-        }
-    }
-
-    woken
-}
-
-pub(super) fn wake_task_on_queue(queue: &WaitQueue, task: TaskId) -> bool {
-    let (woken, targets) = {
-        let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.wake_waiters(queue.claim_task(task))
-    };
+fn send_wakeup_ipis(targets: usize) {
     let current = crate::smp::current_cpu_id();
     for index in 0..crate::smp::discovered_cpu_count() {
         if targets & (1_usize << index) == 0 {
@@ -1386,6 +1514,25 @@ pub(super) fn wake_task_on_queue(queue: &WaitQueue, task: TaskId) -> bool {
             crate::smp::send_ipi(cpu);
         }
     }
+}
+
+pub(super) fn wake_queue(queue: &WaitQueue, maximum: usize) -> usize {
+    let (woken, targets) = {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.wake_waiters(queue, maximum, None)
+    };
+    send_wakeup_ipis(targets);
+    woken
+}
+
+pub(super) fn wake_task_on_queue(queue: &WaitQueue, task: TaskId) -> bool {
+    let (woken, targets) = {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.wake_waiters(queue, 1, Some(task))
+    };
+    send_wakeup_ipis(targets);
     assert!(woken <= 1, "targeted wake claimed multiple tasks");
     woken == 1
 }
@@ -1553,18 +1700,33 @@ pub(crate) fn run_verifier_thread(entry: KernelThreadEntry) {
         "timer verifier requires a quiescent counted kernel-thread set",
     );
 
-    // Linux-style rule: code which can sleep runs in a schedulable task, not
-    // in the per-CPU idle thread.  The idle launcher only yields while the
-    // verifier worker blocks on timers/completions and is woken normally.
-    spawn_kernel_thread(entry);
+    // M6-B r1: verifier launcher follows the real idle path.
+    //
+    // Keep the verifier on CPU0.  The boot idle task may then stop its local
+    // scheduler tick and rely on the verifier's local one-shot deadline (or a
+    // local runnable wakeup) to make progress.  An unpinned verifier could run
+    // remotely while CPU0 has no local deadline and no completion IPI.
+    let (_, target) = spawn_internal(entry, Some(CpuId::BOOT), Some(CpuId::BOOT));
+    assert_eq!(target, CpuId::BOOT, "verifier was queued away from CPU0");
+
     let worker_deadline = verification_deadline();
     while live_kernel_threads() != 0 {
         assert!(
             !deadline_reached(crate::arch::time::counter(), worker_deadline),
             "timer verifier kernel thread timed out",
         );
-        yield_now();
-        spin_loop();
+
+        // This function executes on the boot idle task.  Reuse the same
+        // decision as idle_loop(): schedule runnable work, otherwise perform
+        // the IRQ-disabled final recheck and enter the architecture idle path.
+        // Busy polling here would keep the scheduler tick active and would
+        // make delayed-work/nohz verification impossible by construction.
+        reap_retired_tasks();
+        if current_cpu_has_work() {
+            yield_now();
+        } else {
+            idle_until_interrupt();
+        }
     }
 
     // complete_switch() publishes the retired-task lifetime while holding the
@@ -1599,6 +1761,21 @@ fn spawn_system_thread(
     }
 
     (id, target)
+}
+
+pub(crate) fn spawn_system_thread_on(entry: KernelThreadEntry, cpu: CpuId) -> TaskId {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+    assert!(
+        crate::smp::is_scheduler_active(cpu),
+        "system-thread target CPU is not scheduler-active",
+    );
+    let (id, target) = spawn_system_thread(entry, Some(cpu), Some(cpu));
+    assert_eq!(
+        target, cpu,
+        "pinned system thread was queued on the wrong CPU"
+    );
+    id
 }
 
 fn spawn_internal(
@@ -1732,13 +1909,21 @@ fn exit_current() -> ! {
 
 fn finish_switch() {
     let cpu = crate::smp::current_cpu_id();
-    let retired_task_added = {
+    let running_sp = crate::arch::task::current_stack_pointer();
+    let (retired_task_added, current_is_idle) = {
         let mut slot = SCHEDULER.lock();
-        slot.as_mut()
-            .expect("kernel scheduler is not initialized")
-            .complete_switch(cpu, crate::arch::task::current_stack_pointer())
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        let retired_task_added = scheduler.complete_switch(cpu, running_sp);
+        let current = scheduler.current(cpu);
+        let current_is_idle = scheduler.task(current).kind.is_idle();
+        (retired_task_added, current_is_idle)
     };
 
+    // The switch tail still owns the IRQ-save guard, but no longer owns the
+    // scheduler lock. Restore policy ticks here to preserve Timer < Scheduler.
+    if !current_is_idle {
+        crate::time::leave_idle();
+    }
     if retired_task_added {
         TASK_REAPER_QUEUE.wake_one();
     }
@@ -1964,6 +2149,7 @@ fn idle_until_interrupt() {
         return;
     }
 
+    crate::time::enter_idle();
     let cpu = crate::smp::current_cpu_id();
     #[cfg(debug_assertions)]
     idle_verify::before_arch_wait(cpu);

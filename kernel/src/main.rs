@@ -23,6 +23,7 @@ mod tlb;
 mod tracked_spin;
 mod trap;
 mod vm;
+mod workqueue;
 extern crate alloc;
 
 use myos_boot::BootInfo;
@@ -246,8 +247,11 @@ fn kernel_main(boot: BootInfo) -> ! {
     task::initialize();
     smp::start_secondaries();
     task::finalize_cpu_bringup();
+    workqueue::initialize();
     #[cfg(debug_assertions)]
     timer::verify();
+    #[cfg(debug_assertions)]
+    workqueue::verify();
     #[cfg(debug_assertions)]
     tracked_spin::verify();
 

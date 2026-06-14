@@ -1,4 +1,5 @@
 use core::{
+    mem::size_of,
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     time::Duration,
 };
@@ -9,7 +10,7 @@ use crate::{
     time::MonotonicInstant,
 };
 
-use super::{MAX_TASKS, TaskId};
+use super::TaskId;
 
 static NEXT_WAIT_CHANNEL: AtomicUsize = AtomicUsize::new(1);
 const COMPLETION_ALL: usize = usize::MAX / 2;
@@ -23,115 +24,32 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitEntryState {
-    NotQueued,
-    Queued,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WaitEntry {
-    task: Option<TaskId>,
-    state: WaitEntryState,
-    exclusive: bool,
-}
-
-impl WaitEntry {
-    const EMPTY: Self = Self {
-        task: None,
-        state: WaitEntryState::NotQueued,
-        exclusive: true,
-    };
-}
-
-struct WaitList {
-    entries: [WaitEntry; MAX_TASKS],
-    count: usize,
+/// Compact queue head. Waiter linkage lives in `Task`, exactly as Linux keeps
+/// the queue head small and stores a list node in each wait entry.
+///
+/// All mutations happen while holding `SCHEDULER` followed by this queue's
+/// WaitQueue-rank lock. This makes task state and queue ownership one atomic
+/// scheduler transaction without allocating in IRQ context.
+pub(super) struct WaitList {
+    pub(super) head: Option<TaskId>,
+    pub(super) tail: Option<TaskId>,
+    pub(super) count: usize,
 }
 
 impl WaitList {
     const fn new() -> Self {
         Self {
-            entries: [WaitEntry::EMPTY; MAX_TASKS],
-            count: 0,
-        }
-    }
-
-    fn enqueue(&mut self, task: TaskId, exclusive: bool) {
-        assert!(
-            !self
-                .entries
-                .iter()
-                .any(|entry| entry.task == Some(task) && entry.state == WaitEntryState::Queued),
-            "task was queued twice on the same wait queue: {task:?}",
-        );
-        let slot = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.state == WaitEntryState::NotQueued)
-            .expect("wait queue capacity exhausted");
-        *slot = WaitEntry {
-            task: Some(task),
-            state: WaitEntryState::Queued,
-            exclusive,
-        };
-        self.count = self.count.checked_add(1).expect("waiter count overflowed");
-    }
-
-    fn claim(&mut self, maximum: usize) -> ClaimedWaiters {
-        assert!(maximum != 0, "wake limit must be non-zero");
-        let mut claimed = ClaimedWaiters::empty();
-        for entry in &mut self.entries {
-            if claimed.count == maximum {
-                break;
-            }
-            if entry.state != WaitEntryState::Queued {
-                continue;
-            }
-            let task = entry.task.expect("queued wait entry lost its task");
-            claimed.tasks[claimed.count] = Some(task);
-            claimed.count += 1;
-            let _exclusive = entry.exclusive;
-            *entry = WaitEntry::EMPTY;
-            self.count = self.count.checked_sub(1).expect("waiter count underflowed");
-        }
-        claimed
-    }
-
-    fn claim_task(&mut self, target: TaskId) -> ClaimedWaiters {
-        let mut claimed = ClaimedWaiters::empty();
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.state == WaitEntryState::Queued && entry.task == Some(target))
-        else {
-            return claimed;
-        };
-        claimed.tasks[0] = Some(target);
-        claimed.count = 1;
-        *entry = WaitEntry::EMPTY;
-        self.count = self.count.checked_sub(1).expect("waiter count underflowed");
-        claimed
-    }
-
-    fn waiter_count(&self) -> usize {
-        self.count
-    }
-}
-
-pub(super) struct ClaimedWaiters {
-    pub(super) tasks: [Option<TaskId>; MAX_TASKS],
-    pub(super) count: usize,
-}
-
-impl ClaimedWaiters {
-    const fn empty() -> Self {
-        Self {
-            tasks: [None; MAX_TASKS],
+            head: None,
+            tail: None,
             count: 0,
         }
     }
 }
+
+const _: () = {
+    // Never allow a task-count-sized array to creep back into the queue head.
+    assert!(size_of::<WaitList>() <= 6 * size_of::<usize>());
+};
 
 struct TimeoutContext {
     state: AtomicU8,
@@ -160,14 +78,14 @@ fn timeout_callback(argument: usize) {
     super::wake_task_on_queue(queue, timeout.task);
 }
 
-/// A scheduler wait queue with an explicit waiter list.
+/// A compact scheduler wait-queue head.
 ///
-/// The condition protected by a wait queue must be published before calling
-/// `wake_one` or `wake_all`. Wait paths recheck the condition while the
-/// scheduler lock is held, then queue the current task before switching out.
+/// The queue owns only a head/tail/count triple. Each blocked task contributes
+/// its own intrusive links, so embedding a WaitQueue or Completion in another
+/// kernel object is constant-size and cannot consume kilobytes of kernel stack.
 pub struct WaitQueue {
     channel: AtomicUsize,
-    waiters: IrqSpinLock<WaitList>,
+    pub(super) waiters: IrqSpinLock<WaitList>,
 }
 
 impl WaitQueue {
@@ -258,9 +176,9 @@ impl WaitQueue {
         }
         let _ = crate::timer::cancel_sync(handle);
 
-        // The protected condition wins a boundary race, matching the usual
-        // Linux wait-event timeout rule: a condition observed true at expiry is
-        // success rather than a spurious timeout.
+        // The protected condition wins a boundary race, matching Linux's
+        // wait-event timeout rule: true-at-expiry is success, not a spurious
+        // timeout.
         if condition() {
             WaitOutcome::Satisfied
         } else if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
@@ -308,20 +226,8 @@ impl WaitQueue {
         }
     }
 
-    pub(super) fn enqueue_current(&self, task: TaskId) {
-        self.waiters.lock().enqueue(task, true);
-    }
-
-    pub(super) fn claim_waiters(&self, maximum: usize) -> ClaimedWaiters {
-        self.waiters.lock().claim(maximum)
-    }
-
-    pub(super) fn claim_task(&self, task: TaskId) -> ClaimedWaiters {
-        self.waiters.lock().claim_task(task)
-    }
-
     fn waiter_count_inner(&self) -> usize {
-        self.waiters.lock().waiter_count()
+        self.waiters.lock().count
     }
 
     fn assert_empty(&self, operation: &str) {
@@ -392,10 +298,6 @@ impl Completion {
         }
     }
 
-    /// Consumes one completion token without blocking.
-    ///
-    /// `complete_all()` leaves the completion permanently signalled until an
-    /// externally quiescent caller invokes `reinit()`.
     pub fn try_wait(&self) -> bool {
         loop {
             let done = self.done.load(Ordering::Acquire);
@@ -437,8 +339,6 @@ impl Completion {
         self.waiters.wake_all();
     }
 
-    /// Resets a completion after all users of the previous generation have
-    /// quiesced. Reinitialising concurrently with wait/complete is invalid.
     pub fn reinit(&self) {
         self.waiters.assert_empty("completion reinitialised");
         self.done.store(0, Ordering::Release);
@@ -454,6 +354,13 @@ impl Default for Completion {
         Self::new()
     }
 }
+
+const _: () = {
+    // These caps are deliberately generous enough for lockdep metadata while
+    // still making a regression to O(MAX_TASKS) storage fail at compile time.
+    assert!(size_of::<WaitQueue>() <= 256);
+    assert!(size_of::<Completion>() <= 320);
+};
 
 #[cfg(debug_assertions)]
 pub(super) fn verify_local() {
@@ -474,6 +381,7 @@ pub(super) fn verify_local() {
     assert!(!completion.try_wait());
 
     crate::println!("wait queue/completion invariant test:");
+    crate::println!("  compact intrusive head   : verified");
     crate::println!("  counted completion token : verified");
     crate::println!("  complete-all generation  : verified");
     crate::println!("  quiescent reinitialise   : verified");

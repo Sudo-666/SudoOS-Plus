@@ -26,4 +26,8 @@ __MACOSX/
 .env
 .env.*
 !.env.example
-.github/
+# Python generated cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+__pycache__/

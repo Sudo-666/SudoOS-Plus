@@ -1,6 +1,6 @@
 mod context;
 
-pub use context::Context;
+pub use context::{Context, FRESH_TASK_STACK_RESERVE};
 
 pub fn current_stack_pointer() -> usize {
     let stack_pointer: usize;

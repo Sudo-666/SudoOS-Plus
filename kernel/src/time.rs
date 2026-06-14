@@ -1,5 +1,6 @@
+// M6-B tickless scheduler-idle clockevent policy.
 use core::{
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -18,6 +19,8 @@ static NEXT_SCHEDULER_DEADLINES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new
 static TIMER_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static CLOCKEVENT_MODES: [AtomicU8; MAX_CPUS] =
     [const { AtomicU8::new(CLOCKEVENT_STOPPED) }; MAX_CPUS];
+static SCHEDULER_TICK_ACTIVE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+static TICKLESS_IDLE_ENTRIES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// A point on the architecture's wrapping monotonic counter.
 ///
@@ -145,6 +148,7 @@ fn arm_scheduler_tick_local() {
     let deadline = now().wrapping_add_cycles(tick_period_cycles());
     TIMER_TICKS[cpu].store(0, Ordering::Release);
     NEXT_SCHEDULER_DEADLINES[cpu].store(deadline.cycles(), Ordering::Release);
+    SCHEDULER_TICK_ACTIVE[cpu].store(true, Ordering::Release);
 
     crate::arch::time::acknowledge();
     reprogram_local(crate::timer::earliest_local());
@@ -170,20 +174,24 @@ pub fn begin_timer_interrupt() -> TimerInterrupt {
 
     crate::arch::time::acknowledge();
     let current = now();
-    let period = tick_period_cycles();
-    let scheduled =
-        MonotonicInstant::from_cycles(NEXT_SCHEDULER_DEADLINES[cpu].load(Ordering::Acquire));
+    let elapsed_ticks = if SCHEDULER_TICK_ACTIVE[cpu].load(Ordering::Acquire) {
+        let period = tick_period_cycles();
+        let scheduled =
+            MonotonicInstant::from_cycles(NEXT_SCHEDULER_DEADLINES[cpu].load(Ordering::Acquire));
 
-    let elapsed_ticks = if deadline_reached(current, scheduled) {
-        let overdue = current.cycles().wrapping_sub(scheduled.cycles());
-        let elapsed = overdue / period + 1;
-        let advance = period
-            .checked_mul(elapsed)
-            .expect("scheduler deadline advance overflowed");
-        let next = scheduled.wrapping_add_cycles(advance);
-        NEXT_SCHEDULER_DEADLINES[cpu].store(next.cycles(), Ordering::Release);
-        TIMER_TICKS[cpu].fetch_add(elapsed, Ordering::AcqRel);
-        elapsed
+        if deadline_reached(current, scheduled) {
+            let overdue = current.cycles().wrapping_sub(scheduled.cycles());
+            let elapsed = overdue / period + 1;
+            let advance = period
+                .checked_mul(elapsed)
+                .expect("scheduler deadline advance overflowed");
+            let next = scheduled.wrapping_add_cycles(advance);
+            NEXT_SCHEDULER_DEADLINES[cpu].store(next.cycles(), Ordering::Release);
+            TIMER_TICKS[cpu].fetch_add(elapsed, Ordering::AcqRel);
+            elapsed
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -206,11 +214,21 @@ pub fn reprogram_local(software_deadline: Option<MonotonicInstant>) {
         return;
     }
 
-    let scheduler =
-        MonotonicInstant::from_cycles(NEXT_SCHEDULER_DEADLINES[cpu].load(Ordering::Acquire));
-    let chosen = software_deadline
-        .map(|deadline| earlier_deadline(deadline, scheduler))
-        .unwrap_or(scheduler);
+    let scheduler_deadline = SCHEDULER_TICK_ACTIVE[cpu].load(Ordering::Acquire).then(|| {
+        MonotonicInstant::from_cycles(NEXT_SCHEDULER_DEADLINES[cpu].load(Ordering::Acquire))
+    });
+    let chosen = match (scheduler_deadline, software_deadline) {
+        (Some(scheduler), Some(software)) => earlier_deadline(scheduler, software),
+        (Some(scheduler), None) => scheduler,
+        (None, Some(software)) => software,
+        (None, None) => {
+            crate::arch::time::shutdown().unwrap_or_else(|error| {
+                panic!("unable to stop deadline-free local clockevent: {error:?}")
+            });
+            return;
+        }
+    };
+
     let current = now();
     let minimum_delta = minimum_clockevent_delta_cycles();
     let distance = chosen.cycles().wrapping_sub(current.cycles());
@@ -220,6 +238,42 @@ pub fn reprogram_local(software_deadline: Option<MonotonicInstant>) {
         chosen
     };
     program_deadline(safe);
+    if !crate::arch::time::interrupt_source_enabled() {
+        crate::arch::time::enable_interrupt_source();
+    }
+}
+
+pub(crate) fn enter_idle() {
+    assert!(
+        crate::arch::interrupt::are_disabled(),
+        "tickless idle entry requires local interrupts disabled",
+    );
+    let cpu = current_cpu_index();
+    if CLOCKEVENT_MODES[cpu].load(Ordering::Acquire) != CLOCKEVENT_RUNNING {
+        return;
+    }
+    if SCHEDULER_TICK_ACTIVE[cpu].swap(false, Ordering::AcqRel) {
+        NEXT_SCHEDULER_DEADLINES[cpu].store(0, Ordering::Release);
+        TICKLESS_IDLE_ENTRIES[cpu].fetch_add(1, Ordering::AcqRel);
+    }
+    reprogram_local(crate::timer::earliest_local());
+}
+
+pub(crate) fn leave_idle() {
+    assert!(
+        crate::arch::interrupt::are_disabled(),
+        "tickless idle exit requires local interrupts disabled",
+    );
+    let cpu = current_cpu_index();
+    if CLOCKEVENT_MODES[cpu].load(Ordering::Acquire) != CLOCKEVENT_RUNNING {
+        return;
+    }
+    if SCHEDULER_TICK_ACTIVE[cpu].swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let deadline = now().wrapping_add_cycles(tick_period_cycles());
+    NEXT_SCHEDULER_DEADLINES[cpu].store(deadline.cycles(), Ordering::Release);
+    reprogram_local(crate::timer::earliest_local());
 }
 
 pub fn now() -> MonotonicInstant {
@@ -261,7 +315,16 @@ pub fn timer_ticks_for(cpu: crate::smp::CpuId) -> u64 {
 
 #[cfg(debug_assertions)]
 pub fn periodic_running_for(cpu: crate::smp::CpuId) -> bool {
-    CLOCKEVENT_MODES[cpu.get()].load(Ordering::Acquire) == CLOCKEVENT_RUNNING
+    SCHEDULER_TICK_ACTIVE[cpu.get()].load(Ordering::Acquire)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn scheduler_tick_active_for(cpu: crate::smp::CpuId) -> bool {
+    SCHEDULER_TICK_ACTIVE[cpu.get()].load(Ordering::Acquire)
+}
+#[cfg(debug_assertions)]
+pub fn tickless_idle_entries_for(cpu: crate::smp::CpuId) -> u64 {
+    TICKLESS_IDLE_ENTRIES[cpu.get()].load(Ordering::Acquire)
 }
 
 #[cfg(debug_assertions)]
@@ -295,48 +358,6 @@ pub fn verify_periodic() {
     crate::println!("  periodic timer   : armed at {} Hz", TICKS_PER_SECOND);
 }
 
-#[cfg(debug_assertions)]
-pub fn pause_periodic_for_idle_test() {
-    crate::context::assert_task_context();
-    crate::context::assert_interrupts_enabled();
-    let _interrupt_guard = crate::context::IrqSaveGuard::new();
-    assert!(
-        crate::timer::earliest_local().is_none(),
-        "idle verification cannot pause a clockevent with armed software timers",
-    );
-
-    let cpu = current_cpu_index();
-    assert_eq!(
-        CLOCKEVENT_MODES[cpu].load(Ordering::Acquire),
-        CLOCKEVENT_RUNNING,
-        "idle verification attempted to pause a stopped clockevent",
-    );
-    crate::arch::time::shutdown()
-        .unwrap_or_else(|error| panic!("unable to pause local timer for idle test: {error:?}"));
-    NEXT_SCHEDULER_DEADLINES[cpu].store(0, Ordering::Release);
-    CLOCKEVENT_MODES[cpu].store(CLOCKEVENT_STOPPED, Ordering::Release);
-}
-
-#[cfg(debug_assertions)]
-pub fn resume_periodic_for_idle_test() {
-    crate::context::assert_task_context();
-    crate::context::assert_interrupts_enabled();
-
-    let _interrupt_guard = crate::context::IrqSaveGuard::new();
-    let cpu = current_cpu_index();
-    assert_eq!(
-        CLOCKEVENT_MODES[cpu].load(Ordering::Acquire),
-        CLOCKEVENT_STOPPED,
-        "idle verification attempted to resume a running clockevent",
-    );
-    let deadline = now().wrapping_add_cycles(tick_period_cycles());
-    NEXT_SCHEDULER_DEADLINES[cpu].store(deadline.cycles(), Ordering::Release);
-    CLOCKEVENT_MODES[cpu].store(CLOCKEVENT_RUNNING, Ordering::Release);
-    crate::arch::time::acknowledge();
-    program_deadline(deadline);
-    crate::arch::time::enable_interrupt_source();
-}
-
 pub(crate) fn deadline_reached(now: MonotonicInstant, deadline: MonotonicInstant) -> bool {
     now == deadline || instant_is_after(now, deadline)
 }
@@ -367,6 +388,8 @@ fn reset_current_clockevent() {
     let cpu = current_cpu_index();
     NEXT_SCHEDULER_DEADLINES[cpu].store(0, Ordering::Release);
     TIMER_TICKS[cpu].store(0, Ordering::Release);
+    SCHEDULER_TICK_ACTIVE[cpu].store(false, Ordering::Release);
+    TICKLESS_IDLE_ENTRIES[cpu].store(0, Ordering::Release);
     CLOCKEVENT_MODES[cpu].store(CLOCKEVENT_STOPPED, Ordering::Release);
 }
 

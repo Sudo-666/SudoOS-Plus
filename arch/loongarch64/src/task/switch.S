@@ -48,10 +48,8 @@ __loongarch_switch_context:
     .type __loongarch_fresh_context_entry, @function
 __loongarch_fresh_context_entry:
     # s0 ($r23) carries the Rust bootstrap entry. Build a mapped ABI frame.
-    addi.d $r3, $r3, -16
-    st.d $r0, $r3, 0
-    st.d $r0, $r3, 8
-    jirl $r1, $r23, 0
+    # Fresh SP was validated before publication; touch no stack here.
+jirl $r1, $r23, 0
     bl kernel_fresh_context_returned
     break 0
     .size __loongarch_fresh_context_entry, .-__loongarch_fresh_context_entry

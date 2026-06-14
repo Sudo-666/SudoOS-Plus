@@ -52,10 +52,8 @@ __riscv_switch_context:
     .type __riscv_fresh_context_entry, @function
 __riscv_fresh_context_entry:
     # s0 carries the Rust bootstrap entry. Build a mapped ABI caller frame.
-    addi sp, sp, -16
-    sd zero, 0(sp)
-    sd zero, 8(sp)
-    jalr ra, 0(s0)
+    # Fresh SP was validated before publication; touch no stack here.
+jalr ra, 0(s0)
     call kernel_fresh_context_returned
     .4byte 0
     .size __riscv_fresh_context_entry, .-__riscv_fresh_context_entry

@@ -215,7 +215,7 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 
 ## 下一步
 
-M5 已冻结。M6 从 timer queue / timeout / workqueue 开始，随后进入用户态。
+M5/M6 已冻结。下一阶段严格进入 M7 最小用户模式。
 
 ## M5 之后完整路线图
 
@@ -508,3 +508,24 @@ make m5-release M5_SOAK_LOOPS=200 M5_RELEASE_SOAK_LOOPS=20
 
 M5 后进入 M6：monotonic/one-shot timer、timer queue、timeout 和通用
 workqueue，随后开始最小用户态与 syscall 闭环。
+
+## M6-C 封版状态
+
+<!-- M6-C closure: reproducible local release gate -->
+
+M0–M5 已冻结，M6 的 timer、timeout、workqueue、delayed work 与 tickless
+idle 核心已经完成。M6-C 增加的是可重复的工程封版门禁，而不是另一套运行时状态机。
+
+```bash
+make m6-audit    # 静态检查 M6 跨文件不变量
+make m6-quick    # 双架构 Debug SMP=1/4
+make m6-full     # 双架构 SMP=1/2/4/8 × 64M/256M/1G × Debug/Release
+make m6-soak     # 双架构 SMP=4 重复压力
+make m6-release  # 干净工作树上的完整封版证据
+make m6-tag      # 仅接受当前 commit 的通过报告
+```
+
+完整边界和验收见 [`docs/m6-completion.md`](docs/m6-completion.md)、
+[`docs/m6-robustness.md`](docs/m6-robustness.md) 与
+[`docs/ci.md`](docs/ci.md)。GitHub Actions 默认不启用；本地 release gate 是 M6 的
+正式门禁。

@@ -19,6 +19,9 @@ pub enum LockRank {
     /// task which holds an IRQ-enabled CrossCpu serializer, so Timer
     /// must remain after CrossCpu and before Scheduler.
     Timer = 16,
+    /// IRQ-safe deferred-work bases. Publication may wake a task, so this
+    /// rank remains after Timer and before Scheduler.
+    WorkQueue = 17,
     Scheduler = 20,
     WaitQueue = 30,
     Vm = 40,
@@ -27,6 +30,13 @@ pub enum LockRank {
     PageAllocator = 70,
     Console = 80,
 }
+
+// M6-B deferred-execution lock order.
+const _: () = {
+    assert!((LockRank::CrossCpu as usize) < (LockRank::Timer as usize));
+    assert!((LockRank::Timer as usize) < (LockRank::WorkQueue as usize));
+    assert!((LockRank::WorkQueue as usize) < (LockRank::Scheduler as usize));
+};
 
 // hardirq timer rank must follow IRQ-enabled serializers.
 const _: () = {

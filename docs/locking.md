@@ -103,3 +103,21 @@ Consequences:
   shootdown; that can prevent the acknowledgements the protocol is waiting for.
 - every lock held with IRQs enabled must use `TrackedSpinLock`, whose runtime
   contract now verifies that its rank precedes `Timer`.
+
+## M6-B workqueue and tickless-idle lock graph
+
+M6-B extends the checked order to:
+
+```text
+CrossCpu < Timer < WorkQueue < Scheduler < WaitQueue
+```
+
+`workqueue_base` is IRQ-safe. A delayed timer callback releases `timer_base`
+before acquiring it, publishes only a pending item, releases it, and only then
+wakes a worker through the scheduler. Completion wait predicates read atomic
+generations and never acquire `workqueue_base` while the scheduler lock is held.
+
+Tickless idle follows the same graph: idle entry acquires the timer base only
+after the scheduler's final work check has released `Scheduler`; idle exit
+restores the scheduler tick from the context-switch tail after releasing
+`Scheduler`.

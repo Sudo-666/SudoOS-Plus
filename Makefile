@@ -250,3 +250,37 @@ help:
 	@echo "  STRESS_LOOPS=<count>"
 	@echo "  STRESS_TIMEOUT=<seconds>"
 	@echo "  QEMU_ARGS='<additional arguments>'"
+
+# M6-C closure: reproducible local release gate.
+M6_SOAK_LOOPS ?= 50
+M6_RELEASE_SOAK_LOOPS ?= 10
+export M6_SOAK_LOOPS
+export M6_RELEASE_SOAK_LOOPS
+
+.PHONY: m6-audit
+m6-audit:
+	@python3 scripts/m6-audit.py
+
+.PHONY: m6-quick
+m6-quick:
+	@python3 scripts/m6-verify.py --level quick
+
+.PHONY: m6-full
+m6-full:
+	@python3 scripts/m6-verify.py --level full
+
+.PHONY: m6-soak
+m6-soak:
+	@M6_SOAK_LOOPS="$(M6_SOAK_LOOPS)" \
+	 M6_RELEASE_SOAK_LOOPS="$(M6_RELEASE_SOAK_LOOPS)" \
+	 python3 scripts/m6-verify.py --level soak
+
+.PHONY: m6-release
+m6-release:
+	@M6_SOAK_LOOPS="$(M6_SOAK_LOOPS)" \
+	 M6_RELEASE_SOAK_LOOPS="$(M6_RELEASE_SOAK_LOOPS)" \
+	 python3 scripts/m6-verify.py --level release
+
+.PHONY: m6-tag
+m6-tag:
+	@./scripts/m6-tag.sh
