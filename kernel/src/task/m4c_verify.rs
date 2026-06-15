@@ -117,7 +117,15 @@ fn completion_all_worker() {
     COMPLETION_ALL_DONE.fetch_add(1, Ordering::AcqRel);
 }
 
-pub(super) fn before_block_context_switch() {
+// M7_SWITCH_HOOK_SCOPE_FIX: this fault-injection hook belongs only to the
+// dedicated switching-race waiter. It must never intercept reaper/workqueue
+// blocking on another queue or another CPU.
+pub(super) fn before_block_context_switch(queue: &WaitQueue, cpu: CpuId) {
+    let target = CpuId::new(1).expect("CPU1 exceeds MAX_CPUS");
+    if cpu != target || !core::ptr::eq(queue, &SWITCH_RACE_QUEUE) {
+        return;
+    }
+
     if SWITCH_RACE_HOOK_ARMED
         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -125,12 +133,20 @@ pub(super) fn before_block_context_switch() {
         return;
     }
 
-    // The scheduler lock has been released, but the outgoing task is still in
-    // SwitchingOut and local interrupts remain disabled. Holding this window
-    // open makes the wake-vs-switch race deterministic instead of relying on
-    // QEMU timing.
+    // The scheduler lock has been released, but the intended outgoing task is
+    // still SwitchingOut and local interrupts remain disabled. Bound the test
+    // hook itself so a verifier defect becomes a precise panic rather than an
+    // unbounded CPU stall hidden behind the outer QEMU timeout.
     SWITCH_RACE_HOOK_REACHED.store(true, Ordering::Release);
+    let deadline = super::verification_deadline();
     while !SWITCH_RACE_HOOK_RELEASE.load(Ordering::Acquire) {
+        if super::deadline_reached(crate::arch::time::counter(), deadline) {
+            panic!(
+                "M4C switching-out hook timed out: cpu={} queue={:p}",
+                cpu.get(),
+                queue,
+            );
+        }
         spin_loop();
     }
 }
@@ -304,6 +320,17 @@ fn verify_switching_out_wakeup() {
     SWITCH_RACE_HOOK_ARMED.store(true, Ordering::Release);
 
     let target = CpuId::new(1).expect("CPU1 exceeds MAX_CPUS");
+    // M7_SWITCH_HOOK_SCOPE_FIX: negative probes keep the injection point
+    // object- and CPU-specific. A global hook can deadlock CPU0 if the task
+    // reaper or a workqueue worker blocks before the intended CPU1 waiter.
+    before_block_context_switch(&WAIT_QUEUE, CpuId::BOOT);
+    before_block_context_switch(&SWITCH_RACE_QUEUE, CpuId::BOOT);
+    before_block_context_switch(&WAIT_QUEUE, target);
+    assert!(
+        SWITCH_RACE_HOOK_ARMED.load(Ordering::Acquire),
+        "an unrelated blocker consumed the switching-race hook",
+    );
+
     super::spawn_internal(switching_race_worker, Some(target), Some(target));
 
     wait_until("a waiter to enter SwitchingOut", || {

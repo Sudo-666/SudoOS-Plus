@@ -35,7 +35,11 @@ const MAX_CPUS: usize = crate::smp::MAX_CPUS;
 #[cfg(debug_assertions)]
 const SINGLE_CPU_VERIFY_ITERATIONS: usize = 50_000;
 #[cfg(debug_assertions)]
-const SMP_VERIFY_ITERATIONS: usize = 25_000;
+const SMP_VERIFY_ITERATIONS: usize = 512;
+#[cfg(debug_assertions)]
+const COOPERATIVE_VERIFY_ITERATIONS: usize = 50_256;
+#[cfg(debug_assertions)]
+const COOPERATIVE_MINIMUM_SWITCHES: u64 = 100_000;
 #[cfg(debug_assertions)]
 const STEAL_TASK_COUNT: usize = 16;
 #[cfg(debug_assertions)]
@@ -1502,7 +1506,7 @@ where
         return false;
     };
     #[cfg(debug_assertions)]
-    m4c_verify::before_block_context_switch();
+    m4c_verify::before_block_context_switch(queue, cpu);
     // SAFETY: the outgoing task is held in SwitchingOut until the incoming
     // context completes the switch.
     unsafe { crate::arch::task::switch(previous, next) };
@@ -2500,6 +2504,27 @@ fn verify_work_stealing(cpu_count: usize) {
     synchronize_retired_tasks();
 }
 
+// M7_COOPERATIVE_SWITCH_VERIFIER_V3_EXACT
+// Validate one completed verifier phase before its shared slots are reused.
+#[cfg(debug_assertions)]
+fn verify_worker_results(worker_count: usize, iterations: usize) {
+    for index in 0..worker_count {
+        assert_eq!(WORKER_PROGRESS[index].load(Ordering::Acquire), iterations);
+        assert_ne!(WORKER_STACKS[index].load(Ordering::Acquire), 0);
+        assert_eq!(
+            WORKER_CPUS[index].load(Ordering::Acquire),
+            EXPECTED_CPUS[index].load(Ordering::Acquire),
+        );
+        for stack_slot in WORKER_STACKS.iter().take(index) {
+            assert_ne!(
+                WORKER_STACKS[index].load(Ordering::Acquire),
+                stack_slot.load(Ordering::Acquire),
+                "two kernel threads shared a stack",
+            );
+        }
+    }
+}
+
 #[cfg(debug_assertions)]
 pub fn verify() {
     reset_verification_state();
@@ -2513,49 +2538,88 @@ pub fn verify() {
         crate::smp::ipi_ready_cpu_mask(),
         "scheduler-active and IPI-ready masks diverged before verification",
     );
-    let worker_count = if cpu_count == 1 { 2 } else { cpu_count };
-    let iterations = if cpu_count == 1 {
+
+    // Phase 1 proves topology, affinity, guarded private stacks, concurrent
+    // execution on SMP, and timer coexistence. It does not pretend that a
+    // lone runnable task's yield attempt must commit a task-to-task switch.
+    let topology_worker_count = if cpu_count == 1 { 2 } else { cpu_count };
+    let topology_iterations = if cpu_count == 1 {
         SINGLE_CPU_VERIFY_ITERATIONS
     } else {
         SMP_VERIFY_ITERATIONS
     };
-
-    VERIFY_ITERATIONS.store(iterations, Ordering::Release);
+    VERIFY_ITERATIONS.store(topology_iterations, Ordering::Release);
     USE_CONCURRENT_BARRIER.store(cpu_count > 1, Ordering::Release);
-    EXPECTED_WORKER_MASK.store((1_usize << worker_count) - 1, Ordering::Release);
+    EXPECTED_WORKER_MASK.store((1_usize << topology_worker_count) - 1, Ordering::Release);
 
     let pages_before = crate::page_alloc::total_free_pages()
         .expect("page allocator unavailable before scheduler verification");
     let switches_before = context_switches();
 
     let preempt_guard = PreemptGuard::new();
-    {
-        for index in 0..worker_count {
-            let cpu = if cpu_count == 1 {
-                CpuId::BOOT
-            } else {
-                CpuId::new(index).expect("worker CPU exceeds MAX_CPUS")
-            };
-            EXPECTED_CPUS[index].store(cpu.get(), Ordering::Release);
-            if cpu_count == 1 {
-                spawn_kernel_thread(WORKER_ENTRIES[index]);
-            } else {
-                spawn_queued_without_reschedule(WORKER_ENTRIES[index], Some(cpu), Some(cpu));
-            }
+    for index in 0..topology_worker_count {
+        let cpu = if cpu_count == 1 {
+            CpuId::BOOT
+        } else {
+            CpuId::new(index).expect("worker CPU exceeds MAX_CPUS")
+        };
+        EXPECTED_CPUS[index].store(cpu.get(), Ordering::Release);
+        if cpu_count == 1 {
+            spawn_kernel_thread(WORKER_ENTRIES[index]);
+        } else {
+            spawn_queued_without_reschedule(WORKER_ENTRIES[index], Some(cpu), Some(cpu));
         }
-
-        for index in 0..worker_count {
-            let cpu = if cpu_count == 1 {
-                CpuId::BOOT
-            } else {
-                CpuId::new(index).expect("worker CPU exceeds MAX_CPUS")
-            };
-            request_reschedule_on(cpu);
-        }
+    }
+    for index in 0..topology_worker_count {
+        let cpu = if cpu_count == 1 {
+            CpuId::BOOT
+        } else {
+            CpuId::new(index).expect("worker CPU exceeds MAX_CPUS")
+        };
+        request_reschedule_on(cpu);
     }
     drop(preempt_guard);
 
-    wait_for_workers(worker_count);
+    wait_for_workers(topology_worker_count);
+    verify_worker_results(topology_worker_count, topology_iterations);
+
+    // Phase 2 supplies the missing invariant on SMP: two peers are queued on
+    // the same CPU before either can run. Every cooperative yield therefore
+    // has a runnable peer and measures committed scheduler transitions rather
+    // than calls to yield_now(). The single-CPU topology phase already has two
+    // peers on CPU0 and is used directly.
+    let cooperative_switches = if cpu_count == 1 {
+        context_switches()
+            .checked_sub(switches_before)
+            .expect("context switch counter moved backwards")
+    } else {
+        synchronize_retired_tasks();
+        reset_verification_state();
+        VERIFY_ITERATIONS.store(COOPERATIVE_VERIFY_ITERATIONS, Ordering::Release);
+        USE_CONCURRENT_BARRIER.store(false, Ordering::Release);
+        EXPECTED_WORKER_MASK.store(0b11, Ordering::Release);
+
+        let cooperative_before = context_switches();
+        let preempt_guard = PreemptGuard::new();
+        for index in 0..2 {
+            EXPECTED_CPUS[index].store(CpuId::BOOT.get(), Ordering::Release);
+            let (_, target) = spawn_queued_without_reschedule(
+                WORKER_ENTRIES[index],
+                Some(CpuId::BOOT),
+                Some(CpuId::BOOT),
+            );
+            assert_eq!(target, CpuId::BOOT);
+        }
+        request_reschedule_on(CpuId::BOOT);
+        drop(preempt_guard);
+
+        wait_for_workers(2);
+        verify_worker_results(2, COOPERATIVE_VERIFY_ITERATIONS);
+        context_switches()
+            .checked_sub(cooperative_before)
+            .expect("context switch counter moved backwards during peer stress")
+    };
+
     verify_ipi_delivery(cpu_count);
     idle_verify::verify(cpu_count);
     verify_work_stealing(cpu_count);
@@ -2565,33 +2629,13 @@ pub fn verify() {
     let switches = context_switches()
         .checked_sub(switches_before)
         .expect("context switch counter moved backwards");
-    let minimum_switches = (iterations as u64)
-        .checked_mul(worker_count as u64)
-        .expect("scheduler switch threshold overflowed");
     let pages_after = crate::page_alloc::total_free_pages()
         .expect("page allocator unavailable after scheduler verification");
     let (idle_enters, idle_exits) = idle_counter_totals();
 
-    for index in 0..worker_count {
-        assert_eq!(WORKER_PROGRESS[index].load(Ordering::Acquire), iterations);
-        assert_ne!(WORKER_STACKS[index].load(Ordering::Acquire), 0);
-        assert_eq!(
-            WORKER_CPUS[index].load(Ordering::Acquire),
-            EXPECTED_CPUS[index].load(Ordering::Acquire),
-        );
-
-        for stack_slot in WORKER_STACKS.iter().take(index) {
-            assert_ne!(
-                WORKER_STACKS[index].load(Ordering::Acquire),
-                stack_slot.load(Ordering::Acquire),
-                "two kernel threads shared a stack",
-            );
-        }
-    }
-
     assert!(
-        switches >= minimum_switches,
-        "too few context switches: actual={switches} minimum={minimum_switches}",
+        cooperative_switches >= COOPERATIVE_MINIMUM_SWITCHES,
+        "too few cooperative context switches: actual={cooperative_switches} minimum={COOPERATIVE_MINIMUM_SWITCHES}",
     );
     assert_eq!(
         pages_before,
@@ -2606,34 +2650,37 @@ pub fn verify() {
     run_verifier_thread(m4c2_verify::verify);
 
     crate::println!("kernel scheduler test:");
-    crate::println!("  kernel threads  : verified ({})", worker_count);
-    crate::println!("  private stacks  : verified");
-    crate::println!("  context switch  : verified ({} switches)", switches);
-    crate::println!("  cooperative     : verified");
-    crate::println!("  timer coexistence: verified");
-    crate::println!("  task exit       : verified");
-    crate::println!("  resource reclaim: verified");
+    crate::println!(" kernel threads : verified ({})", topology_worker_count,);
+    crate::println!(" private stacks : verified");
+    crate::println!(" context switch : verified ({} switches)", switches);
     crate::println!(
-        "  idle protocol   : enters={} exits={}",
+        " runnable peers : verified ({} committed switches)",
+        cooperative_switches,
+    );
+    crate::println!(" cooperative : verified");
+    crate::println!(" timer coexistence: verified");
+    crate::println!(" task exit : verified");
+    crate::println!(" resource reclaim: verified");
+    crate::println!(
+        " idle protocol : enters={} exits={}",
         idle_enters,
         idle_exits,
     );
-
     crate::println!("SMP scheduler test:");
-    crate::println!("  participating CPUs : {}", cpu_count);
-    crate::println!("  concurrent threads : verified");
-    crate::println!("  per-CPU current     : verified");
-    crate::println!("  task affinity       : verified");
+    crate::println!(" participating CPUs : {}", cpu_count);
+    crate::println!(" concurrent threads : verified");
+    crate::println!(" per-CPU current : verified");
+    crate::println!(" task affinity : verified");
     if cpu_count > 1 {
-        crate::println!("  remote wakeup       : verified");
-        crate::println!("  IPI delivery        : verified");
-        crate::println!("  work stealing       : verified (runnable task migration)");
+        crate::println!(" remote wakeup : verified");
+        crate::println!(" IPI delivery : verified");
+        crate::println!(" work stealing : verified (runnable task migration)");
     } else {
-        crate::println!("  remote wakeup       : single-CPU fallback");
-        crate::println!("  IPI delivery        : single-CPU fallback");
-        crate::println!("  work stealing       : single-CPU fallback");
+        crate::println!(" remote wakeup : single-CPU fallback");
+        crate::println!(" IPI delivery : single-CPU fallback");
+        crate::println!(" work stealing : single-CPU fallback");
     }
-    crate::println!("  idle fallback       : verified");
-    crate::println!("  resource reclaim    : verified");
+    crate::println!(" idle fallback : verified");
+    crate::println!(" resource reclaim : verified");
     crate::println!("SMP_TEST: PASS");
 }
