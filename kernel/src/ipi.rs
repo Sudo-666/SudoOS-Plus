@@ -22,6 +22,15 @@ impl IpiMessage {
             Self::CallFunction => IPI_CALL_FUNCTION,
         }
     }
+
+    /// Synchronous cross-CPU operations must not depend on an unrelated
+    /// reschedule bit retaining a live hardware wakeup.
+    const fn requires_fresh_doorbell(self) -> bool {
+        match self {
+            Self::Reschedule => false,
+            Self::TlbShootdown | Self::CallFunction => true,
+        }
+    }
 }
 
 struct IpiMailbox {
@@ -53,23 +62,25 @@ impl IpiMailbox {
         self.handled_batches.store(0, Ordering::Release);
         self.spurious_interrupts.store(0, Ordering::Release);
     }
-
-    /// Publishes one level-triggered message.
+    /// Publishes one message into the per-CPU software mailbox.
     ///
-    /// Returning true transfers doorbell ownership to the caller. Returning
-    /// false means an already-pending doorbell owns delivery and this message
-    /// was coalesced into the same drain pass.
+    /// Reschedule messages may share an already-owned doorbell. Synchronous
+    /// TLB and call-function messages always issue a fresh hardware kick:
+    /// otherwise they could become trapped behind a stale reschedule bit while
+    /// their caller waits indefinitely for a completion acknowledgement.
     fn publish(&self, message: IpiMessage) -> bool {
         let bit = message.bit();
         let previous = self.pending.fetch_or(bit, Ordering::Release);
 
-        if previous == 0 {
-            self.doorbells.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
+        if previous != 0 {
             self.coalesced.fetch_add(1, Ordering::Relaxed);
-            false
         }
+
+        let ring_doorbell = previous == 0 || message.requires_fresh_doorbell();
+        if ring_doorbell {
+            self.doorbells.fetch_add(1, Ordering::Relaxed);
+        }
+        ring_doorbell
     }
 
     fn take_pending(&self) -> usize {
@@ -88,8 +99,10 @@ pub fn initialize() {
     crate::call_function::initialize();
 }
 
-/// Publishes a message to one CPU and rings its hardware doorbell only when
-/// this publication transitions the mailbox from empty to non-empty.
+/// Publishes a message to one CPU.
+///
+/// Reschedule traffic is coalesced while synchronous TLB/call-function traffic
+/// always re-kicks the target so completion cannot depend on a stale wakeup.
 pub fn send(cpu: CpuId, message: IpiMessage) {
     assert!(
         crate::smp::is_online(cpu),
@@ -213,9 +226,13 @@ pub fn verify() {
 
     assert!(mailbox.publish(IpiMessage::Reschedule));
     assert!(!mailbox.publish(IpiMessage::Reschedule));
-    assert!(!mailbox.publish(IpiMessage::TlbShootdown));
-    assert!(!mailbox.publish(IpiMessage::CallFunction));
-    assert_eq!(mailbox.doorbells.load(Ordering::Acquire), 1);
+
+    // A synchronous request must issue a fresh kick even though the software
+    // mailbox already contains an unrelated reschedule bit.
+    assert!(mailbox.publish(IpiMessage::TlbShootdown));
+    assert!(mailbox.publish(IpiMessage::CallFunction));
+
+    assert_eq!(mailbox.doorbells.load(Ordering::Acquire), 3);
     assert_eq!(mailbox.coalesced.load(Ordering::Acquire), 3);
 
     let messages = mailbox.take_pending();
@@ -226,13 +243,14 @@ pub fn verify() {
     );
     assert_eq!(mailbox.take_pending(), 0);
 
-    // Once drained, the next publication owns a fresh doorbell.
+    // Once drained, the next reschedule publication owns a fresh doorbell.
     assert!(mailbox.publish(IpiMessage::Reschedule));
-    assert_eq!(mailbox.doorbells.load(Ordering::Acquire), 2);
+    assert_eq!(mailbox.doorbells.load(Ordering::Acquire), 4);
 
     crate::println!("IPI mailbox test:");
     crate::println!("  empty -> doorbell : verified");
     crate::println!("  pending coalescing: verified");
+    crate::println!("  synchronous re-kick: verified");
     crate::println!("  payload message   : verified");
     crate::println!("  drain and re-arm  : verified");
 }
