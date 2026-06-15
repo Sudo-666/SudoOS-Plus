@@ -15,6 +15,7 @@ static TLB_DONE_MASK: AtomicUsize = AtomicUsize::new(0);
 
 static MIGRATION_STARTED: AtomicBool = AtomicBool::new(false);
 static MIGRATION_RESUMED: AtomicBool = AtomicBool::new(false);
+static MIGRATION_RELEASE: AtomicBool = AtomicBool::new(false);
 static MIGRATION_FIRST_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 static MIGRATION_LAST_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -175,6 +176,13 @@ fn migration_worker() {
     MIGRATION_STARTED.store(true, Ordering::Release);
     super::yield_now();
 
+    // The verifier owns the TaskId until it has inspected and, on SMP,
+    // migrated the runnable task. A timer interrupt may schedule this
+    // worker again first; keep it alive until the hand-off is complete.
+    while !MIGRATION_RELEASE.load(Ordering::Acquire) {
+        spin_loop();
+    }
+
     let resumed = crate::smp::current_cpu_id();
     MIGRATION_LAST_CPU.store(resumed.get(), Ordering::Release);
     // migrate_runnable_task retargets the temporary affinity atomically with
@@ -190,6 +198,7 @@ fn verify_started_task_migration(cpu_count: usize) {
 
     MIGRATION_STARTED.store(false, Ordering::Release);
     MIGRATION_RESUMED.store(false, Ordering::Release);
+    MIGRATION_RELEASE.store(false, Ordering::Release);
     MIGRATION_FIRST_CPU.store(usize::MAX, Ordering::Release);
     MIGRATION_LAST_CPU.store(usize::MAX, Ordering::Release);
 
@@ -208,6 +217,7 @@ fn verify_started_task_migration(cpu_count: usize) {
     if cpu_count == 1 {
         // Resume locally to verify the UP fallback without inventing a remote
         // CPU. The common scheduler state machine remains identical.
+        MIGRATION_RELEASE.store(true, Ordering::Release);
         super::yield_now();
         assert!(MIGRATION_RESUMED.load(Ordering::Acquire));
         assert_eq!(
@@ -217,6 +227,9 @@ fn verify_started_task_migration(cpu_count: usize) {
     } else {
         let target = CpuId::new(1).expect("CPU1 exceeds MAX_CPUS");
         super::migrate_runnable_task(task, target);
+        // Publish permission only after queue ownership and temporary affinity
+        // have moved atomically to the target CPU.
+        MIGRATION_RELEASE.store(true, Ordering::Release);
         wait_without_scheduling("an already-run task to resume remotely", || {
             MIGRATION_RESUMED.load(Ordering::Acquire)
         });
