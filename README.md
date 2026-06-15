@@ -215,7 +215,7 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 
 ## 下一步
 
-M5/M6 已冻结。下一阶段严格进入 M7 最小用户模式。
+M5/M6/M7 已冻结。下一阶段严格进入 M8 用户地址空间与 demand paging。
 
 ## M5 之后完整路线图
 
@@ -530,15 +530,24 @@ make m6-tag      # 仅接受当前 commit 的通过报告
 [`docs/ci.md`](docs/ci.md)。GitHub Actions 默认不启用；本地 release gate 是 M6 的
 正式门禁。
 
-## M7-B 最小用户模式封版候选
+## M7 最小用户模式 ⬅ 已完成
 
-M7 已完成双架构 U-mode/PLV3 入口、用户 trap stack、Linux 风格
-`write=64`/`exit=93` ABI、受检用户拷贝、未知 syscall、非法用户指针、
-RX 写保护 fault 隔离和映射重复回收。正式冻结必须在提交后通过：
+M7 已完成并正式冻结。双架构 U-mode/PLV3 入口、用户 trap stack、Linux 风格
+`write=64`/`exit=93` ABI、受检用户拷贝、未知 syscall (`-ENOSYS`)、非法用户指针
+(`-EFAULT`)、RX 写保护 fault 隔离和 session 重复回收均已实现。
+
+M7 release gate 全部通过：
+
+```text
+matrix-full    48/48 PASS   (SMP=1/2/4/8 × 64M/256M/1G × Debug/Release)
+soak-debug    200/200 PASS   (SMP=4 × 256M × 100轮 × 双架构)
+soak-release   40/40 PASS    (SMP=4 × 256M × 20轮 × 双架构)
+```
 
 ```bash
-make m7-release
-make m7-tag
+make m7-quick      # 快速门禁
+make m7-release    # 完整 release gate
+make m7-tag        # 创建 m7-complete 标签
 ```
 
 封版契约见 [`docs/m7-completion.md`](docs/m7-completion.md)。M7 冻结后进入
