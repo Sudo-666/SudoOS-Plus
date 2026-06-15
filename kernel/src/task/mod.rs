@@ -561,10 +561,19 @@ impl Scheduler {
         let previous = self.current(cpu);
         assert_eq!(self.task(previous).state, TaskState::Running(cpu));
 
-        let next = match self.dequeue_next(cpu) {
-            Some(next) => next,
-            None if self.task(previous).kind.is_idle() => return None,
-            None => self.idle(cpu),
+        let Some(next) = self.dequeue_next(cpu) else {
+            // A runnable current task must never yield to the idle task.
+            // Linux keeps the sole runnable task selected; idle is only a
+            // fallback for block/exit or when the current task is already idle.
+            //
+            // Switching a runnable task to idle and re-enqueuing it in
+            // switch-tail creates a runnable-without-wakeup window under
+            // NO_HZ. Treat yield as a hint and continue locally when there is
+            // no alternative task.
+            let cpu_state = &mut self.cpus[cpu.get()];
+            cpu_state.need_resched = false;
+            cpu_state.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+            return None;
         };
 
         assert_ne!(previous, next, "CPU selected its current task as next");
@@ -1731,7 +1740,11 @@ pub(crate) fn run_verifier_thread(entry: KernelThreadEntry) {
 
     // complete_switch() publishes the retired-task lifetime while holding the
     // scheduler lock before live_kernel_threads() can be observed as zero.
-    synchronize_retired_tasks();
+    // Do not synchronously destroy the just-exited verifier stack on the boot
+    // idle launcher's path: kernel-stack vfree performs global TLB work, and
+    // Linux keeps that kind of stack lifetime handoff deferred to a reaper
+    // context rather than folding it into the idle hand-off itself.
+    TASK_REAPER_QUEUE.wake_one();
 }
 
 fn spawn_system_thread(
@@ -1899,7 +1912,6 @@ fn exit_current() -> ! {
         scheduler.assert_schedulable(cpu);
         scheduler.prepare_exit(cpu)
     };
-
     // SAFETY: the exiting task remains allocated and marked SwitchingOut
     // until the incoming context calls finish_switch() from a different stack.
     unsafe { crate::arch::task::switch(previous, next) };
@@ -1978,32 +1990,51 @@ fn reap_retired_tasks() {
 }
 
 #[cfg(debug_assertions)]
-fn synchronize_retired_tasks() {
+pub(super) fn synchronize_retired_tasks_with_live(expected_live: usize) {
     crate::context::might_sleep();
     crate::context::assert_task_context();
     crate::context::assert_interrupts_enabled();
     assert_eq!(
         live_kernel_threads(),
-        0,
-        "task reclamation barrier requires a quiescent verifier",
+        expected_live,
+        "task reclamation barrier observed the wrong live verifier count",
     );
 
-    // Boot verification runs from the per-CPU idle task.  Idle cannot join a
-    // normal WaitQueue, so this debug-only flush wakes the runtime reaper and
-    // cooperatively yields until both queued and detached destruction finish.
-    // RETIRED_OUTSTANDING closes the queue-empty-but-still-destroying race.
-    TASK_REAPER_QUEUE.wake_one();
     let deadline = verification_deadline();
+
     while retired_task_outstanding() != 0 {
+        // This debug barrier is itself task context with interrupts enabled.
+        // Drain directly so verifier progress does not depend on the permanent
+        // reaper being scheduled between two idle/verifier hand-offs, and so a
+        // spurious reaper wake cannot run before the boot idle launcher regains
+        // control after a nested verifier thread exits.
+        drain_retired_queue();
+        if retired_task_outstanding() == 0 {
+            break;
+        }
+
         assert!(
             !deadline_reached(crate::arch::time::counter(), deadline),
-            "retired task reclamation timed out: backlog={} outstanding={}",
+            "retired task reclamation timed out: backlog={} outstanding={} live={}",
             retired_task_backlog(),
             retired_task_outstanding(),
+            live_kernel_threads(),
+        );
+        assert_eq!(
+            live_kernel_threads(),
+            expected_live,
+            "counted verifier population changed during reclamation",
         );
         yield_now();
-        TASK_REAPER_QUEUE.wake_one();
         spin_loop();
+    }
+
+    if current_cpu_has_work() {
+        // A retiring task wakes the permanent reaper from the switch tail. This
+        // verifier barrier may have already drained the queue directly; let the
+        // reaper consume that now-empty wake and block again before a nested
+        // verifier exits back into the boot idle launcher.
+        yield_now();
     }
 
     assert_eq!(
@@ -2013,6 +2044,11 @@ fn synchronize_retired_tasks() {
     );
     let retired = retired_task_count();
     assert_eq!(retired, 0, "retired task queue was not fully drained");
+}
+
+#[cfg(debug_assertions)]
+fn synchronize_retired_tasks() {
+    synchronize_retired_tasks_with_live(0);
 }
 
 fn current_entry() -> KernelThreadEntry {
@@ -2567,7 +2603,7 @@ pub fn verify() {
     assert!(crate::arch::interrupt::are_enabled());
 
     m4c_verify::verify();
-    m4c2_verify::verify();
+    run_verifier_thread(m4c2_verify::verify);
 
     crate::println!("kernel scheduler test:");
     crate::println!("  kernel threads  : verified ({})", worker_count);

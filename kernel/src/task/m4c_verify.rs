@@ -35,9 +35,27 @@ static SWITCH_RACE_DONE: AtomicBool = AtomicBool::new(false);
 
 fn preempt_hog() {
     assert_eq!(crate::smp::current_cpu_id(), CpuId::BOOT);
-    PREEMPT_HOG_STARTED.store(true, Ordering::Release);
 
+    let watchdog_deadline = crate::time::deadline_after(core::time::Duration::from_secs(5));
+    let ticks_before = crate::time::timer_ticks_for(CpuId::BOOT);
+
+    PREEMPT_HOG_STARTED.store(true, Ordering::Release);
     while !PREEMPT_STOP.load(Ordering::Acquire) {
+        if crate::time::deadline_reached(crate::time::now(), watchdog_deadline) {
+            panic!(
+                "M4C timer-preemption stalled: cpu={} \
+                 clockevent_running={} tick_active={} \
+                 scheduler_deadline={:#x} programmed_deadline={:#x} \
+                 ticks_before={} ticks_now={}",
+                CpuId::BOOT.get(),
+                crate::time::clockevent_running_for(CpuId::BOOT),
+                crate::time::scheduler_tick_active_for(CpuId::BOOT),
+                crate::time::scheduler_tick_deadline_for(CpuId::BOOT),
+                crate::time::programmed_clockevent_deadline_for(CpuId::BOOT),
+                ticks_before,
+                crate::time::timer_ticks_for(CpuId::BOOT),
+            );
+        }
         spin_loop();
     }
 
@@ -291,6 +309,7 @@ fn verify_switching_out_wakeup() {
     wait_until("a waiter to enter SwitchingOut", || {
         SWITCH_RACE_HOOK_REACHED.load(Ordering::Acquire)
     });
+    crate::println!("M4C switch-race: hook reached");
 
     let before = SWITCH_RACE_QUEUE.debug_state();
     assert_eq!(before.blocked, 0);
@@ -308,18 +327,22 @@ fn verify_switching_out_wakeup() {
     assert_eq!(claimed.blocked, 0);
     assert_eq!(claimed.switching, 0);
     assert_eq!(claimed.claimed_switching, 1);
+    crate::println!("M4C switch-race: wake claimed");
 
     SWITCH_RACE_HOOK_RELEASE.store(true, Ordering::Release);
+    crate::println!("M4C switch-race: hook released");
 
     wait_until("the SwitchingOut waiter to converge to runnable", || {
         SWITCH_RACE_DONE.load(Ordering::Acquire) && super::live_kernel_threads() == 0
     });
+    crate::println!("M4C switch-race: worker completed");
     assert_eq!(SWITCH_RACE_QUEUE.waiter_count(), 0);
     assert_eq!(
         SWITCH_RACE_QUEUE.debug_state(),
         super::WaiterDebugState::default()
     );
     super::synchronize_retired_tasks();
+    crate::println!("M4C switch-race: reaper drained");
 }
 
 pub(super) fn verify() {
@@ -327,10 +350,15 @@ pub(super) fn verify() {
     let pages_before = crate::page_alloc::total_free_pages()
         .expect("page allocator unavailable before M4C verification");
 
+    crate::println!("M4C stage: timer-preemption");
     verify_timer_preemption();
+    crate::println!("M4C stage: preempt-disable");
     verify_preempt_disable();
+    crate::println!("M4C stage: wait-queue");
     verify_wait_queue();
+    crate::println!("M4C stage: completion");
     verify_completion();
+    crate::println!("M4C stage: switching-out-wakeup");
     verify_switching_out_wakeup();
 
     super::synchronize_retired_tasks();

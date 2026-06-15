@@ -608,7 +608,7 @@ fn worker_entry() {
 mod verify {
     use alloc::{boxed::Box, vec::Vec};
     use core::{
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         time::Duration,
     };
 
@@ -617,6 +617,7 @@ mod verify {
     struct Probe {
         hits: AtomicUsize,
         cpu_mask: AtomicUsize,
+        ticks_at_first_hit: AtomicU64,
     }
 
     impl Probe {
@@ -624,6 +625,7 @@ mod verify {
             Self {
                 hits: AtomicUsize::new(0),
                 cpu_mask: AtomicUsize::new(0),
+                ticks_at_first_hit: AtomicU64::new(u64::MAX),
             }
         }
     }
@@ -660,7 +662,11 @@ mod verify {
         probe
             .cpu_mask
             .fetch_or(1_usize << cpu.get(), Ordering::AcqRel);
-        probe.hits.fetch_add(1, Ordering::AcqRel);
+        if probe.hits.fetch_add(1, Ordering::AcqRel) == 0 {
+            probe
+                .ticks_at_first_hit
+                .store(crate::time::timer_ticks_for(cpu), Ordering::Release);
+        }
     }
 
     fn sleepable_callback(argument: usize) {
@@ -703,12 +709,18 @@ mod verify {
         let after = crate::time::now();
         assert!(after.duration_since(before) >= Duration::from_millis(25));
         assert_eq!(probe.hits.load(Ordering::Acquire), 1);
+        let ticks_at_hit = probe.ticks_at_first_hit.load(Ordering::Acquire);
+        assert_ne!(
+            ticks_at_hit,
+            u64::MAX,
+            "delayed work callback did not publish its tick sample",
+        );
         assert!(
             crate::time::tickless_idle_entries_for(cpu) > idle_entries,
             "delayed work did not pass through tickless idle",
         );
         assert!(
-            crate::time::timer_ticks_for(cpu).wrapping_sub(ticks) <= 1,
+            ticks_at_hit.wrapping_sub(ticks) <= 1,
             "periodic scheduler ticks continued while delayed work was the only deadline",
         );
     }

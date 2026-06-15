@@ -129,9 +129,10 @@ fn initialize_filled_table(frame: PhysFrame, value: u64) {
      * - 分配的物理 RAM 可由当前启动环境直接访问；
      * - 页面来自独占的启动分配器；
      * - 页面尚未被发布给硬件页表遍历器。
+     * 直接初始化目标页，避免在当前内核栈上构造整张 PageTable 临时对象。
      */
     unsafe {
-        pointer.write(PageTable::zeroed());
+        core::ptr::write_bytes(pointer, 0, 1);
         (*pointer).fill(value);
     }
 }

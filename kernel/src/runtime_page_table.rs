@@ -895,8 +895,10 @@ mod imp {
                 .map_err(|_| RuntimePageTableError::PageTableAccess)?;
 
         // SAFETY: frame 是刚分配的独占页表页，尚未发布到任何上级目录。
+        // 直接初始化目标页，避免在 guarded kernel stack 上构造 4 KiB
+        // PageTable 临时对象后再复制。
         unsafe {
-            pointer.write(PageTable::zeroed());
+            core::ptr::write_bytes(pointer, 0, 1);
             (*pointer).fill(fill);
         }
 

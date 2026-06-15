@@ -227,9 +227,10 @@ fn initialize_table_for_level(
         .expect("allocated page-table frame is not accessible");
 
     // SAFETY:
-    // 页面来自独占启动分配器，尚未发布。
+    // 页面来自独占启动分配器，尚未发布。直接初始化目标页，避免在
+    // 当前内核栈上构造整张 PageTable 临时对象。
     unsafe {
-        pointer.write(PageTable::zeroed());
+        core::ptr::write_bytes(pointer, 0, 1);
         (*pointer).fill(fill);
     }
 
