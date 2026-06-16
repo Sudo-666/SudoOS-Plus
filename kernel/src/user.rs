@@ -5,17 +5,35 @@ use myos_mm::{
     FaultAccess, PAGE_SIZE, PhysAddr, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind,
 };
 
-use crate::user_mm::{UserMm, UserMmRuntimeError};
+use crate::user_mm::{
+    UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMm, UserMmRuntimeError,
+};
 
 const USER_CODE: usize = 0x0000_0000_0040_0000;
 const USER_DATA: usize = USER_CODE + PAGE_SIZE;
+const USER_DEMAND: usize = 0x0000_0000_0050_0000;
+const USER_HEAP_START: usize = 0x0000_0000_0060_0000;
+const USER_HEAP_LIMIT: usize = 0x0000_0000_0070_0000;
 const USER_STACK: usize = 0x0000_0000_0080_0000;
 const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
+const USER_MMAP_START: usize = 0x0000_0000_0100_0000;
+const USER_MMAP_END: usize = 0x0000_0000_4000_0000;
 
 const SYS_WRITE: usize = 64;
 const SYS_EXIT: usize = 93;
+const SYS_BRK: usize = 214;
+const SYS_MUNMAP: usize = 215;
+const SYS_MMAP: usize = 222;
+const SYS_MPROTECT: usize = 226;
+
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
+const MAP_PRIVATE: usize = 0x02;
+const MAP_ANONYMOUS: usize = 0x20;
 
 const EBADF: isize = 9;
+const ENOMEM: isize = 12;
 const EFAULT: isize = 14;
 const EINVAL: isize = 22;
 const ENOSYS: isize = 38;
@@ -26,12 +44,20 @@ const USER_MESSAGE: &[u8] = b"hello user\n";
 const FAULT_NONE: usize = 0;
 const FAULT_PAGE: usize = 1;
 const FAULT_EXCEPTION: usize = 2;
+const FAULT_RECOVERED: usize = 3;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TERMINATED: AtomicBool = AtomicBool::new(false);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECOVERED_FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static STACK_GROWTH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BRK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MMAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MUNMAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MPROTECT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LAST_FAULT_KIND: AtomicUsize = AtomicUsize::new(FAULT_NONE);
 static LAST_FAULT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static EXIT_STATUS: AtomicIsize = AtomicIsize::new(isize::MIN);
@@ -51,6 +77,9 @@ unsafe extern "C" {
     static __m7_user_unknown_syscall: u8;
     static __m7_user_bad_pointer: u8;
     static __m7_user_write_code: u8;
+    static __m8_user_vm: u8;
+    static __m8_user_mprotect_fault: u8;
+    static __m8_user_munmap_fault: u8;
     static __m7_user_image_end: u8;
 }
 
@@ -73,12 +102,25 @@ impl UserImage {
                 VmAreaKind::Anonymous,
             ),
             VmArea::new(
+                VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            ),
+            VmArea::new(
                 VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
                 VmAreaFlags::user_rw().union(VmAreaFlags::GROW_DOWN),
                 VmAreaKind::Stack,
             ),
         ];
         let mut mm = Box::new(UserMm::new(&areas)?);
+        if let Err(error) = mm.configure_program_break(
+            VirtAddr::new(USER_HEAP_START),
+            VirtAddr::new(USER_HEAP_LIMIT),
+        ) {
+            mm.destroy()
+                .expect("unable to reclaim M8-B4 mm after brk configuration failure");
+            return Err(error);
+        }
         let result: Result<PhysAddr, UserMmRuntimeError> = (|| {
             let code_physical = mm.populate_page(VirtAddr::new(USER_CODE))?;
             mm.populate_page(VirtAddr::new(USER_DATA))?;
@@ -169,6 +211,13 @@ struct SessionExpected {
     syscall_count: usize,
     write_count: usize,
     fault_count: usize,
+    recovered_fault_count: usize,
+    anonymous_fault_count: usize,
+    stack_growth_count: usize,
+    brk_count: usize,
+    mmap_count: usize,
+    munmap_count: usize,
+    mprotect_count: usize,
     fault_kind: usize,
     fault_address: usize,
 }
@@ -181,6 +230,13 @@ struct SessionObserved {
     syscall_count: usize,
     write_count: usize,
     fault_count: usize,
+    recovered_fault_count: usize,
+    anonymous_fault_count: usize,
+    stack_growth_count: usize,
+    brk_count: usize,
+    mmap_count: usize,
+    munmap_count: usize,
+    mprotect_count: usize,
     fault_kind: usize,
     fault_address: usize,
 }
@@ -204,6 +260,13 @@ pub fn verify() {
         syscall_count: 2,
         write_count: 1,
         fault_count: 0,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
         fault_kind: FAULT_NONE,
         fault_address: 0,
     };
@@ -213,6 +276,13 @@ pub fn verify() {
         syscall_count: 2,
         write_count: 0,
         fault_count: 0,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
         fault_kind: FAULT_NONE,
         fault_address: 0,
     };
@@ -222,8 +292,63 @@ pub fn verify() {
         syscall_count: 0,
         write_count: 0,
         fault_count: 1,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
         fault_kind: FAULT_PAGE,
         fault_address: USER_CODE,
+    };
+    let vm_success = SessionExpected {
+        result: 0,
+        exit_status: 0,
+        syscall_count: 6,
+        write_count: 0,
+        fault_count: 4,
+        recovered_fault_count: 4,
+        anonymous_fault_count: 3,
+        stack_growth_count: 1,
+        brk_count: 2,
+        mmap_count: 1,
+        munmap_count: 1,
+        mprotect_count: 1,
+        fault_kind: FAULT_RECOVERED,
+        fault_address: USER_MMAP_START,
+    };
+    let mprotect_fault = SessionExpected {
+        result: -EFAULT,
+        exit_status: -EFAULT,
+        syscall_count: 2,
+        write_count: 0,
+        fault_count: 2,
+        recovered_fault_count: 1,
+        anonymous_fault_count: 1,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 1,
+        munmap_count: 0,
+        mprotect_count: 1,
+        fault_kind: FAULT_PAGE,
+        fault_address: USER_MMAP_START,
+    };
+    let munmap_fault = SessionExpected {
+        result: -EFAULT,
+        exit_status: -EFAULT,
+        syscall_count: 2,
+        write_count: 0,
+        fault_count: 2,
+        recovered_fault_count: 1,
+        anonymous_fault_count: 1,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 1,
+        munmap_count: 1,
+        mprotect_count: 0,
+        fault_kind: FAULT_PAGE,
+        fault_address: USER_MMAP_START,
     };
 
     assert_session(
@@ -259,6 +384,21 @@ pub fn verify() {
         ),
         success,
     );
+    assert_session(
+        "demand paging and VM syscalls",
+        run_session(core::ptr::addr_of!(__m8_user_vm), None, false),
+        vm_success,
+    );
+    assert_session(
+        "mprotect write rejection",
+        run_session(core::ptr::addr_of!(__m8_user_mprotect_fault), None, false),
+        mprotect_fault,
+    );
+    assert_session(
+        "munmap stale translation rejection",
+        run_session(core::ptr::addr_of!(__m8_user_munmap_fault), None, false),
+        munmap_fault,
+    );
 
     assert!(
         !ACTIVE.load(Ordering::Acquire),
@@ -285,7 +425,16 @@ pub fn verify() {
     crate::println!("  active CPU publish: verified");
     crate::println!("  kernel root return: verified");
     crate::println!("  page/root reclaim : verified");
-    crate::println!("  demand fault path : intentionally deferred");
+    crate::println!("  demand fault path : verified");
+
+    crate::println!("M8-B4 demand paging/VM gate:");
+    crate::println!("  anonymous demand  : verified");
+    crate::println!("  bounded stack grow: verified");
+    crate::println!("  brk growth/shrink : verified");
+    crate::println!("  mmap/munmap       : verified");
+    crate::println!("  mprotect          : verified");
+    crate::println!("  TLB-before-free   : verified");
+    crate::println!("  user fault retry  : verified");
 }
 
 fn run_session(
@@ -333,6 +482,13 @@ fn run_session(
         syscall_count: SYSCALL_COUNT.load(Ordering::Acquire),
         write_count: WRITE_COUNT.load(Ordering::Acquire),
         fault_count: FAULT_COUNT.load(Ordering::Acquire),
+        recovered_fault_count: RECOVERED_FAULT_COUNT.load(Ordering::Acquire),
+        anonymous_fault_count: ANONYMOUS_FAULT_COUNT.load(Ordering::Acquire),
+        stack_growth_count: STACK_GROWTH_COUNT.load(Ordering::Acquire),
+        brk_count: BRK_COUNT.load(Ordering::Acquire),
+        mmap_count: MMAP_COUNT.load(Ordering::Acquire),
+        munmap_count: MUNMAP_COUNT.load(Ordering::Acquire),
+        mprotect_count: MPROTECT_COUNT.load(Ordering::Acquire),
         fault_kind: LAST_FAULT_KIND.load(Ordering::Acquire),
         fault_address: LAST_FAULT_ADDRESS.load(Ordering::Acquire),
     };
@@ -363,6 +519,13 @@ fn reset_session_state() {
     SYSCALL_COUNT.store(0, Ordering::Release);
     WRITE_COUNT.store(0, Ordering::Release);
     FAULT_COUNT.store(0, Ordering::Release);
+    RECOVERED_FAULT_COUNT.store(0, Ordering::Release);
+    ANONYMOUS_FAULT_COUNT.store(0, Ordering::Release);
+    STACK_GROWTH_COUNT.store(0, Ordering::Release);
+    BRK_COUNT.store(0, Ordering::Release);
+    MMAP_COUNT.store(0, Ordering::Release);
+    MUNMAP_COUNT.store(0, Ordering::Release);
+    MPROTECT_COUNT.store(0, Ordering::Release);
     LAST_FAULT_KIND.store(FAULT_NONE, Ordering::Release);
     LAST_FAULT_ADDRESS.store(0, Ordering::Release);
     EXIT_STATUS.store(isize::MIN, Ordering::Release);
@@ -392,6 +555,34 @@ fn assert_session(name: &str, observed: SessionObserved, expected: SessionExpect
     assert_eq!(
         observed.fault_count, expected.fault_count,
         "{name}: wrong user fault count",
+    );
+    assert_eq!(
+        observed.recovered_fault_count, expected.recovered_fault_count,
+        "{name}: wrong recovered fault count",
+    );
+    assert_eq!(
+        observed.anonymous_fault_count, expected.anonymous_fault_count,
+        "{name}: wrong anonymous fault count",
+    );
+    assert_eq!(
+        observed.stack_growth_count, expected.stack_growth_count,
+        "{name}: wrong stack-growth count",
+    );
+    assert_eq!(
+        observed.brk_count, expected.brk_count,
+        "{name}: wrong brk count"
+    );
+    assert_eq!(
+        observed.mmap_count, expected.mmap_count,
+        "{name}: wrong mmap count",
+    );
+    assert_eq!(
+        observed.munmap_count, expected.munmap_count,
+        "{name}: wrong munmap count",
+    );
+    assert_eq!(
+        observed.mprotect_count, expected.mprotect_count,
+        "{name}: wrong mprotect count",
     );
     assert_eq!(
         observed.fault_kind, expected.fault_kind,
@@ -446,6 +637,13 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let result = sys_write(arguments[0], arguments[1], arguments[2]);
             set_syscall_result(frame, result);
         }
+        SYS_BRK => set_syscall_result(frame, sys_brk(arguments[0])),
+        SYS_MUNMAP => set_syscall_result(frame, sys_munmap(arguments[0], arguments[1])),
+        SYS_MMAP => set_syscall_result(frame, sys_mmap(arguments)),
+        SYS_MPROTECT => set_syscall_result(
+            frame,
+            sys_mprotect(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_EXIT => {
             EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
             TERMINATED.store(true, Ordering::Release);
@@ -458,27 +656,48 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
 pub fn handle_fault(
     frame: &mut crate::arch::trap::TrapFrame,
     address: VirtAddr,
-    _access: FaultAccess,
+    access: FaultAccess,
     _raw: usize,
 ) {
     assert!(
         ACTIVE.load(Ordering::Acquire),
-        "user fault arrived without an active M8-B3 session",
+        "user fault arrived without an active M8-B4 session",
     );
     assert!(
         frame.previous_mode_was_user(),
-        "M8-B3 user fault handler received a kernel fault",
+        "M8-B4 user fault handler received a kernel fault",
     );
 
-    // B2 already provides the architecture-neutral fault planner. B3 keeps M7
-    // termination semantics so private-root failures are isolated from demand
-    // allocation and retry behavior.
-    LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
-    LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
     FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
-    TERMINATED.store(true, Ordering::Release);
-    EXIT_STATUS.store(-EFAULT, Ordering::Release);
-    return_to_kernel(frame, -EFAULT);
+    let user_sp = VirtAddr::new(frame.stack_pointer());
+    match crate::user_mm::resolve_active_fault(address, access, user_sp) {
+        Ok(UserFaultResolution::Recovered(recovery)) => {
+            RECOVERED_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+            match recovery {
+                UserFaultRecovery::Anonymous => {
+                    ANONYMOUS_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+                }
+                UserFaultRecovery::StackGrowth => {
+                    STACK_GROWTH_COUNT.fetch_add(1, Ordering::AcqRel);
+                }
+                UserFaultRecovery::Spurious => {}
+            }
+            LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
+            LAST_FAULT_KIND.store(FAULT_RECOVERED, Ordering::Release);
+        }
+        Ok(UserFaultResolution::Fatal(failure)) => {
+            assert!(
+                !matches!(failure, UserFaultFailure::KernelBug),
+                "M8-B4 fault planner classified a user trap as a kernel bug",
+            );
+            LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
+            LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
+            TERMINATED.store(true, Ordering::Release);
+            EXIT_STATUS.store(-EFAULT, Ordering::Release);
+            return_to_kernel(frame, -EFAULT);
+        }
+        Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
+    }
 }
 
 pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) {
@@ -497,6 +716,117 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
     TERMINATED.store(true, Ordering::Release);
     EXIT_STATUS.store(-EFAULT, Ordering::Release);
     return_to_kernel(frame, -EFAULT);
+}
+
+fn sys_brk(address: usize) -> isize {
+    let current = match crate::user_mm::active_program_break() {
+        Ok(current) => current,
+        Err(_) => return -ENOMEM,
+    };
+    if address == 0 {
+        return current.get() as isize;
+    }
+
+    match crate::user_mm::set_active_program_break(VirtAddr::new(address)) {
+        Ok(new_break) => {
+            BRK_COUNT.fetch_add(1, Ordering::AcqRel);
+            new_break.get() as isize
+        }
+        Err(_) => current.get() as isize,
+    }
+}
+
+fn sys_mmap(arguments: [usize; 6]) -> isize {
+    let [address, length, protection, flags, file, offset] = arguments;
+    if address != 0
+        || length == 0
+        || flags != (MAP_PRIVATE | MAP_ANONYMOUS)
+        || file != usize::MAX
+        || offset != 0
+    {
+        return -EINVAL;
+    }
+    let vm_flags = match protection_flags(protection) {
+        Some(flags) => flags,
+        None => return -EINVAL,
+    };
+    let rounded = match length.checked_add(PAGE_SIZE - 1) {
+        Some(length) => length & !(PAGE_SIZE - 1),
+        None => return -ENOMEM,
+    };
+    match crate::user_mm::map_active_anonymous(
+        VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
+        rounded,
+        vm_flags,
+    ) {
+        Ok(start) => {
+            MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            start.get() as isize
+        }
+        Err(_) => -ENOMEM,
+    }
+}
+
+fn sys_munmap(address: usize, length: usize) -> isize {
+    let range = match syscall_range(address, length) {
+        Some(range) => range,
+        None => return -EINVAL,
+    };
+    match crate::user_mm::unmap_active_range(range) {
+        Ok(()) => {
+            MUNMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+        Err(_) => -EINVAL,
+    }
+}
+
+fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
+    let range = match syscall_range(address, length) {
+        Some(range) => range,
+        None => return -EINVAL,
+    };
+    let flags = match protection_flags(protection) {
+        Some(flags) => flags.access_only(),
+        None => return -EINVAL,
+    };
+    match crate::user_mm::protect_active_range(range, flags) {
+        Ok(()) => {
+            MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+        Err(_) => -EINVAL,
+    }
+}
+
+fn syscall_range(address: usize, length: usize) -> Option<VirtRange> {
+    if length == 0 || address & (PAGE_SIZE - 1) != 0 {
+        return None;
+    }
+    let rounded = length.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+    let end = address.checked_add(rounded)?;
+    VirtRange::new(VirtAddr::new(address), VirtAddr::new(end))
+}
+
+fn protection_flags(protection: usize) -> Option<VmAreaFlags> {
+    if protection == 0 || protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return None;
+    }
+
+    let mut flags = VmAreaFlags::USER.union(VmAreaFlags::PRIVATE);
+    if protection & PROT_READ != 0 || protection & (PROT_WRITE | PROT_EXEC) != 0 {
+        flags = flags.union(VmAreaFlags::READ);
+    }
+    if protection & PROT_WRITE != 0 {
+        flags = flags.union(VmAreaFlags::WRITE);
+    }
+    if protection & PROT_EXEC != 0 {
+        flags = flags.union(VmAreaFlags::EXECUTE);
+    }
+    if flags.is_writable() && flags.is_executable() {
+        return None;
+    }
+    Some(flags)
 }
 
 fn sys_write(fd: usize, address: usize, length: usize) -> isize {

@@ -371,6 +371,33 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
     drop(migration_guard);
 }
 
+/// Executes an ASID-scoped request that is known to target only this CPU.
+///
+/// M8's synchronous verifier disables local interrupts while a private user
+/// root is active. It therefore cannot enter the remote serializer/ACK path.
+/// This helper is deliberately fail-closed: a future shared-mm target mask
+/// must use `shootdown_user()` from interruptible task context instead.
+pub fn shootdown_user_local(request: PerMmTlbRequest) {
+    validate_user_request(request);
+    crate::context::assert_interrupts_disabled();
+
+    let requested = usize::try_from(request.targets().bits())
+        .expect("per-mm CPU mask exceeds the kernel target-mask width");
+    let current = crate::smp::current_cpu_id();
+    let current_bit = cpu_bit(current);
+    assert_eq!(
+        requested & !current_bit,
+        0,
+        "local-only per-mm request targeted another CPU: current={} targets={requested:#x}",
+        current.get(),
+    );
+
+    if requested & current_bit != 0 {
+        flush_local(request.flush());
+    }
+    COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn handle_shootdown_ipi() {
     let cpu = crate::smp::current_cpu_id();
     let request = REQUEST.request();

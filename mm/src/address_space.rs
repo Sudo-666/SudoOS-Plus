@@ -49,6 +49,7 @@ impl From<VmAreaError> for AddressSpaceError {
     }
 }
 
+#[derive(Clone)]
 pub struct AddressSpace<const VMA_CAPACITY: usize> {
     user_range: VirtRange,
     areas: VmAreaSet<VMA_CAPACITY>,
@@ -88,6 +89,24 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
 
     pub fn unmap_exact(&mut self, range: VirtRange) -> Result<VmArea, AddressSpaceError> {
         Ok(self.areas.remove_exact(range)?)
+    }
+
+    pub fn unmap_range(&mut self, range: VirtRange) -> Result<usize, AddressSpaceError> {
+        if !self.user_range.contains_range(range) {
+            return Err(AddressSpaceError::RangeOutsideUser);
+        }
+        Ok(self.areas.remove_range(range)?)
+    }
+
+    pub fn protect_range(
+        &mut self,
+        range: VirtRange,
+        access: VmAreaFlags,
+    ) -> Result<usize, AddressSpaceError> {
+        if !self.user_range.contains_range(range) {
+            return Err(AddressSpaceError::RangeOutsideUser);
+        }
+        Ok(self.areas.protect_range(range, access)?)
     }
 
     pub fn find_area(&self, address: VirtAddr) -> Option<VmArea> {
@@ -138,6 +157,45 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
         self.program_break = Some(brk);
 
         Ok(brk.current)
+    }
+
+    /// Updates the logical program break and publishes one contiguous heap VMA.
+    /// The old break and VMA topology are restored if rebuilding the heap fails.
+    pub fn set_program_break_and_sync_heap(
+        &mut self,
+        new_break: VirtAddr,
+    ) -> Result<VirtAddr, AddressSpaceError> {
+        let old_break = self.program_break;
+        let old_areas = self.areas.clone();
+
+        let result = (|| {
+            let current = self.set_program_break(new_break)?;
+            self.areas.remove_kind(VmAreaKind::Heap)?;
+            let brk = self
+                .program_break
+                .ok_or(AddressSpaceError::ProgramBreakNotConfigured)?;
+            let start = brk
+                .start()
+                .align_down(PAGE_SIZE)
+                .ok_or(AddressSpaceError::InvalidProgramBreak)?;
+            let end = current
+                .align_up(PAGE_SIZE)
+                .ok_or(AddressSpaceError::InvalidProgramBreak)?;
+            if end > start {
+                self.map_area(VmArea::new(
+                    VirtRange::new(start, end).ok_or(AddressSpaceError::InvalidProgramBreak)?,
+                    VmAreaFlags::user_rw(),
+                    VmAreaKind::Heap,
+                ))?;
+            }
+            Ok(current)
+        })();
+
+        if result.is_err() {
+            self.program_break = old_break;
+            self.areas = old_areas;
+        }
+        result
     }
 
     pub fn map_anonymous(
@@ -224,5 +282,24 @@ mod tests {
         let area = space.map_heap_from_break().unwrap().unwrap();
 
         assert_eq!(area.range(), VirtRange::from_bounds(0x4000, 0x7000));
+    }
+
+    #[test]
+    fn program_break_rebuild_is_transactional_and_shrinkable() {
+        let mut space: AddressSpace<8> = AddressSpace::new(USER);
+        space
+            .configure_program_break(VirtAddr::new(0x4000), VirtAddr::new(0x9000))
+            .unwrap();
+        space
+            .set_program_break_and_sync_heap(VirtAddr::new(0x7123))
+            .unwrap();
+        assert_eq!(
+            space.find_area(VirtAddr::new(0x6000)).unwrap().kind(),
+            VmAreaKind::Heap,
+        );
+        space
+            .set_program_break_and_sync_heap(VirtAddr::new(0x4000))
+            .unwrap();
+        assert!(space.find_area(VirtAddr::new(0x4000)).is_none());
     }
 }

@@ -67,4 +67,4 @@ pub use fault::{FaultAccess, FaultOutcome, FaultSource, PageFault};
 pub use vmalloc::{KernelVirtualAllocator, KernelVirtualReservation, VmallocKind};
 
 pub use tlb::{AddressSpaceId, TlbFlush, TlbScope, TlbShootdown};
-pub use user_space::{PerMmTlbRequest, StackGrowth, UserAddressSpace, UserMmError};
+pub use user_space::{PerMmTlbRequest, StackGrowth, UserAddressSpace, UserFaultPlan, UserMmError};

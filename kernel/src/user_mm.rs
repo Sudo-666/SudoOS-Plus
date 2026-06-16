@@ -4,15 +4,16 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use myos_mm::{
-    AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, PAGE_SIZE, PageAllocation, PhysAddr,
-    UserAddressSpace, UserMmError, VirtAddr, VirtPage, VmArea, VmAreaFlags,
+    AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, FaultSource, PAGE_SIZE,
+    PageAllocation, PageFault, PerMmTlbRequest, PhysAddr, TlbFlush, TlbScope, UserAddressSpace,
+    UserFaultPlan, UserMmError, VirtAddr, VirtPage, VirtRange, VmArea, VmAreaFlags,
 };
 
 use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
-const VMA_CAPACITY: usize = 16;
+const VMA_CAPACITY: usize = 32;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
@@ -84,6 +85,27 @@ struct UserMmState {
 
 pub struct UserMm {
     state: IrqSpinLock<UserMmState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserFaultRecovery {
+    Anonymous,
+    StackGrowth,
+    Spurious,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserFaultFailure {
+    CopyOnWriteUnsupported,
+    ProtectionViolation,
+    SegmentationViolation,
+    KernelBug,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserFaultResolution {
+    Recovered(UserFaultRecovery),
+    Fatal(UserFaultFailure),
 }
 
 impl UserMm {
@@ -287,6 +309,259 @@ impl UserMm {
             copied += chunk;
         }
         Ok(())
+    }
+
+    pub fn configure_program_break(
+        &self,
+        start: VirtAddr,
+        limit: VirtAddr,
+    ) -> Result<(), UserMmRuntimeError> {
+        let mut state = self.state.lock();
+        state
+            .core
+            .layout_mut()
+            .configure_program_break(start, limit)
+            .map_err(UserMmError::from)?;
+        Ok(())
+    }
+
+    pub fn program_break(&self) -> Result<VirtAddr, UserMmRuntimeError> {
+        let state = self.state.lock();
+        state
+            .core
+            .layout()
+            .program_break()
+            .map(|program_break| program_break.current())
+            .ok_or(UserMmRuntimeError::InvalidRange)
+    }
+
+    pub fn set_program_break(&self, new_break: VirtAddr) -> Result<VirtAddr, UserMmRuntimeError> {
+        let (current, request, backings, tables) = {
+            let mut state = self.state.lock();
+            let old_layout = state.core.layout().clone();
+            let old = old_layout
+                .program_break()
+                .ok_or(UserMmRuntimeError::InvalidRange)?;
+            let current = state
+                .core
+                .layout_mut()
+                .set_program_break_and_sync_heap(new_break)
+                .map_err(UserMmError::from)?;
+            let old_end = old
+                .current()
+                .align_up(PAGE_SIZE)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            let new_end = current
+                .align_up(PAGE_SIZE)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            if new_end < old_end {
+                let range =
+                    VirtRange::new(new_end, old_end).ok_or(UserMmRuntimeError::InvalidRange)?;
+                match retire_range_locked(&mut state, range) {
+                    Ok((request, backings, tables)) => (current, request, backings, tables),
+                    Err(error) => {
+                        *state.core.layout_mut() = old_layout;
+                        return Err(error);
+                    }
+                }
+            } else {
+                (current, None, Vec::new(), Vec::new())
+            }
+        };
+        finish_retirement(request, backings, tables)?;
+        Ok(current)
+    }
+
+    pub fn map_anonymous(
+        &self,
+        search: VirtRange,
+        size: usize,
+        flags: VmAreaFlags,
+    ) -> Result<VirtAddr, UserMmRuntimeError> {
+        let mut state = self.state.lock();
+        let area = state
+            .core
+            .layout_mut()
+            .map_anonymous(search, size, PAGE_SIZE, flags)
+            .map_err(UserMmError::from)?;
+        Ok(area.range().start())
+    }
+
+    pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
+        let (request, backings, tables) = {
+            let mut state = self.state.lock();
+            let old_layout = state.core.layout().clone();
+            state
+                .core
+                .layout_mut()
+                .unmap_range(range)
+                .map_err(UserMmError::from)?;
+            match retire_range_locked(&mut state, range) {
+                Ok(retirement) => retirement,
+                Err(error) => {
+                    *state.core.layout_mut() = old_layout;
+                    return Err(error);
+                }
+            }
+        };
+        finish_retirement(request, backings, tables)
+    }
+
+    pub fn protect_range(
+        &self,
+        range: VirtRange,
+        access: VmAreaFlags,
+    ) -> Result<(), UserMmRuntimeError> {
+        let request = {
+            let mut state = self.state.lock();
+            let old_layout = state.core.layout().clone();
+            let mapped_count = state
+                .pages
+                .iter()
+                .filter(|mapping| range.contains(mapping.page.start_address()))
+                .count();
+            let mut changed_pages = Vec::new();
+            changed_pages
+                .try_reserve(mapped_count)
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            for mapping in &state.pages {
+                if !range.contains(mapping.page.start_address()) {
+                    continue;
+                }
+                let old_area = old_layout
+                    .find_area(mapping.page.start_address())
+                    .expect("mapped user page has no old VMA");
+                changed_pages.push((mapping.page, old_area));
+            }
+
+            let request = if changed_pages.is_empty() {
+                None
+            } else {
+                Some(state.core.plan_tlb_request(TlbFlush::Range {
+                    scope: TlbScope::AddressSpace(state.core.asid().id()),
+                    range,
+                })?)
+            };
+
+            state
+                .core
+                .layout_mut()
+                .protect_range(range, access)
+                .map_err(UserMmError::from)?;
+
+            let result: Result<(), RuntimePageTableError> = (|| {
+                for (page, _) in &changed_pages {
+                    let area = state
+                        .core
+                        .layout()
+                        .find_area(page.start_address())
+                        .expect("mprotect removed a mapped page's VMA");
+                    state
+                        .page_table
+                        .as_mut()
+                        .ok_or(RuntimePageTableError::NotMapped)?
+                        .protect_page(*page, area.mapping_options())?;
+                }
+                Ok(())
+            })();
+
+            if let Err(error) = result {
+                let page_table = state
+                    .page_table
+                    .as_mut()
+                    .expect("mprotect rollback lost the user page table");
+                for (page, old_area) in &changed_pages {
+                    page_table
+                        .protect_page(*page, old_area.mapping_options())
+                        .expect("mprotect rollback could not restore a leaf PTE");
+                }
+                *state.core.layout_mut() = old_layout;
+                return Err(error.into());
+            }
+            request
+        };
+        if let Some(request) = request {
+            crate::tlb::shootdown_user_local(request);
+        }
+        Ok(())
+    }
+
+    pub fn resolve_user_fault(
+        &self,
+        address: VirtAddr,
+        access: FaultAccess,
+        user_sp: VirtAddr,
+    ) -> Result<UserFaultResolution, UserMmRuntimeError> {
+        let (resolution, request) = {
+            let mut state = self.state.lock();
+            let present = state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?
+                .translate(address)?
+                .is_some();
+            let fault = PageFault::new(address, access, FaultSource::User, present);
+            match state.core.plan_user_fault(fault, user_sp)? {
+                UserFaultPlan::MapAnonymous { area, page } => {
+                    let request = state.core.plan_post_install_tlb(page)?;
+                    map_zero_page_locked(&mut state, area, page)?;
+                    (
+                        UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
+                        Some(request),
+                    )
+                }
+                UserFaultPlan::GrowStack { growth } => {
+                    let request = state.core.plan_post_install_tlb(growth.fault_page())?;
+                    state.core.commit_stack_growth(growth)?;
+                    if let Err(error) =
+                        map_zero_page_locked(&mut state, growth.new_area(), growth.fault_page())
+                    {
+                        let removed = state
+                            .core
+                            .unmap_exact(growth.new_area().range())
+                            .expect("stack-growth rollback lost the expanded VMA");
+                        assert_eq!(removed, growth.new_area());
+                        state
+                            .core
+                            .map_area(growth.old_area())
+                            .expect("stack-growth rollback could not restore the old VMA");
+                        return Err(error);
+                    }
+                    (
+                        UserFaultResolution::Recovered(UserFaultRecovery::StackGrowth),
+                        Some(request),
+                    )
+                }
+                UserFaultPlan::Spurious { .. } => {
+                    let request = state.core.plan_post_install_tlb(address)?;
+                    (
+                        UserFaultResolution::Recovered(UserFaultRecovery::Spurious),
+                        Some(request),
+                    )
+                }
+                UserFaultPlan::CopyOnWriteUnsupported { .. } => (
+                    UserFaultResolution::Fatal(UserFaultFailure::CopyOnWriteUnsupported),
+                    None,
+                ),
+                UserFaultPlan::ProtectionViolation { .. } => (
+                    UserFaultResolution::Fatal(UserFaultFailure::ProtectionViolation),
+                    None,
+                ),
+                UserFaultPlan::SegmentationViolation => (
+                    UserFaultResolution::Fatal(UserFaultFailure::SegmentationViolation),
+                    None,
+                ),
+                UserFaultPlan::KernelBug => (
+                    UserFaultResolution::Fatal(UserFaultFailure::KernelBug),
+                    None,
+                ),
+            }
+        };
+
+        if let Some(request) = request {
+            crate::tlb::shootdown_user_local(request);
+        }
+        Ok(resolution)
     }
 
     pub fn bind(&self) -> Result<(), UserMmRuntimeError> {
@@ -522,6 +797,41 @@ pub fn copy_to_active(address: usize, input: &[u8]) -> Result<(), UserMmRuntimeE
     with_active(|mm| mm.copy_to_user(address, input))
 }
 
+pub fn resolve_active_fault(
+    address: VirtAddr,
+    access: FaultAccess,
+    user_sp: VirtAddr,
+) -> Result<UserFaultResolution, UserMmRuntimeError> {
+    with_active(|mm| mm.resolve_user_fault(address, access, user_sp))
+}
+
+pub fn active_program_break() -> Result<VirtAddr, UserMmRuntimeError> {
+    with_active(UserMm::program_break)
+}
+
+pub fn set_active_program_break(new_break: VirtAddr) -> Result<VirtAddr, UserMmRuntimeError> {
+    with_active(|mm| mm.set_program_break(new_break))
+}
+
+pub fn map_active_anonymous(
+    search: VirtRange,
+    size: usize,
+    flags: VmAreaFlags,
+) -> Result<VirtAddr, UserMmRuntimeError> {
+    with_active(|mm| mm.map_anonymous(search, size, flags))
+}
+
+pub fn unmap_active_range(range: VirtRange) -> Result<(), UserMmRuntimeError> {
+    with_active(|mm| mm.unmap_range(range))
+}
+
+pub fn protect_active_range(
+    range: VirtRange,
+    access: VmAreaFlags,
+) -> Result<(), UserMmRuntimeError> {
+    with_active(|mm| mm.protect_range(range, access))
+}
+
 pub fn assert_no_leaks() {
     assert!(
         ACTIVE_MM.load(Ordering::Acquire).is_null(),
@@ -560,6 +870,144 @@ fn with_active<T>(
     // disables local interrupts and neither migrates nor preempts its owner.
     let mm = unsafe { &*pointer };
     f(mm)
+}
+
+fn map_zero_page_locked(
+    state: &mut UserMmState,
+    area: VmArea,
+    page_address: VirtAddr,
+) -> Result<(), UserMmRuntimeError> {
+    let page_address = page_address
+        .align_down(PAGE_SIZE)
+        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+    let page =
+        VirtPage::from_start_address(page_address).ok_or(UserMmRuntimeError::InvalidRange)?;
+    if state
+        .page_table
+        .as_ref()
+        .ok_or(UserMmRuntimeError::NotMapped)?
+        .translate(page_address)?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    state
+        .pages
+        .try_reserve(1)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    let backing =
+        crate::page_alloc::allocate(0, crate::page_alloc::PageAllocationOptions::kernel_zeroed())?;
+    let page_table = state
+        .page_table
+        .as_mut()
+        .ok_or(UserMmRuntimeError::NotMapped)?;
+    if let Err(error) = page_table.map_page(page, backing.start(), area.mapping_options()) {
+        crate::page_alloc::free(backing)?;
+        return Err(error.into());
+    }
+
+    state.pages.push(MappedPage { page, backing });
+    LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+    Ok(())
+}
+
+fn retire_range_locked(
+    state: &mut UserMmState,
+    range: VirtRange,
+) -> Result<
+    (
+        Option<PerMmTlbRequest>,
+        Vec<PageAllocation>,
+        Vec<PageAllocation>,
+    ),
+    UserMmRuntimeError,
+> {
+    let count = state
+        .pages
+        .iter()
+        .filter(|mapping| range.contains(mapping.page.start_address()))
+        .count();
+    if count == 0 {
+        return Ok((None, Vec::new(), Vec::new()));
+    }
+
+    let page_table = state
+        .page_table
+        .as_ref()
+        .ok_or(UserMmRuntimeError::NotMapped)?;
+    for mapping in &state.pages {
+        if !range.contains(mapping.page.start_address()) {
+            continue;
+        }
+        let physical = page_table
+            .translate(mapping.page.start_address())?
+            .ok_or(UserMmRuntimeError::NotMapped)?;
+        assert_eq!(
+            physical,
+            mapping.backing.start().start_address(),
+            "user retirement preflight found a mismatched backing frame",
+        );
+    }
+
+    let table_capacity = page_table.allocated_runtime_tables();
+    let mut backings = Vec::new();
+    backings
+        .try_reserve(count)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    let mut tables = Vec::new();
+    tables
+        .try_reserve(table_capacity)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    let request = state.core.plan_tlb_request(TlbFlush::Range {
+        scope: TlbScope::AddressSpace(state.core.asid().id()),
+        range,
+    })?;
+
+    let mut index = 0;
+    while index < state.pages.len() {
+        if !range.contains(state.pages[index].page.start_address()) {
+            index += 1;
+            continue;
+        }
+        let mapping = state.pages.swap_remove(index);
+        let page_table = state
+            .page_table
+            .as_mut()
+            .expect("retirement preflight lost the user page table");
+        let frame = page_table
+            .unmap_page(mapping.page)
+            .expect("retirement preflight accepted a missing user leaf");
+        assert_eq!(
+            frame,
+            mapping.backing.start(),
+            "user unmap returned a different backing frame",
+        );
+        page_table
+            .reclaim_empty_tables(mapping.page, &mut tables)
+            .expect("user page-table reclamation violated the reviewed topology");
+        backings.push(mapping.backing);
+    }
+
+    Ok((Some(request), backings, tables))
+}
+
+fn finish_retirement(
+    request: Option<PerMmTlbRequest>,
+    backings: Vec<PageAllocation>,
+    tables: Vec<PageAllocation>,
+) -> Result<(), UserMmRuntimeError> {
+    if let Some(request) = request {
+        crate::tlb::shootdown_user_local(request);
+    }
+    for backing in backings {
+        crate::page_alloc::free(backing)?;
+        LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
+    }
+    for table in tables {
+        crate::page_alloc::free(table)?;
+    }
+    Ok(())
 }
 
 fn validate_range(

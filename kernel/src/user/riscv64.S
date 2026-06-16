@@ -167,5 +167,123 @@ __m7_user_write_code:
     ebreak
     .option pop
 
+
+.globl __m8_user_vm
+__m8_user_vm:
+    .option push
+    .option norvc
+    li t0, 0x500000
+    sd zero, 0(t0)
+    li t0, 0x7ff000
+    sd zero, 0(t0)
+
+    li a0, 0x601000
+    li a7, 214
+    ecall
+    li t0, 0x601000
+    bne a0, t0, .Lriscv_m8_vm_failed
+    li t0, 0x600000
+    sd zero, 0(t0)
+    li a0, 0x600000
+    li a7, 214
+    ecall
+    li t0, 0x600000
+    bne a0, t0, .Lriscv_m8_vm_failed
+
+    li a0, 0
+    li a1, 4096
+    li a2, 3
+    li a3, 0x22
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    li t0, 0x01000000
+    bne a0, t0, .Lriscv_m8_vm_failed
+    mv s0, a0
+    sd zero, 0(s0)
+
+    mv a0, s0
+    li a1, 4096
+    li a2, 1
+    li a7, 226
+    ecall
+    bnez a0, .Lriscv_m8_vm_failed
+
+    mv a0, s0
+    li a1, 4096
+    li a7, 215
+    ecall
+    bnez a0, .Lriscv_m8_vm_failed
+
+    li a0, 0
+    li a7, 93
+    ecall
+.Lriscv_m8_vm_failed:
+    li a0, 1
+    li a7, 93
+    ecall
+    ebreak
+    .option pop
+
+.globl __m8_user_mprotect_fault
+__m8_user_mprotect_fault:
+    .option push
+    .option norvc
+    li a0, 0
+    li a1, 4096
+    li a2, 3
+    li a3, 0x22
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    li t0, 0x01000000
+    bne a0, t0, .Lriscv_m8_mprotect_failed
+    mv s0, a0
+    sd zero, 0(s0)
+    mv a0, s0
+    li a1, 4096
+    li a2, 1
+    li a7, 226
+    ecall
+    bnez a0, .Lriscv_m8_mprotect_failed
+    sd zero, 0(s0)
+.Lriscv_m8_mprotect_failed:
+    li a0, 1
+    li a7, 93
+    ecall
+    ebreak
+    .option pop
+
+.globl __m8_user_munmap_fault
+__m8_user_munmap_fault:
+    .option push
+    .option norvc
+    li a0, 0
+    li a1, 4096
+    li a2, 3
+    li a3, 0x22
+    li a4, -1
+    li a5, 0
+    li a7, 222
+    ecall
+    li t0, 0x01000000
+    bne a0, t0, .Lriscv_m8_munmap_failed
+    mv s0, a0
+    sd zero, 0(s0)
+    mv a0, s0
+    li a1, 4096
+    li a7, 215
+    ecall
+    bnez a0, .Lriscv_m8_munmap_failed
+    ld t1, 0(s0)
+.Lriscv_m8_munmap_failed:
+    li a0, 1
+    li a7, 93
+    ecall
+    ebreak
+    .option pop
+
 .globl __m7_user_image_end
 __m7_user_image_end:

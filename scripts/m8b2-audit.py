@@ -29,4 +29,4 @@ if missing:
 print("M8-B2 audit: PASS")
 for name, _ in checks:
     print(f"  {name:<22}: present")
-print("  hardware root switch    : intentionally deferred to next M8 gate")
+print("  hardware integration    : supplied by M8-B3/B4")
