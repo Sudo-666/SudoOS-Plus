@@ -45,11 +45,12 @@ CHECKS = {
         "crate::context::assert_interrupts_disabled();",
     ),
     "kernel/src/user.rs": (
-        "SYS_BRK: usize = 214",
-        "SYS_MUNMAP: usize = 215",
-        "SYS_MMAP: usize = 222",
-        "SYS_MPROTECT: usize = 226",
-        "resolve_active_fault",
+        "SYS_BRK",
+        "SYS_MUNMAP",
+        "SYS_MMAP",
+        "SYS_MPROTECT",
+        "resolve_user_fault",
+        "current_user_mm()",
         "M8-B4 demand paging/VM gate:",
         "TLB-before-free   : verified",
         "demand fault path : verified",
@@ -78,6 +79,38 @@ for relative, markers in CHECKS.items():
         continue
     text = path.read_text(encoding="utf-8")
     missing.extend(f"{relative}: {marker}" for marker in markers if marker not in text)
+
+user = (ROOT / "kernel/src/user.rs").read_text(encoding="utf-8")
+syscall_path = ROOT / "kernel/src/syscall.rs"
+syscall = syscall_path.read_text(encoding="utf-8") if syscall_path.is_file() else ""
+legacy_numbers = all(
+    marker in user
+    for marker in (
+        "SYS_BRK: usize = 214",
+        "SYS_MUNMAP: usize = 215",
+        "SYS_MMAP: usize = 222",
+        "SYS_MPROTECT: usize = 226",
+    )
+)
+central_numbers = all(
+    marker in syscall
+    for marker in (
+        "BRK: usize = 214",
+        "MUNMAP: usize = 215",
+        "MMAP: usize = 222",
+        "MPROTECT: usize = 226",
+    )
+) and all(
+    marker in user
+    for marker in (
+        "crate::syscall::number::BRK",
+        "crate::syscall::number::MUNMAP",
+        "crate::syscall::number::MMAP",
+        "crate::syscall::number::MPROTECT",
+    )
+)
+if not (legacy_numbers or central_numbers):
+    missing.append("Linux VM syscall numbers")
 
 if missing:
     print("M8-B4 audit: FAIL", file=sys.stderr)

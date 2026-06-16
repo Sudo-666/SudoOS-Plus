@@ -209,19 +209,19 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 | tracked spin lock | ✅ | Rank-aware SpinLock、IRQ-enabled contention、migration pinning、instance-aware lockdep |
 | idle/IPI 确定性验证 | ✅ | target timer disable、IRQ-disabled recheck、pending IPI at wait、single reschedule IPI |
 | M5 并发基础 | ✅ | m5-quick 4/4 PASS、双架构 SMP=1/2/4/8 smoke 全绿、200 轮 pressure test |
-| 系统调用 | ⬜ | syscall 表, U-mode |
+| 系统调用 | ✅ | Linux 通用 64 位 ABI 核心：write/exit/exit_group/sched_yield/brk/mmap/munmap/mprotect |
 | 设备驱动 | ⬜ | virtio-blk, virtio-net |
 | 文件系统 | ⬜ | VFS, tmpfs/ext4（lwext4 适配层） |
 
 ## 下一步
 
-M5/M6/M7 已冻结；M8 Linux-like 用户 MM 已进入最终验证，之后进入 M9 Process/Thread。
+M5–M9 已冻结。当前进入 M10：ELF64 loader、`execve`、Linux 初始用户栈和 initramfs。
 
 ## M5 之后完整路线图
 
-M5 完成后内核底座已具备：双架构启动、高半内核、SMP、抢占、等待队列、IPI、TLB shootdown、
-lockdep、并发验证。但还没有真正的 Process、用户页表、syscall ABI、ELF 加载、VFS、
-fork/exec/wait、pipe/signal、块设备和根文件系统。
+M9 完成后内核底座已具备：双架构启动、高半内核、SMP、抢占、等待队列、IPI、TLB shootdown、
+lockdep、独立用户 MM、Process/Thread 强所有权、scheduler loaded-mm 和 Linux 通用 64 位 syscall ABI。
+仍待完成 ELF/exec、VFS、fork/wait、pipe/signal、块设备和根文件系统。
 
 接下来的目标按依赖顺序分为以下几层。
 
@@ -247,7 +247,7 @@ M7  U-mode / PLV3 + write/exit
   ↓
 M8  per-process AddressSpace + user fault
   ↓
-M9  Process/Thread + Linux syscall ABI
+M9  Process/Thread + Linux syscall ABI  ← 已完成
   ↓
 M10 ELF + execve + initramfs
   ↓
@@ -348,6 +348,11 @@ scheduler state。
 ABI：尽量采用 Linux 通用 64 位 syscall ABI（RISC-V 用 Linux RISC-V ABI、
 LoongArch 用 Linux LoongArch ABI），syscall number、参数寄存器、错误返回
 尽量兼容 Linux，这样 musl、BusyBox 只需极少补丁。
+
+**状态：已完成。** scheduler `TaskKind::UserThread`、独立 guarded kernel stack、
+per-CPU `loaded_mm: Arc<UserMm>`、IRQ-off `switch_mm_irqs_off()`、用户态 timer/IPI
+抢占、deferred task reap，以及 `sched_yield`/`exit_group` 双架构回归已接入。
+完整契约见 [`docs/m9-completion.md`](docs/m9-completion.md)。
 
 ### M10：ELF、execve 和 initramfs
 
@@ -561,6 +566,7 @@ M8 从 `main@c85b611` 重建，采用单一同步 verifier session 所有权：
 `active_cpus`、per-mm TLB request、anonymous demand paging、栈增长以及
 `brk/mmap/munmap/mprotect` 已接入。
 
-M8 不伪造 scheduler current-mm。Process/Thread 对 `UserMm` 的强所有权、
-per-CPU loaded-mm 和 `switch_mm_irqs_off()` 严格留到 M9。完整不变量和
-门禁见 [`docs/m8-linuxlike-contract.md`](docs/m8-linuxlike-contract.md)。
+M8 没有伪造 scheduler current-mm；该冻结边界现已由 M9 的 Process/Thread
+强所有权、per-CPU loaded-mm 和 `switch_mm_irqs_off()` 正式接管。M8 原始
+不变量见 [`docs/m8-linuxlike-contract.md`](docs/m8-linuxlike-contract.md)，M9
+闭环见 [`docs/m9-completion.md`](docs/m9-completion.md)。

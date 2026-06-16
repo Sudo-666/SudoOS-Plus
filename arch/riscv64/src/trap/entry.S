@@ -4,6 +4,13 @@
 .globl __riscv_trap_entry
 .type __riscv_trap_entry, @function
 
+.equ RISCV_USER_ANCHOR_KERNEL_SP, 0
+.equ RISCV_USER_ANCHOR_KERNEL_TP, 8
+.equ RISCV_USER_ANCHOR_USER_TP, 16
+.equ RISCV_TF_STVAL, 35*8
+.equ RISCV_TF_GUARD, 36*8
+.equ RISCV_TF_PADDING, 37*8
+
 /*
  * TrapFrame layout (304 bytes, 16-byte aligned):
  *
@@ -12,11 +19,20 @@
  * sscratch invariant:
  *
  *   - while executing kernel code: sscratch == 0
- *   - while executing user code:   sscratch == kernel stack top
+ *   - while executing user code:   sscratch points at a task-stack anchor
  *
- * A trap from user swaps the user SP into sscratch and starts on the
- * kernel stack.  sscratch is then cleared before calling Rust so a nested
- * kernel trap cannot mistake a stale value for a kernel stack pointer.
+ * The 24-byte anchor temporarily occupies the future stval/guard/padding
+ * slots immediately below the task's saved kernel SP:
+ *
+ *   anchor[0] = saved kernel SP
+ *   anchor[1] = kernel tp (logical CPU identity)
+ *   anchor[2] = temporary user tp storage used only during entry
+ *
+ * This is the same ownership split used by Linux RISC-V entry code: user tp
+ * must never be treated as kernel per-CPU state.  A user trap restores the
+ * kernel-owned tp before entering Rust, while the user tp is preserved in the
+ * TrapFrame and restored only on sret.  The anchor is rebuilt on every return
+ * to user, so task migration records the destination CPU's tp.
  */
 __riscv_trap_entry:
     csrrw sp, sscratch, sp
@@ -28,14 +44,20 @@ __riscv_trap_entry:
     j .Lriscv_allocate_frame
 
 .Lriscv_from_user:
-    /* sp is now the task's kernel stack top; sscratch contains user SP. */
+    /*
+     * sp points at the task anchor and sscratch contains user SP.  Preserve
+     * user tp before restoring kernel tp; ordinary task switches deliberately
+     * leave the kernel-owned tp untouched.
+     */
+    sd tp, RISCV_USER_ANCHOR_USER_TP(sp)
+    ld tp, RISCV_USER_ANCHOR_KERNEL_TP(sp)
+    ld sp, RISCV_USER_ANCHOR_KERNEL_SP(sp)
 
 .Lriscv_allocate_frame:
     addi sp, sp, -304
 
     sd ra, 1*8(sp)
     sd gp, 3*8(sp)
-    sd tp, 4*8(sp)
     sd t0, 5*8(sp)
     sd t1, 6*8(sp)
     sd t2, 7*8(sp)
@@ -66,13 +88,17 @@ __riscv_trap_entry:
 
     /* sscratch is non-zero only for a trap that originated in user mode. */
     csrr t0, sscratch
-    beqz t0, .Lriscv_save_kernel_sp
+    beqz t0, .Lriscv_save_kernel_origin
 
+    /* The anchor's third word survived at TrapFrame padding offset 37*8. */
+    ld t1, RISCV_TF_PADDING(sp)
+    sd t1, 4*8(sp)
     sd t0, 2*8(sp)
     csrw sscratch, zero
     j .Lriscv_save_csrs
 
-.Lriscv_save_kernel_sp:
+.Lriscv_save_kernel_origin:
+    sd tp, 4*8(sp)
     addi t0, sp, 304
     sd t0, 2*8(sp)
 
@@ -115,17 +141,28 @@ __riscv_trap_entry:
     andi t1, t0, 0x100
     bnez t1, .Lriscv_return_to_kernel
 
+    /*
+     * Rebuild the task-local entry anchor before restoring user registers.
+     * Current tp belongs to the destination CPU, so migration is reflected in
+     * the next user-to-kernel transition.
+     */
     addi t1, sp, 304
+    sd t1, RISCV_TF_STVAL(sp)
+    sd tp, RISCV_TF_GUARD(sp)
+    addi t1, sp, RISCV_TF_STVAL
     csrw sscratch, t1
-    j .Lriscv_restore_registers
+    j .Lriscv_restore_user_tp
 
 .Lriscv_return_to_kernel:
     csrw sscratch, zero
+    j .Lriscv_restore_registers
+
+.Lriscv_restore_user_tp:
+    ld tp, 4*8(sp)
 
 .Lriscv_restore_registers:
     ld ra, 1*8(sp)
     ld gp, 3*8(sp)
-    ld tp, 4*8(sp)
     ld t0, 5*8(sp)
     ld t1, 6*8(sp)
     ld t2, 7*8(sp)

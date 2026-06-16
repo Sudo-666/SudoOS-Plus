@@ -87,6 +87,7 @@ DEBUG_M5_MARKERS = (
     ('timer', b'workqueue runtime test:'),
     ('user', b'hello user\n'),
     ('user', b'minimal user mode test:'),
+    ('user', b'M9-B scheduler/MM gate:'),
     ('wait', b'M4C_SCHED_TEST: PASS'),
     ('tlb', b'M4C_TLB_TEST: PASS'),
     ('final', b'SMP_TEST: PASS'),

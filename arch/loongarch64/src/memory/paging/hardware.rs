@@ -183,8 +183,6 @@ pub unsafe fn activate(root: PhysFrame) -> Result<PagingHardwareState, HardwareP
     })
 }
 
-/// Invalidate the TLB pair containing `address` on the current CPU.
-
 /// Invalidate every non-global entry for one user ASID on this CPU.
 pub fn flush_asid(asid: AddressSpaceId) {
     let asid = validate_user_asid(asid);

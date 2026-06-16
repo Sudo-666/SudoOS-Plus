@@ -288,8 +288,6 @@ pub fn shootdown(flush: TlbFlush) {
     drop(migration_guard);
 }
 
-/// Handles the TLB component of one mailbox batch on the current CPU.
-
 /// Executes one synchronous, exact-target TLB request for a user address space.
 ///
 /// The request must be created by `UserAddressSpace::plan_tlb_request()` after

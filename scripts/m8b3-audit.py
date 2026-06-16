@@ -65,10 +65,18 @@ def main() -> int:
             (
                 "M8-B3 private-root gate:",
                 "session recycle   : verified (5 runs)",
-                "image.activate_current_cpu();",
-                "image.deactivate_current_cpu();",
                 "private user root : verified",
                 "kernel root return: verified",
+                "run_scheduled_thread",
+            ),
+        )
+        require(
+            "kernel/src/task/mod.rs",
+            (
+                "fn switch_mm_irqs_off(",
+                "loaded_mm: Option<Arc<crate::user_mm::UserMm>>",
+                ".activate_current_cpu()",
+                ".deactivate_current_cpu()",
             ),
         )
         require(

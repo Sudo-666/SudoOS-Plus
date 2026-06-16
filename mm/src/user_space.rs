@@ -239,7 +239,6 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
     /// - the fault is within one bounded growth step and close to saved SP;
     /// - the expanded VMA preserves a guard gap above the preceding VMA;
     /// - the expanded range remains inside the configured user range.
-
     pub fn plan_user_fault(
         &self,
         fault: PageFault,

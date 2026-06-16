@@ -83,10 +83,11 @@ pub fn set_current_cpu_id(cpu: usize) {
         cpu < MAX_CPUS,
         "logical CPU ID is outside the supported range"
     );
+    let scratch = cpu;
     // SAFETY: r21/u0 is the kernel per-CPU logical identifier at PLV0.
     // KSave3 mirrors the canonical value so trap entry can restore it after
-    // capturing user-controlled GPR state and before calling Rust.
-    let scratch = cpu;
+    // capturing user-controlled GPR state and before calling Rust. The CSR
+    // write and register copy touch no Rust-managed memory or stack.
     unsafe {
         asm!(
             "csrwr {scratch}, {percpu_id_save}",

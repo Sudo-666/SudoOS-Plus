@@ -3,12 +3,19 @@
 .globl __m7_enter_user
 .type __m7_enter_user, @function
 
+.equ RISCV_USER_ANCHOR_SIZE, 24
+.equ RISCV_USER_ANCHOR_KERNEL_SP, 0
+.equ RISCV_USER_ANCHOR_KERNEL_TP, 8
+.equ RISCV_USER_ANCHOR_USER_TP, 16
+
 /*
  * a0 = user entry, a1 = user stack top.
  *
- * M7 runs synchronously with local interrupts disabled. sscratch owns the
- * kernel stack pointer while U-mode is active. The normal trap entry switches
- * back to this stack and clears sscratch before entering Rust.
+ * M9-B runs as a schedulable task. While U-mode is active, sscratch
+ * points at a task-stack anchor containing the saved kernel SP and kernel tp.
+ * Trap entry restores both before entering Rust and preserves user tp as part
+ * of the TrapFrame, matching Linux's separation of user TLS from kernel
+ * current/per-CPU state.
  */
 __m7_enter_user:
     addi sp, sp, -128
@@ -30,11 +37,20 @@ __m7_enter_user:
     csrr t0, sstatus
     sd t0, 120(sp)
 
-    csrw sscratch, sp
+    /*
+     * Build the 24-byte entry anchor in the area that the next TrapFrame will
+     * occupy.  Trap entry consumes these words before writing stval/guard/pad.
+     */
+    addi t2, sp, -RISCV_USER_ANCHOR_SIZE
+    sd sp, RISCV_USER_ANCHOR_KERNEL_SP(t2)
+    sd tp, RISCV_USER_ANCHOR_KERNEL_TP(t2)
+    sd zero, RISCV_USER_ANCHOR_USER_TP(t2)
+    csrw sscratch, t2
     csrw sepc, a0
-    li t1, 0x40122          /* SUM | SPP | SPIE | SIE */
+    li t1, 0x40102          /* SUM | SPP | SIE */
     not t1, t1
     and t0, t0, t1
+    ori t0, t0, 0x20        /* SPIE: enable timer/IPI after sret */
     csrw sstatus, t0
 
     mv sp, a1
@@ -281,6 +297,27 @@ __m8_user_munmap_fault:
 .Lriscv_m8_munmap_failed:
     li a0, 1
     li a7, 93
+    ecall
+    ebreak
+    .option pop
+
+.globl __m9_user_sched_yield
+__m9_user_sched_yield:
+    .option push
+    .option norvc
+    li t0, 8
+.Lriscv_m9_yield_loop:
+    li a7, 124
+    ecall
+    bnez tp, .Lriscv_m9_tp_leaked
+    addi t0, t0, -1
+    bnez t0, .Lriscv_m9_yield_loop
+    li a0, 0
+    li a7, 94
+    ecall
+.Lriscv_m9_tp_leaked:
+    li a0, 1
+    li a7, 94
     ecall
     ebreak
     .option pop

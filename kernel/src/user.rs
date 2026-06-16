@@ -1,10 +1,11 @@
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use myos_mm::{
     FaultAccess, PAGE_SIZE, PhysAddr, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind,
 };
 
+use crate::process::{Process, Thread};
 use crate::user_mm::{
     UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMm, UserMmRuntimeError,
 };
@@ -19,12 +20,14 @@ const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
 const USER_MMAP_START: usize = 0x0000_0000_0100_0000;
 const USER_MMAP_END: usize = 0x0000_0000_4000_0000;
 
-const SYS_WRITE: usize = 64;
-const SYS_EXIT: usize = 93;
-const SYS_BRK: usize = 214;
-const SYS_MUNMAP: usize = 215;
-const SYS_MMAP: usize = 222;
-const SYS_MPROTECT: usize = 226;
+const SYS_WRITE: usize = crate::syscall::number::WRITE;
+const SYS_EXIT: usize = crate::syscall::number::EXIT;
+const SYS_EXIT_GROUP: usize = crate::syscall::number::EXIT_GROUP;
+const SYS_SCHED_YIELD: usize = crate::syscall::number::SCHED_YIELD;
+const SYS_BRK: usize = crate::syscall::number::BRK;
+const SYS_MUNMAP: usize = crate::syscall::number::MUNMAP;
+const SYS_MMAP: usize = crate::syscall::number::MMAP;
+const SYS_MPROTECT: usize = crate::syscall::number::MPROTECT;
 
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
@@ -32,11 +35,11 @@ const PROT_EXEC: usize = 4;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_ANONYMOUS: usize = 0x20;
 
-const EBADF: isize = 9;
-const ENOMEM: isize = 12;
-const EFAULT: isize = 14;
-const EINVAL: isize = 22;
-const ENOSYS: isize = 38;
+const EBADF: isize = crate::syscall::errno::EBADF;
+const ENOMEM: isize = crate::syscall::errno::ENOMEM;
+const EFAULT: isize = crate::syscall::errno::EFAULT;
+const EINVAL: isize = crate::syscall::errno::EINVAL;
+const ENOSYS: isize = crate::syscall::errno::ENOSYS;
 
 const MAX_USER_COPY: usize = 256;
 const USER_MESSAGE: &[u8] = b"hello user\n";
@@ -61,6 +64,10 @@ static MPROTECT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LAST_FAULT_KIND: AtomicUsize = AtomicUsize::new(FAULT_NONE);
 static LAST_FAULT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static EXIT_STATUS: AtomicIsize = AtomicIsize::new(isize::MIN);
+static SCHED_YIELD_SWITCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_PEER_STOP: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_PEER_READY: crate::task::Completion = crate::task::Completion::new();
+static SCHEDULER_PEER_DONE: crate::task::Completion = crate::task::Completion::new();
 
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!("user/riscv64.S"));
@@ -80,11 +87,13 @@ unsafe extern "C" {
     static __m8_user_vm: u8;
     static __m8_user_mprotect_fault: u8;
     static __m8_user_munmap_fault: u8;
+    static __m9_user_sched_yield: u8;
     static __m7_user_image_end: u8;
 }
 
 struct UserImage {
-    mm: Box<UserMm>,
+    process: Arc<Process>,
+    thread: Arc<Thread>,
     code_physical: PhysAddr,
 }
 
@@ -136,7 +145,29 @@ impl UserImage {
             }
         };
 
-        Ok(Self { mm, code_physical })
+        let process = Process::create(mm);
+        let thread = match process.create_initial_thread(
+            VirtAddr::new(USER_CODE),
+            VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
+        ) {
+            Ok(thread) => thread,
+            Err(error) => {
+                let process = Arc::try_unwrap(process).unwrap_or_else(|_| {
+                    panic!("M9-A retained Process after thread creation failure")
+                });
+                process
+                    .destroy()
+                    .expect("unable to reclaim M9-A process after thread creation failure");
+                return Err(error.into());
+            }
+        };
+        crate::process::assert_initial_pair(&process, &thread);
+
+        Ok(Self {
+            process,
+            thread,
+            code_physical,
+        })
     }
 
     fn publish(&self) {
@@ -144,7 +175,6 @@ impl UserImage {
             !ACTIVE.load(Ordering::Acquire),
             "M8-B3 attempted to publish two user sessions",
         );
-        self.mm.bind().expect("unable to bind the M8-B3 user mm");
         ACTIVE.store(true, Ordering::Release);
     }
 
@@ -154,7 +184,6 @@ impl UserImage {
             was_active,
             "M8-B3 attempted to unpublish an inactive session"
         );
-        self.mm.unbind();
     }
 
     fn load_code(&self) {
@@ -167,40 +196,32 @@ impl UserImage {
         prepare_user_instruction_stream();
     }
 
-    fn activate_current_cpu(&self) {
-        self.mm
-            .activate_current_cpu()
-            .expect("unable to activate the M8-B3 user page-table root");
-    }
-
-    fn deactivate_current_cpu(&self) {
-        self.mm
-            .deactivate_current_cpu()
-            .expect("unable to restore the kernel page-table root");
-    }
-
-    fn assert_private_hardware_state(&self) {
-        assert!(
-            self.mm
-                .root_is_private()
-                .expect("unable to compare M8-B3 page-table roots"),
-            "M8-B3 user mm reused the kernel page-table root",
+    fn destroy(self) {
+        let Self {
+            process,
+            thread,
+            code_physical: _,
+        } = self;
+        assert_eq!(
+            thread.exit_status(),
+            Some(EXIT_STATUS.load(Ordering::Acquire)),
+            "M9-B Process teardown observed a mismatched Thread exit status",
         );
-        self.mm
-            .assert_hardware_active()
-            .expect("M8-B3 hardware root/ASID verification failed");
         assert!(
-            self.mm
-                .kernel_mapping_is_shared(VirtAddr::new(verify as usize))
-                .expect("unable to verify the shared kernel mapping"),
-            "M8-B3 user root lost the shared high-half kernel mapping",
+            thread.scheduler_task().is_some(),
+            "M9-B user Thread was never bound to a scheduler task",
         );
-    }
-
-    fn destroy(mut self) {
-        self.mm
+        drop(thread);
+        assert_eq!(
+            Arc::strong_count(&process),
+            1,
+            "M9-B retained an unexpected Process owner after scheduler detach",
+        );
+        let process = Arc::try_unwrap(process)
+            .unwrap_or_else(|_| panic!("M9-B could not obtain unique Process ownership"));
+        process
             .destroy()
-            .expect("unable to destroy the M8-B3 user address space");
+            .expect("unable to destroy the M9-B process address space");
     }
 }
 
@@ -242,6 +263,11 @@ struct SessionObserved {
 }
 
 pub fn verify() {
+    crate::task::run_kernel_thread_sync(verify_worker);
+}
+
+fn verify_worker() {
+    crate::syscall::verify_contract();
     crate::context::assert_task_context();
     crate::context::assert_interrupts_enabled();
     assert_eq!(
@@ -274,6 +300,22 @@ pub fn verify() {
         result: 0,
         exit_status: 0,
         syscall_count: 2,
+        write_count: 0,
+        fault_count: 0,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
+        fault_kind: FAULT_NONE,
+        fault_address: 0,
+    };
+    let scheduler_success = SessionExpected {
+        result: 0,
+        exit_status: 0,
+        syscall_count: 9,
         write_count: 0,
         fault_count: 0,
         recovered_fault_count: 0,
@@ -400,11 +442,28 @@ pub fn verify() {
         munmap_fault,
     );
 
+    let scheduler_cpu = if crate::smp::scheduler_active_cpu_count() > 1 {
+        crate::smp::CpuId::new(1).expect("CPU1 must fit the configured CPU mask")
+    } else {
+        crate::smp::CpuId::BOOT
+    };
+    assert_session(
+        "schedulable user thread",
+        run_scheduler_session(core::ptr::addr_of!(__m9_user_sched_yield), scheduler_cpu),
+        scheduler_success,
+    );
+
     assert!(
         !ACTIVE.load(Ordering::Acquire),
         "M8-B3 verifier leaked an active user session",
     );
     crate::user_mm::assert_no_leaks();
+    crate::process::assert_no_leaks();
+    crate::task::assert_user_mm_quiescent();
+    assert!(
+        crate::task::user_mm_switches() >= 18,
+        "M9-B did not exercise enough scheduler-owned MM transitions",
+    );
 
     // Keep the frozen M7 evidence strings intact for the existing harness.
     crate::println!("minimal user mode test:");
@@ -435,12 +494,43 @@ pub fn verify() {
     crate::println!("  mprotect          : verified");
     crate::println!("  TLB-before-free   : verified");
     crate::println!("  user fault retry  : verified");
+
+    crate::println!("M9-A Process/Thread + ABI gate:");
+    crate::println!("  Process owns MM   : verified");
+    crate::println!("  Thread owns proc  : verified");
+    crate::println!("  cycle-free reap   : verified");
+    crate::println!("  Linux generic ABI : verified");
+    crate::println!("M9-B scheduler/MM gate:");
+    crate::println!("  schedulable user task : verified");
+    crate::println!("  per-CPU loaded MM     : verified");
+    crate::println!("  timer-preemptible user: verified");
+    crate::println!("  deferred task reap    : verified");
 }
 
 fn run_session(
     entry_symbol: *const u8,
     initial_data: Option<&[u8]>,
     exercise_copy_guards: bool,
+) -> SessionObserved {
+    run_session_on(
+        entry_symbol,
+        initial_data,
+        exercise_copy_guards,
+        None,
+        false,
+    )
+}
+
+fn run_scheduler_session(entry_symbol: *const u8, target: crate::smp::CpuId) -> SessionObserved {
+    run_session_on(entry_symbol, None, false, Some(target), true)
+}
+
+fn run_session_on(
+    entry_symbol: *const u8,
+    initial_data: Option<&[u8]>,
+    exercise_copy_guards: bool,
+    target: Option<crate::smp::CpuId>,
+    scheduler_probe: bool,
 ) -> SessionObserved {
     reset_session_state();
 
@@ -449,31 +539,67 @@ fn run_session(
     image.publish();
 
     if let Some(data) = initial_data {
-        copy_to_user(USER_DATA, data).expect("checked copy_to_user rejected M8-B3 user data");
+        image
+            .process
+            .mm()
+            .copy_to_user(USER_DATA, data)
+            .expect("checked copy_to_user rejected M9-B user data");
         let mut round_trip = [0_u8; USER_MESSAGE.len()];
-        copy_from_user(USER_DATA, &mut round_trip)
-            .expect("checked copy_from_user rejected M8-B3 user data");
+        image
+            .process
+            .mm()
+            .copy_from_user(USER_DATA, &mut round_trip)
+            .expect("checked copy_from_user rejected M9-B user data");
         assert_eq!(&round_trip, data, "M8-B3 user copy changed data");
     }
 
     if exercise_copy_guards {
-        verify_copy_guards();
+        verify_copy_guards(image.process.mm());
     }
 
-    let entry = user_entry(entry_symbol);
-    let result = {
-        /*
-         * The M8 verifier retains M7's synchronous, non-preemptible user
-         * round trip. M9 will attach an mm to schedulable Process/Thread
-         * objects and move root switching into the context-switch path.
-         */
-        let _interrupt_guard = crate::context::IrqSaveGuard::new();
-        image.activate_current_cpu();
-        image.assert_private_hardware_state();
-        let result = enter_user(entry, USER_STACK_TOP);
-        image.deactivate_current_cpu();
-        result
-    };
+    let entry = VirtAddr::new(user_entry(entry_symbol));
+    image
+        .thread
+        .prepare_entry(entry)
+        .expect("unable to prepare the M9-A user entry");
+    if scheduler_probe {
+        let target = target.expect("M9-B scheduler probe requires a target CPU");
+        SCHEDULER_PEER_READY.reinit();
+        SCHEDULER_PEER_DONE.reinit();
+        SCHEDULER_PEER_STOP.store(false, Ordering::Release);
+        crate::task::spawn_kernel_thread_on(scheduler_peer, target);
+        SCHEDULER_PEER_READY.wait();
+    }
+
+    let task = crate::task::spawn_user_thread_on(Arc::clone(&image.thread), target);
+    assert_eq!(
+        image.thread.scheduler_task(),
+        Some(task.id()),
+        "M9-B scheduler task binding diverged from Thread state",
+    );
+    let result = image.thread.wait_for_exit();
+    task.wait_for_detach();
+
+    if scheduler_probe {
+        let target = target.expect("M9-B scheduler probe lost its target CPU");
+        let expected_mask = 1_usize << target.get();
+        assert_eq!(
+            image.thread.visited_cpu_mask(),
+            expected_mask,
+            "M9-B user task ran outside its pinned scheduler target",
+        );
+        assert_eq!(
+            SCHED_YIELD_SWITCH_COUNT.load(Ordering::Acquire),
+            8,
+            "M9-B did not prove all eight sched_yield calls switched away and back",
+        );
+        assert!(
+            image.thread.schedule_count() >= 8,
+            "M9-B scheduler did not record the proven user-task resumptions",
+        );
+        SCHEDULER_PEER_STOP.store(true, Ordering::Release);
+        SCHEDULER_PEER_DONE.wait();
+    }
 
     let observed = SessionObserved {
         result,
@@ -496,6 +622,7 @@ fn run_session(
     image.unpublish();
     image.destroy();
     crate::user_mm::assert_no_leaks();
+    crate::process::assert_no_leaks();
 
     assert!(
         crate::arch::trap::kernel_scratch_is_clean(),
@@ -508,6 +635,14 @@ fn run_session(
     );
 
     observed
+}
+
+fn scheduler_peer() {
+    SCHEDULER_PEER_READY.complete_all();
+    while !SCHEDULER_PEER_STOP.load(Ordering::Acquire) {
+        crate::task::yield_now();
+    }
+    SCHEDULER_PEER_DONE.complete_all();
 }
 
 fn reset_session_state() {
@@ -526,6 +661,7 @@ fn reset_session_state() {
     MMAP_COUNT.store(0, Ordering::Release);
     MUNMAP_COUNT.store(0, Ordering::Release);
     MPROTECT_COUNT.store(0, Ordering::Release);
+    SCHED_YIELD_SWITCH_COUNT.store(0, Ordering::Release);
     LAST_FAULT_KIND.store(FAULT_NONE, Ordering::Release);
     LAST_FAULT_ADDRESS.store(0, Ordering::Release);
     EXIT_STATUS.store(isize::MIN, Ordering::Release);
@@ -594,25 +730,26 @@ fn assert_session(name: &str, observed: SessionObserved, expected: SessionExpect
     );
 }
 
-fn verify_copy_guards() {
+fn verify_copy_guards(mm: &crate::user_mm::UserMm) {
     assert!(
-        copy_to_user(USER_CODE, &[0]).is_err(),
+        mm.copy_to_user(USER_CODE, &[0]).is_err(),
         "copy_to_user wrote through an RX user mapping",
     );
 
     let mut crossing = [0_u8; 2];
     assert!(
-        copy_from_user(USER_DATA + PAGE_SIZE - 1, &mut crossing).is_err(),
+        mm.copy_from_user(USER_DATA + PAGE_SIZE - 1, &mut crossing)
+            .is_err(),
         "copy_from_user accepted a cross-VMA range",
     );
     assert!(
-        copy_from_user(usize::MAX - 1, &mut crossing).is_err(),
+        mm.copy_from_user(usize::MAX - 1, &mut crossing).is_err(),
         "copy_from_user accepted an overflowing range",
     );
 
     let mut empty = [];
     assert!(
-        copy_from_user(usize::MAX, &mut empty).is_ok(),
+        mm.copy_from_user(usize::MAX, &mut empty).is_ok(),
         "zero-length user copy should not inspect its address",
     );
 }
@@ -644,7 +781,19 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_mprotect(arguments[0], arguments[1], arguments[2]),
         ),
-        SYS_EXIT => {
+        SYS_SCHED_YIELD => {
+            let thread = crate::task::current_user_thread()
+                .expect("M9-B sched_yield arrived without a current user Thread");
+            let schedules_before = thread.schedule_count();
+            set_syscall_result(frame, 0);
+            crate::task::yield_from_user_trap();
+            assert!(
+                thread.schedule_count() > schedules_before,
+                "M9-B sched_yield returned without switching to a runnable peer",
+            );
+            SCHED_YIELD_SWITCH_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        SYS_EXIT | SYS_EXIT_GROUP => {
             EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
             TERMINATED.store(true, Ordering::Release);
             return_to_kernel(frame, arguments[0] as isize);
@@ -670,7 +819,7 @@ pub fn handle_fault(
 
     FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
     let user_sp = VirtAddr::new(frame.stack_pointer());
-    match crate::user_mm::resolve_active_fault(address, access, user_sp) {
+    match current_user_mm().resolve_user_fault(address, access, user_sp) {
         Ok(UserFaultResolution::Recovered(recovery)) => {
             RECOVERED_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
             match recovery {
@@ -719,7 +868,8 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
 }
 
 fn sys_brk(address: usize) -> isize {
-    let current = match crate::user_mm::active_program_break() {
+    let mm = current_user_mm();
+    let current = match mm.program_break() {
         Ok(current) => current,
         Err(_) => return -ENOMEM,
     };
@@ -727,7 +877,7 @@ fn sys_brk(address: usize) -> isize {
         return current.get() as isize;
     }
 
-    match crate::user_mm::set_active_program_break(VirtAddr::new(address)) {
+    match mm.set_program_break(VirtAddr::new(address)) {
         Ok(new_break) => {
             BRK_COUNT.fetch_add(1, Ordering::AcqRel);
             new_break.get() as isize
@@ -754,7 +904,7 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
         Some(length) => length & !(PAGE_SIZE - 1),
         None => return -ENOMEM,
     };
-    match crate::user_mm::map_active_anonymous(
+    match current_user_mm().map_anonymous(
         VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
         rounded,
         vm_flags,
@@ -772,7 +922,7 @@ fn sys_munmap(address: usize, length: usize) -> isize {
         Some(range) => range,
         None => return -EINVAL,
     };
-    match crate::user_mm::unmap_active_range(range) {
+    match current_user_mm().unmap_range(range) {
         Ok(()) => {
             MUNMAP_COUNT.fetch_add(1, Ordering::AcqRel);
             0
@@ -790,7 +940,7 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
         Some(flags) => flags.access_only(),
         None => return -EINVAL,
     };
-    match crate::user_mm::protect_active_range(range, flags) {
+    match current_user_mm().protect_range(range, flags) {
         Ok(()) => {
             MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
             0
@@ -852,12 +1002,39 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
     length as isize
 }
 
-fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
-    crate::user_mm::copy_from_active(address, output).map_err(|_| ())
+fn current_user_mm() -> Arc<crate::user_mm::UserMm> {
+    crate::task::current_user_thread()
+        .expect("M9-B user-memory operation has no current user Thread")
+        .process()
+        .mm_arc()
 }
 
+fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
+    let Some(thread) = crate::task::current_user_thread() else {
+        return Err(());
+    };
+    thread
+        .process()
+        .mm()
+        .copy_from_user(address, output)
+        .map_err(|_| ())
+}
+
+/// Scheduler-current uaccess write helper reserved for read-like syscalls.
+///
+/// M9-B has no syscall that copies kernel output into userspace yet, but the
+/// helper remains the checked counterpart of `copy_from_user` for the next VFS
+/// stage. Keeping the allowance local prevents unrelated dead code.
+#[allow(dead_code)]
 fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
-    crate::user_mm::copy_to_active(address, input).map_err(|_| ())
+    let Some(thread) = crate::task::current_user_thread() else {
+        return Err(());
+    };
+    thread
+        .process()
+        .mm()
+        .copy_to_user(address, input)
+        .map_err(|_| ())
 }
 
 fn copy_to_physical(physical: PhysAddr, bytes: &[u8]) {
@@ -897,6 +1074,29 @@ fn user_entry(symbol: *const u8) -> usize {
         .expect("M8-B3 user entry address overflow")
 }
 
+pub(crate) fn run_scheduled_thread(thread: &crate::process::Thread) -> isize {
+    assert!(
+        crate::task::current_user_thread().is_some_and(|current| current.id() == thread.id()),
+        "M9-B scheduler current Thread diverged before user entry",
+    );
+
+    let mm = thread.process().mm();
+    assert!(
+        mm.root_is_private()
+            .expect("unable to compare M9-B user/kernel page-table roots"),
+        "M9-B user mm reused the kernel page-table root",
+    );
+    mm.assert_hardware_active()
+        .expect("M9-B scheduler did not install the current Thread MM");
+    assert!(
+        mm.kernel_mapping_is_shared(VirtAddr::new(verify as *const () as usize))
+            .expect("unable to verify the M9-B shared kernel mapping"),
+        "M9-B user root lost the shared high-half kernel mapping",
+    );
+
+    enter_user(thread.entry().get(), thread.user_stack().end().get())
+}
+
 fn enter_user(entry: usize, stack_top: usize) -> isize {
     assert_eq!(
         stack_top & 0xf,
@@ -904,8 +1104,10 @@ fn enter_user(entry: usize, stack_top: usize) -> isize {
         "M8-B3 user stack is not 16-byte aligned",
     );
 
-    // SAFETY: the verifier installed a validated private user root, keeps the
-    // current kernel stack alive, and disables local interrupts until return.
+    // SAFETY: switch_mm_irqs_off() installed the current Thread's validated
+    // private root, and the scheduler owns this task's guarded kernel stack for
+    // the complete user/trap round trip. Trap return may enable timer/IPI
+    // delivery, but scheduler ownership keeps both objects alive across preemption.
     unsafe { __m7_enter_user(entry, stack_top) }
 }
 
@@ -929,52 +1131,20 @@ fn prepare_user_instruction_stream() {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
 fn syscall_number(frame: &crate::arch::trap::TrapFrame) -> usize {
-    frame.gpr[17]
+    crate::syscall::abi::decode(frame).number
 }
 
-#[cfg(target_arch = "loongarch64")]
-fn syscall_number(frame: &crate::arch::trap::TrapFrame) -> usize {
-    frame.gpr[11]
-}
-
-#[cfg(target_arch = "riscv64")]
 fn syscall_arguments(frame: &crate::arch::trap::TrapFrame) -> [usize; 6] {
-    [
-        frame.gpr[10],
-        frame.gpr[11],
-        frame.gpr[12],
-        frame.gpr[13],
-        frame.gpr[14],
-        frame.gpr[15],
-    ]
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn syscall_arguments(frame: &crate::arch::trap::TrapFrame) -> [usize; 6] {
-    [
-        frame.gpr[4],
-        frame.gpr[5],
-        frame.gpr[6],
-        frame.gpr[7],
-        frame.gpr[8],
-        frame.gpr[9],
-    ]
+    crate::syscall::abi::decode(frame).arguments
 }
 
 fn advance_syscall_pc(frame: &mut crate::arch::trap::TrapFrame) {
-    frame.advance_pc(4);
+    crate::syscall::abi::advance(frame);
 }
 
-#[cfg(target_arch = "riscv64")]
 fn set_syscall_result(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
-    frame.gpr[10] = result as usize;
-}
-
-#[cfg(target_arch = "loongarch64")]
-fn set_syscall_result(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
-    frame.gpr[4] = result as usize;
+    crate::syscall::abi::set_result(frame, result);
 }
 
 #[cfg(target_arch = "riscv64")]

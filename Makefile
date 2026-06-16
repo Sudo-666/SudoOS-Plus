@@ -153,8 +153,17 @@ clippy-host:
 source-tree-check:
 	@./scripts/check-source-tree.sh
 
+.PHONY: m9-audit
+m9-audit:
+	@python3 scripts/m8-audit.py
+	@python3 scripts/m8b3-audit.py
+	@python3 scripts/m8b4-audit.py
+	@python3 scripts/m8-linuxlike-audit.py "$(CURDIR)"
+	@python3 scripts/m9a-audit.py
+	@python3 scripts/m9b-audit.py
+
 .PHONY: check
-check: source-tree-check fmt-check test harness-test build-riscv64 build-loongarch64 clippy
+check: source-tree-check fmt-check test harness-test m9-audit build-riscv64 build-loongarch64 clippy
 
 .PHONY: verify
 verify: check smoke-all smoke-smp-all

@@ -85,6 +85,10 @@ pub unsafe fn switch_user_address_space(root: myos_mm::PhysFrame, asid: myos_mm:
      * page-table reads. Keep publication, root/ASID selection, and local
      * invalidation in one non-interruptible instruction sequence.
      */
+    // SAFETY: the caller guarantees that `root` and every reachable page-table
+    // page remain alive and that this hart's address-space switch is serialized.
+    // The validated SATP value selects only that root/ASID, and the assembly
+    // touches no Rust-managed memory or stack while fencing the local hart.
     unsafe {
         core::arch::asm!(
             "fence rw, rw",
@@ -125,7 +129,6 @@ pub fn flush_page(address: myos_mm::VirtAddr) {
     }
 }
 
-#[inline]
 #[inline]
 pub fn flush_asid(asid: myos_mm::AddressSpaceId) {
     assert_ne!(

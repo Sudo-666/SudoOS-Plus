@@ -1,7 +1,6 @@
 use alloc::vec::Vec;
 use core::cmp::min;
-use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use myos_mm::{
     AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, FaultSource, PAGE_SIZE,
@@ -17,7 +16,6 @@ const VMA_CAPACITY: usize = 32;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
-static ACTIVE_MM: AtomicPtr<UserMm> = AtomicPtr::new(ptr::null_mut());
 static ASID_ROLLOVER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LIVE_MMS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_ROOTS: AtomicUsize = AtomicUsize::new(0);
@@ -81,6 +79,27 @@ struct UserMmState {
     core: UserAddressSpace<VMA_CAPACITY>,
     page_table: Option<RuntimePageTable>,
     pages: Vec<MappedPage>,
+}
+
+/// Page-table and backing allocations detached under the MM lock.
+///
+/// The caller must complete the optional TLB request before releasing either
+/// allocation vector. Keeping the request and retired storage in one value
+/// makes the TLB-before-free contract explicit at every call site.
+struct RetirementBatch {
+    request: Option<PerMmTlbRequest>,
+    backings: Vec<PageAllocation>,
+    page_tables: Vec<PageAllocation>,
+}
+
+impl RetirementBatch {
+    fn empty() -> Self {
+        Self {
+            request: None,
+            backings: Vec::new(),
+            page_tables: Vec::new(),
+        }
+    }
 }
 
 pub struct UserMm {
@@ -336,7 +355,7 @@ impl UserMm {
     }
 
     pub fn set_program_break(&self, new_break: VirtAddr) -> Result<VirtAddr, UserMmRuntimeError> {
-        let (current, request, backings, tables) = {
+        let (current, retirement) = {
             let mut state = self.state.lock();
             let old_layout = state.core.layout().clone();
             let old = old_layout
@@ -358,17 +377,17 @@ impl UserMm {
                 let range =
                     VirtRange::new(new_end, old_end).ok_or(UserMmRuntimeError::InvalidRange)?;
                 match retire_range_locked(&mut state, range) {
-                    Ok((request, backings, tables)) => (current, request, backings, tables),
+                    Ok(retirement) => (current, retirement),
                     Err(error) => {
                         *state.core.layout_mut() = old_layout;
                         return Err(error);
                     }
                 }
             } else {
-                (current, None, Vec::new(), Vec::new())
+                (current, RetirementBatch::empty())
             }
         };
-        finish_retirement(request, backings, tables)?;
+        finish_retirement(retirement)?;
         Ok(current)
     }
 
@@ -388,7 +407,7 @@ impl UserMm {
     }
 
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
-        let (request, backings, tables) = {
+        let retirement = {
             let mut state = self.state.lock();
             let old_layout = state.core.layout().clone();
             state
@@ -404,7 +423,7 @@ impl UserMm {
                 }
             }
         };
-        finish_retirement(request, backings, tables)
+        finish_retirement(retirement)
     }
 
     pub fn protect_range(
@@ -564,25 +583,6 @@ impl UserMm {
         Ok(resolution)
     }
 
-    pub fn bind(&self) -> Result<(), UserMmRuntimeError> {
-        let pointer = self as *const Self as *mut Self;
-        ACTIVE_MM
-            .compare_exchange(
-                ptr::null_mut(),
-                pointer,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .map_err(|_| UserMmRuntimeError::AlreadyActive)?;
-        Ok(())
-    }
-
-    pub fn unbind(&self) {
-        let pointer = self as *const Self as *mut Self;
-        let old = ACTIVE_MM.swap(ptr::null_mut(), Ordering::AcqRel);
-        assert_eq!(old, pointer, "M8-B3 unbound a different active mm");
-    }
-
     /// Installs the private root, synchronizes the local ASID, and publishes
     /// this CPU only after both hardware operations are complete.
     pub fn activate_current_cpu(&self) -> Result<(), UserMmRuntimeError> {
@@ -590,9 +590,9 @@ impl UserMm {
         let cpu = crate::smp::current_cpu_id().get();
 
         // Keep the generation stable across root installation and active-mask
-        // publication. M9 can replace this fail-closed gate with lazy renewal.
+        // publication. A future lazy-renewal path may relax this fail-closed gate.
         let mut allocator = ASID_ALLOCATOR.lock();
-        ensure_asid_allocator(&mut *allocator)?;
+        ensure_asid_allocator(&mut allocator)?;
         let current_asid_generation = allocator
             .as_ref()
             .expect("ASID allocator was just initialized")
@@ -614,8 +614,9 @@ impl UserMm {
                 (page_table.root_frame(), token, tlb_generation)
             };
 
-            // SAFETY: the owned root and every shared kernel table remain alive
-            // throughout this synchronous, non-preemptible M8 verifier session.
+            // SAFETY: Process owns the root and shared kernel tables, while the
+            // scheduler's loaded_mm Arc pins this UserMm across installation and
+            // the complete interval in which this CPU can execute the user task.
             unsafe {
                 crate::vm::activate_user_page_table(root, token.id());
             }
@@ -715,13 +716,6 @@ impl UserMm {
     }
 
     pub fn destroy(&mut self) -> Result<(), UserMmRuntimeError> {
-        let self_pointer = self as *mut Self;
-        assert_ne!(
-            ACTIVE_MM.load(Ordering::Acquire),
-            self_pointer,
-            "M8-B3 attempted to destroy the bound mm",
-        );
-
         let mut state = self.state.lock();
         state.core.assert_inactive_for_destroy()?;
         let table_capacity = state
@@ -789,54 +783,7 @@ impl Drop for UserMm {
     }
 }
 
-pub fn copy_from_active(address: usize, output: &mut [u8]) -> Result<(), UserMmRuntimeError> {
-    with_active(|mm| mm.copy_from_user(address, output))
-}
-
-pub fn copy_to_active(address: usize, input: &[u8]) -> Result<(), UserMmRuntimeError> {
-    with_active(|mm| mm.copy_to_user(address, input))
-}
-
-pub fn resolve_active_fault(
-    address: VirtAddr,
-    access: FaultAccess,
-    user_sp: VirtAddr,
-) -> Result<UserFaultResolution, UserMmRuntimeError> {
-    with_active(|mm| mm.resolve_user_fault(address, access, user_sp))
-}
-
-pub fn active_program_break() -> Result<VirtAddr, UserMmRuntimeError> {
-    with_active(UserMm::program_break)
-}
-
-pub fn set_active_program_break(new_break: VirtAddr) -> Result<VirtAddr, UserMmRuntimeError> {
-    with_active(|mm| mm.set_program_break(new_break))
-}
-
-pub fn map_active_anonymous(
-    search: VirtRange,
-    size: usize,
-    flags: VmAreaFlags,
-) -> Result<VirtAddr, UserMmRuntimeError> {
-    with_active(|mm| mm.map_anonymous(search, size, flags))
-}
-
-pub fn unmap_active_range(range: VirtRange) -> Result<(), UserMmRuntimeError> {
-    with_active(|mm| mm.unmap_range(range))
-}
-
-pub fn protect_active_range(
-    range: VirtRange,
-    access: VmAreaFlags,
-) -> Result<(), UserMmRuntimeError> {
-    with_active(|mm| mm.protect_range(range, access))
-}
-
 pub fn assert_no_leaks() {
-    assert!(
-        ACTIVE_MM.load(Ordering::Acquire).is_null(),
-        "M8-B3 leaked an active mm pointer",
-    );
     assert!(
         !ASID_ROLLOVER_IN_PROGRESS.load(Ordering::Acquire),
         "M8-B3 leaked the ASID rollover publication gate",
@@ -856,20 +803,6 @@ pub fn assert_no_leaks() {
         0,
         "M8-B3 leaked a user backing page",
     );
-}
-
-fn with_active<T>(
-    f: impl FnOnce(&UserMm) -> Result<T, UserMmRuntimeError>,
-) -> Result<T, UserMmRuntimeError> {
-    let pointer = ACTIVE_MM.load(Ordering::Acquire);
-    if pointer.is_null() {
-        return Err(UserMmRuntimeError::NoActiveAddressSpace);
-    }
-
-    // SAFETY: UserImage owns the boxed mm for the complete bound session. B3
-    // disables local interrupts and neither migrates nor preempts its owner.
-    let mm = unsafe { &*pointer };
-    f(mm)
 }
 
 fn map_zero_page_locked(
@@ -915,21 +848,14 @@ fn map_zero_page_locked(
 fn retire_range_locked(
     state: &mut UserMmState,
     range: VirtRange,
-) -> Result<
-    (
-        Option<PerMmTlbRequest>,
-        Vec<PageAllocation>,
-        Vec<PageAllocation>,
-    ),
-    UserMmRuntimeError,
-> {
+) -> Result<RetirementBatch, UserMmRuntimeError> {
     let count = state
         .pages
         .iter()
         .filter(|mapping| range.contains(mapping.page.start_address()))
         .count();
     if count == 0 {
-        return Ok((None, Vec::new(), Vec::new()));
+        return Ok(RetirementBatch::empty());
     }
 
     let page_table = state
@@ -989,22 +915,22 @@ fn retire_range_locked(
         backings.push(mapping.backing);
     }
 
-    Ok((Some(request), backings, tables))
+    Ok(RetirementBatch {
+        request: Some(request),
+        backings,
+        page_tables: tables,
+    })
 }
 
-fn finish_retirement(
-    request: Option<PerMmTlbRequest>,
-    backings: Vec<PageAllocation>,
-    tables: Vec<PageAllocation>,
-) -> Result<(), UserMmRuntimeError> {
-    if let Some(request) = request {
+fn finish_retirement(retirement: RetirementBatch) -> Result<(), UserMmRuntimeError> {
+    if let Some(request) = retirement.request {
         crate::tlb::shootdown_user_local(request);
     }
-    for backing in backings {
+    for backing in retirement.backings {
         crate::page_alloc::free(backing)?;
         LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
     }
-    for table in tables {
+    for table in retirement.page_tables {
         crate::page_alloc::free(table)?;
     }
     Ok(())
@@ -1069,7 +995,7 @@ fn reserve_asid_for_mm() -> Result<AsidToken, UserMmRuntimeError> {
         if ASID_ROLLOVER_IN_PROGRESS.load(Ordering::Acquire) {
             return Err(UserMmRuntimeError::AsidRolloverInProgress);
         }
-        ensure_asid_allocator(&mut *slot)?;
+        ensure_asid_allocator(&mut slot)?;
         let allocator = slot.as_mut().expect("ASID allocator was just initialized");
         let will_roll = allocator.next_allocation_rolls_generation();
         if will_roll && LIVE_MMS.load(Ordering::Acquire) != 0 {

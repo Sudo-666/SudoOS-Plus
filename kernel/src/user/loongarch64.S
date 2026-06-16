@@ -28,7 +28,7 @@ __m7_enter_user:
     ori $r12, $r3, 0
     csrwr $r12, 0x30
     csrwr $r4, 0x6
-    addi.d $r12, $r0, 3       /* PPLV=3, PIE=0 */
+    addi.d $r12, $r0, 7       /* PPLV=3, PIE=1 */
     csrwr $r12, 0x1
     ori $r3, $r5, 0
 
@@ -255,6 +255,19 @@ __m8_user_munmap_fault:
 .Lloong_m8_munmap_failed:
     addi.d $r4, $r0, 1
     addi.d $r11, $r0, 93
+    syscall 0
+    break 0
+
+.globl __m9_user_sched_yield
+__m9_user_sched_yield:
+    addi.d $r12, $r0, 8
+.Lloong_m9_yield_loop:
+    addi.d $r11, $r0, 124
+    syscall 0
+    addi.d $r12, $r12, -1
+    bnez $r12, .Lloong_m9_yield_loop
+    addi.d $r4, $r0, 0
+    addi.d $r11, $r0, 94
     syscall 0
     break 0
 

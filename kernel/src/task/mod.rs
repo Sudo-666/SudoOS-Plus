@@ -11,7 +11,7 @@ mod wait_queue;
 
 pub use wait_queue::{Completion, WaitOutcome, WaitQueue};
 
-use alloc::{collections::VecDeque, vec::Vec};
+use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 #[cfg(debug_assertions)]
 use core::{
     hint::{black_box, spin_loop},
@@ -104,6 +104,10 @@ impl TaskId {
     pub(crate) const fn raw(self) -> usize {
         self.0
     }
+
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +125,7 @@ enum TaskKind {
     Idle(CpuId),
     KernelThread,
     SystemThread,
+    UserThread,
 }
 
 impl TaskKind {
@@ -140,6 +145,8 @@ struct Task {
     context: crate::arch::task::Context,
     stack: Option<KernelStack>,
     entry: Option<KernelThreadEntry>,
+    user_thread: Option<Arc<crate::process::Thread>>,
+    user_join: Option<Arc<Completion>>,
     affinity: Option<CpuId>,
     queued_on: Option<CpuId>,
     has_run: bool,
@@ -184,6 +191,8 @@ impl Task {
             context: crate::arch::task::Context::default(),
             stack: None,
             entry: None,
+            user_thread: None,
+            user_join: None,
             affinity: Some(CpuId::BOOT),
             queued_on: None,
             has_run: true,
@@ -202,6 +211,8 @@ impl Task {
             context: fresh_task_context(&stack, idle_thread_bootstrap),
             stack: Some(stack),
             entry: None,
+            user_thread: None,
+            user_join: None,
             affinity: Some(cpu),
             queued_on: None,
             has_run: false,
@@ -230,6 +241,8 @@ impl Task {
             context: fresh_task_context(&stack, kernel_thread_bootstrap),
             stack: Some(stack),
             entry: Some(entry),
+            user_thread: None,
+            user_join: None,
             affinity,
             queued_on: None,
             has_run: false,
@@ -238,6 +251,41 @@ impl Task {
             wait_next: None,
             wake_after_switch: false,
         }
+    }
+
+    fn user_thread(
+        id: TaskId,
+        thread: Arc<crate::process::Thread>,
+        join: Arc<Completion>,
+        stack: KernelStack,
+        affinity: Option<CpuId>,
+    ) -> Self {
+        thread
+            .bind_scheduler_task(id)
+            .expect("M9-B failed to bind Thread to scheduler task");
+        Self {
+            id,
+            kind: TaskKind::UserThread,
+            state: TaskState::Runnable,
+            context: fresh_task_context(&stack, user_thread_bootstrap),
+            stack: Some(stack),
+            entry: None,
+            user_thread: Some(thread),
+            user_join: Some(join),
+            affinity,
+            queued_on: None,
+            has_run: false,
+            wait_channel: None,
+            wait_prev: None,
+            wait_next: None,
+            wake_after_switch: false,
+        }
+    }
+
+    fn user_mm(&self) -> Option<Arc<crate::user_mm::UserMm>> {
+        self.user_thread
+            .as_ref()
+            .map(|thread| thread.process().mm_arc())
     }
 
     #[cfg(debug_assertions)]
@@ -274,6 +322,10 @@ impl Task {
                 .destroy()
                 .unwrap_or_else(|error| panic!("unable to release kernel stack: {error:?}"));
         }
+        drop(self.user_thread.take());
+        if let Some(join) = self.user_join.take() {
+            join.complete_all();
+        }
     }
 }
 
@@ -302,10 +354,12 @@ pub(super) struct WaiterDebugState {
 struct CpuScheduler {
     current: Option<TaskId>,
     idle: Option<TaskId>,
+    loaded_mm: Option<Arc<crate::user_mm::UserMm>>,
     run_queue: VecDeque<TaskId>,
     pending: Option<PendingSwitch>,
     context_switches: u64,
     preemptions: u64,
+    mm_switches: u64,
     irq_depth: usize,
     preempt_count: usize,
     need_resched: bool,
@@ -317,10 +371,12 @@ impl CpuScheduler {
         Self {
             current: None,
             idle: None,
+            loaded_mm: None,
             run_queue: VecDeque::with_capacity(MAX_TASKS),
             pending: None,
             context_switches: 0,
             preemptions: 0,
+            mm_switches: 0,
             irq_depth: 0,
             preempt_count: 0,
             need_resched: false,
@@ -335,6 +391,7 @@ struct Scheduler {
     cpus: [CpuScheduler; MAX_CPUS],
     discovered_cpus: usize,
     live_kernel_threads: usize,
+    live_user_threads: usize,
 }
 
 impl Scheduler {
@@ -371,6 +428,7 @@ impl Scheduler {
             cpus,
             discovered_cpus,
             live_kernel_threads: 0,
+            live_user_threads: 0,
         }
     }
 
@@ -471,6 +529,91 @@ impl Scheduler {
         (id, target)
     }
 
+    fn spawn_user(
+        &mut self,
+        thread: Arc<crate::process::Thread>,
+        join: Arc<Completion>,
+        stack: KernelStack,
+        affinity: Option<CpuId>,
+        queue_hint: Option<CpuId>,
+    ) -> (TaskId, CpuId) {
+        let target = match affinity.or(queue_hint) {
+            Some(cpu) => {
+                assert!(cpu.get() < self.discovered_cpus);
+                assert!(crate::smp::is_scheduler_active(cpu));
+                cpu
+            }
+            None => self.choose_target_cpu(),
+        };
+
+        let id = self.allocate_task_id();
+        let task = Task::user_thread(id, thread, join, stack, affinity);
+        if id.0 == self.tasks.len() {
+            self.tasks.push(Some(task));
+        } else {
+            assert!(self.tasks[id.0].is_none());
+            self.tasks[id.0] = Some(task);
+        }
+        self.enqueue(id, target);
+        self.cpus[target.get()].need_resched = true;
+        self.live_user_threads = self
+            .live_user_threads
+            .checked_add(1)
+            .expect("live user-thread counter overflowed");
+        (id, target)
+    }
+
+    fn switch_mm_irqs_off(&mut self, cpu: CpuId, previous: TaskId, next: TaskId) {
+        assert!(
+            crate::arch::interrupt::are_disabled(),
+            "M9-B switch_mm_irqs_off ran with local interrupts enabled",
+        );
+
+        let previous_mm = self.task(previous).user_mm();
+        let next_mm = self.task(next).user_mm();
+        let loaded_mm = self.cpus[cpu.get()].loaded_mm.as_ref().cloned();
+
+        match (&previous_mm, &loaded_mm) {
+            (None, None) => {}
+            (Some(previous), Some(loaded)) => assert!(
+                Arc::ptr_eq(previous, loaded),
+                "M9-B CPU loaded-mm diverged from the outgoing user task",
+            ),
+            _ => panic!("M9-B kernel/user task state diverged from per-CPU loaded-mm"),
+        }
+
+        if let (Some(loaded), Some(incoming)) = (&loaded_mm, &next_mm)
+            && Arc::ptr_eq(loaded, incoming)
+        {
+            if let Some(thread) = self.task(next).user_thread.as_ref() {
+                thread.record_cpu(cpu);
+            }
+            return;
+        }
+
+        self.cpus[cpu.get()].mm_switches = self.cpus[cpu.get()]
+            .mm_switches
+            .checked_add(1)
+            .expect("M9-B MM switch counter overflowed");
+
+        if let Some(loaded) = loaded_mm {
+            loaded
+                .deactivate_current_cpu()
+                .unwrap_or_else(|error| panic!("M9-B failed to leave outgoing mm: {error:?}"));
+            self.cpus[cpu.get()].loaded_mm = None;
+        }
+
+        if let Some(next_mm) = next_mm {
+            next_mm
+                .activate_current_cpu()
+                .unwrap_or_else(|error| panic!("M9-B failed to enter incoming mm: {error:?}"));
+            self.cpus[cpu.get()].loaded_mm = Some(next_mm);
+            if let Some(thread) = self.task(next).user_thread.as_ref() {
+                thread.record_cpu(cpu);
+            }
+        }
+    }
+
     fn enqueue(&mut self, id: TaskId, cpu: CpuId) {
         {
             let task = self.task_mut(id);
@@ -536,7 +679,7 @@ impl Scheduler {
                 assert_eq!(owner, cpu, "idle task selected by the wrong CPU");
                 assert_eq!(task.state, TaskState::Idle(cpu));
             }
-            TaskKind::KernelThread | TaskKind::SystemThread => {
+            TaskKind::KernelThread | TaskKind::SystemThread | TaskKind::UserThread => {
                 assert_eq!(task.state, TaskState::Runnable);
                 if let Some(affinity) = task.affinity {
                     assert_eq!(affinity, cpu, "pinned task selected by the wrong CPU");
@@ -584,6 +727,7 @@ impl Scheduler {
         self.cpus[cpu.get()].need_resched = false;
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
+        self.switch_mm_irqs_off(cpu, previous, next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
             next,
@@ -628,6 +772,7 @@ impl Scheduler {
         self.cpus[cpu.get()].need_resched = false;
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
+        self.switch_mm_irqs_off(cpu, previous, next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
             next,
@@ -693,6 +838,7 @@ impl Scheduler {
         }
         self.link_waiter(queue, previous, channel);
         self.activate_next(next, cpu);
+        self.switch_mm_irqs_off(cpu, previous, next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
             next,
@@ -735,6 +881,7 @@ impl Scheduler {
 
         self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
         self.activate_next(next, cpu);
+        self.switch_mm_irqs_off(cpu, previous, next);
         self.cpus[cpu.get()].pending = Some(PendingSwitch {
             previous,
             next,
@@ -836,6 +983,12 @@ impl Scheduler {
                         .live_kernel_threads
                         .checked_sub(1)
                         .expect("live kernel-thread counter underflowed");
+                }
+                if matches!(self.task(pending.previous).kind, TaskKind::UserThread) {
+                    self.live_user_threads = self
+                        .live_user_threads
+                        .checked_sub(1)
+                        .expect("live user-thread counter underflowed");
                 }
 
                 let task = self.tasks[pending.previous.0]
@@ -1018,6 +1171,10 @@ impl Scheduler {
         self.task(self.current(cpu))
             .entry
             .expect("current task is not a kernel thread")
+    }
+
+    fn current_user_thread(&self, cpu: CpuId) -> Option<Arc<crate::process::Thread>> {
+        self.task(self.current(cpu)).user_thread.as_ref().cloned()
     }
 
     #[cfg(debug_assertions)]
@@ -1325,6 +1482,37 @@ impl Scheduler {
             .take(self.discovered_cpus)
             .map(|cpu| cpu.context_switches)
             .sum()
+    }
+
+    fn mm_switches_total(&self) -> u64 {
+        self.cpus
+            .iter()
+            .take(self.discovered_cpus)
+            .map(|cpu| cpu.mm_switches)
+            .sum()
+    }
+
+    fn assert_user_mm_quiescent(&self) {
+        assert_eq!(self.live_user_threads, 0, "M9-B leaked a live user task");
+        assert!(
+            self.tasks
+                .iter()
+                .flatten()
+                .all(|task| !matches!(task.kind, TaskKind::UserThread)),
+            "M9-B retained a user task in the scheduler table",
+        );
+        assert!(
+            self.retired_tasks
+                .iter()
+                .all(|task| !matches!(task.kind, TaskKind::UserThread)),
+            "M9-B retained a user task in the reaper queue",
+        );
+        for (index, cpu) in self.cpus.iter().take(self.discovered_cpus).enumerate() {
+            assert!(
+                cpu.loaded_mm.is_none(),
+                "M9-B CPU {index} retained a loaded user MM",
+            );
+        }
     }
 
     fn preemptions_total(&self) -> u64 {
@@ -1683,8 +1871,110 @@ pub fn enter_secondary_idle() -> ! {
     panic!("secondary bootstrap context resumed unexpectedly");
 }
 
+pub(crate) struct UserTaskHandle {
+    id: TaskId,
+    detached: Arc<Completion>,
+}
+
+impl UserTaskHandle {
+    pub(crate) const fn id(&self) -> TaskId {
+        self.id
+    }
+
+    pub(crate) fn wait_for_detach(&self) {
+        self.detached.wait();
+    }
+}
+
+pub(crate) fn spawn_user_thread_on(
+    thread: Arc<crate::process::Thread>,
+    affinity: Option<CpuId>,
+) -> UserTaskHandle {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+    let stack = KernelStack::allocate()
+        .unwrap_or_else(|error| panic!("unable to allocate user-thread kernel stack: {error:?}"));
+    let detached = Arc::new(Completion::new());
+    let (id, target) = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("kernel scheduler is not initialized")
+            .spawn_user(thread, Arc::clone(&detached), stack, affinity, affinity)
+    };
+    if target != crate::smp::current_cpu_id() {
+        crate::smp::send_ipi(target);
+    }
+    UserTaskHandle { id, detached }
+}
+
+pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
+    let cpu = crate::smp::current_cpu_id();
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("kernel scheduler is not initialized")
+        .current_user_thread(cpu)
+}
+
+pub(crate) fn user_mm_switches() -> u64 {
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("kernel scheduler is not initialized")
+        .mm_switches_total()
+}
+
+pub(crate) fn assert_user_mm_quiescent() {
+    let slot = SCHEDULER.lock();
+    slot.as_ref()
+        .expect("kernel scheduler is not initialized")
+        .assert_user_mm_quiescent();
+}
+
 pub fn spawn_kernel_thread(entry: KernelThreadEntry) -> TaskId {
     spawn_internal(entry, None, None).0
+}
+
+pub(crate) fn spawn_kernel_thread_on(entry: KernelThreadEntry, cpu: CpuId) -> TaskId {
+    spawn_internal(entry, Some(cpu), Some(cpu)).0
+}
+
+pub(crate) fn run_kernel_thread_sync(entry: KernelThreadEntry) {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+    assert_eq!(
+        crate::smp::current_cpu_id(),
+        CpuId::BOOT,
+        "synchronous kernel-thread launcher must run on the boot CPU",
+    );
+    let caller_is_idle = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        scheduler
+            .task(scheduler.current(CpuId::BOOT))
+            .kind
+            .is_idle()
+    };
+    assert!(
+        caller_is_idle,
+        "synchronous launcher must run from boot idle"
+    );
+    assert_eq!(
+        counted_kernel_threads(),
+        0,
+        "synchronous launcher requires a quiescent counted thread set",
+    );
+
+    let (_, target) = spawn_internal(entry, Some(CpuId::BOOT), Some(CpuId::BOOT));
+    assert_eq!(target, CpuId::BOOT);
+
+    while counted_kernel_threads() != 0 {
+        reap_retired_tasks();
+        if current_cpu_has_work() {
+            yield_now();
+        } else {
+            idle_until_interrupt();
+        }
+    }
+    TASK_REAPER_QUEUE.wake_one();
 }
 
 #[cfg(debug_assertions)]
@@ -1870,6 +2160,25 @@ pub fn yield_now() {
     finish_switch();
     drop(interrupt_guard);
     reap_retired_tasks();
+}
+
+pub(crate) fn yield_from_user_trap() {
+    crate::context::assert_interrupts_disabled();
+    let cpu = crate::smp::current_cpu_id();
+    let switch = {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.assert_schedulable(cpu);
+        scheduler.prepare_yield(cpu)
+    };
+    let Some((previous, next)) = switch else {
+        return;
+    };
+
+    // SAFETY: this is the synchronous syscall trap path with local interrupts
+    // disabled. Both task contexts and their kernel stacks remain scheduler-owned.
+    unsafe { crate::arch::task::switch(previous, next) };
+    finish_switch();
 }
 
 fn preempt_schedule() {
@@ -2109,12 +2418,16 @@ fn retired_task_count() -> usize {
         .retired_task_count()
 }
 
-#[cfg(debug_assertions)]
-fn live_kernel_threads() -> usize {
+fn counted_kernel_threads() -> usize {
     let slot = SCHEDULER.lock();
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .live_kernel_threads
+}
+
+#[cfg(debug_assertions)]
+fn live_kernel_threads() -> usize {
+    counted_kernel_threads()
 }
 
 #[cfg(debug_assertions)]
@@ -2131,6 +2444,29 @@ pub(super) fn preemptions() -> u64 {
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .preemptions_total()
+}
+
+unsafe extern "C" fn user_thread_bootstrap() -> ! {
+    finish_switch();
+
+    // SAFETY: the task owns a guarded kernel stack, the scheduler has installed
+    // its UserMm for this CPU, and trap/IPI/timer state is fully initialized.
+    unsafe { crate::arch::interrupt::enable() };
+
+    let thread = current_user_thread().expect("M9-B user task lost its Thread binding");
+    thread
+        .mark_running()
+        .expect("M9-B user Thread entered an invalid lifecycle state");
+    let result = crate::user::run_scheduled_thread(&thread);
+    thread
+        .exit(result)
+        .expect("M9-B user Thread failed to publish exit state");
+
+    // `exit_current()` switches away without unwinding this bootstrap frame.
+    // Release the scheduler lookup clone now; otherwise it remains stranded on
+    // the retired kernel stack and keeps Thread -> Process alive after reaping.
+    drop(thread);
+    exit_current()
 }
 
 unsafe extern "C" fn kernel_thread_bootstrap() -> ! {

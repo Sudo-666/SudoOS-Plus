@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Audit the accepted Linux-like M8 boundary.
 
-This audit intentionally rejects the abandoned closure design that introduced
-per-CPU raw current-mm pointers before Process/Task ownership existed.
+This audit rejects the abandoned closure design that introduced per-CPU raw
+current-mm pointers before Process/Task ownership existed. After M9-A it also
+accepts the documented Process -> Arc<UserMm> ownership supersession.
 """
 
 from __future__ import annotations
@@ -51,6 +52,9 @@ def main() -> None:
 
     user_mm = read(repo, "kernel/src/user_mm.rs")
     user = read(repo, "kernel/src/user.rs")
+    process_path = repo / "kernel/src/process.rs"
+    process = process_path.read_text() if process_path.is_file() else ""
+    task = read(repo, "kernel/src/task/mod.rs")
     tlb = read(repo, "kernel/src/tlb.rs")
     user_space = read(repo, "mm/src/user_space.rs")
     asid = read(repo, "mm/src/asid.rs")
@@ -75,14 +79,11 @@ def main() -> None:
     finish_flush = finish.find("crate::tlb::shootdown_user_local(request)")
     finish_free = finish.find("crate::page_alloc::free(")
 
-    run_session = function_body(user, "run_session")
-    irq_guard = run_session.find("let _interrupt_guard = crate::context::IrqSaveGuard::new()")
-    activate = run_session.find("image.activate_current_cpu()", irq_guard)
-    enter = run_session.find("enter_user(", activate)
-    deactivate = run_session.find("image.deactivate_current_cpu()", enter)
-
+    switch_mm = function_body(task, "switch_mm_irqs_off")
     publish = function_body(user, "publish")
     unpublish = function_body(user, "unpublish")
+    publish_compact = re.sub(r"\s+", "", publish)
+    unpublish_compact = re.sub(r"\s+", "", unpublish)
 
     m8_payload = (
         la_user.split("__m8_user_vm:", 1)[1]
@@ -93,9 +94,10 @@ def main() -> None:
     failures: list[str] = []
 
     check(
-        "M8 uses one verifier-session ACTIVE_MM binding",
-        re.search(r"\bstatic\s+ACTIVE_MM\s*:\s*AtomicPtr\s*<\s*UserMm\s*>", user_mm)
-        is not None,
+        "M8 ACTIVE_MM verifier pointer is superseded by scheduler current Thread",
+        "static ACTIVE_MM" not in user_mm
+        and "current_user_thread()" in user
+        and "current_user_mm()" in user,
         failures,
     )
     check(
@@ -103,19 +105,35 @@ def main() -> None:
         all(marker not in combined_runtime for marker in forbidden),
         failures,
     )
+    legacy_ownership = (
+        re.search(r"\bmm\s*:\s*Box\s*<\s*UserMm\s*>", user) is not None
+    )
+    m9_ownership = (
+        "process: Arc<Process>" in user
+        and "thread: Arc<Thread>" in user
+        and "mm: Arc<UserMm>" in process
+        and "process: Arc<Process>" in process
+    )
     check(
-        "UserImage strongly owns one UserMm",
-        re.search(r"\bmm\s*:\s*Box\s*<\s*UserMm\s*>", user) is not None,
+        "UserImage has a strong, explicit UserMm ownership chain",
+        legacy_ownership or m9_ownership,
         failures,
     )
     check(
-        "publish/unpublish bind exactly the owned mm",
-        "self.mm.bind()" in publish and "self.mm.unbind()" in unpublish,
+        "session publication no longer stores a raw MM pointer",
+        "ACTIVE.store(true" in publish_compact
+        and "ACTIVE.swap(false" in unpublish_compact
+        and ".bind()" not in publish_compact
+        and ".unbind()" not in unpublish_compact,
         failures,
     )
+    switch_compact = re.sub(r"\s+", "", switch_mm)
     check(
-        "private-root round trip is one IRQ-off critical section",
-        0 <= irq_guard < activate < enter < deactivate,
+        "private-root round trip lives in scheduler switch_mm_irqs_off",
+        "assert!(crate::arch::interrupt::are_disabled()" in switch_compact
+        and ".deactivate_current_cpu()" in switch_compact
+        and ".activate_current_cpu()" in switch_compact
+        and "loaded_mm" in switch_compact,
         failures,
     )
     check(
