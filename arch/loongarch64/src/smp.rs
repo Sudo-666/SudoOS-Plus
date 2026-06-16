@@ -9,6 +9,7 @@ const BOOT_STACK_SIZE: usize = 64 * 1024;
 const HARDWARE_CPU_ID_LIMIT: usize = 1 << 10;
 
 const CSR_CPUNUM: usize = 0x20;
+const CSR_PERCPU_ID_SAVE: usize = 0x33;
 const CPU_NUMBER_MASK: usize = 0x3ff;
 const CSR_ECFG: usize = 0x4;
 const ECFG_IPI_INTERRUPT: usize = 1 << 12;
@@ -82,11 +83,18 @@ pub fn set_current_cpu_id(cpu: usize) {
         cpu < MAX_CPUS,
         "logical CPU ID is outside the supported range"
     );
-
-    // SAFETY: r21/u0 is reserved as the kernel per-CPU logical identifier.
-    // Ordinary task contexts deliberately do not save or restore it.
+    // SAFETY: r21/u0 is the kernel per-CPU logical identifier at PLV0.
+    // KSave3 mirrors the canonical value so trap entry can restore it after
+    // capturing user-controlled GPR state and before calling Rust.
+    let scratch = cpu;
     unsafe {
-        asm!("or $r21, {cpu}, $r0", cpu = in(reg) cpu, options(nomem, nostack));
+        asm!(
+            "csrwr {scratch}, {percpu_id_save}",
+            "csrrd $r21, {percpu_id_save}",
+            scratch = inout(reg) scratch => _,
+            percpu_id_save = const CSR_PERCPU_ID_SAVE,
+            options(nomem, nostack),
+        );
     }
 }
 

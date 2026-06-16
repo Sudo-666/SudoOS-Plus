@@ -1,12 +1,19 @@
 use alloc::vec::Vec;
 
-use myos_mm::{MappingOptions, PhysAddr, PhysFrame, VirtAddr, VirtPage};
+#[cfg(target_arch = "riscv64")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use myos_mm::{MappingOptions, PageAllocation, PhysAddr, PhysFrame, VirtAddr, VirtPage};
 
 use crate::page_alloc::{self, GlobalPageAllocatorError, PageAllocationOptions};
+
+#[cfg(target_arch = "riscv64")]
+static SHARED_KERNEL_ROOT_BORROWERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub struct RuntimePageTable {
     inner: imp::RuntimePageTable,
+    root_owner: Option<PageAllocation>,
 }
 
 #[allow(dead_code)]
@@ -25,6 +32,10 @@ pub enum RuntimePageTableError {
     PageTableEntry,
     PageTableAccess,
     MetadataOutOfMemory,
+    KernelMappingMutationDenied,
+    KernelRootRequired,
+    OwnedRootRequired,
+    OwnedTablesRemain,
 
     #[cfg(target_arch = "loongarch64")]
     HardwarePaging(crate::arch::memory::paging::HardwarePagingError),
@@ -42,7 +53,79 @@ impl RuntimePageTable {
     ) -> Result<Self, RuntimePageTableError> {
         Ok(Self {
             inner: imp::RuntimePageTable::from_boot(boot)?,
+            root_owner: None,
         })
+    }
+
+    /// Creates an owned user root while borrowing the kernel-only mapping
+    /// topology. The returned root never owns shared kernel table pages.
+    pub fn new_user(kernel: &Self) -> Result<Self, RuntimePageTableError> {
+        if kernel.root_owner.is_some() {
+            return Err(RuntimePageTableError::KernelRootRequired);
+        }
+        let owner = allocate_zeroed_table()?;
+        let root = owner.start();
+        let inner = match imp::RuntimePageTable::from_user_root(root, &kernel.inner) {
+            Ok(inner) => inner,
+            Err(error) => {
+                free_table(owner);
+                return Err(error);
+            }
+        };
+
+        borrow_shared_kernel_root();
+        Ok(Self {
+            inner,
+            root_owner: Some(owner),
+        })
+    }
+
+    pub fn root_frame(&self) -> PhysFrame {
+        self.inner.root_frame()
+    }
+
+    /// Refreshes architecture-specific shared-kernel root state before a user
+    /// root is installed on a CPU.
+    pub fn synchronize_kernel_mappings(
+        &mut self,
+        kernel: &Self,
+    ) -> Result<(), RuntimePageTableError> {
+        if self.root_owner.is_none() {
+            return Err(RuntimePageTableError::OwnedRootRequired);
+        }
+        if kernel.root_owner.is_some() {
+            return Err(RuntimePageTableError::KernelRootRequired);
+        }
+        self.inner.synchronize_kernel_mappings(&kernel.inner)
+    }
+
+    /// Releases an owned root after all user leaves and private intermediate
+    /// tables have been removed. Taking `&mut self` keeps ownership recoverable
+    /// when the precondition is not yet satisfied.
+    pub fn release_empty(&mut self) -> Result<(), RuntimePageTableError> {
+        if self.allocated_runtime_tables() != 0 {
+            return Err(RuntimePageTableError::OwnedTablesRemain);
+        }
+        let owner = self
+            .root_owner
+            .take()
+            .ok_or(RuntimePageTableError::OwnedRootRequired)?;
+        free_table(owner);
+        release_shared_kernel_root();
+        Ok(())
+    }
+
+    pub fn is_owned_user_root(&self) -> bool {
+        self.root_owner.is_some()
+    }
+
+    fn ensure_mutable_page(&self, page: VirtPage) -> Result<(), RuntimePageTableError> {
+        if self.root_owner.is_some()
+            && !crate::arch::memory::layout::USER_RANGE.contains(page.start_address())
+        {
+            return Err(RuntimePageTableError::KernelMappingMutationDenied);
+        }
+        Ok(())
     }
 
     pub fn map_page(
@@ -51,6 +134,7 @@ impl RuntimePageTable {
         frame: PhysFrame,
         options: MappingOptions,
     ) -> Result<(), RuntimePageTableError> {
+        self.ensure_mutable_page(page)?;
         self.inner.map_page(page, frame, options)
     }
 
@@ -59,6 +143,7 @@ impl RuntimePageTable {
         page: VirtPage,
         options: MappingOptions,
     ) -> Result<(), RuntimePageTableError> {
+        self.ensure_mutable_page(page)?;
         self.inner.protect_page(page, options)
     }
 
@@ -68,10 +153,12 @@ impl RuntimePageTable {
         frame: PhysFrame,
         options: MappingOptions,
     ) -> Result<PhysFrame, RuntimePageTableError> {
+        self.ensure_mutable_page(page)?;
         self.inner.replace_page(page, frame, options)
     }
 
     pub fn unmap_page(&mut self, page: VirtPage) -> Result<PhysFrame, RuntimePageTableError> {
+        self.ensure_mutable_page(page)?;
         self.inner.unmap_page(page)
     }
 
@@ -80,6 +167,16 @@ impl RuntimePageTable {
         page: VirtPage,
         retired: &mut Vec<myos_mm::PageAllocation>,
     ) -> Result<(), RuntimePageTableError> {
+        self.ensure_mutable_page(page)?;
+        if self.root_owner.is_none()
+            && shared_kernel_tables_are_borrowed()
+            && !crate::arch::memory::layout::USER_RANGE.contains(page.start_address())
+        {
+            // RISC-V user roots borrow high-half descendants through copied
+            // top-level entries. Keep an emptied kernel table pinned until all
+            // borrowers are gone rather than leaving a dangling shared entry.
+            return Ok(());
+        }
         self.inner.reclaim_empty_tables(page, retired)
     }
 
@@ -95,6 +192,33 @@ impl RuntimePageTable {
     pub fn hardware_state(&self) -> crate::arch::memory::paging::PagingHardwareState {
         self.inner.hardware_state()
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn borrow_shared_kernel_root() {
+    SHARED_KERNEL_ROOT_BORROWERS.fetch_add(1, Ordering::AcqRel);
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn borrow_shared_kernel_root() {}
+
+#[cfg(target_arch = "riscv64")]
+fn release_shared_kernel_root() {
+    let old = SHARED_KERNEL_ROOT_BORROWERS.fetch_sub(1, Ordering::AcqRel);
+    assert_ne!(old, 0, "shared kernel-root borrower counter underflow");
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn release_shared_kernel_root() {}
+
+#[cfg(target_arch = "riscv64")]
+fn shared_kernel_tables_are_borrowed() -> bool {
+    SHARED_KERNEL_ROOT_BORROWERS.load(Ordering::Acquire) != 0
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn shared_kernel_tables_are_borrowed() -> bool {
+    false
 }
 
 fn allocate_zeroed_table() -> Result<myos_mm::PageAllocation, RuntimePageTableError> {
@@ -131,6 +255,34 @@ mod imp {
                 root: boot.root_frame(),
                 runtime_tables: Vec::new(),
             })
+        }
+
+        pub fn from_user_root(
+            root: PhysFrame,
+            kernel: &Self,
+        ) -> Result<Self, RuntimePageTableError> {
+            let mut table = Self {
+                root,
+                runtime_tables: Vec::new(),
+            };
+            table.synchronize_kernel_mappings(kernel)?;
+            Ok(table)
+        }
+
+        pub fn root_frame(&self) -> PhysFrame {
+            self.root
+        }
+
+        pub fn synchronize_kernel_mappings(
+            &mut self,
+            kernel: &Self,
+        ) -> Result<(), RuntimePageTableError> {
+            // Sv39 splits at the top-level midpoint. Copy only the shared
+            // high-half root entries; their descendants remain kernel-owned.
+            for index in ENTRIES_PER_TABLE / 2..ENTRIES_PER_TABLE {
+                write_entry(self.root, index, read_entry(kernel.root, index)?)?;
+            }
+            Ok(())
         }
 
         pub fn allocated_runtime_tables(&self) -> usize {
@@ -543,6 +695,38 @@ mod imp {
             self.hardware
         }
 
+        pub fn from_user_root(
+            root: PhysFrame,
+            kernel: &Self,
+        ) -> Result<Self, RuntimePageTableError> {
+            let root_fill = TablePointerEntry::new(kernel.invalid_pud)
+                .map_err(|_| RuntimePageTableError::PageTableEntry)?
+                .raw();
+            initialize_table_with_fill(root, root_fill)?;
+
+            Ok(Self {
+                root,
+                invalid_pud: kernel.invalid_pud,
+                invalid_pmd: kernel.invalid_pmd,
+                invalid_pte: kernel.invalid_pte,
+                hardware: kernel.hardware,
+                runtime_tables: Vec::new(),
+            })
+        }
+
+        pub fn root_frame(&self) -> PhysFrame {
+            self.root
+        }
+
+        pub fn synchronize_kernel_mappings(
+            &mut self,
+            _kernel: &Self,
+        ) -> Result<(), RuntimePageTableError> {
+            // LoongArch keeps the permanent kernel root in PGDH and installs
+            // this private user root only in PGDL. No kernel entries are copied.
+            Ok(())
+        }
+
         pub fn allocated_runtime_tables(&self) -> usize {
             self.runtime_tables.len()
         }
@@ -890,13 +1074,19 @@ mod imp {
             _ => return Err(RuntimePageTableError::InvalidTableEntry { level: table_level }),
         };
 
+        initialize_table_with_fill(frame, fill)
+    }
+
+    fn initialize_table_with_fill(
+        frame: PhysFrame,
+        fill: u64,
+    ) -> Result<(), RuntimePageTableError> {
         let pointer =
             crate::arch::memory::phys_access::ram_mut_ptr::<PageTable>(frame.start_address())
                 .map_err(|_| RuntimePageTableError::PageTableAccess)?;
 
-        // SAFETY: frame 是刚分配的独占页表页，尚未发布到任何上级目录。
-        // 直接初始化目标页，避免在 guarded kernel stack 上构造 4 KiB
-        // PageTable 临时对象后再复制。
+        // SAFETY: frame is a newly allocated exclusive page-table page that
+        // has not been published through an upper-level directory.
         unsafe {
             core::ptr::write_bytes(pointer, 0, 1);
             (*pointer).fill(fill);

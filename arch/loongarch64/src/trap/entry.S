@@ -57,6 +57,12 @@ __loongarch_trap_entry:
     st.d $r29, $r3, 29*8
     st.d $r30, $r3, 30*8
     st.d $r31, $r3, 31*8
+  /*
+   * r21/u0 may be controlled by PLV3. All user GPRs are captured now;
+   * reload the canonical kernel per-CPU ID before any Rust code runs.
+   */
+  csrrd $r21, 0x33
+
 
     csrrd $r12, 0x30
     beqz $r12, .Lloongarch_save_kernel_sp

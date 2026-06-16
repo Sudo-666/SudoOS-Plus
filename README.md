@@ -215,7 +215,7 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 
 ## 下一步
 
-M5/M6/M7 已冻结。下一阶段严格进入 M8 用户地址空间与 demand paging。
+M5/M6/M7 已冻结；M8 Linux-like 用户 MM 已进入最终验证，之后进入 M9 Process/Thread。
 
 ## M5 之后完整路线图
 
@@ -553,3 +553,14 @@ make m7-tag        # 创建 m7-complete 标签
 封版契约见 [`docs/m7-completion.md`](docs/m7-completion.md)。M7 冻结后进入
 M8：独立 per-process AddressSpace、ASID、per-mm TLB shootdown 与用户 fault
 恢复。
+
+## M8 Linux-like 重构基线
+
+M8 从 `main@c85b611` 重建，采用单一同步 verifier session 所有权：
+`UserImage -> Box<UserMm>`。独立用户根、共享内核映射、ASID generation、
+`active_cpus`、per-mm TLB request、anonymous demand paging、栈增长以及
+`brk/mmap/munmap/mprotect` 已接入。
+
+M8 不伪造 scheduler current-mm。Process/Thread 对 `UserMm` 的强所有权、
+per-CPU loaded-mm 和 `switch_mm_irqs_off()` 严格留到 M9。完整不变量和
+门禁见 [`docs/m8-linuxlike-contract.md`](docs/m8-linuxlike-contract.md)。

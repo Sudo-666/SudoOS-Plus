@@ -23,6 +23,8 @@ mod tlb;
 mod tracked_spin;
 mod trap;
 mod user;
+mod user_mm;
+
 mod vm;
 mod workqueue;
 extern crate alloc;

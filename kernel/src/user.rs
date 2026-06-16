@@ -1,16 +1,39 @@
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
-use myos_mm::{MappingOptions, PAGE_SIZE, PhysAddr, VirtAddr};
+use myos_mm::{
+    FaultAccess, PAGE_SIZE, PhysAddr, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind,
+};
+
+use crate::user_mm::{
+    UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMm, UserMmRuntimeError,
+};
 
 const USER_CODE: usize = 0x0000_0000_0040_0000;
 const USER_DATA: usize = USER_CODE + PAGE_SIZE;
-const USER_STACK: usize = USER_DATA + PAGE_SIZE;
+const USER_DEMAND: usize = 0x0000_0000_0050_0000;
+const USER_HEAP_START: usize = 0x0000_0000_0060_0000;
+const USER_HEAP_LIMIT: usize = 0x0000_0000_0070_0000;
+const USER_STACK: usize = 0x0000_0000_0080_0000;
 const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
+const USER_MMAP_START: usize = 0x0000_0000_0100_0000;
+const USER_MMAP_END: usize = 0x0000_0000_4000_0000;
 
 const SYS_WRITE: usize = 64;
 const SYS_EXIT: usize = 93;
+const SYS_BRK: usize = 214;
+const SYS_MUNMAP: usize = 215;
+const SYS_MMAP: usize = 222;
+const SYS_MPROTECT: usize = 226;
+
+const PROT_READ: usize = 1;
+const PROT_WRITE: usize = 2;
+const PROT_EXEC: usize = 4;
+const MAP_PRIVATE: usize = 0x02;
+const MAP_ANONYMOUS: usize = 0x20;
 
 const EBADF: isize = 9;
+const ENOMEM: isize = 12;
 const EFAULT: isize = 14;
 const EINVAL: isize = 22;
 const ENOSYS: isize = 38;
@@ -21,15 +44,20 @@ const USER_MESSAGE: &[u8] = b"hello user\n";
 const FAULT_NONE: usize = 0;
 const FAULT_PAGE: usize = 1;
 const FAULT_EXCEPTION: usize = 2;
+const FAULT_RECOVERED: usize = 3;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TERMINATED: AtomicBool = AtomicBool::new(false);
-static CODE_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
-static DATA_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
-static STACK_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static RECOVERED_FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static ANONYMOUS_FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static STACK_GROWTH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static BRK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MMAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MUNMAP_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MPROTECT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LAST_FAULT_KIND: AtomicUsize = AtomicUsize::new(FAULT_NONE);
 static LAST_FAULT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static EXIT_STATUS: AtomicIsize = AtomicIsize::new(isize::MIN);
@@ -49,79 +77,130 @@ unsafe extern "C" {
     static __m7_user_unknown_syscall: u8;
     static __m7_user_bad_pointer: u8;
     static __m7_user_write_code: u8;
+    static __m8_user_vm: u8;
+    static __m8_user_mprotect_fault: u8;
+    static __m8_user_munmap_fault: u8;
     static __m7_user_image_end: u8;
 }
 
 struct UserImage {
-    code: crate::vm::UserPageMapping,
-    data: crate::vm::UserPageMapping,
-    stack: crate::vm::UserPageMapping,
+    mm: Box<UserMm>,
+    code_physical: PhysAddr,
 }
 
 impl UserImage {
-    fn create() -> Result<Self, crate::vm::KernelVmError> {
-        let code = crate::vm::map_user_page(VirtAddr::new(USER_CODE), MappingOptions::user_code())?;
-
-        let data =
-            match crate::vm::map_user_page(VirtAddr::new(USER_DATA), MappingOptions::user_data()) {
-                Ok(mapping) => mapping,
-                Err(error) => {
-                    crate::vm::unmap_user_page(code)
-                        .expect("unable to roll back M7 user code mapping");
-                    return Err(error);
-                }
-            };
-
-        let stack = match crate::vm::map_user_page(
-            VirtAddr::new(USER_STACK),
-            MappingOptions::user_data(),
+    fn create() -> Result<Self, UserMmRuntimeError> {
+        let areas = [
+            VmArea::new(
+                VirtRange::from_bounds(USER_CODE, USER_CODE + PAGE_SIZE),
+                VmAreaFlags::user_rx(),
+                VmAreaKind::Anonymous,
+            ),
+            VmArea::new(
+                VirtRange::from_bounds(USER_DATA, USER_DATA + PAGE_SIZE),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            ),
+            VmArea::new(
+                VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            ),
+            VmArea::new(
+                VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
+                VmAreaFlags::user_rw().union(VmAreaFlags::GROW_DOWN),
+                VmAreaKind::Stack,
+            ),
+        ];
+        let mut mm = Box::new(UserMm::new(&areas)?);
+        if let Err(error) = mm.configure_program_break(
+            VirtAddr::new(USER_HEAP_START),
+            VirtAddr::new(USER_HEAP_LIMIT),
         ) {
-            Ok(mapping) => mapping,
+            mm.destroy()
+                .expect("unable to reclaim M8-B4 mm after brk configuration failure");
+            return Err(error);
+        }
+        let result: Result<PhysAddr, UserMmRuntimeError> = (|| {
+            let code_physical = mm.populate_page(VirtAddr::new(USER_CODE))?;
+            mm.populate_page(VirtAddr::new(USER_DATA))?;
+            mm.populate_page(VirtAddr::new(USER_STACK))?;
+            Ok(code_physical)
+        })();
+        let code_physical = match result {
+            Ok(physical) => physical,
             Err(error) => {
-                crate::vm::unmap_user_page(data).expect("unable to roll back M7 user data mapping");
-                crate::vm::unmap_user_page(code).expect("unable to roll back M7 user code mapping");
+                mm.destroy()
+                    .expect("unable to reclaim a partially built M8-B3 user mm");
                 return Err(error);
             }
         };
 
-        Ok(Self { code, data, stack })
+        Ok(Self { mm, code_physical })
     }
 
     fn publish(&self) {
         assert!(
             !ACTIVE.load(Ordering::Acquire),
-            "M7 attempted to publish two user sessions",
+            "M8-B3 attempted to publish two user sessions",
         );
-
-        CODE_PHYSICAL.store(self.code.physical_address().get(), Ordering::Relaxed);
-        DATA_PHYSICAL.store(self.data.physical_address().get(), Ordering::Relaxed);
-        STACK_PHYSICAL.store(self.stack.physical_address().get(), Ordering::Relaxed);
+        self.mm.bind().expect("unable to bind the M8-B3 user mm");
         ACTIVE.store(true, Ordering::Release);
     }
 
     fn unpublish(&self) {
         let was_active = ACTIVE.swap(false, Ordering::AcqRel);
-        assert!(was_active, "M7 attempted to unpublish an inactive session");
-
-        CODE_PHYSICAL.store(0, Ordering::Relaxed);
-        DATA_PHYSICAL.store(0, Ordering::Relaxed);
-        STACK_PHYSICAL.store(0, Ordering::Relaxed);
+        assert!(
+            was_active,
+            "M8-B3 attempted to unpublish an inactive session"
+        );
+        self.mm.unbind();
     }
 
     fn load_code(&self) {
         let image = embedded_user_image();
         assert!(
             !image.is_empty() && image.len() <= PAGE_SIZE,
-            "M7 embedded user image does not fit in one page",
+            "M8-B3 embedded user image does not fit in one page",
         );
-        copy_to_physical(self.code.physical_address(), image);
+        copy_to_physical(self.code_physical, image);
         prepare_user_instruction_stream();
     }
 
-    fn destroy(self) {
-        crate::vm::unmap_user_page(self.stack).expect("unable to release M7 user stack mapping");
-        crate::vm::unmap_user_page(self.data).expect("unable to release M7 user data mapping");
-        crate::vm::unmap_user_page(self.code).expect("unable to release M7 user code mapping");
+    fn activate_current_cpu(&self) {
+        self.mm
+            .activate_current_cpu()
+            .expect("unable to activate the M8-B3 user page-table root");
+    }
+
+    fn deactivate_current_cpu(&self) {
+        self.mm
+            .deactivate_current_cpu()
+            .expect("unable to restore the kernel page-table root");
+    }
+
+    fn assert_private_hardware_state(&self) {
+        assert!(
+            self.mm
+                .root_is_private()
+                .expect("unable to compare M8-B3 page-table roots"),
+            "M8-B3 user mm reused the kernel page-table root",
+        );
+        self.mm
+            .assert_hardware_active()
+            .expect("M8-B3 hardware root/ASID verification failed");
+        assert!(
+            self.mm
+                .kernel_mapping_is_shared(VirtAddr::new(verify as usize))
+                .expect("unable to verify the shared kernel mapping"),
+            "M8-B3 user root lost the shared high-half kernel mapping",
+        );
+    }
+
+    fn destroy(mut self) {
+        self.mm
+            .destroy()
+            .expect("unable to destroy the M8-B3 user address space");
     }
 }
 
@@ -132,6 +211,13 @@ struct SessionExpected {
     syscall_count: usize,
     write_count: usize,
     fault_count: usize,
+    recovered_fault_count: usize,
+    anonymous_fault_count: usize,
+    stack_growth_count: usize,
+    brk_count: usize,
+    mmap_count: usize,
+    munmap_count: usize,
+    mprotect_count: usize,
     fault_kind: usize,
     fault_address: usize,
 }
@@ -144,6 +230,13 @@ struct SessionObserved {
     syscall_count: usize,
     write_count: usize,
     fault_count: usize,
+    recovered_fault_count: usize,
+    anonymous_fault_count: usize,
+    stack_growth_count: usize,
+    brk_count: usize,
+    mmap_count: usize,
+    munmap_count: usize,
+    mprotect_count: usize,
     fault_kind: usize,
     fault_address: usize,
 }
@@ -154,11 +247,11 @@ pub fn verify() {
     assert_eq!(
         crate::smp::current_cpu_id(),
         crate::smp::CpuId::BOOT,
-        "M7 verifier must run on the boot CPU",
+        "M8-B3 verifier must run on the boot CPU",
     );
     assert!(
         !ACTIVE.load(Ordering::Acquire),
-        "M7 user session was already active",
+        "M8-B3 user session was already active",
     );
 
     let success = SessionExpected {
@@ -167,6 +260,13 @@ pub fn verify() {
         syscall_count: 2,
         write_count: 1,
         fault_count: 0,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
         fault_kind: FAULT_NONE,
         fault_address: 0,
     };
@@ -176,6 +276,13 @@ pub fn verify() {
         syscall_count: 2,
         write_count: 0,
         fault_count: 0,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
         fault_kind: FAULT_NONE,
         fault_address: 0,
     };
@@ -185,8 +292,63 @@ pub fn verify() {
         syscall_count: 0,
         write_count: 0,
         fault_count: 1,
+        recovered_fault_count: 0,
+        anonymous_fault_count: 0,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 0,
+        munmap_count: 0,
+        mprotect_count: 0,
         fault_kind: FAULT_PAGE,
         fault_address: USER_CODE,
+    };
+    let vm_success = SessionExpected {
+        result: 0,
+        exit_status: 0,
+        syscall_count: 6,
+        write_count: 0,
+        fault_count: 4,
+        recovered_fault_count: 4,
+        anonymous_fault_count: 3,
+        stack_growth_count: 1,
+        brk_count: 2,
+        mmap_count: 1,
+        munmap_count: 1,
+        mprotect_count: 1,
+        fault_kind: FAULT_RECOVERED,
+        fault_address: USER_MMAP_START,
+    };
+    let mprotect_fault = SessionExpected {
+        result: -EFAULT,
+        exit_status: -EFAULT,
+        syscall_count: 2,
+        write_count: 0,
+        fault_count: 2,
+        recovered_fault_count: 1,
+        anonymous_fault_count: 1,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 1,
+        munmap_count: 0,
+        mprotect_count: 1,
+        fault_kind: FAULT_PAGE,
+        fault_address: USER_MMAP_START,
+    };
+    let munmap_fault = SessionExpected {
+        result: -EFAULT,
+        exit_status: -EFAULT,
+        syscall_count: 2,
+        write_count: 0,
+        fault_count: 2,
+        recovered_fault_count: 1,
+        anonymous_fault_count: 1,
+        stack_growth_count: 0,
+        brk_count: 0,
+        mmap_count: 1,
+        munmap_count: 1,
+        mprotect_count: 0,
+        fault_kind: FAULT_PAGE,
+        fault_address: USER_MMAP_START,
     };
 
     assert_session(
@@ -222,12 +384,29 @@ pub fn verify() {
         ),
         success,
     );
+    assert_session(
+        "demand paging and VM syscalls",
+        run_session(core::ptr::addr_of!(__m8_user_vm), None, false),
+        vm_success,
+    );
+    assert_session(
+        "mprotect write rejection",
+        run_session(core::ptr::addr_of!(__m8_user_mprotect_fault), None, false),
+        mprotect_fault,
+    );
+    assert_session(
+        "munmap stale translation rejection",
+        run_session(core::ptr::addr_of!(__m8_user_munmap_fault), None, false),
+        munmap_fault,
+    );
 
     assert!(
         !ACTIVE.load(Ordering::Acquire),
-        "M7 verifier leaked an active user session",
+        "M8-B3 verifier leaked an active user session",
     );
+    crate::user_mm::assert_no_leaks();
 
+    // Keep the frozen M7 evidence strings intact for the existing harness.
     crate::println!("minimal user mode test:");
     crate::println!("  U-mode/PLV3 entry : verified");
     crate::println!("  user trap stack   : verified");
@@ -238,6 +417,24 @@ pub fn verify() {
     crate::println!("  RX write fault    : isolated from kernel");
     crate::println!("  session recycle   : verified (5 runs)");
     crate::println!("  mapping reclaim   : verified");
+
+    crate::println!("M8-B3 private-root gate:");
+    crate::println!("  private user root : verified");
+    crate::println!("  kernel high half  : shared");
+    crate::println!("  ASID root switch  : verified");
+    crate::println!("  active CPU publish: verified");
+    crate::println!("  kernel root return: verified");
+    crate::println!("  page/root reclaim : verified");
+    crate::println!("  demand fault path : verified");
+
+    crate::println!("M8-B4 demand paging/VM gate:");
+    crate::println!("  anonymous demand  : verified");
+    crate::println!("  bounded stack grow: verified");
+    crate::println!("  brk growth/shrink : verified");
+    crate::println!("  mmap/munmap       : verified");
+    crate::println!("  mprotect          : verified");
+    crate::println!("  TLB-before-free   : verified");
+    crate::println!("  user fault retry  : verified");
 }
 
 fn run_session(
@@ -247,16 +444,16 @@ fn run_session(
 ) -> SessionObserved {
     reset_session_state();
 
-    let image = UserImage::create().expect("unable to create M7 user image");
+    let image = UserImage::create().expect("unable to create M8-B3 user image");
     image.load_code();
     image.publish();
 
     if let Some(data) = initial_data {
-        copy_to_user(USER_DATA, data).expect("checked copy_to_user rejected M7 user data");
+        copy_to_user(USER_DATA, data).expect("checked copy_to_user rejected M8-B3 user data");
         let mut round_trip = [0_u8; USER_MESSAGE.len()];
         copy_from_user(USER_DATA, &mut round_trip)
-            .expect("checked copy_from_user rejected M7 user data");
-        assert_eq!(&round_trip, data, "M7 user copy changed data");
+            .expect("checked copy_from_user rejected M8-B3 user data");
+        assert_eq!(&round_trip, data, "M8-B3 user copy changed data");
     }
 
     if exercise_copy_guards {
@@ -266,12 +463,16 @@ fn run_session(
     let entry = user_entry(entry_symbol);
     let result = {
         /*
-         * M7 keeps local interrupts disabled for the complete user round trip.
-         * The current kernel task remains the sole owner of this kernel stack.
-         * Preemptible user threads belong to M9.
+         * The M8 verifier retains M7's synchronous, non-preemptible user
+         * round trip. M9 will attach an mm to schedulable Process/Thread
+         * objects and move root switching into the context-switch path.
          */
         let _interrupt_guard = crate::context::IrqSaveGuard::new();
-        enter_user(entry, USER_STACK_TOP)
+        image.activate_current_cpu();
+        image.assert_private_hardware_state();
+        let result = enter_user(entry, USER_STACK_TOP);
+        image.deactivate_current_cpu();
+        result
     };
 
     let observed = SessionObserved {
@@ -281,18 +482,25 @@ fn run_session(
         syscall_count: SYSCALL_COUNT.load(Ordering::Acquire),
         write_count: WRITE_COUNT.load(Ordering::Acquire),
         fault_count: FAULT_COUNT.load(Ordering::Acquire),
+        recovered_fault_count: RECOVERED_FAULT_COUNT.load(Ordering::Acquire),
+        anonymous_fault_count: ANONYMOUS_FAULT_COUNT.load(Ordering::Acquire),
+        stack_growth_count: STACK_GROWTH_COUNT.load(Ordering::Acquire),
+        brk_count: BRK_COUNT.load(Ordering::Acquire),
+        mmap_count: MMAP_COUNT.load(Ordering::Acquire),
+        munmap_count: MUNMAP_COUNT.load(Ordering::Acquire),
+        mprotect_count: MPROTECT_COUNT.load(Ordering::Acquire),
         fault_kind: LAST_FAULT_KIND.load(Ordering::Acquire),
         fault_address: LAST_FAULT_ADDRESS.load(Ordering::Acquire),
     };
 
     image.unpublish();
     image.destroy();
+    crate::user_mm::assert_no_leaks();
 
     assert!(
         crate::arch::trap::kernel_scratch_is_clean(),
         "architecture user/kernel stack scratch was not restored",
     );
-
     let mut revoked = [0_u8; 1];
     assert!(
         copy_from_user(USER_DATA, &mut revoked).is_err(),
@@ -305,12 +513,19 @@ fn run_session(
 fn reset_session_state() {
     assert!(
         !ACTIVE.load(Ordering::Acquire),
-        "M7 session state was reset while active",
+        "M8-B3 session state was reset while active",
     );
     TERMINATED.store(false, Ordering::Release);
     SYSCALL_COUNT.store(0, Ordering::Release);
     WRITE_COUNT.store(0, Ordering::Release);
     FAULT_COUNT.store(0, Ordering::Release);
+    RECOVERED_FAULT_COUNT.store(0, Ordering::Release);
+    ANONYMOUS_FAULT_COUNT.store(0, Ordering::Release);
+    STACK_GROWTH_COUNT.store(0, Ordering::Release);
+    BRK_COUNT.store(0, Ordering::Release);
+    MMAP_COUNT.store(0, Ordering::Release);
+    MUNMAP_COUNT.store(0, Ordering::Release);
+    MPROTECT_COUNT.store(0, Ordering::Release);
     LAST_FAULT_KIND.store(FAULT_NONE, Ordering::Release);
     LAST_FAULT_ADDRESS.store(0, Ordering::Release);
     EXIT_STATUS.store(isize::MIN, Ordering::Release);
@@ -342,6 +557,34 @@ fn assert_session(name: &str, observed: SessionObserved, expected: SessionExpect
         "{name}: wrong user fault count",
     );
     assert_eq!(
+        observed.recovered_fault_count, expected.recovered_fault_count,
+        "{name}: wrong recovered fault count",
+    );
+    assert_eq!(
+        observed.anonymous_fault_count, expected.anonymous_fault_count,
+        "{name}: wrong anonymous fault count",
+    );
+    assert_eq!(
+        observed.stack_growth_count, expected.stack_growth_count,
+        "{name}: wrong stack-growth count",
+    );
+    assert_eq!(
+        observed.brk_count, expected.brk_count,
+        "{name}: wrong brk count"
+    );
+    assert_eq!(
+        observed.mmap_count, expected.mmap_count,
+        "{name}: wrong mmap count",
+    );
+    assert_eq!(
+        observed.munmap_count, expected.munmap_count,
+        "{name}: wrong munmap count",
+    );
+    assert_eq!(
+        observed.mprotect_count, expected.mprotect_count,
+        "{name}: wrong mprotect count",
+    );
+    assert_eq!(
         observed.fault_kind, expected.fault_kind,
         "{name}: wrong user fault class",
     );
@@ -360,7 +603,7 @@ fn verify_copy_guards() {
     let mut crossing = [0_u8; 2];
     assert!(
         copy_from_user(USER_DATA + PAGE_SIZE - 1, &mut crossing).is_err(),
-        "copy_from_user accepted a cross-page range",
+        "copy_from_user accepted a cross-VMA range",
     );
     assert!(
         copy_from_user(usize::MAX - 1, &mut crossing).is_err(),
@@ -377,7 +620,7 @@ fn verify_copy_guards() {
 pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     assert!(
         ACTIVE.load(Ordering::Acquire),
-        "user syscall arrived without an active M7 session",
+        "user syscall arrived without an active M8-B3 session",
     );
     assert!(
         frame.previous_mode_was_user(),
@@ -394,6 +637,13 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let result = sys_write(arguments[0], arguments[1], arguments[2]);
             set_syscall_result(frame, result);
         }
+        SYS_BRK => set_syscall_result(frame, sys_brk(arguments[0])),
+        SYS_MUNMAP => set_syscall_result(frame, sys_munmap(arguments[0], arguments[1])),
+        SYS_MMAP => set_syscall_result(frame, sys_mmap(arguments)),
+        SYS_MPROTECT => set_syscall_result(
+            frame,
+            sys_mprotect(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_EXIT => {
             EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
             TERMINATED.store(true, Ordering::Release);
@@ -406,32 +656,177 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
 pub fn handle_fault(
     frame: &mut crate::arch::trap::TrapFrame,
     address: VirtAddr,
-    _access: myos_mm::FaultAccess,
+    access: FaultAccess,
     _raw: usize,
 ) {
     assert!(
-        frame.previous_mode_was_user(),
-        "M7 user fault handler received a kernel fault",
+        ACTIVE.load(Ordering::Acquire),
+        "user fault arrived without an active M8-B4 session",
     );
-    LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
-    LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
+    assert!(
+        frame.previous_mode_was_user(),
+        "M8-B4 user fault handler received a kernel fault",
+    );
+
     FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
-    TERMINATED.store(true, Ordering::Release);
-    EXIT_STATUS.store(-EFAULT, Ordering::Release);
-    return_to_kernel(frame, -EFAULT);
+    let user_sp = VirtAddr::new(frame.stack_pointer());
+    match crate::user_mm::resolve_active_fault(address, access, user_sp) {
+        Ok(UserFaultResolution::Recovered(recovery)) => {
+            RECOVERED_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+            match recovery {
+                UserFaultRecovery::Anonymous => {
+                    ANONYMOUS_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+                }
+                UserFaultRecovery::StackGrowth => {
+                    STACK_GROWTH_COUNT.fetch_add(1, Ordering::AcqRel);
+                }
+                UserFaultRecovery::Spurious => {}
+            }
+            LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
+            LAST_FAULT_KIND.store(FAULT_RECOVERED, Ordering::Release);
+        }
+        Ok(UserFaultResolution::Fatal(failure)) => {
+            assert!(
+                !matches!(failure, UserFaultFailure::KernelBug),
+                "M8-B4 fault planner classified a user trap as a kernel bug",
+            );
+            LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
+            LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
+            TERMINATED.store(true, Ordering::Release);
+            EXIT_STATUS.store(-EFAULT, Ordering::Release);
+            return_to_kernel(frame, -EFAULT);
+        }
+        Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
+    }
 }
 
 pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) {
     assert!(
-        frame.previous_mode_was_user(),
-        "M7 user exception handler received a kernel exception",
+        ACTIVE.load(Ordering::Acquire),
+        "user exception arrived without an active M8-B3 session",
     );
+    assert!(
+        frame.previous_mode_was_user(),
+        "M8-B3 user exception handler received a kernel exception",
+    );
+
     LAST_FAULT_ADDRESS.store(0, Ordering::Release);
     LAST_FAULT_KIND.store(FAULT_EXCEPTION, Ordering::Release);
     FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
     TERMINATED.store(true, Ordering::Release);
     EXIT_STATUS.store(-EFAULT, Ordering::Release);
     return_to_kernel(frame, -EFAULT);
+}
+
+fn sys_brk(address: usize) -> isize {
+    let current = match crate::user_mm::active_program_break() {
+        Ok(current) => current,
+        Err(_) => return -ENOMEM,
+    };
+    if address == 0 {
+        return current.get() as isize;
+    }
+
+    match crate::user_mm::set_active_program_break(VirtAddr::new(address)) {
+        Ok(new_break) => {
+            BRK_COUNT.fetch_add(1, Ordering::AcqRel);
+            new_break.get() as isize
+        }
+        Err(_) => current.get() as isize,
+    }
+}
+
+fn sys_mmap(arguments: [usize; 6]) -> isize {
+    let [address, length, protection, flags, file, offset] = arguments;
+    if address != 0
+        || length == 0
+        || flags != (MAP_PRIVATE | MAP_ANONYMOUS)
+        || file != usize::MAX
+        || offset != 0
+    {
+        return -EINVAL;
+    }
+    let vm_flags = match protection_flags(protection) {
+        Some(flags) => flags,
+        None => return -EINVAL,
+    };
+    let rounded = match length.checked_add(PAGE_SIZE - 1) {
+        Some(length) => length & !(PAGE_SIZE - 1),
+        None => return -ENOMEM,
+    };
+    match crate::user_mm::map_active_anonymous(
+        VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
+        rounded,
+        vm_flags,
+    ) {
+        Ok(start) => {
+            MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            start.get() as isize
+        }
+        Err(_) => -ENOMEM,
+    }
+}
+
+fn sys_munmap(address: usize, length: usize) -> isize {
+    let range = match syscall_range(address, length) {
+        Some(range) => range,
+        None => return -EINVAL,
+    };
+    match crate::user_mm::unmap_active_range(range) {
+        Ok(()) => {
+            MUNMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+        Err(_) => -EINVAL,
+    }
+}
+
+fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
+    let range = match syscall_range(address, length) {
+        Some(range) => range,
+        None => return -EINVAL,
+    };
+    let flags = match protection_flags(protection) {
+        Some(flags) => flags.access_only(),
+        None => return -EINVAL,
+    };
+    match crate::user_mm::protect_active_range(range, flags) {
+        Ok(()) => {
+            MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
+            0
+        }
+        Err(_) => -EINVAL,
+    }
+}
+
+fn syscall_range(address: usize, length: usize) -> Option<VirtRange> {
+    if length == 0 || address & (PAGE_SIZE - 1) != 0 {
+        return None;
+    }
+    let rounded = length.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+    let end = address.checked_add(rounded)?;
+    VirtRange::new(VirtAddr::new(address), VirtAddr::new(end))
+}
+
+fn protection_flags(protection: usize) -> Option<VmAreaFlags> {
+    if protection == 0 || protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+        return None;
+    }
+
+    let mut flags = VmAreaFlags::USER.union(VmAreaFlags::PRIVATE);
+    if protection & PROT_READ != 0 || protection & (PROT_WRITE | PROT_EXEC) != 0 {
+        flags = flags.union(VmAreaFlags::READ);
+    }
+    if protection & PROT_WRITE != 0 {
+        flags = flags.union(VmAreaFlags::WRITE);
+    }
+    if protection & PROT_EXEC != 0 {
+        flags = flags.union(VmAreaFlags::EXECUTE);
+    }
+    if flags.is_writable() && flags.is_executable() {
+        return None;
+    }
+    Some(flags)
 }
 
 fn sys_write(fd: usize, address: usize, length: usize) -> isize {
@@ -446,6 +841,7 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
     if copy_from_user(address, &mut buffer[..length]).is_err() {
         return -EFAULT;
     }
+
     let text = match core::str::from_utf8(&buffer[..length]) {
         Ok(text) => text,
         Err(_) => return -EINVAL,
@@ -457,60 +853,17 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
 }
 
 fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
-    if output.is_empty() {
-        return Ok(());
-    }
-    let physical = resolve_user_range(address, output.len(), false)?;
-    let source = crate::arch::memory::phys_access::ram_ptr::<u8>(physical).map_err(|_| ())?;
-    // SAFETY: resolve_user_range proved the complete source range belongs to
-    // a live M7 user page; output is a valid, non-overlapping kernel slice.
-    unsafe {
-        core::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), output.len());
-    }
-    Ok(())
+    crate::user_mm::copy_from_active(address, output).map_err(|_| ())
 }
 
 fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
-    if input.is_empty() {
-        return Ok(());
-    }
-    let physical = resolve_user_range(address, input.len(), true)?;
-    let destination =
-        crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical).map_err(|_| ())?;
-    // SAFETY: resolve_user_range proved the complete destination range belongs
-    // to a writable live M7 user page; input is a valid non-overlapping slice.
-    unsafe {
-        core::ptr::copy_nonoverlapping(input.as_ptr(), destination, input.len());
-    }
-    Ok(())
-}
-
-fn resolve_user_range(address: usize, length: usize, write: bool) -> Result<PhysAddr, ()> {
-    if !ACTIVE.load(Ordering::Acquire) || length > PAGE_SIZE {
-        return Err(());
-    }
-    let end = address.checked_add(length).ok_or(())?;
-
-    let mappings = [
-        (USER_CODE, CODE_PHYSICAL.load(Ordering::Relaxed), false),
-        (USER_DATA, DATA_PHYSICAL.load(Ordering::Relaxed), true),
-        (USER_STACK, STACK_PHYSICAL.load(Ordering::Relaxed), true),
-    ];
-
-    for (start, physical, writable) in mappings {
-        let page_end = start.checked_add(PAGE_SIZE).ok_or(())?;
-        if address >= start && end <= page_end && (!write || writable) && physical != 0 {
-            let offset = address - start;
-            let resolved = physical.checked_add(offset).ok_or(())?;
-            return Ok(PhysAddr::new(resolved));
-        }
-    }
-    Err(())
+    crate::user_mm::copy_to_active(address, input).map_err(|_| ())
 }
 
 fn copy_to_physical(physical: PhysAddr, bytes: &[u8]) {
     let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
-        .expect("M7 backing page is outside RAM");
+        .expect("M8-B3 backing page is outside RAM");
+
     // SAFETY: the caller owns a zeroed full page and has checked bytes.len().
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
@@ -522,7 +875,8 @@ fn embedded_user_image() -> &'static [u8] {
     let end = core::ptr::addr_of!(__m7_user_image_end) as usize;
     let length = end
         .checked_sub(start)
-        .expect("M7 embedded user image symbols are reversed");
+        .expect("M8-B3 embedded user image symbols are reversed");
+
     // SAFETY: both linker symbols delimit immutable bytes emitted by the
     // architecture-specific assembly in this crate.
     unsafe { core::slice::from_raw_parts(start as *const u8, length) }
@@ -532,20 +886,26 @@ fn user_entry(symbol: *const u8) -> usize {
     let image_start = core::ptr::addr_of!(__m7_user_image_start) as usize;
     let image_end = core::ptr::addr_of!(__m7_user_image_end) as usize;
     let symbol = symbol as usize;
+
     assert!(
         symbol >= image_start && symbol < image_end,
-        "M7 user entry symbol is outside the embedded image",
+        "M8-B3 user entry symbol is outside the embedded image",
     );
+
     USER_CODE
         .checked_add(symbol - image_start)
-        .expect("M7 user entry address overflow")
+        .expect("M8-B3 user entry address overflow")
 }
 
 fn enter_user(entry: usize, stack_top: usize) -> isize {
-    assert_eq!(stack_top & 0xf, 0, "M7 user stack is not 16-byte aligned");
-    // SAFETY: the verifier installed validated user mappings, keeps the current
-    // kernel stack alive, and disables local interrupts until this routine
-    // returns through __m7_user_return.
+    assert_eq!(
+        stack_top & 0xf,
+        0,
+        "M8-B3 user stack is not 16-byte aligned",
+    );
+
+    // SAFETY: the verifier installed a validated private user root, keeps the
+    // current kernel stack alive, and disables local interrupts until return.
     unsafe { __m7_enter_user(entry, stack_top) }
 }
 
@@ -626,7 +986,7 @@ fn return_to_kernel(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
 
     let kernel_stack = (frame as *mut crate::arch::trap::TrapFrame as usize)
         .checked_add(core::mem::size_of::<crate::arch::trap::TrapFrame>())
-        .expect("M7 kernel stack pointer overflow");
+        .expect("M8-B3 kernel stack pointer overflow");
 
     frame.gpr[2] = kernel_stack;
     frame.gpr[10] = result as usize;
@@ -641,7 +1001,7 @@ fn return_to_kernel(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
 
     let kernel_stack = (frame as *mut crate::arch::trap::TrapFrame as usize)
         .checked_add(core::mem::size_of::<crate::arch::trap::TrapFrame>())
-        .expect("M7 kernel stack pointer overflow");
+        .expect("M8-B3 kernel stack pointer overflow");
 
     frame.gpr[3] = kernel_stack;
     frame.gpr[4] = result as usize;

@@ -2,7 +2,9 @@
 
 mod address;
 mod address_space;
+mod asid;
 mod buddy;
+mod cpu_mask;
 mod early_allocator;
 mod fault;
 mod frame;
@@ -13,6 +15,7 @@ mod paging;
 mod range;
 mod slab;
 mod tlb;
+mod user_space;
 mod virtual_address;
 mod virtual_page;
 mod virtual_range;
@@ -56,9 +59,12 @@ pub use heap::{HeapAllocator, HeapError, HeapStats};
 pub use vma::{VmArea, VmAreaError, VmAreaFlags, VmAreaKind, VmAreaSet};
 
 pub use address_space::{AddressSpace, AddressSpaceError, ProgramBreak};
+pub use asid::{AsidAllocation, AsidAllocator, AsidAllocatorError, AsidToken};
+pub use cpu_mask::{AtomicCpuMask, CPU_MASK_BITS, CpuMask, CpuMaskError};
 
 pub use fault::{FaultAccess, FaultOutcome, FaultSource, PageFault};
 
 pub use vmalloc::{KernelVirtualAllocator, KernelVirtualReservation, VmallocKind};
 
 pub use tlb::{AddressSpaceId, TlbFlush, TlbScope, TlbShootdown};
+pub use user_space::{PerMmTlbRequest, StackGrowth, UserAddressSpace, UserFaultPlan, UserMmError};

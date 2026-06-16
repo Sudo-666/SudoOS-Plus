@@ -5,7 +5,12 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering, fence},
 };
 
-use myos_mm::{AddressSpaceId, PAGE_SIZE, TlbFlush, TlbScope, TlbShootdown, VirtAddr, VirtRange};
+use myos_mm::{
+    AddressSpaceId, PAGE_SIZE, PerMmTlbRequest, TlbFlush, TlbScope, TlbShootdown, VirtAddr,
+    VirtRange,
+};
+#[cfg(debug_assertions)]
+use myos_mm::{AsidToken, UserAddressSpace};
 
 use crate::{
     lockdep::{LockClass, LockRank},
@@ -284,6 +289,115 @@ pub fn shootdown(flush: TlbFlush) {
 }
 
 /// Handles the TLB component of one mailbox batch on the current CPU.
+
+/// Executes one synchronous, exact-target TLB request for a user address space.
+///
+/// The request must be created by `UserAddressSpace::plan_tlb_request()` after
+/// the page-table/VMA locks have been released.  This function reuses the
+/// kernel request slot, serializer, mailbox bit, timeout, and ACK protocol.
+pub fn shootdown_user(request: PerMmTlbRequest) {
+    validate_user_request(request);
+    crate::context::assert_interrupts_enabled();
+    crate::context::assert_task_context();
+
+    let requested = usize::try_from(request.targets().bits())
+        .expect("per-mm CPU mask exceeds the kernel target-mask width");
+    let flush = request.flush();
+    let migration_guard = crate::task::MigrationGuard::new();
+    let current = crate::smp::current_cpu_id();
+    let current_bit = cpu_bit(current);
+    let online = crate::smp::online_cpu_mask();
+    let ready = crate::smp::ipi_ready_cpu_mask();
+
+    assert_ne!(
+        online & current_bit,
+        0,
+        "per-mm TLB shootdown attempted from an offline CPU: cpu={} online={online:#x}",
+        current.get(),
+    );
+    assert_eq!(
+        requested & !online,
+        0,
+        "per-mm TLB request targeted an offline CPU: requested={requested:#x} online={online:#x}",
+    );
+    assert_eq!(
+        requested & !ready,
+        0,
+        "per-mm TLB request targeted a CPU that is not IPI-ready: \
+         requested={requested:#x} ready={ready:#x}",
+    );
+
+    if requested == 0 {
+        COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+        drop(migration_guard);
+        return;
+    }
+
+    let targets = requested & !current_bit;
+    if targets == 0 {
+        if requested & current_bit != 0 {
+            flush_local(flush);
+        }
+        COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+        drop(migration_guard);
+        return;
+    }
+
+    // Reuse the same serializer as kernel-wide requests.  Interrupts remain
+    // enabled so this CPU can acknowledge another CPU's request while waiting.
+    let serializer = acquire_serializer(current);
+    let request_id = NEXT_REQUEST_ID
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    assert_ne!(request_id, 0, "TLB request ID wrapped to zero");
+
+    REQUEST.begin_publish();
+    REQUEST.publish(TlbRequest {
+        shootdown: TlbShootdown::new(flush, request_id),
+        targets,
+    });
+    fence(Ordering::SeqCst);
+    for_each_cpu(targets, crate::smp::send_tlb_shootdown);
+
+    if requested & current_bit != 0 {
+        flush_local(flush);
+    }
+    wait_for_completion(request_id, targets);
+    fence(Ordering::Acquire);
+    REQUEST.release(targets);
+    COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+
+    drop(serializer);
+    drop(migration_guard);
+}
+
+/// Executes an ASID-scoped request that is known to target only this CPU.
+///
+/// M8's synchronous verifier disables local interrupts while a private user
+/// root is active. It therefore cannot enter the remote serializer/ACK path.
+/// This helper is deliberately fail-closed: a future shared-mm target mask
+/// must use `shootdown_user()` from interruptible task context instead.
+pub fn shootdown_user_local(request: PerMmTlbRequest) {
+    validate_user_request(request);
+    crate::context::assert_interrupts_disabled();
+
+    let requested = usize::try_from(request.targets().bits())
+        .expect("per-mm CPU mask exceeds the kernel target-mask width");
+    let current = crate::smp::current_cpu_id();
+    let current_bit = cpu_bit(current);
+    assert_eq!(
+        requested & !current_bit,
+        0,
+        "local-only per-mm request targeted another CPU: current={} targets={requested:#x}",
+        current.get(),
+    );
+
+    if requested & current_bit != 0 {
+        flush_local(request.flush());
+    }
+    COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn handle_shootdown_ipi() {
     let cpu = crate::smp::current_cpu_id();
     let request = REQUEST.request();
@@ -402,6 +516,49 @@ fn validate_scope(scope: TlbScope) {
     }
 }
 
+fn validate_user_request(request: PerMmTlbRequest) {
+    let asid = request.asid().id();
+    assert_ne!(
+        asid,
+        AddressSpaceId::KERNEL,
+        "per-mm TLB request used the reserved kernel ASID",
+    );
+    assert_ne!(
+        request.generation(),
+        0,
+        "per-mm TLB request used generation zero",
+    );
+
+    match request.flush() {
+        TlbFlush::All { scope } => validate_user_scope(scope, asid),
+        TlbFlush::Page { scope, address } => {
+            validate_user_scope(scope, asid);
+            assert!(
+                address.is_aligned(PAGE_SIZE),
+                "per-mm TLB page request is not page-aligned: address={:#x}",
+                address.get(),
+            );
+        }
+        TlbFlush::Range { scope, range } => {
+            validate_user_scope(scope, asid);
+            assert!(
+                range.is_page_aligned(),
+                "per-mm TLB range request is not page-aligned: start={:#x} end={:#x}",
+                range.start().get(),
+                range.end().get(),
+            );
+        }
+    }
+}
+
+fn validate_user_scope(scope: TlbScope, asid: AddressSpaceId) {
+    assert_eq!(
+        scope,
+        TlbScope::AddressSpace(asid),
+        "per-mm TLB request scope does not match its ASID token",
+    );
+}
+
 fn target_mask(flush: TlbFlush, online: usize, current_bit: usize) -> usize {
     match flush_scope(flush) {
         TlbScope::Local => 0,
@@ -423,28 +580,46 @@ const fn flush_scope(flush: TlbFlush) -> TlbScope {
 
 fn flush_local(flush: TlbFlush) {
     match flush {
-        TlbFlush::All { .. } => crate::arch::memory::paging::flush_all(),
-        TlbFlush::Page { address, .. } => {
-            crate::arch::memory::paging::flush_page(address);
-        }
-        TlbFlush::Range { range, .. } => flush_range_local(range),
+        TlbFlush::All { scope } => flush_all_local(scope),
+        TlbFlush::Page { scope, address } => flush_page_local(scope, address),
+        TlbFlush::Range { scope, range } => flush_range_local(scope, range),
     }
 }
 
-fn flush_range_local(range: VirtRange) {
+fn flush_all_local(scope: TlbScope) {
+    match scope {
+        TlbScope::AddressSpace(address_space) if address_space != AddressSpaceId::KERNEL => {
+            crate::arch::memory::paging::flush_asid(address_space);
+        }
+        TlbScope::Local | TlbScope::AllCpus | TlbScope::AddressSpace(_) => {
+            crate::arch::memory::paging::flush_all();
+        }
+    }
+}
+
+fn flush_page_local(scope: TlbScope, address: VirtAddr) {
+    match scope {
+        TlbScope::AddressSpace(address_space) if address_space != AddressSpaceId::KERNEL => {
+            crate::arch::memory::paging::flush_asid_page(address_space, address);
+        }
+        TlbScope::Local | TlbScope::AllCpus | TlbScope::AddressSpace(_) => {
+            crate::arch::memory::paging::flush_page(address);
+        }
+    }
+}
+
+fn flush_range_local(scope: TlbScope, range: VirtRange) {
     if range.is_empty() {
         return;
     }
-
     let pages = range.size() / PAGE_SIZE;
     if pages > RANGE_PAGE_FLUSH_LIMIT {
-        crate::arch::memory::paging::flush_all();
+        flush_all_local(scope);
         return;
     }
-
     let mut address = range.start();
     while address.get() < range.end().get() {
-        crate::arch::memory::paging::flush_page(address);
+        flush_page_local(scope, address);
         address = address
             .checked_add(PAGE_SIZE)
             .expect("TLB range iteration overflowed");
@@ -585,4 +760,89 @@ pub fn verify_request_model() {
     crate::println!("  page request        : verified");
     crate::println!("  range request       : verified");
     crate::println!("  long-range fallback : {} pages", RANGE_PAGE_FLUSH_LIMIT);
+
+    let exact_completed_before = completed_shootdowns();
+    let mut exact_remote_before = [0_u64; MAX_CPUS];
+    for (logical, before) in exact_remote_before
+        .iter_mut()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
+        let cpu = CpuId::new(logical).expect("M8-B1 verifier CPU exceeds MAX_CPUS");
+        *before = remote_flush_count(cpu);
+    }
+
+    let current = crate::smp::current_cpu_id();
+    let current_bit = cpu_bit(current);
+    let ready = crate::smp::ipi_ready_cpu_mask();
+    let mut exact_targets = current_bit;
+    for logical in 0..crate::smp::discovered_cpu_count() {
+        let bit = 1_usize << logical;
+        if bit != current_bit && ready & bit != 0 {
+            exact_targets |= bit;
+            break;
+        }
+    }
+
+    let user_asid = AddressSpaceId::new(7);
+    let user_mm: UserAddressSpace<1> = UserAddressSpace::new(
+        VirtRange::from_bounds(0, PAGE_SIZE),
+        AsidToken::new(user_asid, 1),
+    );
+    for_each_cpu(exact_targets, |cpu| {
+        user_mm
+            .enter_cpu_after_local_sync(cpu.get(), 1, 0)
+            .expect("M8-B1 verifier could not publish active CPU");
+    });
+    let per_mm_request = user_mm
+        .plan_tlb_request(TlbFlush::Page {
+            scope: TlbScope::AddressSpace(user_asid),
+            address: VirtAddr::new(0),
+        })
+        .expect("M8-B1 verifier could not plan per-mm TLB request");
+    shootdown_user(per_mm_request);
+
+    assert_eq!(
+        completed_shootdowns(),
+        exact_completed_before + 1,
+        "M8-B1 verifier lost the per-mm request",
+    );
+    for (logical, before) in exact_remote_before
+        .iter()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
+        let bit = 1_usize << logical;
+        let cpu = CpuId::new(logical).expect("M8-B1 target exceeds MAX_CPUS");
+        let increment = if exact_targets & bit != 0 && bit != current_bit {
+            1
+        } else {
+            0
+        };
+        let expected = *before + increment;
+        assert_eq!(
+            remote_flush_count(cpu),
+            expected,
+            "M8-B1 per-mm request did not honor the exact active CPU mask: cpu={logical}",
+        );
+    }
+    for_each_cpu(exact_targets, |cpu| {
+        user_mm
+            .leave_cpu_after_local_flush(cpu.get(), per_mm_request.generation())
+            .expect("M8-B1 verifier could not retire active CPU");
+    });
+    user_mm
+        .assert_inactive_for_destroy()
+        .expect("M8-B1 verifier leaked active CPU membership");
+    assert_eq!(
+        REQUEST.state.load(Ordering::Acquire),
+        REQUEST_FREE,
+        "M8-B1 verifier leaked the shared request slot",
+    );
+
+    crate::println!("M8-B1 per-mm TLB test:");
+    crate::println!("  ASID-local invalidate : verified");
+    crate::println!("  exact active CPU mask : verified");
+    crate::println!("  shared ACK protocol   : verified");
+    crate::println!("  generation handshake  : verified");
 }

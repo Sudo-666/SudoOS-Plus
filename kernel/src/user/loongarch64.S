@@ -95,6 +95,8 @@ __m7_user_image_start:
 
 .globl __m7_user_success
 __m7_user_success:
+  /* Adversarial regression: user state must not become CPU ID. */
+  lu12i.w $r21, 0x1000
     addi.d $r4, $r0, 1
     lu12i.w $r5, 0x401
     addi.d $r6, $r0, 11
@@ -142,6 +144,115 @@ __m7_user_bad_pointer:
 __m7_user_write_code:
     lu12i.w $r12, 0x400
     st.w $r0, $r12, 0
+    addi.d $r4, $r0, 1
+    addi.d $r11, $r0, 93
+    syscall 0
+    break 0
+
+
+.globl __m8_user_vm
+__m8_user_vm:
+    lu12i.w $r12, 0x500
+    st.d $r0, $r12, 0
+    lu12i.w $r12, 0x7ff
+    st.d $r0, $r12, 0
+
+    lu12i.w $r4, 0x601
+    addi.d $r11, $r0, 214
+    syscall 0
+    lu12i.w $r12, 0x601
+    bne $r4, $r12, .Lloong_m8_vm_failed
+    lu12i.w $r12, 0x600
+    st.d $r0, $r12, 0
+    lu12i.w $r4, 0x600
+    addi.d $r11, $r0, 214
+    syscall 0
+    lu12i.w $r12, 0x600
+    bne $r4, $r12, .Lloong_m8_vm_failed
+
+    or $r4, $r0, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r6, $r0, 3
+    addi.d $r7, $r0, 0x22
+    addi.d $r8, $r0, -1
+    or $r9, $r0, $r0
+    addi.d $r11, $r0, 222
+    syscall 0
+    lu12i.w $r12, 0x1000
+    bne $r4, $r12, .Lloong_m8_vm_failed
+    or $r23, $r4, $r0
+    st.d $r0, $r23, 0
+
+    or $r4, $r23, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r6, $r0, 1
+    addi.d $r11, $r0, 226
+    syscall 0
+    bne $r4, $r0, .Lloong_m8_vm_failed
+
+    or $r4, $r23, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r11, $r0, 215
+    syscall 0
+    bne $r4, $r0, .Lloong_m8_vm_failed
+
+    or $r4, $r0, $r0
+    addi.d $r11, $r0, 93
+    syscall 0
+.Lloong_m8_vm_failed:
+    addi.d $r4, $r0, 1
+    addi.d $r11, $r0, 93
+    syscall 0
+    break 0
+
+.globl __m8_user_mprotect_fault
+__m8_user_mprotect_fault:
+    or $r4, $r0, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r6, $r0, 3
+    addi.d $r7, $r0, 0x22
+    addi.d $r8, $r0, -1
+    or $r9, $r0, $r0
+    addi.d $r11, $r0, 222
+    syscall 0
+    lu12i.w $r12, 0x1000
+    bne $r4, $r12, .Lloong_m8_mprotect_failed
+    or $r23, $r4, $r0
+    st.d $r0, $r23, 0
+    or $r4, $r23, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r6, $r0, 1
+    addi.d $r11, $r0, 226
+    syscall 0
+    bne $r4, $r0, .Lloong_m8_mprotect_failed
+    st.d $r0, $r23, 0
+.Lloong_m8_mprotect_failed:
+    addi.d $r4, $r0, 1
+    addi.d $r11, $r0, 93
+    syscall 0
+    break 0
+
+.globl __m8_user_munmap_fault
+__m8_user_munmap_fault:
+    or $r4, $r0, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r6, $r0, 3
+    addi.d $r7, $r0, 0x22
+    addi.d $r8, $r0, -1
+    or $r9, $r0, $r0
+    addi.d $r11, $r0, 222
+    syscall 0
+    lu12i.w $r12, 0x1000
+    bne $r4, $r12, .Lloong_m8_munmap_failed
+    or $r23, $r4, $r0
+    st.d $r0, $r23, 0
+    or $r4, $r23, $r0
+    lu12i.w $r5, 0x1
+    addi.d $r11, $r0, 215
+    syscall 0
+    bne $r4, $r0, .Lloong_m8_munmap_failed
+    ld.d $r12, $r23, 0
+.Lloong_m8_munmap_failed:
     addi.d $r4, $r0, 1
     addi.d $r11, $r0, 93
     syscall 0
