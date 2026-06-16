@@ -44,6 +44,7 @@ dependencies = [
  "myos-mm",
  "myos-runtime",
  "myos-sync",
+ "myos-vfs",
 ]
 
 [[package]]
@@ -57,3 +58,10 @@ version = "0.1.0"
 [[package]]
 name = "myos-sync"
 version = "0.1.0"
+
+[[package]]
+name = "myos-vfs"
+version = "0.1.0"
+dependencies = [
+ "myos-mm",
+]

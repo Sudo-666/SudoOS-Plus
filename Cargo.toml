@@ -10,6 +10,7 @@ members = [
     "firmware/fdt",
     "mm",
     "sync",
+    "vfs",
 ]
 
 exclude = [

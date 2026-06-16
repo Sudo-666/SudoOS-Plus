@@ -5,6 +5,7 @@ mod call_function;
 mod console;
 mod context;
 mod fault;
+mod fs;
 mod heap;
 mod ipi;
 mod irq;
@@ -259,6 +260,12 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(debug_assertions)]
     task::verify();
     user::verify();
+
+    #[cfg(debug_assertions)]
+    fs::tmpfs::verify();
+
+    #[cfg(debug_assertions)]
+    fs::devfs::verify();
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");

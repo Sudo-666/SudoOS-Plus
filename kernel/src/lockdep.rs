@@ -27,7 +27,15 @@ pub enum LockRank {
     Vm = 40,
     PageTable = 50,
     Heap = 60,
+    /// Per-inode data lock (tmpfs / future filesystems).
+    /// Inode operations may allocate memory, so this rank sits above
+    /// Heap and below the global page allocator.
+    Inode = 65,
     PageAllocator = 70,
+    /// Per-process file descriptor table.
+    /// Ranked between PageAllocator and Console; fd table modifications
+    /// may allocate fd slots but should not contend with page allocation.
+    FileTable = 75,
     Console = 80,
 }
 

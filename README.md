@@ -100,6 +100,7 @@ kernel ← boot, fdt, mm, runtime, arch-riscv64, arch-loongarch64
 | `myos-fdt` | `firmware/fdt/` | FDT 验证 + parser 封装 + 设备枚举 |
 | `myos-mm` | `mm/` | `PhysAddr`, `MemoryMap`, `PagePermissions`, `MappingOptions`, `EarlyFrameAllocator` |
 | `myos-runtime` | `runtime/` | `ByteConsole` trait + `ConsoleWriter<C>` |
+| `myos-vfs` | `vfs/` | VFS 抽象层：File/Inode/Dentry/SuperBlock、FileTable、tmpfs、devfs |
 | `arch-riscv64` | `arch/riscv64/` | 两阶段启动汇编、Sv39 页表、direct-map、UART |
 | `arch-loongarch64` | `arch/loongarch64/` | DMW 窗口启动、EFI system table、LA64 页表 |
 
@@ -209,13 +210,16 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 | tracked spin lock | ✅ | Rank-aware SpinLock、IRQ-enabled contention、migration pinning、instance-aware lockdep |
 | idle/IPI 确定性验证 | ✅ | target timer disable、IRQ-disabled recheck、pending IPI at wait、single reschedule IPI |
 | M5 并发基础 | ✅ | m5-quick 4/4 PASS、双架构 SMP=1/2/4/8 smoke 全绿、200 轮 pressure test |
-| 系统调用 | ⬜ | syscall 表, U-mode |
+| 最小用户模式 (M7) | ✅ | U-mode/PLV3、write/exit ABI、checked user copy、fault isolation、session recycle |
+| VFS 抽象层 (M11) | ✅ | Linux 2.6 风格 VFS crate (22 文件, 78 单测)、tmpfs (7 集成测试)、devfs (3 集成测试) |
+| 文件描述符表 | ✅ | FileTable<128>、allocate/close/dup/cloexec、AtomicU32 引用计数 |
+| 系统调用 | ⬜ | syscall 表 |
 | 设备驱动 | ⬜ | virtio-blk, virtio-net |
-| 文件系统 | ⬜ | VFS, tmpfs/ext4（lwext4 适配层） |
+| ext4 文件系统 | ⬜ | lwext4 适配层 |
 
 ## 下一步
 
-M5/M6/M7 已冻结。下一阶段严格进入 M8 用户地址空间与 demand paging。
+M5/M6/M7/M11 已冻结。M8 用户地址空间与 demand paging 由协作者并行开发中。
 
 ## M5 之后完整路线图
 
@@ -550,6 +554,40 @@ make m7-release    # 完整 release gate
 make m7-tag        # 创建 m7-complete 标签
 ```
 
-封版契约见 [`docs/m7-completion.md`](docs/m7-completion.md)。M7 冻结后进入
-M8：独立 per-process AddressSpace、ASID、per-mm TLB shootdown 与用户 fault
-恢复。
+封版契约见 [`docs/m7-completion.md`](docs/m7-completion.md)。
+
+## M11 VFS 层 ← 已完成
+
+M11 实现 Linux 2.6 风格的虚拟文件系统抽象层：
+
+- 5 个核心 trait：`FileOperations`、`InodeOperations`、`SuperBlockOperations`、`FileSystemType`、`DentryOperations`
+- 4 个引用计数结构：`File`/`ArcFile`、`Inode`/`ArcInode`、`Dentry`/`DentryRef`、`SuperBlock`/`ArcSuperBlock`
+- `FileTable<const MAX_FDS>` per-process 文件描述符表
+
+```bash
+cargo test -p myos-vfs   # 78 单元测试全部通过
+```
+
+### 已实现文件系统
+
+- **tmpfs** — 内存文件系统（create/lookup/mkdir/rmdir/unlink/rename/symlink/readlink/readdir）
+- **devfs** — 设备文件系统（`/dev/null`、`/dev/zero`、`/dev/console`）
+
+QEMU smoke 输出：
+```
+tmpfs test:
+  create/lookup   : verified
+  read/write      : verified
+  mkdir/rmdir     : verified
+  rename          : verified
+  symlink/readlink: verified
+  unlink          : verified
+  readdir         : verified
+
+devfs test:
+  /dev/null       : verified
+  /dev/zero       : verified
+  /dev/console    : verified
+```
+
+设计文档见 [`docs/m11-vfs.md`](docs/m11-vfs.md)。
