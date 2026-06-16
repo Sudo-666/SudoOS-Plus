@@ -515,28 +515,41 @@ pub fn prepare_riscv_early_uart_mapping(state: &mut EarlyMemoryState) {
     use myos_mm::{MappingOptions, PhysAddr, PhysFrame, VirtAddr, VirtPage};
 
     let physical = PhysAddr::new(crate::arch::early_console::MMIO_BASE);
-
     let frame = PhysFrame::from_start_address(physical).expect("RISC-V UART base is unaligned");
-
-    let page = VirtPage::from_start_address(VirtAddr::new(physical.get()))
-        .expect("RISC-V UART VA is unaligned");
-
+    let identity_page = VirtPage::from_start_address(VirtAddr::new(physical.get()))
+        .expect("RISC-V UART identity VA is unaligned");
+    let fixmap_page = VirtPage::from_start_address(crate::arch::memory::layout::EARLY_UART_FIXMAP)
+        .expect("RISC-V UART fixmap VA is unaligned");
     let (allocator, page_table) = state.parts_mut();
 
-    page_table
-        .map_page(allocator, page, frame, MappingOptions::kernel_device())
-        .unwrap_or_else(|error| {
-            panic!(
-                "unable to map early RISC-V UART: \
-                 {error:?}",
-            );
-        });
+    for page in [identity_page, fixmap_page] {
+        let virtual_address = page.start_address().get();
+        page_table
+            .map_page(allocator, page, frame, MappingOptions::kernel_device())
+            .unwrap_or_else(|error| {
+                panic!("unable to map early RISC-V UART at {virtual_address:#018x}: {error:?}",);
+            });
+    }
+
+    assert_eq!(
+        page_table
+            .translate(crate::arch::memory::layout::EARLY_UART_FIXMAP)
+            .expect("unable to inspect the RISC-V UART fixmap")
+            .expect("RISC-V UART fixmap is absent"),
+        physical,
+    );
 
     crate::println!("RISC-V final early MMIO:");
     crate::println!(
         "  uart identity: [{:#018x}, {:#018x})",
         physical.get(),
         physical.get() + crate::arch::early_console::MMIO_SIZE,
+    );
+    crate::println!(
+        "  uart fixmap  : [{:#018x}, {:#018x})",
+        crate::arch::memory::layout::EARLY_UART_FIXMAP.get(),
+        crate::arch::memory::layout::EARLY_UART_FIXMAP.get()
+            + crate::arch::early_console::MMIO_SIZE,
     );
 }
 
@@ -558,6 +571,7 @@ pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
              {error:?}",
         );
     });
+    crate::arch::early_console::activate_runtime_mapping();
 
     let current_pc: usize;
 

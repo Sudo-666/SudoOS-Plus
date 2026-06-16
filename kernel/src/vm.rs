@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
 use myos_mm::{
-    KernelVirtualAllocator, KernelVirtualReservation, MappingOptions, PAGE_SIZE, PageAllocation,
-    PhysAddr, VirtAddr, VirtPage, VirtRange, VmallocKind,
+    AddressSpaceId, KernelVirtualAllocator, KernelVirtualReservation, MappingOptions, PAGE_SIZE,
+    PageAllocation, PhysAddr, PhysFrame, VirtAddr, VirtPage, VirtRange, VmallocKind,
 };
 
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
@@ -90,21 +90,6 @@ impl KernelIoMapping {
 
     pub fn size(&self) -> usize {
         self.size
-    }
-}
-
-/// One temporary user leaf mapping owned by the M7 verifier.
-///
-/// The mapping is installed in the current kernel page-table root only. M8
-/// replaces this object with a real per-process AddressSpace.
-pub struct UserPageMapping {
-    page: VirtPage,
-    backing: PageAllocation,
-}
-
-impl UserPageMapping {
-    pub fn physical_address(&self) -> PhysAddr {
-        self.backing.start().start_address()
     }
 }
 
@@ -201,6 +186,60 @@ pub fn activate_secondary_cpu() {
         hardware.root(),
         "secondary CPU installed a different kernel page-table root",
     );
+}
+
+/// Allocates a private user page-table root while borrowing kernel mappings.
+pub(crate) fn create_user_page_table() -> Result<RuntimePageTable, KernelVmError> {
+    let slot = KERNEL_PAGE_TABLE.lock();
+    let kernel = slot.as_ref().ok_or(KernelVmError::NotInitialized)?;
+    Ok(RuntimePageTable::new_user(kernel)?)
+}
+
+pub(crate) fn synchronize_user_page_table(
+    user: &mut RuntimePageTable,
+) -> Result<(), KernelVmError> {
+    let slot = KERNEL_PAGE_TABLE.lock();
+    let kernel = slot.as_ref().ok_or(KernelVmError::NotInitialized)?;
+    user.synchronize_kernel_mappings(kernel)?;
+    Ok(())
+}
+
+pub(crate) fn kernel_page_table_root() -> Result<PhysFrame, KernelVmError> {
+    let slot = KERNEL_PAGE_TABLE.lock();
+    Ok(slot
+        .as_ref()
+        .ok_or(KernelVmError::NotInitialized)?
+        .root_frame())
+}
+
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn kernel_translate(address: VirtAddr) -> Result<Option<PhysAddr>, KernelVmError> {
+    let slot = KERNEL_PAGE_TABLE.lock();
+    Ok(slot
+        .as_ref()
+        .ok_or(KernelVmError::NotInitialized)?
+        .translate(address)?)
+}
+
+/// Installs a private user root and its non-zero hardware ASID.
+///
+/// # Safety
+/// The caller must keep the root and every shared kernel page-table descendant
+/// alive, disable migration, and serialize this CPU's address-space switch.
+pub(crate) unsafe fn activate_user_page_table(root: PhysFrame, asid: AddressSpaceId) {
+    // SAFETY: upheld by the caller and the owned UserMm lifetime.
+    unsafe { crate::arch::memory::paging::switch_user_address_space(root, asid) };
+}
+
+/// Restores the permanent kernel root with ASID zero.
+///
+/// # Safety
+/// The caller must serialize this CPU's address-space switch.
+pub(crate) unsafe fn activate_kernel_page_table() -> Result<(), KernelVmError> {
+    let root = kernel_page_table_root()?;
+    // SAFETY: KERNEL_PAGE_TABLE owns this permanent root for the kernel lifetime.
+    unsafe { crate::arch::memory::paging::switch_user_address_space(root, AddressSpaceId::KERNEL) };
+    Ok(())
 }
 
 pub fn reserve_vmalloc(
@@ -376,66 +415,6 @@ pub fn iounmap(mapping: KernelIoMapping) -> Result<(), KernelVmError> {
     let page_count = pages_for_size(mapping.mapped_size)?;
     unmap_reservation_pages(mapping.reservation, page_count)?;
     release_vmalloc(mapping.reservation)
-}
-
-pub fn map_user_page(
-    address: VirtAddr,
-    options: MappingOptions,
-) -> Result<UserPageMapping, KernelVmError> {
-    if !options.is_user() {
-        return Err(KernelVmError::InvalidArgument);
-    }
-    options
-        .validate()
-        .map_err(|_| KernelVmError::InvalidArgument)?;
-    let page = VirtPage::from_start_address(address).ok_or(KernelVmError::InvalidArgument)?;
-    let backing =
-        crate::page_alloc::allocate(0, crate::page_alloc::PageAllocationOptions::kernel_zeroed())?;
-
-    let map_result = with_kernel_page_table(|page_table| {
-        page_table.map_page(page, backing.start(), options)?;
-        Ok(())
-    });
-    if let Err(error) = map_result {
-        crate::page_alloc::free(backing)?;
-        return Err(error);
-    }
-
-    crate::tlb::shootdown_kernel_all();
-    Ok(UserPageMapping { page, backing })
-}
-
-pub fn unmap_user_page(mapping: UserPageMapping) -> Result<(), KernelVmError> {
-    let table_capacity =
-        with_kernel_page_table(|page_table| Ok(page_table.allocated_runtime_tables()))?;
-    let mut retired_tables = Vec::new();
-    retired_tables
-        .try_reserve(table_capacity)
-        .map_err(|_| KernelVmError::MetadataOutOfMemory)?;
-
-    let unmapped = with_kernel_page_table(|page_table| Ok(page_table.unmap_page(mapping.page)?))?;
-    assert_eq!(
-        unmapped,
-        mapping.backing.start(),
-        "M7 user mapping returned a different physical frame",
-    );
-
-    crate::tlb::shootdown_kernel_all();
-
-    let reclaim_result = with_kernel_page_table(|page_table| {
-        page_table.reclaim_empty_tables(mapping.page, &mut retired_tables)?;
-        Ok(())
-    });
-
-    if !retired_tables.is_empty() {
-        crate::tlb::shootdown_kernel_all();
-        for table in retired_tables {
-            crate::page_alloc::free(table)?;
-        }
-    }
-
-    crate::page_alloc::free(mapping.backing)?;
-    reclaim_result
 }
 
 #[cfg(debug_assertions)]

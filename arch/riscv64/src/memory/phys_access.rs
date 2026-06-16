@@ -39,8 +39,8 @@ pub fn ram_virtual_address(physical: PhysAddr, size: usize) -> Result<VirtAddr, 
 
 /// 早期 MMIO 访问。
 ///
-/// 启用分页前，物理 MMIO 可以恒等访问；启用分页后，当前只允许
-/// 已显式保留恒等映射的 early UART。
+/// 最终 Sv39 根发布前使用 UART 恒等映射；发布后统一使用共享高半
+/// fixmap 别名，避免内核在用户地址空间中依赖低地址 supervisor 映射。
 pub fn mmio_virtual_address(physical: PhysAddr, size: usize) -> Result<VirtAddr, PhysAccessError> {
     let end = physical
         .get()
@@ -64,7 +64,15 @@ pub fn mmio_virtual_address(physical: PhysAddr, size: usize) -> Result<VirtAddr,
         });
     }
 
-    Ok(VirtAddr::new(physical.get()))
+    let offset = physical
+        .get()
+        .checked_sub(uart_start)
+        .ok_or(PhysAccessError::AddressOverflow)?;
+    let virtual_address = crate::early_console::virtual_base()
+        .checked_add(offset)
+        .ok_or(PhysAccessError::AddressOverflow)?;
+
+    Ok(VirtAddr::new(virtual_address))
 }
 
 pub fn ram_ptr<T>(physical: PhysAddr) -> Result<*const T, PhysAccessError> {

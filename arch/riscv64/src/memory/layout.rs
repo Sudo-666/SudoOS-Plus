@@ -12,6 +12,9 @@ pub const KERNEL_CANONICAL_START: VirtAddr = VirtAddr::new(0xffff_ffc0_0000_0000
 
 pub const FIXMAP: VirtRange = VirtRange::from_bounds(0xffff_ffc4_fea0_0000, 0xffff_ffc4_ff00_0000);
 
+/// 高半 early UART 固定映射。FIXMAP 的第一页保留给启动 FDT。
+pub const EARLY_UART_FIXMAP: VirtAddr = VirtAddr::new(0xffff_ffc4_fea0_1000);
+
 pub const PCI_IO: VirtRange = VirtRange::from_bounds(0xffff_ffc4_ff00_0000, 0xffff_ffc5_0000_0000);
 
 pub const VMEMMAP: VirtRange = VirtRange::from_bounds(0xffff_ffc5_0000_0000, 0xffff_ffc6_0000_0000);
@@ -54,6 +57,8 @@ pub const fn is_kernel_address(address: VirtAddr) -> bool {
 
 pub fn validate() -> Result<(), VirtualLayoutError> {
     validate_regions(KERNEL_REGIONS, is_kernel_address)?;
+    assert!(FIXMAP.contains(EARLY_UART_FIXMAP));
+    assert_eq!(EARLY_UART_FIXMAP.get() & (myos_mm::PAGE_SIZE - 1), 0);
 
     require_address_in_region(
         "kernel link address",

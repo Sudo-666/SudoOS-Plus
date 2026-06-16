@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use myos_mm::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr};
+use myos_mm::{AddressSpaceId, PAGE_SHIFT, PAGE_SIZE, PhysAddr, PhysFrame, VirtAddr};
 
 use crate::memory::layout;
 
@@ -56,8 +56,11 @@ const TLBREHI_PAGE_SIZE_SHIFT: usize = 0;
 const TLBREHI_PAGE_SIZE_MASK: usize = 0x3f << TLBREHI_PAGE_SIZE_SHIFT;
 
 const INVTLB_ALL: usize = 0x0;
+const INVTLB_MATCHING_ASID: usize = 0x4;
+const INVTLB_MATCHING_ASID_AND_VA: usize = 0x5;
 const INVTLB_GLOBAL_OR_MATCHING_ASID_AND_VA: usize = 0x6;
 const TLB_PAIR_SIZE: usize = PAGE_SIZE * 2;
+const HARDWARE_ASID_MASK: usize = 0x03ff;
 
 unsafe extern "C" {
     fn __loongarch_tlb_refill_entry();
@@ -182,6 +185,62 @@ pub unsafe fn activate(root: PhysFrame) -> Result<PagingHardwareState, HardwareP
 }
 
 /// Invalidate the TLB pair containing `address` on the current CPU.
+
+/// Invalidate every non-global entry for one user ASID on this CPU.
+pub fn flush_asid(asid: AddressSpaceId) {
+    let asid = validate_user_asid(asid);
+
+    // SAFETY: INVTLB op 0x4 uses the register-specified ASID and changes only
+    // local translation state.  DBAR publishes prior page-table writes.
+    unsafe {
+        data_barrier();
+        asm!(
+            "invtlb {operation}, {asid}, $r0",
+            operation = const INVTLB_MATCHING_ASID,
+            asid = in(reg) asid,
+            options(nostack),
+        );
+        data_barrier();
+        instruction_barrier();
+    }
+}
+
+/// Invalidate one non-global ASID/virtual-address pair on this CPU.
+pub fn flush_asid_page(asid: AddressSpaceId, address: VirtAddr) {
+    let asid = validate_user_asid(asid);
+    let pair_address = address.get() & !(TLB_PAIR_SIZE - 1);
+
+    // SAFETY: INVTLB op 0x5 matches the register-specified ASID and VA and
+    // changes only local translation state.
+    unsafe {
+        data_barrier();
+        asm!(
+            "invtlb {operation}, {asid}, {address}",
+            operation = const INVTLB_MATCHING_ASID_AND_VA,
+            asid = in(reg) asid,
+            address = in(reg) pair_address,
+            options(nostack),
+        );
+        data_barrier();
+        instruction_barrier();
+    }
+}
+
+fn validate_user_asid(asid: AddressSpaceId) -> usize {
+    assert_ne!(
+        asid,
+        AddressSpaceId::KERNEL,
+        "kernel/global translations require the kernel flush path",
+    );
+    let raw = usize::from(asid.get());
+    assert_eq!(
+        raw & !HARDWARE_ASID_MASK,
+        0,
+        "LoongArch ASID exceeds the architectural 10-bit field: asid={raw}",
+    );
+    raw
+}
+
 pub fn flush_page(address: VirtAddr) {
     let pair_address = address.get() & !(TLB_PAIR_SIZE - 1);
 

@@ -1,10 +1,15 @@
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
-use myos_mm::{MappingOptions, PAGE_SIZE, PhysAddr, VirtAddr};
+use myos_mm::{
+    FaultAccess, PAGE_SIZE, PhysAddr, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind,
+};
+
+use crate::user_mm::{UserMm, UserMmRuntimeError};
 
 const USER_CODE: usize = 0x0000_0000_0040_0000;
 const USER_DATA: usize = USER_CODE + PAGE_SIZE;
-const USER_STACK: usize = USER_DATA + PAGE_SIZE;
+const USER_STACK: usize = 0x0000_0000_0080_0000;
 const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
 
 const SYS_WRITE: usize = 64;
@@ -24,9 +29,6 @@ const FAULT_EXCEPTION: usize = 2;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TERMINATED: AtomicBool = AtomicBool::new(false);
-static CODE_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
-static DATA_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
-static STACK_PHYSICAL: AtomicUsize = AtomicUsize::new(0);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -53,75 +55,110 @@ unsafe extern "C" {
 }
 
 struct UserImage {
-    code: crate::vm::UserPageMapping,
-    data: crate::vm::UserPageMapping,
-    stack: crate::vm::UserPageMapping,
+    mm: Box<UserMm>,
+    code_physical: PhysAddr,
 }
 
 impl UserImage {
-    fn create() -> Result<Self, crate::vm::KernelVmError> {
-        let code = crate::vm::map_user_page(VirtAddr::new(USER_CODE), MappingOptions::user_code())?;
-
-        let data =
-            match crate::vm::map_user_page(VirtAddr::new(USER_DATA), MappingOptions::user_data()) {
-                Ok(mapping) => mapping,
-                Err(error) => {
-                    crate::vm::unmap_user_page(code)
-                        .expect("unable to roll back M7 user code mapping");
-                    return Err(error);
-                }
-            };
-
-        let stack = match crate::vm::map_user_page(
-            VirtAddr::new(USER_STACK),
-            MappingOptions::user_data(),
-        ) {
-            Ok(mapping) => mapping,
+    fn create() -> Result<Self, UserMmRuntimeError> {
+        let areas = [
+            VmArea::new(
+                VirtRange::from_bounds(USER_CODE, USER_CODE + PAGE_SIZE),
+                VmAreaFlags::user_rx(),
+                VmAreaKind::Anonymous,
+            ),
+            VmArea::new(
+                VirtRange::from_bounds(USER_DATA, USER_DATA + PAGE_SIZE),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            ),
+            VmArea::new(
+                VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
+                VmAreaFlags::user_rw().union(VmAreaFlags::GROW_DOWN),
+                VmAreaKind::Stack,
+            ),
+        ];
+        let mut mm = Box::new(UserMm::new(&areas)?);
+        let result: Result<PhysAddr, UserMmRuntimeError> = (|| {
+            let code_physical = mm.populate_page(VirtAddr::new(USER_CODE))?;
+            mm.populate_page(VirtAddr::new(USER_DATA))?;
+            mm.populate_page(VirtAddr::new(USER_STACK))?;
+            Ok(code_physical)
+        })();
+        let code_physical = match result {
+            Ok(physical) => physical,
             Err(error) => {
-                crate::vm::unmap_user_page(data).expect("unable to roll back M7 user data mapping");
-                crate::vm::unmap_user_page(code).expect("unable to roll back M7 user code mapping");
+                mm.destroy()
+                    .expect("unable to reclaim a partially built M8-B3 user mm");
                 return Err(error);
             }
         };
 
-        Ok(Self { code, data, stack })
+        Ok(Self { mm, code_physical })
     }
 
     fn publish(&self) {
         assert!(
             !ACTIVE.load(Ordering::Acquire),
-            "M7 attempted to publish two user sessions",
+            "M8-B3 attempted to publish two user sessions",
         );
-
-        CODE_PHYSICAL.store(self.code.physical_address().get(), Ordering::Relaxed);
-        DATA_PHYSICAL.store(self.data.physical_address().get(), Ordering::Relaxed);
-        STACK_PHYSICAL.store(self.stack.physical_address().get(), Ordering::Relaxed);
+        self.mm.bind().expect("unable to bind the M8-B3 user mm");
         ACTIVE.store(true, Ordering::Release);
     }
 
     fn unpublish(&self) {
         let was_active = ACTIVE.swap(false, Ordering::AcqRel);
-        assert!(was_active, "M7 attempted to unpublish an inactive session");
-
-        CODE_PHYSICAL.store(0, Ordering::Relaxed);
-        DATA_PHYSICAL.store(0, Ordering::Relaxed);
-        STACK_PHYSICAL.store(0, Ordering::Relaxed);
+        assert!(
+            was_active,
+            "M8-B3 attempted to unpublish an inactive session"
+        );
+        self.mm.unbind();
     }
 
     fn load_code(&self) {
         let image = embedded_user_image();
         assert!(
             !image.is_empty() && image.len() <= PAGE_SIZE,
-            "M7 embedded user image does not fit in one page",
+            "M8-B3 embedded user image does not fit in one page",
         );
-        copy_to_physical(self.code.physical_address(), image);
+        copy_to_physical(self.code_physical, image);
         prepare_user_instruction_stream();
     }
 
-    fn destroy(self) {
-        crate::vm::unmap_user_page(self.stack).expect("unable to release M7 user stack mapping");
-        crate::vm::unmap_user_page(self.data).expect("unable to release M7 user data mapping");
-        crate::vm::unmap_user_page(self.code).expect("unable to release M7 user code mapping");
+    fn activate_current_cpu(&self) {
+        self.mm
+            .activate_current_cpu()
+            .expect("unable to activate the M8-B3 user page-table root");
+    }
+
+    fn deactivate_current_cpu(&self) {
+        self.mm
+            .deactivate_current_cpu()
+            .expect("unable to restore the kernel page-table root");
+    }
+
+    fn assert_private_hardware_state(&self) {
+        assert!(
+            self.mm
+                .root_is_private()
+                .expect("unable to compare M8-B3 page-table roots"),
+            "M8-B3 user mm reused the kernel page-table root",
+        );
+        self.mm
+            .assert_hardware_active()
+            .expect("M8-B3 hardware root/ASID verification failed");
+        assert!(
+            self.mm
+                .kernel_mapping_is_shared(VirtAddr::new(verify as usize))
+                .expect("unable to verify the shared kernel mapping"),
+            "M8-B3 user root lost the shared high-half kernel mapping",
+        );
+    }
+
+    fn destroy(mut self) {
+        self.mm
+            .destroy()
+            .expect("unable to destroy the M8-B3 user address space");
     }
 }
 
@@ -154,11 +191,11 @@ pub fn verify() {
     assert_eq!(
         crate::smp::current_cpu_id(),
         crate::smp::CpuId::BOOT,
-        "M7 verifier must run on the boot CPU",
+        "M8-B3 verifier must run on the boot CPU",
     );
     assert!(
         !ACTIVE.load(Ordering::Acquire),
-        "M7 user session was already active",
+        "M8-B3 user session was already active",
     );
 
     let success = SessionExpected {
@@ -225,9 +262,11 @@ pub fn verify() {
 
     assert!(
         !ACTIVE.load(Ordering::Acquire),
-        "M7 verifier leaked an active user session",
+        "M8-B3 verifier leaked an active user session",
     );
+    crate::user_mm::assert_no_leaks();
 
+    // Keep the frozen M7 evidence strings intact for the existing harness.
     crate::println!("minimal user mode test:");
     crate::println!("  U-mode/PLV3 entry : verified");
     crate::println!("  user trap stack   : verified");
@@ -238,6 +277,15 @@ pub fn verify() {
     crate::println!("  RX write fault    : isolated from kernel");
     crate::println!("  session recycle   : verified (5 runs)");
     crate::println!("  mapping reclaim   : verified");
+
+    crate::println!("M8-B3 private-root gate:");
+    crate::println!("  private user root : verified");
+    crate::println!("  kernel high half  : shared");
+    crate::println!("  ASID root switch  : verified");
+    crate::println!("  active CPU publish: verified");
+    crate::println!("  kernel root return: verified");
+    crate::println!("  page/root reclaim : verified");
+    crate::println!("  demand fault path : intentionally deferred");
 }
 
 fn run_session(
@@ -247,16 +295,16 @@ fn run_session(
 ) -> SessionObserved {
     reset_session_state();
 
-    let image = UserImage::create().expect("unable to create M7 user image");
+    let image = UserImage::create().expect("unable to create M8-B3 user image");
     image.load_code();
     image.publish();
 
     if let Some(data) = initial_data {
-        copy_to_user(USER_DATA, data).expect("checked copy_to_user rejected M7 user data");
+        copy_to_user(USER_DATA, data).expect("checked copy_to_user rejected M8-B3 user data");
         let mut round_trip = [0_u8; USER_MESSAGE.len()];
         copy_from_user(USER_DATA, &mut round_trip)
-            .expect("checked copy_from_user rejected M7 user data");
-        assert_eq!(&round_trip, data, "M7 user copy changed data");
+            .expect("checked copy_from_user rejected M8-B3 user data");
+        assert_eq!(&round_trip, data, "M8-B3 user copy changed data");
     }
 
     if exercise_copy_guards {
@@ -266,12 +314,16 @@ fn run_session(
     let entry = user_entry(entry_symbol);
     let result = {
         /*
-         * M7 keeps local interrupts disabled for the complete user round trip.
-         * The current kernel task remains the sole owner of this kernel stack.
-         * Preemptible user threads belong to M9.
+         * The M8 verifier retains M7's synchronous, non-preemptible user
+         * round trip. M9 will attach an mm to schedulable Process/Thread
+         * objects and move root switching into the context-switch path.
          */
         let _interrupt_guard = crate::context::IrqSaveGuard::new();
-        enter_user(entry, USER_STACK_TOP)
+        image.activate_current_cpu();
+        image.assert_private_hardware_state();
+        let result = enter_user(entry, USER_STACK_TOP);
+        image.deactivate_current_cpu();
+        result
     };
 
     let observed = SessionObserved {
@@ -287,12 +339,12 @@ fn run_session(
 
     image.unpublish();
     image.destroy();
+    crate::user_mm::assert_no_leaks();
 
     assert!(
         crate::arch::trap::kernel_scratch_is_clean(),
         "architecture user/kernel stack scratch was not restored",
     );
-
     let mut revoked = [0_u8; 1];
     assert!(
         copy_from_user(USER_DATA, &mut revoked).is_err(),
@@ -305,7 +357,7 @@ fn run_session(
 fn reset_session_state() {
     assert!(
         !ACTIVE.load(Ordering::Acquire),
-        "M7 session state was reset while active",
+        "M8-B3 session state was reset while active",
     );
     TERMINATED.store(false, Ordering::Release);
     SYSCALL_COUNT.store(0, Ordering::Release);
@@ -360,7 +412,7 @@ fn verify_copy_guards() {
     let mut crossing = [0_u8; 2];
     assert!(
         copy_from_user(USER_DATA + PAGE_SIZE - 1, &mut crossing).is_err(),
-        "copy_from_user accepted a cross-page range",
+        "copy_from_user accepted a cross-VMA range",
     );
     assert!(
         copy_from_user(usize::MAX - 1, &mut crossing).is_err(),
@@ -377,7 +429,7 @@ fn verify_copy_guards() {
 pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     assert!(
         ACTIVE.load(Ordering::Acquire),
-        "user syscall arrived without an active M7 session",
+        "user syscall arrived without an active M8-B3 session",
     );
     assert!(
         frame.previous_mode_was_user(),
@@ -406,13 +458,21 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
 pub fn handle_fault(
     frame: &mut crate::arch::trap::TrapFrame,
     address: VirtAddr,
-    _access: myos_mm::FaultAccess,
+    _access: FaultAccess,
     _raw: usize,
 ) {
     assert!(
-        frame.previous_mode_was_user(),
-        "M7 user fault handler received a kernel fault",
+        ACTIVE.load(Ordering::Acquire),
+        "user fault arrived without an active M8-B3 session",
     );
+    assert!(
+        frame.previous_mode_was_user(),
+        "M8-B3 user fault handler received a kernel fault",
+    );
+
+    // B2 already provides the architecture-neutral fault planner. B3 keeps M7
+    // termination semantics so private-root failures are isolated from demand
+    // allocation and retry behavior.
     LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
     LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
     FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -423,9 +483,14 @@ pub fn handle_fault(
 
 pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) {
     assert!(
-        frame.previous_mode_was_user(),
-        "M7 user exception handler received a kernel exception",
+        ACTIVE.load(Ordering::Acquire),
+        "user exception arrived without an active M8-B3 session",
     );
+    assert!(
+        frame.previous_mode_was_user(),
+        "M8-B3 user exception handler received a kernel exception",
+    );
+
     LAST_FAULT_ADDRESS.store(0, Ordering::Release);
     LAST_FAULT_KIND.store(FAULT_EXCEPTION, Ordering::Release);
     FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -446,6 +511,7 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
     if copy_from_user(address, &mut buffer[..length]).is_err() {
         return -EFAULT;
     }
+
     let text = match core::str::from_utf8(&buffer[..length]) {
         Ok(text) => text,
         Err(_) => return -EINVAL,
@@ -457,60 +523,17 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
 }
 
 fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
-    if output.is_empty() {
-        return Ok(());
-    }
-    let physical = resolve_user_range(address, output.len(), false)?;
-    let source = crate::arch::memory::phys_access::ram_ptr::<u8>(physical).map_err(|_| ())?;
-    // SAFETY: resolve_user_range proved the complete source range belongs to
-    // a live M7 user page; output is a valid, non-overlapping kernel slice.
-    unsafe {
-        core::ptr::copy_nonoverlapping(source, output.as_mut_ptr(), output.len());
-    }
-    Ok(())
+    crate::user_mm::copy_from_active(address, output).map_err(|_| ())
 }
 
 fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
-    if input.is_empty() {
-        return Ok(());
-    }
-    let physical = resolve_user_range(address, input.len(), true)?;
-    let destination =
-        crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical).map_err(|_| ())?;
-    // SAFETY: resolve_user_range proved the complete destination range belongs
-    // to a writable live M7 user page; input is a valid non-overlapping slice.
-    unsafe {
-        core::ptr::copy_nonoverlapping(input.as_ptr(), destination, input.len());
-    }
-    Ok(())
-}
-
-fn resolve_user_range(address: usize, length: usize, write: bool) -> Result<PhysAddr, ()> {
-    if !ACTIVE.load(Ordering::Acquire) || length > PAGE_SIZE {
-        return Err(());
-    }
-    let end = address.checked_add(length).ok_or(())?;
-
-    let mappings = [
-        (USER_CODE, CODE_PHYSICAL.load(Ordering::Relaxed), false),
-        (USER_DATA, DATA_PHYSICAL.load(Ordering::Relaxed), true),
-        (USER_STACK, STACK_PHYSICAL.load(Ordering::Relaxed), true),
-    ];
-
-    for (start, physical, writable) in mappings {
-        let page_end = start.checked_add(PAGE_SIZE).ok_or(())?;
-        if address >= start && end <= page_end && (!write || writable) && physical != 0 {
-            let offset = address - start;
-            let resolved = physical.checked_add(offset).ok_or(())?;
-            return Ok(PhysAddr::new(resolved));
-        }
-    }
-    Err(())
+    crate::user_mm::copy_to_active(address, input).map_err(|_| ())
 }
 
 fn copy_to_physical(physical: PhysAddr, bytes: &[u8]) {
     let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
-        .expect("M7 backing page is outside RAM");
+        .expect("M8-B3 backing page is outside RAM");
+
     // SAFETY: the caller owns a zeroed full page and has checked bytes.len().
     unsafe {
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
@@ -522,7 +545,8 @@ fn embedded_user_image() -> &'static [u8] {
     let end = core::ptr::addr_of!(__m7_user_image_end) as usize;
     let length = end
         .checked_sub(start)
-        .expect("M7 embedded user image symbols are reversed");
+        .expect("M8-B3 embedded user image symbols are reversed");
+
     // SAFETY: both linker symbols delimit immutable bytes emitted by the
     // architecture-specific assembly in this crate.
     unsafe { core::slice::from_raw_parts(start as *const u8, length) }
@@ -532,20 +556,26 @@ fn user_entry(symbol: *const u8) -> usize {
     let image_start = core::ptr::addr_of!(__m7_user_image_start) as usize;
     let image_end = core::ptr::addr_of!(__m7_user_image_end) as usize;
     let symbol = symbol as usize;
+
     assert!(
         symbol >= image_start && symbol < image_end,
-        "M7 user entry symbol is outside the embedded image",
+        "M8-B3 user entry symbol is outside the embedded image",
     );
+
     USER_CODE
         .checked_add(symbol - image_start)
-        .expect("M7 user entry address overflow")
+        .expect("M8-B3 user entry address overflow")
 }
 
 fn enter_user(entry: usize, stack_top: usize) -> isize {
-    assert_eq!(stack_top & 0xf, 0, "M7 user stack is not 16-byte aligned");
-    // SAFETY: the verifier installed validated user mappings, keeps the current
-    // kernel stack alive, and disables local interrupts until this routine
-    // returns through __m7_user_return.
+    assert_eq!(
+        stack_top & 0xf,
+        0,
+        "M8-B3 user stack is not 16-byte aligned",
+    );
+
+    // SAFETY: the verifier installed a validated private user root, keeps the
+    // current kernel stack alive, and disables local interrupts until return.
     unsafe { __m7_enter_user(entry, stack_top) }
 }
 
@@ -626,7 +656,7 @@ fn return_to_kernel(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
 
     let kernel_stack = (frame as *mut crate::arch::trap::TrapFrame as usize)
         .checked_add(core::mem::size_of::<crate::arch::trap::TrapFrame>())
-        .expect("M7 kernel stack pointer overflow");
+        .expect("M8-B3 kernel stack pointer overflow");
 
     frame.gpr[2] = kernel_stack;
     frame.gpr[10] = result as usize;
@@ -641,7 +671,7 @@ fn return_to_kernel(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
 
     let kernel_stack = (frame as *mut crate::arch::trap::TrapFrame as usize)
         .checked_add(core::mem::size_of::<crate::arch::trap::TrapFrame>())
-        .expect("M7 kernel stack pointer overflow");
+        .expect("M8-B3 kernel stack pointer overflow");
 
     frame.gpr[3] = kernel_stack;
     frame.gpr[4] = result as usize;
