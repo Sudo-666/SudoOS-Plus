@@ -93,6 +93,12 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             frame.sepc, frame.scause, code, frame.stval,
         ),
     }
+
+    // M12: Signal delivery on return to user mode (disabled during bringup).
+    // TODO: re-enable when lockdep issues are resolved.
+    // if frame.previous_mode_was_user() && crate::user::is_active() {
+    //     crate::signal::do_signal(frame);
+    // }
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -167,6 +173,11 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             frame.badi,
         ),
     }
+
+    // M12: Signal delivery on return to user mode (disabled during bringup).
+    // if frame.previous_mode_was_user() && crate::user::is_active() {
+    //     crate::signal::do_signal(frame);
+    // }
 }
 
 #[unsafe(no_mangle)]

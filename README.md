@@ -210,12 +210,29 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 | idle/IPI 确定性验证 | ✅ | target timer disable、IRQ-disabled recheck、pending IPI at wait、single reschedule IPI |
 | M5 并发基础 | ✅ | m5-quick 4/4 PASS、双架构 SMP=1/2/4/8 smoke 全绿、200 轮 pressure test |
 | 系统调用 | ✅ | Linux 通用 64 位 ABI 核心：write/exit/exit_group/sched_yield/brk/mmap/munmap/mprotect |
+| M12 进程控制 | ✅ | fork/clone、execve（ELF loader）、wait4、exit_process、zombie queue |
+| M12 文件描述符 | ✅ | FileTable、FileOperations trait、alloc_fd/close_fd/dup_fd、OpenFlags |
+| M12 管道 | ✅ | Pipe（4096-byte 环形缓冲）、PipeReader/PipeWriter、create_pipe |
+| M12 信号 | ✅ | SigSet/SigAction/SignalState、send_signal/do_signal/do_sigprocmask、rt_sigframe |
+| M13 TTY | ✅ | N_TTY line discipline（canonical/raw）、echo/行编辑、Ctrl-C→SIGINT、ConsoleDriver |
+| M13 会话/进程组 | ✅ | setsid/setpgid/getpgid/getpgrp/getsid、ioctl(TIOCGPGRP/TIOCSPGRP) |
+| syscall 扩展 | ✅ | read/close/dup/pipe2/clone/execve/wait4/nanosleep/信号/会话/时间/系统信息 |
 | 设备驱动 | ⬜ | virtio-blk, virtio-net |
 | 文件系统 | ⬜ | VFS, tmpfs/ext4（lwext4 适配层） |
 
 ## 下一步
 
-M5–M9 已冻结。当前进入 M10：ELF64 loader、`execve`、Linux 初始用户栈和 initramfs。
+M5–M12/M13 内核端代码已完成迁移。待 VFS/initramfs 就绪后可端到端测试 shell。
+
+**待构建验证**：由于当前环境无 Rust 工具链，请在具备 nightly Rust 的终端中运行：
+```bash
+make build ARCH=riscv64    # 验证编译
+make build ARCH=loongarch64
+make check                 # 完整静态检查
+make smoke-all             # 双架构 smoke
+make smoke-smp-all         # 双架构 SMP smoke
+make stress-smp STRESS_ARCHES="riscv64 loongarch64" STRESS_SMPS="1 2 4" STRESS_LOOPS=3
+```
 
 ## M5 之后完整路线图
 

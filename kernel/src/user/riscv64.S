@@ -321,6 +321,214 @@ __m9_user_sched_yield:
     ecall
     ebreak
     .option pop
+	/*
+	 * M12 pipe test: pipe2, write, read, close.
+	 */
+	.globl __m12_pipe_test
+__m12_pipe_test:
+	    .option push
+	    .option norvc
+	    /* Just test pipe2 creation */
+	    li s0, 0x401000
+	    addi a0, s0, 8
+	    li a1, 0
+	    li a7, 59
+	    ecall
+	    bnez a0, .Lm12pipe_fail
+	    /* Verify fds are valid */
+	    lw t0, 8(s0)
+	    lw t1, 12(s0)
+	    /* Write to pipe writer */
+	    li t2, 0x45504950
+	    sw t2, 0(s0)
+	    li t2, 0x21
+	    sb t2, 4(s0)
+	    mv a0, t1
+	    mv a1, s0
+	    li a2, 5
+	    li a7, 64
+	    ecall
+	    mv t2, a0
+	    li t3, 5
+	    bne t2, t3, .Lm12pipe_fail
+	    /* Read from pipe reader */
+	    mv a0, t0
+	    addi a1, s0, 16
+	    li a2, 5
+	    li a7, 63
+	    ecall
+	    mv t2, a0
+	    li t3, 5
+	    bne t2, t3, .Lm12pipe_fail
+	    /* Close */
+	    lw a0, 8(s0)
+	    li a7, 57
+	    ecall
+	    bnez a0, .Lm12pipe_fail
+	    lw a0, 12(s0)
+	    li a7, 57
+	    ecall
+	    bnez a0, .Lm12pipe_fail
+	    li a0, 0
+	    li a7, 93
+	    ecall
+	.Lm12pipe_fail:
+	    li a0, 1
+	    li a7, 93
+	    ecall
+	    ebreak
+	    .option pop
 
-.globl __m7_user_image_end
-__m7_user_image_end:
+	/*
+	 * M12 signal test: rt_sigaction, rt_sigprocmask, kill(self).
+	 */
+	.globl __m12_signal_test
+	__m12_signal_test:
+	    .option push
+	    .option norvc
+	    /* sigaction struct at 0x401020 */
+	    li s1, 0x401020
+	    li t0, 1
+	    sd t0, 0(s1)
+	    sd zero, 8(s1)
+	    sd zero, 16(s1)
+	    sd zero, 24(s1)
+	    li a0, 10
+	    mv a1, s1
+	    li a2, 0
+	    li a3, 8
+	    li a7, 134
+	    ecall
+	    bnez a0, .Lm12sig_fail
+	    li a0, 0
+	    mv a1, s1
+	    li t0, 1
+	    slli t0, t0, 9
+	    sd t0, 0(s1)
+	    li a2, 0
+	    li a3, 8
+	    li a7, 135
+	    ecall
+	    bnez a0, .Lm12sig_fail
+	    li a0, 1
+	    mv a1, s1
+	    li t0, 1
+	    slli t0, t0, 9
+	    sd t0, 0(s1)
+	    li a2, 0
+	    li a3, 8
+	    li a7, 135
+	    ecall
+	    bnez a0, .Lm12sig_fail
+	    li a7, 172
+	    ecall
+	    mv a1, a0
+	    li a0, 10
+	    mv a2, a1
+	    mv a1, a0
+	    mv a0, a2
+	    li a7, 129
+	    ecall
+	    bnez a0, .Lm12sig_fail
+	    li a0, 0
+	    li a7, 93
+	    ecall
+	.Lm12sig_fail:
+	    li a0, 1
+	    li a7, 93
+	    ecall
+	    ebreak
+	    .option pop
+
+	/*
+	 * M12 info test: getpid, getppid, times, clock_gettime.
+	 */
+	.globl __m12_info_test
+__m12_info_test:
+	    .option push
+	    .option norvc
+	    /* just getpid + getppid */
+	    li a7, 172
+	    ecall
+	    blez a0, .Lm12info_fail
+	    li a7, 173
+	    ecall
+	    bltz a0, .Lm12info_fail
+	    li a0, 0
+	    li a7, 93
+	    ecall
+	.Lm12info_fail:
+	    li a0, 1
+	    li a7, 93
+	    ecall
+	    ebreak
+	    .option pop
+
+	/*
+	 * M12 nanosleep test: sleep 10ms.
+	 */
+	.globl __m12_sleep_test
+	__m12_sleep_test:
+	    .option push
+	    .option norvc
+	    /* timespec at 0x401080 */
+	    li s3, 0x401080
+	    sd zero, 0(s3)
+	    li t0, 10000000
+	    sd t0, 8(s3)
+	    mv a0, s3
+	    li a1, 0
+	    li a7, 101
+	    ecall
+	    bnez a0, .Lm12sleep_fail
+	    li a0, 0
+	    li a7, 93
+	    ecall
+	.Lm12sleep_fail:
+	    li a0, 1
+	    li a7, 93
+	    ecall
+	    ebreak
+	    .option pop
+
+	.globl __m7_user_image_end
+		/*
+	 * M13 session test: setsid, setpgid, getpgid, getsid, ioctl.
+	 */
+			.globl __m13_session_test
+	__m13_session_test:
+	    .option push
+	    .option norvc
+	    /* getpid — verify we have a valid PID */
+	    li a7, 172
+	    ecall
+	    blez a0, .Lm13session_fail
+	    mv s0, a0
+	    /* getpgid(0) — should return our pgrp */
+	    li a0, 0
+	    li a7, 155
+	    ecall
+	    blez a0, .Lm13session_fail
+	    /* getsid(0) — get session ID (may be 0) */
+	    li a0, 0
+	    li a7, 156
+	    ecall
+	    bltz a0, .Lm13session_fail
+	    /* ioctl(0, TIOCGPGRP, buf) — query foreground pgrp */
+	    li a0, 0
+	    li a1, 0x540f
+	    li a2, 0x401050
+	    li a7, 29
+	    ecall
+	    bnez a0, .Lm13session_fail
+	    li a0, 0
+	    li a7, 93
+	    ecall
+	.Lm13session_fail:
+	    li a0, 1
+	    li a7, 93
+	    ecall
+	    ebreak
+	    .option pop
+	.globl __m7_user_image_end
+	__m7_user_image_end:

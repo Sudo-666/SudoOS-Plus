@@ -51,6 +51,33 @@ impl TrapFrame {
             .checked_add(bytes)
             .expect("exception return PC overflow");
     }
+
+    // M12: Signal frame helpers (LoongArch ABI).
+
+    /// User stack pointer (r3/sp).
+    pub fn user_stack_pointer(&self) -> usize {
+        self.gpr[3]
+    }
+
+    /// Set user stack pointer (r3/sp).
+    pub fn set_user_stack_pointer(&mut self, sp: usize) {
+        self.gpr[3] = sp;
+    }
+
+    /// Set return address (r1/ra).
+    pub fn set_return_address(&mut self, ra: usize) {
+        self.gpr[1] = ra;
+    }
+
+    /// Set argument register (a0=idx 0 → r4, a1=idx 1 → r5, etc.).
+    pub fn set_argument_register(&mut self, index: usize, value: usize) {
+        self.gpr[4 + index] = value;
+    }
+
+    /// Set program counter (era).
+    pub fn set_program_counter(&mut self, pc: usize) {
+        self.era = pc;
+    }
 }
 
 const _: () = {

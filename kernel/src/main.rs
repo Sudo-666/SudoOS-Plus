@@ -4,7 +4,9 @@
 mod call_function;
 mod console;
 mod context;
+mod elf;
 mod fault;
+mod file_table;
 mod heap;
 mod ipi;
 mod irq;
@@ -14,8 +16,10 @@ mod lockdep;
 mod memory;
 mod page_alloc;
 mod panic;
+mod pipe;
 mod process;
 mod runtime_page_table;
+mod signal;
 mod smp;
 mod syscall;
 mod task;
@@ -24,6 +28,7 @@ mod timer;
 mod tlb;
 mod tracked_spin;
 mod trap;
+mod tty;
 mod user;
 mod user_mm;
 
@@ -259,6 +264,10 @@ fn kernel_main(boot: BootInfo) -> ! {
     workqueue::verify();
     #[cfg(debug_assertions)]
     tracked_spin::verify();
+
+    // M12/M13: Initialize signal, TTY, and file subsystems.
+    signal::initialize();
+    tty::initialize();
 
     #[cfg(debug_assertions)]
     task::verify();

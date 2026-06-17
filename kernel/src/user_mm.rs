@@ -406,6 +406,13 @@ impl UserMm {
         Ok(area.range().start())
     }
 
+    /// Map a VMA at an exact virtual address (for ELF loading).
+    pub fn map_fixed_area(&self, area: VmArea) -> Result<(), UserMmRuntimeError> {
+        let mut state = self.state.lock();
+        state.core.map_area(area).map_err(UserMmError::from)?;
+        Ok(())
+    }
+
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();

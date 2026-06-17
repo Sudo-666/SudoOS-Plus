@@ -271,5 +271,6 @@ __m9_user_sched_yield:
     syscall 0
     break 0
 
-.globl __m7_user_image_end
-__m7_user_image_end:
+
+	.globl __m7_user_image_end
+	__m7_user_image_end:
