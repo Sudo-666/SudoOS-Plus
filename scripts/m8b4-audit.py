@@ -30,7 +30,7 @@ CHECKS = {
         "UserFaultPlan::GrowStack",
         "fn retire_range_locked(",
         "fn finish_retirement(",
-        "crate::tlb::shootdown_user_local(request);",
+        "shootdown_user_request(request);",
         "pub fn set_program_break(",
         "pub fn map_anonymous(",
         "pub fn unmap_range(",
@@ -131,7 +131,7 @@ if plan > unmap:
 finish_start = user_mm.index("fn finish_retirement(")
 finish_end = user_mm.index("\nfn validate_range(", finish_start)
 finish = user_mm[finish_start:finish_end]
-flush = finish.index("crate::tlb::shootdown_user_local(request);")
+flush = finish.index("shootdown_user_request(request);")
 free_backing = finish.index("crate::page_alloc::free(backing)?;")
 free_table = finish.index("crate::page_alloc::free(table)?;")
 if not (flush < free_backing < free_table):

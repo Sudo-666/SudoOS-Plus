@@ -27,6 +27,7 @@ pub enum LockRank {
     /// Process and thread-group metadata. Process state may lead into VM
     /// state, but VM teardown must not call back into this rank.
     Process = 35,
+    Vfs = 36,
     Vm = 40,
     PageTable = 50,
     Heap = 60,
@@ -38,6 +39,7 @@ pub enum LockRank {
 const _: () = {
     assert!((LockRank::WaitQueue as usize) < (LockRank::Process as usize));
     assert!((LockRank::Process as usize) < (LockRank::Vm as usize));
+    assert!((LockRank::Vfs as usize) < (LockRank::Vm as usize));
 };
 
 // M6-B deferred-execution lock order.

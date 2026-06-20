@@ -24,6 +24,10 @@ impl<T> IrqSpinLock<T> {
             owner: AtomicUsize::new(NO_OWNER),
         }
     }
+
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
 }
 
 impl<T> IrqSpinLock<T> {

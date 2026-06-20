@@ -1,11 +1,16 @@
 #![no_std]
 #![no_main]
 
+mod block;
 mod call_function;
 mod console;
 mod context;
+mod elf;
+mod exec;
 mod fault;
+mod fs;
 mod heap;
+mod initramfs;
 mod ipi;
 mod irq;
 mod irq_lock;
@@ -14,8 +19,10 @@ mod lockdep;
 mod memory;
 mod page_alloc;
 mod panic;
+mod pipe;
 mod process;
 mod runtime_page_table;
+mod signal;
 mod smp;
 mod syscall;
 mod task;
@@ -24,8 +31,10 @@ mod timer;
 mod tlb;
 mod tracked_spin;
 mod trap;
+mod tty;
 mod user;
 mod user_mm;
+mod virtio;
 
 mod vm;
 mod workqueue;
@@ -144,7 +153,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
 
-    let (memory_layout, firmware_timer_frequency) = {
+    let (memory_layout, firmware_timer_frequency, virtio_regions) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
@@ -161,6 +170,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         });
 
         inspect_device_tree(&boot, &blob, &tree);
+        let virtio_regions = collect_virtio_mmio_regions(&tree);
         smp::initialize(&tree, boot_hardware_cpu_id(&boot));
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
@@ -172,7 +182,7 @@ fn kernel_main(boot: BootInfo) -> ! {
                 );
             });
 
-        (memory_layout, firmware_timer_frequency)
+        (memory_layout, firmware_timer_frequency, virtio_regions)
     };
 
     memory::print_boot_memory_map(memory_layout.free());
@@ -233,13 +243,28 @@ fn kernel_main(boot: BootInfo) -> ! {
     time::initialize(firmware_timer_frequency);
     timer::initialize();
     vm::initialize(kernel_memory);
+    virtio::initialize(&virtio_regions);
     fault::initialize();
+    fs::initialize();
+    tty::initialize();
 
     #[cfg(debug_assertions)]
     vm::verify();
 
     #[cfg(debug_assertions)]
     fault::verify();
+    #[cfg(debug_assertions)]
+    fs::verify();
+    #[cfg(debug_assertions)]
+    block::verify();
+    #[cfg(debug_assertions)]
+    virtio::verify();
+    #[cfg(debug_assertions)]
+    pipe::verify();
+    #[cfg(debug_assertions)]
+    signal::verify();
+    #[cfg(debug_assertions)]
+    tty::verify();
 
     #[cfg(debug_assertions)]
     trap::verify_breakpoint();
@@ -353,4 +378,14 @@ fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_
     if virtio_count == 0 {
         println!("    unavailable");
     }
+}
+
+fn collect_virtio_mmio_regions(tree: &DeviceTree<'_>) -> virtio::MmioRegions {
+    let mut regions = virtio::MmioRegions::new();
+
+    for region in tree.virtio_mmio_regions() {
+        regions.push(virtio::MmioRegion::new(region.base(), region.size()));
+    }
+
+    regions
 }

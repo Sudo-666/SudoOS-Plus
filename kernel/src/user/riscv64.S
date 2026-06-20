@@ -112,6 +112,86 @@ __m7_user_return:
 .size __m7_user_return, . - __m7_user_return
 .size __m7_enter_user, . - __m7_enter_user
 
+.globl __m12_enter_user_frame
+.type __m12_enter_user_frame, @function
+__m12_enter_user_frame:
+    addi sp, sp, -128
+    sd ra, 0(sp)
+    sd gp, 8(sp)
+    sd tp, 16(sp)
+    sd s0, 24(sp)
+    sd s1, 32(sp)
+    sd s2, 40(sp)
+    sd s3, 48(sp)
+    sd s4, 56(sp)
+    sd s5, 64(sp)
+    sd s6, 72(sp)
+    sd s7, 80(sp)
+    sd s8, 88(sp)
+    sd s9, 96(sp)
+    sd s10, 104(sp)
+    sd s11, 112(sp)
+    csrr t0, sstatus
+    sd t0, 120(sp)
+
+    addi sp, sp, -304
+    mv t0, sp
+    mv t1, a0
+    li t2, 38
+.Lriscv_m12_copy_frame:
+    ld t3, 0(t1)
+    sd t3, 0(t0)
+    addi t0, t0, 8
+    addi t1, t1, 8
+    addi t2, t2, -1
+    bnez t2, .Lriscv_m12_copy_frame
+
+    ld t0, 32*8(sp)
+    csrw sstatus, t0
+    ld t1, 33*8(sp)
+    csrw sepc, t1
+
+    addi t1, sp, 304
+    sd t1, 35*8(sp)
+    sd tp, 36*8(sp)
+    sd zero, 37*8(sp)
+    addi t1, sp, 35*8
+    csrw sscratch, t1
+
+    ld tp, 4*8(sp)
+    ld ra, 1*8(sp)
+    ld gp, 3*8(sp)
+    ld t0, 5*8(sp)
+    ld t1, 6*8(sp)
+    ld t2, 7*8(sp)
+    ld s0, 8*8(sp)
+    ld s1, 9*8(sp)
+    ld a0, 10*8(sp)
+    ld a1, 11*8(sp)
+    ld a2, 12*8(sp)
+    ld a3, 13*8(sp)
+    ld a4, 14*8(sp)
+    ld a5, 15*8(sp)
+    ld a6, 16*8(sp)
+    ld a7, 17*8(sp)
+    ld s2, 18*8(sp)
+    ld s3, 19*8(sp)
+    ld s4, 20*8(sp)
+    ld s5, 21*8(sp)
+    ld s6, 22*8(sp)
+    ld s7, 23*8(sp)
+    ld s8, 24*8(sp)
+    ld s9, 25*8(sp)
+    ld s10, 26*8(sp)
+    ld s11, 27*8(sp)
+    ld t3, 28*8(sp)
+    ld t4, 29*8(sp)
+    ld t5, 30*8(sp)
+    ld t6, 31*8(sp)
+    ld sp, 2*8(sp)
+    sret
+.size __m12_enter_user_frame, . - __m12_enter_user_frame
+
 .section .rodata.m7_user, "a", @progbits
 .balign 4
 .globl __m7_user_image_start
@@ -318,6 +398,255 @@ __m9_user_sched_yield:
 .Lriscv_m9_tp_leaked:
     li a0, 1
     li a7, 94
+    ecall
+    ebreak
+    .option pop
+
+.globl __m11_user_vfs
+__m11_user_vfs:
+    .option push
+    .option norvc
+    li a0, -100
+    li a1, 0x401000
+    li a2, 578              /* O_CREAT | O_RDWR | O_TRUNC */
+    li a7, 56
+    ecall
+    li t0, 3
+    blt a0, t0, .Lriscv_m11_vfs_failed
+    mv s0, a0
+
+    mv a0, s0
+    li a1, 0x401020
+    li a2, 4
+    li a7, 64
+    ecall
+    li t0, 4
+    bne a0, t0, .Lriscv_m11_vfs_failed
+
+    mv a0, s0
+    li a1, 0
+    li a2, 0
+    li a7, 62
+    ecall
+    bnez a0, .Lriscv_m11_vfs_failed
+
+    mv a0, s0
+    li a1, 0x401040
+    li a2, 4
+    li a7, 63
+    ecall
+    li t0, 4
+    bne a0, t0, .Lriscv_m11_vfs_failed
+    li t1, 0x401040
+    lbu t0, 0(t1)
+    li t2, 117
+    bne t0, t2, .Lriscv_m11_vfs_failed
+    lbu t0, 1(t1)
+    li t2, 118
+    bne t0, t2, .Lriscv_m11_vfs_failed
+    lbu t0, 2(t1)
+    li t2, 102
+    bne t0, t2, .Lriscv_m11_vfs_failed
+    lbu t0, 3(t1)
+    li t2, 115
+    bne t0, t2, .Lriscv_m11_vfs_failed
+
+    mv a0, s0
+    li a7, 57
+    ecall
+    bnez a0, .Lriscv_m11_vfs_failed
+    li a0, 0
+    li a7, 93
+    ecall
+.Lriscv_m11_vfs_failed:
+    li a0, 1
+    li a7, 93
+    ecall
+    ebreak
+    .option pop
+
+.globl __m12_exec_success
+__m12_exec_success:
+    .option push
+    .option norvc
+    li a0, 0
+    li a7, 93
+    ecall
+    ebreak
+    .option pop
+
+.globl __m12_m13_user_probe
+__m12_m13_user_probe:
+    .option push
+    .option norvc
+    li a0, 17               /* SIGCHLD */
+    li a1, 0
+    li a2, 0
+    li a3, 0
+    li a4, 0
+    li a7, 220
+    ecall
+    beqz a0, .Lriscv_m12_m13_child
+    bltz a0, .Lriscv_m12_m13_failed
+    mv s3, a0
+
+    mv a0, s3
+    li a1, 0x4010c0
+    li a2, 0
+    li a3, 0
+    li a7, 260
+    ecall
+    bne a0, s3, .Lriscv_m12_m13_failed
+    li t1, 0x4010c0
+    lw t0, 0(t1)
+    li t2, 42
+    bne t0, t2, .Lriscv_m12_m13_failed
+
+    li a0, 0x401020
+    li a1, 0
+    li a7, 59
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+    li t0, 0x401020
+    lw s0, 0(t0)
+    lw s1, 4(t0)
+
+    mv a0, s1
+    li a1, 0x401000
+    li a2, 4
+    li a7, 64
+    ecall
+    li t0, 4
+    bne a0, t0, .Lriscv_m12_m13_failed
+
+    mv a0, s1
+    li a7, 57
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+
+    mv a0, s0
+    li a1, 0x401040
+    li a2, 4
+    li a7, 63
+    ecall
+    li t0, 4
+    bne a0, t0, .Lriscv_m12_m13_failed
+    li t1, 0x401040
+    lbu t0, 0(t1)
+    li t2, 112
+    bne t0, t2, .Lriscv_m12_m13_failed
+    lbu t0, 1(t1)
+    li t2, 105
+    bne t0, t2, .Lriscv_m12_m13_failed
+    lbu t0, 2(t1)
+    li t2, 112
+    bne t0, t2, .Lriscv_m12_m13_failed
+    lbu t0, 3(t1)
+    li t2, 101
+    bne t0, t2, .Lriscv_m12_m13_failed
+
+    mv a0, s0
+    li a7, 57
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+
+    li a7, 172
+    ecall
+    blez a0, .Lriscv_m12_m13_failed
+    mv s2, a0
+    li a7, 132
+    ecall
+    bne a0, s2, .Lriscv_m12_m13_failed
+    li a0, 0
+    li a7, 155
+    ecall
+    bne a0, s2, .Lriscv_m12_m13_failed
+
+    li t1, 0x401120
+    la t0, .Lriscv_m12_signal_handler
+    sd t0, 0(t1)
+    sd zero, 8(t1)
+    la t0, .Lriscv_m12_signal_restorer
+    sd t0, 16(t1)
+    sd zero, 24(t1)
+    li t1, 0x401148
+    sd zero, 0(t1)
+    li a0, 15
+    li a1, 0x401120
+    li a2, 0
+    li a3, 8
+    li a7, 134
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+    mv a0, s2
+    li a1, 15
+    li a7, 129
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+    li t1, 0x401148
+    ld t0, 0(t1)
+    li t2, 1
+    bne t0, t2, .Lriscv_m12_m13_failed
+
+    li a0, 1
+    li a1, 0x401060
+    li a7, 113
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+
+    li a0, 0x401080
+    li a7, 160
+    ecall
+    bnez a0, .Lriscv_m12_m13_failed
+
+    li a0, 0x401040
+    li a1, 8
+    li a2, 0
+    li a7, 278
+    ecall
+    li t0, 8
+    bne a0, t0, .Lriscv_m12_m13_failed
+
+    li t0, 0x401100
+    li t1, 47
+    sb t1, 0(t0)
+    li t1, 105
+    sb t1, 1(t0)
+    li t1, 110
+    sb t1, 2(t0)
+    li t1, 105
+    sb t1, 3(t0)
+    li t1, 116
+    sb t1, 4(t0)
+    sb zero, 5(t0)
+    mv a0, t0
+    li a1, 0
+    li a2, 0
+    li a7, 221
+    ecall
+    j .Lriscv_m12_m13_failed
+.Lriscv_m12_m13_child:
+    li a0, 42
+    li a7, 93
+    ecall
+.Lriscv_m12_m13_failed:
+    li a0, 1
+    li a7, 93
+    ecall
+    ebreak
+.Lriscv_m12_signal_handler:
+    li t0, 15
+    bne a0, t0, .Lriscv_m12_m13_failed
+    li t1, 0x401148
+    ld t0, 0(t1)
+    addi t0, t0, 1
+    sd t0, 0(t1)
+    ret
+.Lriscv_m12_signal_restorer:
+    li a7, 139
+    ecall
+    li a0, 3
+    li a7, 93
     ecall
     ebreak
     .option pop

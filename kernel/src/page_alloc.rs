@@ -49,6 +49,13 @@ impl PageAllocationOptions {
         }
     }
 
+    pub const fn dma32_zeroed() -> Self {
+        Self {
+            class: AllocationClass::Dma32,
+            zeroed: true,
+        }
+    }
+
     pub const fn class(self) -> AllocationClass {
         self.class
     }

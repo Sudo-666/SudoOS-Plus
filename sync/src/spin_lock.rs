@@ -25,6 +25,10 @@ impl<T> SpinLock<T> {
             value: UnsafeCell::new(value),
         }
     }
+
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
 }
 
 impl<T: ?Sized> SpinLock<T> {

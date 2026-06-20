@@ -76,7 +76,7 @@ def main() -> None:
     )
 
     finish = function_body(user_mm, "finish_retirement")
-    finish_flush = finish.find("crate::tlb::shootdown_user_local(request)")
+    finish_flush = finish.find("shootdown_user_request(request)")
     finish_free = finish.find("crate::page_alloc::free(")
 
     switch_mm = function_body(task, "switch_mm_irqs_off")
@@ -111,7 +111,7 @@ def main() -> None:
     m9_ownership = (
         "process: Arc<Process>" in user
         and "thread: Arc<Thread>" in user
-        and "mm: Arc<UserMm>" in process
+        and ("mm: Arc<UserMm>" in process or "mm: IrqSpinLock<Arc<UserMm>>" in process)
         and "process: Arc<Process>" in process
     )
     check(
@@ -208,8 +208,9 @@ def main() -> None:
         failures,
     )
     check(
-        "M8 fault and mutation paths use the local verifier shootdown",
-        user_mm.count("crate::tlb::shootdown_user_local(request)") >= 3,
+        "M8 fault path and mutation paths preserve reviewed shootdown helpers",
+        "crate::tlb::shootdown_user_local(request)" in user_mm
+        and user_mm.count("shootdown_user_request(request)") >= 2,
         failures,
     )
     check(

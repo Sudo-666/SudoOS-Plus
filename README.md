@@ -168,6 +168,9 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 - [`docs/locking.md`](docs/locking.md)：当前锁、锁顺序草案和 M5 lockdep-lite 前置约束。
 - [`docs/cpu-lifecycle.md`](docs/cpu-lifecycle.md)：CPU discovered/online/active/IPI-ready 生命周期。
 - [`docs/scheduler-state-machine.md`](docs/scheduler-state-machine.md)：任务状态机、M4C/M4C2 verifier 证明边界。
+- [`docs/m10-completion.md`](docs/m10-completion.md)：M10 ELF64 loader、initramfs、初始 exec 路径完成记录。
+- [`docs/m12-m13-process-tty.md`](docs/m12-m13-process-tty.md)：M12/M13 pipe、signal 基础、process/session ABI、TTY 完成记录。
+- [`docs/m11-vfs.md`](docs/m11-vfs.md)：M11 VFS/fd table 集成记录和剩余边界。
 
 ## 当前进度
 
@@ -209,19 +212,35 @@ stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口�
 | tracked spin lock | ✅ | Rank-aware SpinLock、IRQ-enabled contention、migration pinning、instance-aware lockdep |
 | idle/IPI 确定性验证 | ✅ | target timer disable、IRQ-disabled recheck、pending IPI at wait、single reschedule IPI |
 | M5 并发基础 | ✅ | m5-quick 4/4 PASS、双架构 SMP=1/2/4/8 smoke 全绿、200 轮 pressure test |
-| 系统调用 | ✅ | Linux 通用 64 位 ABI 核心：write/exit/exit_group/sched_yield/brk/mmap/munmap/mprotect |
-| 设备驱动 | ⬜ | virtio-blk, virtio-net |
-| 文件系统 | ⬜ | VFS, tmpfs/ext4（lwext4 适配层） |
+| 系统调用 | ✅ | Linux 通用 64 位 ABI 核心；M14 已补 symlink/link、ppoll、termios、nanosleep、musl 基础 syscall |
+| ELF / initramfs | ✅ | ELF64 PT_LOAD loader、newc initramfs、Linux 初始用户栈、kernel execve `/init` 路径 |
+| VFS / fd table | ✅ | myos-vfs、per-process fd table、tmpfs/devfs、目录 syscall、dup/fcntl、cwd、symlink/hardlink |
+| 设备驱动 | 🚧 | virtio-mmio probe、vendor virtio-blk 初始化、DMA32 HAL、block device 包装、`/dev/vda` 注册已接；virtio-net 待后续 |
+| 文件系统 | 🚧 | tmpfs/devfs 已接 VFS；mount table、block devfs、buffer/page cache、`fsync` 和 ext4 superblock gate 已验证；完整 lwext4 文件操作待后续 |
 
 ## 下一步
 
-M5–M9 已冻结。当前进入 M10：ELF64 loader、`execve`、Linux 初始用户栈和 initramfs。
+M5–M13 的可运行底座已冻结。M10 已完成 ELF64 loader、newc initramfs、Linux
+初始用户栈和 kernel execve `/init` 路径；M11 已完成 VFS/fd table、tmpfs/devfs、
+目录 syscall、cwd 相对路径和 fd 复制/控制；M12/M13 已完成 fork-like `clone(2)`、
+`wait4(2)` 阻塞回收、用户态 `execve(2)` 当前镜像替换、blocking pipe、signal mask/
+pending 基础、process group/session ABI、console TTY 和 BusyBox 相邻基础 syscall。
+M14 已推进静态 BusyBox 相邻 syscall、tmpfs symlink/hardlink、TTY termios/winsize、
+pipe readiness 和 `nanosleep(2)`。M15 已接入 vendor `virtio-drivers` 的
+virtio-mmio/virtio-blk 初始化、DMA32 HAL、内核 block layer、bounded buffer/page
+cache、VFS mount table、block devfs 节点和 ext4 superblock gate；完整 lwext4 文件操作
+与 M16 动态 ELF/musl 仍未完成，真实边界见
+[`docs/m14-m16-progress.md`](docs/m14-m16-progress.md)。
 
 ## M5 之后完整路线图
 
-M9 完成后内核底座已具备：双架构启动、高半内核、SMP、抢占、等待队列、IPI、TLB shootdown、
-lockdep、独立用户 MM、Process/Thread 强所有权、scheduler loaded-mm 和 Linux 通用 64 位 syscall ABI。
-仍待完成 ELF/exec、VFS、fork/wait、pipe/signal、块设备和根文件系统。
+M11 完成后内核底座已具备：双架构启动、高半内核、SMP、抢占、等待队列、IPI、TLB
+shootdown、lockdep、独立用户 MM、Process/Thread 强所有权、scheduler loaded-mm、
+Linux 通用 64 位 syscall ABI、ELF/initramfs 启动路径、VFS/fd table 和 tmpfs/devfs。
+M12/M13 进一步补上 fork-like clone、execve 当前镜像替换、wait4 阻塞回收、blocking
+pipe 和 console TTY。M14 进一步补上 symlink/hardlink、termios/ioctl、ppoll、
+nanosleep 和 musl 基础 syscall。仍待完成 COW、完整 signal delivery、select、
+块设备、mount table、根文件系统和动态链接。
 
 接下来的目标按依赖顺序分为以下几层。
 
@@ -249,13 +268,13 @@ M8  per-process AddressSpace + user fault
   ↓
 M9  Process/Thread + Linux syscall ABI  ← 已完成
   ↓
-M10 ELF + execve + initramfs
+M10 ELF + kernel execve + initramfs  ← 已完成
   ↓
-M11 VFS + fd table
+M11 VFS + fd table  ← 已完成
   ↓
-M12 fork/exec/wait/pipe/signal
+M12 fork/exec/wait/pipe/signal  ← 已完成
   ↓
-M13 console TTY + 简易 shell
+M13 console TTY + 简易 shell 基础  ← 已完成
   ↓
 M14 静态 BusyBox
   ↓
@@ -381,6 +400,12 @@ trait SuperBlockOperations;
 `fstat`、`newfstatat`、`getdents64`、`mkdirat`、`unlinkat`、`renameat`、
 `readlinkat`、`chdir`、`getcwd`、`dup`、`dup3`、`fcntl`、`ioctl`。
 
+**状态：已完成。** 当前完成项见 [`docs/m11-vfs.md`](docs/m11-vfs.md)。M11 已接入
+`openat/read/write/close/lseek/fstat/newfstatat/getdents64/mkdirat/unlinkat/renameat`
+以及 `chdir/getcwd/dup/dup3/fcntl/ioctl/fsync/ftruncate`；`readlinkat` 对非 symlink
+按 Linux 语义返回 `EINVAL`。mount table、ext4、symlink/hardlink、权限和持久化写回
+属于后续文件系统里程碑。
+
 为了稳健运行 Git，文件系统必须支持：原子 rename、正确 truncate、
 fsync/fdatasync、文件锁定语义、symlink、hardlink、可执行位、时间戳、目录一致性。
 
@@ -397,6 +422,17 @@ SIGILL、SIGBUS、`rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`。
 **Pipe**：pipe buffer、读端等待、写端等待、EOF、SIGPIPE、关闭引用计数、
 poll readiness。
 
+**状态：已完成第一版 Linux-like 语义。** 当前完成项见
+[`docs/m12-m13-process-tty.md`](docs/m12-m13-process-tty.md)。`clone` 已支持 fork-like
+进程创建：独立 eager-copied `UserMm`、复制 open-file description、复制 cwd/root 和
+signal mask、子进程 trap-frame resume；`wait4` 会阻塞并回收 zombie child；用户态
+`execve` 会替换当前进程镜像、切换 scheduler loaded-mm、执行 `CLOEXEC` 并销毁旧 mm。
+`pipe2` 支持 blocking read/write、EOF、`EPIPE`、`O_CLOEXEC`/`O_NONBLOCK`；`kill`、
+`rt_sigaction`、`rt_sigprocmask`、基础用户 signal frame/`rt_sigreturn`、
+pid/session/process-group syscall、`clock_gettime`、`nanosleep`、`uname`、`getrandom`
+均由双架构 smoke 覆盖。后续再做 COW、`siginfo`/`ucontext`/altstack/restart 等完整
+signal 语义和 poll/select。
+
 ### M13：TTY 和基础 Shell
 
 console TTY、canonical/raw mode、echo、backspace、Ctrl-C、foreground process
@@ -405,6 +441,12 @@ group、session、process group、`setsid`、`setpgid`、`tcsetpgrp`、
 
 第一版可以暂时不做完整 job control，只支持前台命令：`/bin/sh`、`ls`、`cat`、
 `echo`、`cd`、`pwd`、`prog1 | prog2`、`prog > file`。
+
+**状态：TTY 基础完成，shell 依赖的核心进程原语已接上。** `/dev/console` 已接
+TTY canonical 输入、echo、backspace、Ctrl-C 到 foreground process group，以及
+`TIOCGPGRP/TIOCSPGRP`。blocking pipe/TTY、fork-like `clone`、`execve` 和 `wait4`
+已由 M12/M13 smoke 覆盖；完整 shell 还需要 raw/termios、poll/select、更完整的
+signal/job-control 语义和更完整的用户程序集合。
 
 ### M14：静态 BusyBox
 
@@ -429,14 +471,25 @@ false、mount、dmesg、ps。不要一开始启用所有网络工具。
 | 时间 | clock_gettime、nanosleep |
 | musl 基础 | set_tid_address、set_robust_list、getrandom、uname |
 
+当前 M14 已完成其中的大部分基础 ABI，并额外补上 `symlinkat`、`linkat`、
+`readlinkat` 的 symlink 语义、`ppoll`、uid/gid/gettid、`faccessat`、`prlimit64`
+和 `sysinfo`。基础用户 handler delivery/`rt_sigreturn` 已由双架构 smoke 覆盖；仍需
+用真实静态 BusyBox initramfs 跑 applet 级 smoke，并补齐 `siginfo`/`ucontext`、
+altstack、syscall restart 等高级 signal 语义。
+
 ### M15：块设备和 ext4
 
 ```text
 virtio-mmio → virtqueue → DMA → virtio-blk → block layer → buffer/page cache → ext4
 ```
 
-已有 lwext4，它应该接在 VFS → ext4 adapter → block layer → virtio-blk 链路上。
+当前已完成 FDT virtio-mmio 枚举、`ioremap`-backed MMIO transport probe、vendor
+`virtio-drivers` HAL/DMA、virtio-blk 初始化、内核 `BlockDevice` 包装、bounded
+buffer/page cache、VFS mount table、block devfs 节点、`fsync` 写回路径和 ext4
+superblock magic gate；带 raw virtio-blk 磁盘的 RISC-V QEMU smoke 已验证 `/dev/vda`
+设备注册。
 
+剩余路径是 lwext4 blockdev adapter → ext4 inode/dentry/file operations → 持久化根文件系统。
 实体机还需要 cache coherent/non-coherent DMA、DMA barrier、地址宽度、
 scatter-gather、IOMMU 后续支持、中断 affinity。
 

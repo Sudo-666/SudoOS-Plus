@@ -1,6 +1,6 @@
 use myos_mm::{PAGE_SIZE, VirtRange};
 
-const KERNEL_STACK_SIZE: usize = 16 * 1024;
+const KERNEL_STACK_SIZE: usize = 32 * 1024;
 const KERNEL_STACK_ALIGNMENT: usize = PAGE_SIZE;
 // M6-B r3: architecture-owned fresh-task bootstrap reserve.
 //

@@ -1561,7 +1561,7 @@ pub fn initialize() {
     wait_queue::verify_local();
     crate::println!("kernel scheduler:");
     crate::println!("  policy          : preemptive per-CPU FIFO round-robin");
-    crate::println!("  kernel stack    : 16 KiB plus guard pages");
+    crate::println!("  kernel stack    : 32 KiB plus guard pages");
     crate::println!("  bootstrap CPUs  : 1");
     crate::println!("  configured CPUs : {}", discovered);
     crate::println!(
@@ -1907,12 +1907,42 @@ pub(crate) fn spawn_user_thread_on(
     UserTaskHandle { id, detached }
 }
 
+pub(crate) fn spawn_user_thread_from_user_trap(
+    thread: Arc<crate::process::Thread>,
+) -> UserTaskHandle {
+    let stack = KernelStack::allocate()
+        .unwrap_or_else(|error| panic!("unable to allocate cloned user-thread stack: {error:?}"));
+    let detached = Arc::new(Completion::new());
+    let _interrupt_guard = crate::context::IrqSaveGuard::new();
+    let current = crate::smp::current_cpu_id();
+    let (id, target) = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("kernel scheduler is not initialized")
+            .spawn_user(
+                thread,
+                Arc::clone(&detached),
+                stack,
+                Some(current),
+                Some(current),
+            )
+    };
+    if target != current {
+        crate::smp::send_ipi(target);
+    }
+    UserTaskHandle { id, detached }
+}
+
 pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
     let cpu = crate::smp::current_cpu_id();
     let slot = SCHEDULER.lock();
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .current_user_thread(cpu)
+}
+
+pub(crate) fn scheduler_is_initialized() -> bool {
+    SCHEDULER.lock().is_some()
 }
 
 pub(crate) fn user_mm_switches() -> u64 {
@@ -1927,6 +1957,36 @@ pub(crate) fn assert_user_mm_quiescent() {
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .assert_user_mm_quiescent();
+}
+
+pub(crate) fn replace_current_user_mm(
+    old_mm: Arc<crate::user_mm::UserMm>,
+    new_mm: Arc<crate::user_mm::UserMm>,
+) {
+    let _interrupt_guard = crate::context::IrqSaveGuard::new();
+    let cpu = crate::smp::current_cpu_id();
+    let mut slot = SCHEDULER.lock();
+    let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+    let current = scheduler.current(cpu);
+    assert!(
+        scheduler.task(current).user_thread.is_some(),
+        "attempted to replace mm outside a user task",
+    );
+    let loaded = scheduler.cpus[cpu.get()]
+        .loaded_mm
+        .as_ref()
+        .expect("current user task has no loaded mm");
+    assert!(
+        Arc::ptr_eq(loaded, &old_mm),
+        "exec old mm diverged from scheduler loaded mm",
+    );
+    old_mm
+        .deactivate_current_cpu()
+        .unwrap_or_else(|error| panic!("exec failed to leave old mm: {error:?}"));
+    new_mm
+        .activate_current_cpu()
+        .unwrap_or_else(|error| panic!("exec failed to enter new mm: {error:?}"));
+    scheduler.cpus[cpu.get()].loaded_mm = Some(new_mm);
 }
 
 pub fn spawn_kernel_thread(entry: KernelThreadEntry) -> TaskId {
@@ -2163,7 +2223,7 @@ pub fn yield_now() {
 }
 
 pub(crate) fn yield_from_user_trap() {
-    crate::context::assert_interrupts_disabled();
+    let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
     let switch = {
         let mut slot = SCHEDULER.lock();
@@ -2179,6 +2239,36 @@ pub(crate) fn yield_from_user_trap() {
     // disabled. Both task contexts and their kernel stacks remain scheduler-owned.
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
+    drop(interrupt_guard);
+}
+
+pub(crate) fn block_current_on_if_from_user_trap<F>(queue: &WaitQueue, should_block: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    let interrupt_guard = crate::context::IrqSaveGuard::new();
+    let cpu = crate::smp::current_cpu_id();
+    let switch = {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        scheduler.assert_schedulable(cpu);
+        if should_block() {
+            Some(scheduler.prepare_block(cpu, queue))
+        } else {
+            None
+        }
+    };
+    let Some((previous, next)) = switch else {
+        drop(interrupt_guard);
+        return false;
+    };
+    // SAFETY: this mirrors sched_yield from the user trap path. The current
+    // task is linked into the wait queue before the switch and can be woken by
+    // another task before this syscall resumes.
+    unsafe { crate::arch::task::switch(previous, next) };
+    finish_switch();
+    drop(interrupt_guard);
+    true
 }
 
 fn preempt_schedule() {
@@ -2458,6 +2548,15 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
         .mark_running()
         .expect("M9-B user Thread entered an invalid lifecycle state");
     let result = crate::user::run_scheduled_thread(&thread);
+
+    // User return paths intentionally restore a kernel-mode trap frame, and
+    // some architectures leave local interrupts disabled at that boundary.
+    // Thread teardown and task exit are ordinary sleepable task-context work.
+    if crate::arch::interrupt::are_disabled() {
+        // SAFETY: we are back on this task's kernel stack with no scheduler
+        // lock held; the user trap frame has already been consumed.
+        unsafe { crate::arch::interrupt::enable() };
+    }
     thread
         .exit(result)
         .expect("M9-B user Thread failed to publish exit state");

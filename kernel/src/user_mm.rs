@@ -75,6 +75,12 @@ struct MappedPage {
     backing: PageAllocation,
 }
 
+#[derive(Clone, Copy)]
+struct MappedPageSource {
+    page: VirtPage,
+    physical: PhysAddr,
+}
+
 struct UserMmState {
     core: UserAddressSpace<VMA_CAPACITY>,
     page_table: Option<RuntimePageTable>,
@@ -171,6 +177,56 @@ impl UserMm {
             .ok_or(UserMmRuntimeError::NotMapped)?;
         Ok(page_table.is_owned_user_root()
             && page_table.root_frame() != crate::vm::kernel_page_table_root()?)
+    }
+
+    pub fn fork_clone_eager(&self) -> Result<alloc::boxed::Box<Self>, UserMmRuntimeError> {
+        let (areas, program_break, mapped_pages) = {
+            let state = self.state.lock();
+            let layout = state.core.layout();
+            let mut areas = Vec::new();
+            areas
+                .try_reserve(layout.area_count())
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            for index in 0..layout.area_count() {
+                areas.push(
+                    layout
+                        .area_at(index)
+                        .expect("area index below count was empty"),
+                );
+            }
+
+            let page_table = state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let mut mapped_pages = Vec::new();
+            mapped_pages
+                .try_reserve(state.pages.len())
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            for mapping in &state.pages {
+                let physical = page_table
+                    .translate(mapping.page.start_address())?
+                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                mapped_pages.push(MappedPageSource {
+                    page: mapping.page,
+                    physical,
+                });
+            }
+            (areas, layout.program_break(), mapped_pages)
+        };
+
+        let child = alloc::boxed::Box::new(Self::new(&areas)?);
+        if let Some(program_break) = program_break {
+            child.configure_program_break(program_break.start(), program_break.limit())?;
+            child.set_program_break(program_break.current())?;
+        }
+
+        for source in mapped_pages {
+            let destination = child.populate_page(source.page.start_address())?;
+            copy_physical_page(source.physical, destination)?;
+        }
+
+        Ok(child)
     }
 
     pub fn kernel_mapping_is_shared(
@@ -500,7 +556,7 @@ impl UserMm {
             request
         };
         if let Some(request) = request {
-            crate::tlb::shootdown_user_local(request);
+            shootdown_user_request(request);
         }
         Ok(())
     }
@@ -924,7 +980,7 @@ fn retire_range_locked(
 
 fn finish_retirement(retirement: RetirementBatch) -> Result<(), UserMmRuntimeError> {
     if let Some(request) = retirement.request {
-        crate::tlb::shootdown_user_local(request);
+        shootdown_user_request(request);
     }
     for backing in retirement.backings {
         crate::page_alloc::free(backing)?;
@@ -932,6 +988,28 @@ fn finish_retirement(retirement: RetirementBatch) -> Result<(), UserMmRuntimeErr
     }
     for table in retirement.page_tables {
         crate::page_alloc::free(table)?;
+    }
+    Ok(())
+}
+
+fn shootdown_user_request(request: myos_mm::PerMmTlbRequest) {
+    if crate::arch::interrupt::are_disabled() || !crate::task::scheduler_is_initialized() {
+        crate::tlb::shootdown_user_local(request);
+    } else {
+        crate::tlb::shootdown_user(request);
+    }
+}
+
+fn copy_physical_page(source: PhysAddr, destination: PhysAddr) -> Result<(), UserMmRuntimeError> {
+    let source = crate::arch::memory::phys_access::ram_ptr::<u8>(source)
+        .map_err(|_| UserMmRuntimeError::NotMapped)?;
+    let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(destination)
+        .map_err(|_| UserMmRuntimeError::NotMapped)?;
+
+    // SAFETY: both pointers name RAM pages owned by live user address spaces,
+    // and the copy is exactly one page starting at page-aligned translations.
+    unsafe {
+        core::ptr::copy_nonoverlapping(source, destination, PAGE_SIZE);
     }
     Ok(())
 }

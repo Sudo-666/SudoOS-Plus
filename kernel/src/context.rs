@@ -34,6 +34,7 @@ impl Drop for IrqSaveGuard {
     }
 }
 
+#[track_caller]
 pub fn assert_interrupts_enabled() {
     assert!(
         crate::arch::interrupt::are_enabled(),
@@ -41,6 +42,7 @@ pub fn assert_interrupts_enabled() {
     );
 }
 
+#[track_caller]
 pub fn assert_interrupts_disabled() {
     assert!(
         crate::arch::interrupt::are_disabled(),
@@ -60,6 +62,7 @@ pub fn preempt_count() -> usize {
     crate::task::preempt_count()
 }
 
+#[track_caller]
 pub fn assert_task_context() {
     assert!(!in_irq(), "operation is not allowed in IRQ context");
 }
@@ -69,6 +72,7 @@ pub fn assert_irq_context() {
     assert_ne!(irq_depth(), 0, "operation requires IRQ context");
 }
 
+#[track_caller]
 pub fn might_sleep() {
     assert_task_context();
     assert_eq!(

@@ -111,6 +111,7 @@ test:
 		-p myos-runtime \
 		-p myos-fdt \
 		-p myos-mm \
+		-p myos-vfs \
 		-p myos-sync
 
 .PHONY: clippy
@@ -145,6 +146,7 @@ clippy-host:
 		-p myos-runtime \
 		-p myos-fdt \
 		-p myos-mm \
+		-p myos-vfs \
 		-p myos-sync \
 		--all-targets \
 		-- -D warnings

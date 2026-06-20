@@ -56,7 +56,11 @@ def main() -> int:
         failures,
     )
 
-    check("Process owns Arc<UserMm>", "mm: Arc<UserMm>" in process, failures)
+    check(
+        "Process owns Arc<UserMm>",
+        "mm: Arc<UserMm>" in process or "mm: IrqSpinLock<Arc<UserMm>>" in process,
+        failures,
+    )
     check("Thread owns Arc<Process>", "process: Arc<Process>" in process, failures)
     check(
         "thread group stores IDs rather than Arc<Thread>",
@@ -94,6 +98,7 @@ def main() -> int:
         all(
             marker in process
             for marker in (
+                "user_sp: AtomicUsize",
                 "trap_frame: IrqSpinLock<Option<crate::arch::trap::TrapFrame>>",
                 "tls: AtomicUsize",
                 "blocked_signals: AtomicU64",
@@ -135,7 +140,7 @@ def main() -> int:
     check(
         "user entry and stack come from Thread",
         "thread.entry().get()" in user
-        and "thread.user_stack().end().get()" in user,
+        and "thread.user_stack_pointer().get()" in user,
         failures,
     )
     check(

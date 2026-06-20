@@ -7,15 +7,17 @@
 //! `Thread` owns an `Arc<Process>`. The process thread group stores only thread
 //! IDs, so the ownership graph cannot form a strong-reference cycle.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{VirtAddr, VirtRange};
 
 use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
-use crate::task::{Completion, TaskId};
+use crate::task::{Completion, TaskId, WaitQueue};
 use crate::user_mm::{UserMm, UserMmRuntimeError};
+
+pub const PROCESS_MAX_FDS: usize = 128;
 
 const THREAD_READY: u8 = 0;
 const THREAD_RUNNABLE: u8 = 1;
@@ -24,13 +26,23 @@ const THREAD_EXITING: u8 = 3;
 const THREAD_EXITED: u8 = 4;
 const UNBOUND_SCHEDULER_TASK: usize = usize::MAX;
 
+const PROCESS_MM_LOCK: LockClass = LockClass::new("process.mm", LockRank::Process, 0);
 const PROCESS_THREAD_GROUP_LOCK: LockClass =
-    LockClass::new("process.thread_group", LockRank::Process, 0);
+    LockClass::new("process.thread_group", LockRank::Process, 1);
 const THREAD_TRAP_FRAME_LOCK: LockClass = LockClass::new("thread.trap_frame", LockRank::Process, 1);
+const PROCESS_SIGNAL_ACTION_LOCK: LockClass =
+    LockClass::new("process.signal_action", LockRank::Process, 1);
+const PROCESS_FILE_TABLE_LOCK: LockClass =
+    LockClass::new("process.file_table", LockRank::Process, 2);
+const PROCESS_FS_LOCK: LockClass = LockClass::new("process.fs", LockRank::Process, 3);
+const PROCESS_RELATION_LOCK: LockClass = LockClass::new("process.relation", LockRank::Process, 4);
+const PROCESS_REGISTRY_LOCK: LockClass = LockClass::new("process.registry", LockRank::Process, 5);
 
 static NEXT_PROCESS_ID: AtomicUsize = AtomicUsize::new(1);
 static LIVE_PROCESSES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+static PROCESS_REGISTRY: IrqSpinLock<Option<BTreeMap<ProcessId, alloc::sync::Weak<Process>>>> =
+    IrqSpinLock::new_with_class(None, PROCESS_REGISTRY_LOCK);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProcessId(usize);
@@ -38,6 +50,10 @@ pub struct ProcessId(usize);
 impl ProcessId {
     pub const fn get(self) -> usize {
         self.0
+    }
+
+    pub const fn from_raw_for_kernel(raw: usize) -> Self {
+        Self(raw)
     }
 }
 
@@ -51,40 +67,181 @@ impl ThreadId {
 }
 
 /// Process-wide descriptor-table anchor.
-///
-/// M11 will replace the allocation hint with actual file references. Keeping
-/// the object process-owned now prevents syscall work from regressing to a
-/// global descriptor table.
 pub struct FileTable {
-    next_fd_hint: AtomicUsize,
+    table: IrqSpinLock<myos_vfs::FileTable<PROCESS_MAX_FDS>>,
 }
 
 impl FileTable {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            next_fd_hint: AtomicUsize::new(0),
+            table: IrqSpinLock::new_with_class(myos_vfs::FileTable::new(), PROCESS_FILE_TABLE_LOCK),
         }
     }
 
-    pub fn next_fd_hint(&self) -> usize {
-        self.next_fd_hint.load(Ordering::Acquire)
+    pub fn open_count(&self) -> usize {
+        self.table.lock().open_count()
+    }
+
+    pub fn install_at(
+        &self,
+        fd: usize,
+        file: myos_vfs::ArcFile,
+        close_on_exec: bool,
+    ) -> Result<(), myos_vfs::Errno> {
+        let old = self.table.lock().replace_fd_take(fd, file, close_on_exec)?;
+        drop(old);
+        Ok(())
+    }
+
+    pub fn allocate(
+        &self,
+        file: myos_vfs::ArcFile,
+        close_on_exec: bool,
+    ) -> Result<usize, myos_vfs::Errno> {
+        self.table.lock().allocate_fd(file, close_on_exec)
+    }
+
+    pub fn get(&self, fd: usize) -> Result<myos_vfs::ArcFile, myos_vfs::Errno> {
+        self.table.lock().get_file(fd)
+    }
+
+    pub fn close(&self, fd: usize) -> Result<(), myos_vfs::Errno> {
+        let file = self.table.lock().take_fd(fd)?;
+        drop(file);
+        Ok(())
+    }
+
+    pub fn dup_from(
+        &self,
+        old_fd: usize,
+        min_fd: usize,
+        close_on_exec: bool,
+    ) -> Result<usize, myos_vfs::Errno> {
+        self.table.lock().dup_from(old_fd, min_fd, close_on_exec)
+    }
+
+    pub fn dup_to(
+        &self,
+        old_fd: usize,
+        new_fd: usize,
+        close_on_exec: bool,
+    ) -> Result<usize, myos_vfs::Errno> {
+        let (fd, old) = self
+            .table
+            .lock()
+            .dup_to_take(old_fd, new_fd, close_on_exec)?;
+        drop(old);
+        Ok(fd)
+    }
+
+    pub fn fd_flags(&self, fd: usize) -> Result<u32, myos_vfs::Errno> {
+        self.table.lock().fd_flags(fd)
+    }
+
+    pub fn set_close_on_exec(&self, fd: usize, close_on_exec: bool) -> Result<(), myos_vfs::Errno> {
+        self.table.lock().set_close_on_exec(fd, close_on_exec)
+    }
+
+    pub fn file_flags(&self, fd: usize) -> Result<myos_vfs::OpenFlags, myos_vfs::Errno> {
+        self.table.lock().file_flags(fd)
+    }
+
+    pub fn close_on_exec(&self) -> Result<(), myos_vfs::Errno> {
+        let mut files = Vec::new();
+        files
+            .try_reserve(PROCESS_MAX_FDS)
+            .map_err(|_| myos_vfs::Errno::Enomem)?;
+        self.table.lock().take_close_on_exec(&mut files);
+        drop(files);
+        Ok(())
     }
 }
 
 /// Process-wide pending-signal anchor. Per-thread masks live in `Thread`.
 pub struct SignalState {
     pending: AtomicU64,
+    blocked: AtomicU64,
+    actions: IrqSpinLock<[crate::signal::KernelSigAction; 64]>,
 }
 
 impl SignalState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             pending: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            actions: IrqSpinLock::new_with_class(
+                [crate::signal::KernelSigAction::default(); 64],
+                PROCESS_SIGNAL_ACTION_LOCK,
+            ),
         }
     }
 
     pub fn pending(&self) -> u64 {
         self.pending.load(Ordering::Acquire)
+    }
+
+    pub fn blocked(&self) -> u64 {
+        self.blocked.load(Ordering::Acquire)
+    }
+
+    pub fn set_blocked(&self, mask: u64) {
+        self.blocked.store(mask, Ordering::Release);
+    }
+
+    pub fn add_pending(&self, signal: u32) -> Result<(), myos_vfs::Errno> {
+        if signal == 0 || signal >= 64 {
+            return Err(myos_vfs::Errno::Einval);
+        }
+        let bit = 1_u64 << (signal - 1);
+        self.pending.fetch_or(bit, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub fn action(&self, signal: u32) -> Option<crate::signal::KernelSigAction> {
+        signal
+            .checked_sub(1)
+            .and_then(|index| self.actions.lock().get(index as usize).copied())
+    }
+
+    pub fn set_action(
+        &self,
+        signal: u32,
+        action: crate::signal::KernelSigAction,
+    ) -> Result<(), myos_vfs::Errno> {
+        let index = signal.checked_sub(1).ok_or(myos_vfs::Errno::Einval)? as usize;
+        let mut actions = self.actions.lock();
+        let slot = actions.get_mut(index).ok_or(myos_vfs::Errno::Einval)?;
+        *slot = action;
+        Ok(())
+    }
+
+    pub fn copy_actions_from(&self, parent: &Self) {
+        for signal in 1..64 {
+            let action = parent
+                .action(signal)
+                .expect("parent signal action table lost a valid signal slot");
+            self.set_action(signal, action)
+                .expect("child signal action table lost a valid signal slot");
+        }
+    }
+
+    pub fn take_unblocked(&self, blocked: u64) -> Option<u32> {
+        loop {
+            let pending = self.pending.load(Ordering::Acquire);
+            let available = pending & !blocked;
+            if available == 0 {
+                return None;
+            }
+            let signal = available.trailing_zeros() + 1;
+            let bit = 1_u64 << (signal - 1);
+            if self
+                .pending
+                .compare_exchange(pending, pending & !bit, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(signal);
+            }
+        }
     }
 }
 
@@ -123,34 +280,76 @@ impl Credentials {
     }
 }
 
-/// Process-wide root and current-directory anchors.
-///
-/// They remain opaque until the VFS introduces a reference-counted path type.
+/// Process-wide root and current-directory paths.
 pub struct FsContext {
-    root_anchor: AtomicUsize,
-    cwd_anchor: AtomicUsize,
+    root: IrqSpinLock<String>,
+    cwd: IrqSpinLock<String>,
 }
 
 impl FsContext {
-    const fn bootstrap() -> Self {
+    fn bootstrap() -> Self {
         Self {
-            root_anchor: AtomicUsize::new(0),
-            cwd_anchor: AtomicUsize::new(0),
+            root: IrqSpinLock::new_with_class(String::from("/"), PROCESS_FS_LOCK),
+            cwd: IrqSpinLock::new_with_class(String::from("/"), PROCESS_FS_LOCK),
         }
     }
 
-    pub fn root_anchor(&self) -> usize {
-        self.root_anchor.load(Ordering::Acquire)
+    pub fn root_path(&self) -> String {
+        self.root.lock().clone()
     }
 
-    pub fn cwd_anchor(&self) -> usize {
-        self.cwd_anchor.load(Ordering::Acquire)
+    pub fn cwd_path(&self) -> String {
+        self.cwd.lock().clone()
+    }
+
+    pub fn set_cwd(&self, path: &str) -> Result<(), myos_vfs::Errno> {
+        let mut stored = String::new();
+        stored
+            .try_reserve(path.len())
+            .map_err(|_| myos_vfs::Errno::Enomem)?;
+        stored.push_str(path);
+        *self.cwd.lock() = stored;
+        Ok(())
+    }
+
+    fn copy_from(&self, other: &Self) -> Result<(), ProcessError> {
+        let root = other.root_path();
+        let cwd = other.cwd_path();
+        let mut stored_root = String::new();
+        stored_root
+            .try_reserve(root.len())
+            .map_err(|_| ProcessError::MetadataOutOfMemory)?;
+        stored_root.push_str(&root);
+        let mut stored_cwd = String::new();
+        stored_cwd
+            .try_reserve(cwd.len())
+            .map_err(|_| ProcessError::MetadataOutOfMemory)?;
+        stored_cwd.push_str(&cwd);
+        *self.root.lock() = stored_root;
+        *self.cwd.lock() = stored_cwd;
+        Ok(())
     }
 }
 
 struct ThreadGroup {
     leader: Option<ThreadId>,
     members: Vec<ThreadId>,
+}
+
+struct ProcessRelations {
+    parent: Option<ProcessId>,
+    children: Vec<Arc<Process>>,
+    zombie_children: Vec<(Arc<Process>, isize)>,
+}
+
+impl ProcessRelations {
+    const fn new() -> Self {
+        Self {
+            parent: None,
+            children: Vec::new(),
+            zombie_children: Vec::new(),
+        }
+    }
 }
 
 impl ThreadGroup {
@@ -187,11 +386,15 @@ impl From<ProcessError> for UserMmRuntimeError {
 
 pub struct Process {
     id: ProcessId,
-    mm: Arc<UserMm>,
+    mm: IrqSpinLock<Arc<UserMm>>,
     files: FileTable,
     signals: SignalState,
     credentials: Credentials,
     fs: FsContext,
+    relations: IrqSpinLock<ProcessRelations>,
+    child_wait: WaitQueue,
+    process_group: AtomicIsize,
+    session: AtomicIsize,
     thread_group: IrqSpinLock<ThreadGroup>,
 }
 
@@ -200,18 +403,41 @@ impl Process {
         let id = ProcessId(allocate_process_id());
         let process = Arc::new(Self {
             id,
-            mm: Arc::from(mm),
+            mm: IrqSpinLock::new_with_class(Arc::from(mm), PROCESS_MM_LOCK),
             files: FileTable::new(),
             signals: SignalState::new(),
             credentials: Credentials::bootstrap(),
             fs: FsContext::bootstrap(),
+            relations: IrqSpinLock::new_with_class(ProcessRelations::new(), PROCESS_RELATION_LOCK),
+            child_wait: WaitQueue::new(),
+            process_group: AtomicIsize::new(id.get() as isize),
+            session: AtomicIsize::new(0),
             thread_group: IrqSpinLock::new_with_class(
                 ThreadGroup::new(),
                 PROCESS_THREAD_GROUP_LOCK,
             ),
         });
+        register_process(&process);
         LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
         process
+    }
+
+    pub fn fork_child(self: &Arc<Self>, mm: Box<UserMm>) -> Result<Arc<Self>, ProcessError> {
+        let child = Self::create(mm);
+        {
+            let mut child_files = child.files.table.lock();
+            *child_files = self.files.table.lock().fork_clone();
+        }
+        child.fs.copy_from(&self.fs)?;
+        child.signals.set_blocked(self.signals.blocked());
+        child.signals.copy_actions_from(&self.signals);
+        child
+            .process_group
+            .store(self.process_group(), Ordering::Release);
+        child.session.store(self.session(), Ordering::Release);
+        child.set_parent(self.id())?;
+        self.add_child(Arc::clone(&child))?;
+        Ok(child)
     }
 
     pub const fn id(&self) -> ProcessId {
@@ -219,11 +445,24 @@ impl Process {
     }
 
     pub fn mm(&self) -> &UserMm {
-        self.mm.as_ref()
+        let mm = self.mm.lock();
+        // SAFETY: Process owns the Arc<UserMm> for its complete lifetime. This
+        // borrowed reference is used only by call sites that immediately use it
+        // without retaining the reference across a possible exec replacement.
+        unsafe { &*Arc::as_ptr(&mm) }
     }
 
     pub(crate) fn mm_arc(&self) -> Arc<UserMm> {
-        Arc::clone(&self.mm)
+        Arc::clone(&self.mm.lock())
+    }
+
+    fn mm_strong_count(&self) -> usize {
+        Arc::strong_count(&self.mm.lock())
+    }
+
+    pub fn replace_mm(&self, mm: Box<UserMm>) -> Arc<UserMm> {
+        let mut slot = self.mm.lock();
+        core::mem::replace(&mut *slot, Arc::from(mm))
     }
 
     pub fn files(&self) -> &FileTable {
@@ -232,6 +471,112 @@ impl Process {
 
     pub fn signals(&self) -> &SignalState {
         &self.signals
+    }
+
+    pub fn parent_id(&self) -> Option<ProcessId> {
+        self.relations.lock().parent
+    }
+
+    #[allow(dead_code)]
+    pub fn set_parent(&self, parent: ProcessId) -> Result<(), ProcessError> {
+        let mut relations = self.relations.lock();
+        relations.parent = Some(parent);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn add_child(&self, child: Arc<Process>) -> Result<(), ProcessError> {
+        let mut relations = self.relations.lock();
+        relations
+            .children
+            .try_reserve(1)
+            .map_err(|_| ProcessError::MetadataOutOfMemory)?;
+        relations.children.push(child);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_child_zombie(
+        &self,
+        child: Arc<Process>,
+        status: isize,
+    ) -> Result<(), ProcessError> {
+        {
+            let mut relations = self.relations.lock();
+            let Some(index) = relations
+                .children
+                .iter()
+                .position(|candidate| candidate.id() == child.id())
+            else {
+                return Err(ProcessError::ThreadNotFound);
+            };
+            let child = relations.children.remove(index);
+            relations
+                .zombie_children
+                .try_reserve(1)
+                .map_err(|_| ProcessError::MetadataOutOfMemory)?;
+            relations.zombie_children.push((child, status));
+        }
+        self.child_wait.wake_all();
+        Ok(())
+    }
+
+    pub fn wait_zombie_child(
+        &self,
+        requested: isize,
+    ) -> Result<Option<(Arc<Process>, isize)>, ProcessError> {
+        let mut relations = self.relations.lock();
+        let Some(index) = relations
+            .zombie_children
+            .iter()
+            .position(|(process, _)| requested == -1 || requested == process.id().get() as isize)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(relations.zombie_children.remove(index)))
+    }
+
+    pub fn has_child(&self, requested: isize) -> bool {
+        let relations = self.relations.lock();
+        relations
+            .children
+            .iter()
+            .any(|process| requested == -1 || requested == process.id().get() as isize)
+            || relations
+                .zombie_children
+                .iter()
+                .any(|(process, _)| requested == -1 || requested == process.id().get() as isize)
+    }
+
+    pub fn has_zombie_child(&self, requested: isize) -> bool {
+        let relations = self.relations.lock();
+        relations
+            .zombie_children
+            .iter()
+            .any(|(process, _)| requested == -1 || requested == process.id().get() as isize)
+    }
+
+    pub const fn child_wait_queue(&self) -> &WaitQueue {
+        &self.child_wait
+    }
+
+    pub fn process_group(&self) -> isize {
+        self.process_group.load(Ordering::Acquire)
+    }
+
+    pub fn set_process_group(&self, pgid: isize) {
+        self.process_group.store(pgid, Ordering::Release);
+    }
+
+    pub fn session(&self) -> isize {
+        self.session.load(Ordering::Acquire)
+    }
+
+    pub fn setsid(&self) -> isize {
+        let sid = self.id.get() as isize;
+        self.session.store(sid, Ordering::Release);
+        self.process_group.store(sid, Ordering::Release);
+        sid
     }
 
     pub const fn credentials(&self) -> Credentials {
@@ -279,6 +624,7 @@ impl Process {
             process: Arc::clone(self),
             user_pc: AtomicUsize::new(entry.get()),
             user_stack,
+            user_sp: AtomicUsize::new(user_stack.end().get()),
             trap_frame: IrqSpinLock::new_with_class(None, THREAD_TRAP_FRAME_LOCK),
             tls: AtomicUsize::new(0),
             blocked_signals: AtomicU64::new(0),
@@ -307,7 +653,9 @@ impl Process {
             );
         }
 
+        unregister_process(self.id);
         let Self { mm, .. } = self;
+        let mm = mm.into_inner();
         let mut mm = Arc::try_unwrap(mm)
             .unwrap_or_else(|_| panic!("M9-B address space retained an unexpected owner"));
         mm.destroy()?;
@@ -330,11 +678,33 @@ impl Process {
     }
 }
 
+fn register_process(process: &Arc<Process>) {
+    let mut registry = PROCESS_REGISTRY.lock();
+    let map = registry.get_or_insert_with(BTreeMap::new);
+    map.insert(process.id(), Arc::downgrade(process));
+}
+
+fn unregister_process(pid: ProcessId) {
+    let mut registry = PROCESS_REGISTRY.lock();
+    if let Some(map) = registry.as_mut() {
+        map.remove(&pid);
+    }
+}
+
+pub fn lookup_process(pid: ProcessId) -> Option<Arc<Process>> {
+    PROCESS_REGISTRY
+        .lock()
+        .as_ref()
+        .and_then(|registry| registry.get(&pid))
+        .and_then(alloc::sync::Weak::upgrade)
+}
+
 pub struct Thread {
     id: ThreadId,
     process: Arc<Process>,
     user_pc: AtomicUsize,
     user_stack: VirtRange,
+    user_sp: AtomicUsize,
     trap_frame: IrqSpinLock<Option<crate::arch::trap::TrapFrame>>,
     tls: AtomicUsize,
     blocked_signals: AtomicU64,
@@ -355,6 +725,10 @@ impl Thread {
         self.process.as_ref()
     }
 
+    pub fn process_arc(&self) -> Arc<Process> {
+        Arc::clone(&self.process)
+    }
+
     pub fn entry(&self) -> VirtAddr {
         VirtAddr::new(self.user_pc.load(Ordering::Acquire))
     }
@@ -363,6 +737,11 @@ impl Thread {
         self.user_stack
     }
 
+    pub fn user_stack_pointer(&self) -> VirtAddr {
+        VirtAddr::new(self.user_sp.load(Ordering::Acquire))
+    }
+
+    #[allow(dead_code)]
     pub fn prepare_entry(&self, entry: VirtAddr) -> Result<(), ProcessError> {
         if self.lifecycle.load(Ordering::Acquire) != THREAD_READY {
             return Err(ProcessError::ThreadNotReady);
@@ -371,6 +750,42 @@ impl Thread {
             return Err(ProcessError::InvalidUserContext);
         }
         self.user_pc.store(entry.get(), Ordering::Release);
+        Ok(())
+    }
+
+    pub fn prepare_stack_pointer(&self, stack_pointer: VirtAddr) -> Result<(), ProcessError> {
+        if self.lifecycle.load(Ordering::Acquire) != THREAD_READY {
+            return Err(ProcessError::ThreadNotReady);
+        }
+        if stack_pointer.get() & 0xf != 0 || !self.user_stack.contains(stack_pointer) {
+            return Err(ProcessError::InvalidUserContext);
+        }
+        self.user_sp.store(stack_pointer.get(), Ordering::Release);
+        Ok(())
+    }
+
+    pub fn exec_replace_context(
+        &self,
+        entry: VirtAddr,
+        user_stack: VirtRange,
+        stack_pointer: VirtAddr,
+    ) -> Result<(), ProcessError> {
+        if self.lifecycle.load(Ordering::Acquire) != THREAD_RUNNING {
+            return Err(ProcessError::ThreadNotReady);
+        }
+        let user_range = crate::arch::memory::layout::USER_RANGE;
+        if user_stack != self.user_stack
+            || !user_range.contains(entry)
+            || user_stack.is_empty()
+            || !user_range.contains_range(user_stack)
+            || stack_pointer.get() & 0xf != 0
+            || !(stack_pointer == user_stack.end() || user_stack.contains(stack_pointer))
+        {
+            return Err(ProcessError::InvalidUserContext);
+        }
+        self.user_pc.store(entry.get(), Ordering::Release);
+        self.user_sp.store(stack_pointer.get(), Ordering::Release);
+        *self.trap_frame.lock() = None;
         Ok(())
     }
 
@@ -521,6 +936,16 @@ impl Drop for Thread {
         self.process
             .detach_thread(self.id)
             .expect("M9-B Thread disappeared from its process thread group");
+        if let Some(parent) = self
+            .process
+            .parent_id()
+            .and_then(crate::process::lookup_process)
+        {
+            let status = self
+                .exit_status()
+                .expect("Thread dropped before publishing an exit status");
+            let _ = parent.mark_child_zombie(Arc::clone(&self.process), status);
+        }
         LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -530,18 +955,24 @@ pub fn assert_initial_pair(process: &Arc<Process>, thread: &Arc<Thread>) {
     assert_eq!(thread.id().get(), process.id().get());
     assert_eq!(process.thread_count(), 1);
     assert_eq!(Arc::strong_count(process), 2);
-    assert_eq!(Arc::strong_count(&process.mm), 1);
-    assert_eq!(process.files().next_fd_hint(), 0);
+    assert_eq!(process.mm_strong_count(), 1);
+    assert_eq!(process.files().open_count(), 3);
     assert_eq!(process.signals().pending(), 0);
     assert_eq!(process.credentials().real_uid(), 0);
     assert_eq!(process.credentials().effective_uid(), 0);
     assert_eq!(process.credentials().real_gid(), 0);
     assert_eq!(process.credentials().effective_gid(), 0);
-    assert_eq!(process.fs().root_anchor(), 0);
-    assert_eq!(process.fs().cwd_anchor(), 0);
+    assert_eq!(process.fs().root_path(), "/");
+    assert_eq!(process.fs().cwd_path(), "/");
     assert_eq!(thread.tls(), 0);
     assert_eq!(thread.blocked_signals(), 0);
     assert!(thread.exit_status().is_none());
+    let stack_pointer = thread.user_stack_pointer();
+    assert_eq!(stack_pointer.get() & 0xf, 0);
+    assert!(
+        stack_pointer == thread.user_stack().end() || thread.user_stack().contains(stack_pointer),
+        "initial user stack pointer is outside the declared stack VMA",
+    );
     assert_eq!(thread.visited_cpu_mask(), 0);
     assert_eq!(thread.schedule_count(), 0);
 }

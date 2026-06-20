@@ -33,6 +33,16 @@ myos-sync = {
     path = "../sync",
 }
 
+myos-vfs = {
+    path = "../vfs",
+}
+
+virtio-drivers = {
+    path = "../vendor/virtio-drivers",
+    default-features = false,
+    features = ["alloc"],
+}
+
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 arch-riscv64 = {
     path = "../arch/riscv64",

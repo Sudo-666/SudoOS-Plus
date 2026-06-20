@@ -170,6 +170,7 @@ static REMOTE_RANGE_FLUSH_COUNTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::ne
 static COMPLETED_SHOOTDOWNS: AtomicU64 = AtomicU64::new(0);
 
 /// Discards every cached translation for the shared kernel address space.
+#[track_caller]
 pub fn shootdown_kernel_all() {
     shootdown(TlbFlush::All {
         scope: TlbScope::AddressSpace(AddressSpaceId::KERNEL),
@@ -178,6 +179,7 @@ pub fn shootdown_kernel_all() {
 
 /// Discards one page translation for the shared kernel address space.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[track_caller]
 pub fn shootdown_kernel_page(address: VirtAddr) {
     assert!(
         address.is_aligned(PAGE_SIZE),
@@ -192,6 +194,7 @@ pub fn shootdown_kernel_page(address: VirtAddr) {
 
 /// Discards translations in one page-aligned half-open kernel range.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
+#[track_caller]
 pub fn shootdown_kernel_range(range: VirtRange) {
     assert!(
         range.is_page_aligned(),
@@ -211,6 +214,7 @@ pub fn shootdown_kernel_range(range: VirtRange) {
 /// `AddressSpaceId` target every online/IPI-ready CPU. Non-kernel address-space
 /// scopes are deliberately rejected until process address spaces maintain an
 /// `active_cpus` mask.
+#[track_caller]
 pub fn shootdown(flush: TlbFlush) {
     validate_flush(flush);
 
@@ -293,6 +297,7 @@ pub fn shootdown(flush: TlbFlush) {
 /// The request must be created by `UserAddressSpace::plan_tlb_request()` after
 /// the page-table/VMA locks have been released.  This function reuses the
 /// kernel request slot, serializer, mailbox bit, timeout, and ACK protocol.
+#[track_caller]
 pub fn shootdown_user(request: PerMmTlbRequest) {
     validate_user_request(request);
     crate::context::assert_interrupts_enabled();

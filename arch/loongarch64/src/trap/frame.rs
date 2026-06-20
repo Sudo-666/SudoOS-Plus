@@ -1,5 +1,6 @@
 pub const TRAP_FRAME_GUARD: usize = 0x5a5;
 
+#[derive(Clone, Copy)]
 #[repr(C, align(16))]
 pub struct TrapFrame {
     pub gpr: [usize; 32],

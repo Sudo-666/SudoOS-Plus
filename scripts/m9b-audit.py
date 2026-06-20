@@ -167,9 +167,9 @@ def main() -> int:
         failures,
     )
     check(
-        "future copy_to_user uaccess helper has only a local dead-code allowance",
-        '#[allow(dead_code)]\nfn copy_to_user' in user
-        and user.count("#[allow(dead_code)]") == 1,
+        "copy_to_user uaccess helper is live code without dead-code allowance",
+        "fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()>" in user
+        and '#[allow(dead_code)]\nfn copy_to_user' not in user,
         failures,
     )
     check(
@@ -275,7 +275,7 @@ def main() -> int:
                 "enter_cpu_after_local_sync",
                 "leave_cpu_after_local_flush",
                 "finish_retirement",
-                "crate::tlb::shootdown_user_local(request)",
+                "shootdown_user_request(request)",
             )
         ),
         failures,
