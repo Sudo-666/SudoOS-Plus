@@ -7,6 +7,7 @@ mod console;
 mod context;
 mod elf;
 mod exec;
+mod ext4;
 mod fault;
 mod fs;
 mod heap;

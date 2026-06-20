@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# SUDOOS_M16_PRE_PATCH_V1
+set -euo pipefail
+
+: "${BUSYBOX:?set BUSYBOX=/absolute/path/to/static/busybox}"
+OUT="${OUT:-build/initramfs/busybox.cpio}"
+STAGE="${STAGE:-build/initramfs/busybox-root}"
+
+if [[ ! -x "$BUSYBOX" ]]; then
+  echo "error: BUSYBOX is not executable: $BUSYBOX" >&2
+  exit 1
+fi
+
+if command -v file >/dev/null 2>&1; then
+  if file "$BUSYBOX" | grep -qi "dynamically linked"; then
+    echo "warning: BUSYBOX appears dynamically linked; M14 gate expects static BusyBox." >&2
+  fi
+fi
+
+rm -rf "$STAGE"
+mkdir -p "$STAGE"/{bin,sbin,usr/bin,usr/sbin,dev,proc,sys,tmp,etc,mnt,root}
+chmod 1777 "$STAGE/tmp"
+cp "$BUSYBOX" "$STAGE/bin/busybox"
+chmod +x "$STAGE/bin/busybox"
+
+applets=(sh echo cat ls pwd mkdir rm cp mv ln sleep true false mount dmesg ps)
+for app in "${applets[@]}"; do
+  ln -sf busybox "$STAGE/bin/$app"
+done
+
+cat > "$STAGE/init" <<'EOF'
+#!/bin/sh
+mount -t devtmpfs none /dev 2>/dev/null || true
+mount -t proc none /proc 2>/dev/null || true
+echo "SudoOS BusyBox initramfs smoke"
+echo "pwd=$(pwd)"
+/bin/echo hello-from-busybox
+/bin/ls /
+/bin/true
+/bin/false || true
+exec /bin/sh
+EOF
+chmod +x "$STAGE/init"
+
+mkdir -p "$(dirname "$OUT")"
+(
+  cd "$STAGE"
+  if command -v cpio >/dev/null 2>&1; then
+    find . -print0 | cpio --null -ov --format=newc > "../../$(basename "$(dirname "$OUT")")/$(basename "$OUT")" 2>/dev/null
+  else
+    echo "error: cpio not found; install cpio or set OUT after building on a host with cpio." >&2
+    exit 1
+  fi
+)
+
+# The subshell path above works for the default layout. If OUT was nested differently,
+# rebuild the archive directly here for correctness.
+if [[ ! -s "$OUT" ]]; then
+  (cd "$STAGE" && find . -print0 | cpio --null -ov --format=newc > "$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")" 2>/dev/null)
+fi
+
+echo "wrote $OUT"

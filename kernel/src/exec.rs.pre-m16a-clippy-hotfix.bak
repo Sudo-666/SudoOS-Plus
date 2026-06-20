@@ -115,9 +115,13 @@ pub fn exec_elf(image: &[u8], config: ExecConfig<'_>) -> Result<ExecImage, ExecE
 pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec, ExecError> {
     let elf = crate::elf::parse(image)?;
 
-    // SUDOOS_M16A_CLIPPY_HOTFIX_V1: centralize M16-A dynamic handoff policy and consume the
-    // parsed metadata in the real exec path instead of suppressing warnings.
-    reject_dynamic_handoff_if_needed(&elf)?;
+    // M16-A parses the dynamic metadata and builds correct auxv, but still
+    // fails closed for dynamic handoff. Jumping directly to the main ET_DYN
+    // entry without loading PT_INTERP, relocations, TLS, and RELRO would be a
+    // fake success and becomes much harder to debug under BusyBox/musl.
+    if elf.interpreter.is_some() || elf.dynamic.is_some() {
+        return Err(ExecError::DynamicInterpreterUnsupported);
+    }
 
     let mut areas = Vec::new();
     areas
@@ -148,45 +152,6 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         stack: config.stack,
         stack_pointer,
     })
-}
-
-// SUDOOS_M16A_CLIPPY_HOTFIX_V1: M16-A records ET_DYN/PT_INTERP/PT_DYNAMIC metadata before the
-// full interpreter/relocation/TLS path exists. Linux enters the interpreter for
-// dynamic executables; this kernel must therefore fail closed until M16-B can
-// load PT_INTERP, apply relocations, set up TLS, and seal RELRO.
-fn reject_dynamic_handoff_if_needed(elf: &crate::elf::ElfImage) -> Result<(), ExecError> {
-    match elf.kind {
-        crate::elf::ElfKind::Executable => {
-            if elf.load_bias != 0 {
-                return Err(ExecError::Elf(crate::elf::ElfError::InvalidHeader));
-            }
-        }
-        crate::elf::ElfKind::PositionIndependent => {
-            if elf.load_bias == 0 {
-                return Err(ExecError::Elf(crate::elf::ElfError::InvalidHeader));
-            }
-        }
-    }
-
-    // Keep this predicate explicit: scripts/m16a-elf-auxv-audit.py verifies
-    // the same M16-A fail-closed contract.
-    let needs_dynamic_handoff = elf.interpreter.is_some() || elf.dynamic.is_some();
-
-    if let Some(dynamic) = elf.dynamic {
-        let dynamic_start = dynamic.virtual_address.get();
-        let _dynamic_end = dynamic_start
-            .checked_add(dynamic.memory_size)
-            .ok_or(ExecError::AddressOverflow)?;
-        let _dynamic_file_metadata_end = dynamic
-            .file_offset
-            .checked_add(dynamic.memory_size)
-            .ok_or(ExecError::AddressOverflow)?;
-    }
-
-    if needs_dynamic_handoff {
-        return Err(ExecError::DynamicInterpreterUnsupported);
-    }
-    Ok(())
 }
 
 fn build_mm(

@@ -330,3 +330,40 @@ m7-release:
 .PHONY: m7-tag
 m7-tag:
 	@./scripts/m7-tag.sh
+
+# SUDOOS_M16_PRE_PATCH_V1: global M14/M15/M16 convergence gates.
+.PHONY: m16-preflight verify-m16-pre busybox-initramfs
+m16-preflight:
+	python3 scripts/m16-preflight-audit.py
+
+verify-m16-pre: check smoke-all smoke-smp-all m16-preflight
+	@echo "M16-pre verifier complete"
+
+busybox-initramfs:
+	scripts/build-static-busybox-initramfs.sh
+
+# SUDOOS_M16A_ELF_AUXV_PATCH_V1: M16-A ELF metadata and auxv gate.
+.PHONY: m16a-audit
+m16a-audit:
+	python3 scripts/m16a-elf-auxv-audit.py
+
+# SUDOOS_M15A_EXT4_RO_PATCH_V1: read-only ext4 VFS snapshot gate.
+.PHONY: m15a-ext4-ro-audit verify-m15a-ext4-ro
+m15a-ext4-ro-audit:
+	python3 scripts/m15a-ext4-ro-audit.py
+
+verify-m15a-ext4-ro: m15a-ext4-ro-audit check smoke-all smoke-smp-all m16-preflight
+	@echo "M15-A ext4 read-only verifier complete"
+
+.PHONY: busybox-initramfs m14-busybox-artifact-audit verify-m14-busybox
+BUSYBOX_INITRAMFS ?= build/initramfs/busybox.cpio
+
+busybox-initramfs:
+	@test -n "$(BUSYBOX)" || (echo "error: BUSYBOX=/absolute/path/to/static/busybox is required" >&2; exit 2)
+	OUT="$(BUSYBOX_INITRAMFS)" BUSYBOX="$(BUSYBOX)" scripts/build-static-busybox-initramfs.sh
+
+m14-busybox-artifact-audit:
+	python3 scripts/m14-busybox-artifact-audit.py
+
+verify-m14-busybox: m14-busybox-artifact-audit busybox-initramfs
+	python3 scripts/m14-busybox-artifact-audit.py "$(BUSYBOX_INITRAMFS)"

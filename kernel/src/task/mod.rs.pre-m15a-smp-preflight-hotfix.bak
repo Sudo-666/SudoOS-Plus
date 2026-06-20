@@ -996,15 +996,10 @@ impl Scheduler {
                     .expect("exited task disappeared before reclamation");
                 assert_eq!(task.id, pending.previous);
                 assert_eq!(task.state, TaskState::Exited);
-                // M15-A: grow the deferred reclamation queue instead of
-                // panicking during SMP verifier/user-exit bursts. Linux-like
-                // task reclamation must tolerate transient exit bursts until
-                // the reaper catches up.
-                if self.retired_tasks.len() == self.retired_tasks.capacity() {
-                    self.retired_tasks
-                        .try_reserve(MAX_TASKS)
-                        .expect("unable to grow retired task queue");
-                }
+                assert!(
+                    self.retired_tasks.len() < self.retired_tasks.capacity(),
+                    "retired task queue exhausted",
+                );
                 self.retired_tasks.push(task);
                 // Publish the flush/barrier lifetime before making the task
                 // visible to the reaper.  The scheduler lock prevents a consumer

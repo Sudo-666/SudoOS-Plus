@@ -1,5 +1,5 @@
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use myos_vfs::{
     DirEntry, Errno, File, FileMode, FileOperations, IoBuffer, MutableIoBuffer, OpenFlags,
@@ -28,7 +28,6 @@ struct Node {
     parent_ino: AtomicU64,
     nlink: AtomicU64,
     mode: FileMode,
-    read_only: AtomicBool,
     state: IrqSpinLock<NodeState>,
 }
 
@@ -194,9 +193,6 @@ pub fn mkdir(path: &str, mode: u32) -> Result<(), Errno> {
     let _tree = TREE.lock();
     let (parent_path, name) = split_parent(path)?;
     let parent = lookup(parent_path)?;
-    if is_node_read_only(&parent) {
-        return Err(Errno::Erofs);
-    }
     let permissions = mode & 0o777;
     insert_child(
         &parent,
@@ -209,9 +205,6 @@ pub fn unlink(path: &str, remove_dir: bool) -> Result<(), Errno> {
     let _tree = TREE.lock();
     let (parent_path, name) = split_parent(path)?;
     let parent = lookup(parent_path)?;
-    if is_node_read_only(&parent) {
-        return Err(Errno::Erofs);
-    }
     remove_child(&parent, name, remove_dir).map(|_| ())
 }
 
@@ -224,13 +217,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), Errno> {
     }
     let old_parent = lookup(old_parent_path)?;
     let new_parent = lookup(new_parent_path)?;
-    if is_node_read_only(&old_parent) || is_node_read_only(&new_parent) {
-        return Err(Errno::Erofs);
-    }
     let source = lookup_child(&old_parent, old_name)?.ok_or(Errno::Enoent)?;
-    if is_node_read_only(&source) {
-        return Err(Errno::Erofs);
-    }
     if source.mode.file_type() == myos_vfs::FileType::Directory
         && is_path_descendant(new_path, old_path)
     {
@@ -256,9 +243,6 @@ pub fn symlink(target: &str, link_path: &str) -> Result<(), Errno> {
     let _tree = TREE.lock();
     let (parent_path, name) = split_parent(link_path)?;
     let parent = lookup(parent_path)?;
-    if is_node_read_only(&parent) {
-        return Err(Errno::Erofs);
-    }
     insert_child(&parent, name, symlink_node(target))
 }
 
@@ -274,9 +258,6 @@ pub fn link(old_path: &str, new_path: &str, follow_source: bool) -> Result<(), E
     }
     let (parent_path, name) = split_parent(new_path)?;
     let parent = lookup(parent_path)?;
-    if is_node_read_only(&parent) {
-        return Err(Errno::Erofs);
-    }
     insert_child(&parent, name, Arc::clone(&source))?;
     source.nlink.fetch_add(1, Ordering::AcqRel);
     Ok(())
@@ -319,11 +300,6 @@ pub fn mount(
         let device_name = normalize_block_source(source)?;
         let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
         verify_ext4_superblock(&device)?;
-        ensure_mount_target_free(target)?;
-        if !directory_is_empty(&target_node)? {
-            return Err(Errno::Ebusy);
-        }
-        install_ext4_snapshot(&target_node, device)?;
         insert_mount(source, target, fs_type, flags)
     } else {
         insert_mount(source.unwrap_or("none"), target, fs_type, flags)
@@ -335,17 +311,13 @@ pub fn umount(target: &str, _flags: usize) -> Result<(), Errno> {
         return Err(Errno::Ebusy);
     }
     let _tree = TREE.lock();
-    let target_node = lookup(target)?;
+    let _ = lookup(target)?;
     let mut mounts = MOUNTS.lock();
     let index = mounts
         .iter()
         .position(|entry| entry.target == target)
         .ok_or(Errno::Einval)?;
-    let removed = mounts.remove(index);
-    drop(mounts);
-    if removed.fs_type == MountFsType::Ext4 {
-        clear_ext4_snapshot(&target_node)?;
-    }
+    mounts.remove(index);
     Ok(())
 }
 
@@ -501,18 +473,12 @@ fn lookup_follow(path: &str, follow_final: bool, depth: usize) -> Result<Arc<Nod
 fn create_regular(path: &str) -> Result<Arc<Node>, Errno> {
     let (parent_path, name) = split_parent(path)?;
     let parent = lookup(parent_path)?;
-    if is_node_read_only(&parent) {
-        return Err(Errno::Erofs);
-    }
     let node = regular();
     insert_child(&parent, name, Arc::clone(&node))?;
     Ok(node)
 }
 
 fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
-    if is_node_read_only(node) {
-        return Err(Errno::Erofs);
-    }
     let length = usize::try_from(length).map_err(|_| Errno::Eoverflow)?;
     let mut state = node.state.lock();
     match &mut *state {
@@ -531,112 +497,6 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     }
 }
 
-// SUDOOS_M15A_EXT4_RO_PATCH_V1: native read-only ext4 VFS snapshot handoff.
-
-fn ensure_mount_target_free(target: &str) -> Result<(), Errno> {
-    let mounts = MOUNTS.lock();
-    if mounts.iter().any(|entry| entry.target == target) {
-        return Err(Errno::Ebusy);
-    }
-    Ok(())
-}
-
-fn directory_is_empty(node: &Arc<Node>) -> Result<bool, Errno> {
-    match &*node.state.lock() {
-        NodeState::Directory(children) => Ok(children.is_empty()),
-        _ => Err(Errno::Enotdir),
-    }
-}
-
-fn clear_ext4_snapshot(target: &Arc<Node>) -> Result<(), Errno> {
-    target.read_only.store(false, Ordering::Release);
-    *target.state.lock() = NodeState::Directory(Vec::new());
-    Ok(())
-}
-
-fn install_ext4_snapshot(
-    target: &Arc<Node>,
-    device: Arc<dyn crate::block::BlockDevice>,
-) -> Result<(), Errno> {
-    let snapshot = crate::ext4::load_root_snapshot(device).map_err(ext4_errno)?;
-    let mut children = Vec::new();
-    let crate::ext4::Ext4SnapshotKind::Directory(entries) = snapshot.kind else {
-        return Err(Errno::Enotdir);
-    };
-    children
-        .try_reserve(entries.len())
-        .map_err(|_| Errno::Enomem)?;
-    for entry in entries {
-        validate_component(&entry.name)?;
-        let node = ext4_snapshot_node(entry.node)?;
-        node.parent_ino.store(target.ino, Ordering::Release);
-        children.push((entry.name, node));
-    }
-    target.read_only.store(true, Ordering::Release);
-    *target.state.lock() = NodeState::Directory(children);
-    Ok(())
-}
-
-fn ext4_snapshot_node(snapshot: crate::ext4::Ext4SnapshotNode) -> Result<Arc<Node>, Errno> {
-    let declared_size = snapshot.size;
-    let state = match snapshot.kind {
-        crate::ext4::Ext4SnapshotKind::Directory(entries) => {
-            let mut children = Vec::new();
-            children
-                .try_reserve(entries.len())
-                .map_err(|_| Errno::Enomem)?;
-            for entry in entries {
-                validate_component(&entry.name)?;
-                let node = ext4_snapshot_node(entry.node)?;
-                children.push((entry.name, node));
-            }
-            NodeState::Directory(children)
-        }
-        crate::ext4::Ext4SnapshotKind::Regular(data) => {
-            if data.len() as u64 != declared_size {
-                return Err(Errno::Eoverflow);
-            }
-            NodeState::Regular(data)
-        }
-        crate::ext4::Ext4SnapshotKind::Symlink(target) => NodeState::Symlink(target),
-    };
-    let node = Arc::new(Node {
-        ino: snapshot.ino,
-        parent_ino: AtomicU64::new(0),
-        nlink: AtomicU64::new(1),
-        mode: FileMode::from_bits(snapshot.mode),
-        read_only: AtomicBool::new(true),
-        state: IrqSpinLock::new_with_class(state, NODE_LOCK),
-    });
-    if let NodeState::Directory(children) = &*node.state.lock() {
-        for (_, child) in children {
-            child.parent_ino.store(node.ino, Ordering::Release);
-        }
-    }
-    Ok(node)
-}
-
-fn is_node_read_only(node: &Arc<Node>) -> bool {
-    node.read_only.load(Ordering::Acquire)
-}
-
-fn ext4_errno(error: crate::ext4::Ext4Error) -> Errno {
-    match error {
-        crate::ext4::Ext4Error::AddressOverflow => Errno::Eoverflow,
-        crate::ext4::Ext4Error::BadBlockSize => Errno::Einval,
-        crate::ext4::Ext4Error::BadDirectory => Errno::Einval,
-        crate::ext4::Ext4Error::BadExtentTree => Errno::Einval,
-        crate::ext4::Ext4Error::BadGroupDescriptor => Errno::Einval,
-        crate::ext4::Ext4Error::BadInode => Errno::Einval,
-        crate::ext4::Ext4Error::BlockIo(err) => block_errno(err),
-        crate::ext4::Ext4Error::FileTooLarge => Errno::Eoverflow,
-        crate::ext4::Ext4Error::InvalidFeatureSet => Errno::Enosys,
-        crate::ext4::Ext4Error::InvalidSuperblock => Errno::Einval,
-        crate::ext4::Ext4Error::OutOfMemory => Errno::Enomem,
-        crate::ext4::Ext4Error::Unsupported => Errno::Enosys,
-    }
-}
-
 fn root() -> Result<Arc<Node>, Errno> {
     ROOT.lock().as_ref().cloned().ok_or(Errno::Enodev)
 }
@@ -647,7 +507,6 @@ fn directory(mode: FileMode) -> Arc<Node> {
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
         mode,
-        read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Directory(Vec::new()), NODE_LOCK),
     })
 }
@@ -658,7 +517,6 @@ fn regular() -> Arc<Node> {
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
         mode: FileMode::FILE_DEFAULT,
-        read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Regular(Vec::new()), NODE_LOCK),
     })
 }
@@ -669,7 +527,6 @@ fn symlink_node(target: &str) -> Arc<Node> {
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
         mode: FileMode::SYMLINK_DEFAULT,
-        read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Symlink(String::from(target)), NODE_LOCK),
     })
 }
@@ -680,7 +537,6 @@ fn device(kind: DeviceKind) -> Arc<Node> {
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
         mode: FileMode::CHAR_DEFAULT,
-        read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Device(kind), NODE_LOCK),
     })
 }
@@ -701,7 +557,6 @@ fn block_device_node(
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
         mode: FileMode::BLOCK_DEFAULT,
-        read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(
             NodeState::BlockDevice {
                 name: stored_name,
@@ -815,9 +670,6 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
 
 fn remove_child(parent: &Arc<Node>, name: &str, remove_dir: bool) -> Result<Arc<Node>, Errno> {
     let child = lookup_child(parent, name)?.ok_or(Errno::Enoent)?;
-    if is_node_read_only(&child) {
-        return Err(Errno::Erofs);
-    }
     match child.mode.file_type() {
         myos_vfs::FileType::Directory => {
             if !remove_dir {
@@ -1034,11 +886,6 @@ impl FileOperations for RegularFile {
     }
 
     fn write(&self, file: &File, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
-        if is_node_read_only(&self.node) {
-            // M15-A ext4 mounts are a read-only file snapshot. Never let writes
-            // silently mutate the tmpfs mirror and pretend persistence works.
-            return Err(Errno::Erofs);
-        }
         file.with_position(|position| {
             let mut state = self.node.state.lock();
             let NodeState::Regular(data) = &mut *state else {
@@ -1457,82 +1304,25 @@ pub fn verify() {
     umount("/m15-mnt", 0).expect("tmpfs umount failed");
     unlink("/m15-mnt", true).expect("tmpfs mountpoint rmdir failed");
 
-    let ext4_device = Arc::new(
-        crate::block::MemoryBlockDevice::new(512, 32).expect("ext4 ro fixture block device"),
-    );
-
-    // M15-A no longer accepts a magic-only fake disk. Build the smallest valid
-    // read-only ext4 root that this native parser supports: 1 KiB blocks,
-    // one group descriptor, one inode table, and an extent-backed empty root dir.
+    let ext4_device =
+        Arc::new(crate::block::MemoryBlockDevice::new(512, 16).expect("ext4 probe block device"));
     let mut super_sector = [0_u8; 512];
-    super_sector[24..28].copy_from_slice(&0_u32.to_le_bytes()); // s_log_block_size => 1024
-    super_sector[32..36].copy_from_slice(&8_u32.to_le_bytes()); // s_blocks_per_group
-    super_sector[40..44].copy_from_slice(&16_u32.to_le_bytes()); // s_inodes_per_group
     super_sector[56..58].copy_from_slice(&0xef53_u16.to_le_bytes());
-    super_sector[88..90].copy_from_slice(&128_u16.to_le_bytes()); // s_inode_size
-    super_sector[96..100].copy_from_slice(&(0x0000_0002_u32 | 0x0000_0040_u32).to_le_bytes());
-    super_sector[254..256].copy_from_slice(&32_u16.to_le_bytes());
     ext4_device
         .write_block(2, &super_sector)
-        .expect("ext4 ro fixture superblock write failed");
-
-    let mut group_sector = [0_u8; 512];
-    group_sector[8..12].copy_from_slice(&3_u32.to_le_bytes()); // bg_inode_table_lo
-    ext4_device
-        .write_block(4, &group_sector)
-        .expect("ext4 ro fixture group descriptor write failed");
-
-    let mut inode_sector = [0_u8; 512];
-    let root_inode = &mut inode_sector[128..256]; // inode #2, inode size 128
-    root_inode[0..2].copy_from_slice(&0o040755_u16.to_le_bytes());
-    root_inode[4..8].copy_from_slice(&24_u32.to_le_bytes()); // two compact dirents
-    root_inode[32..36].copy_from_slice(&0x0008_0000_u32.to_le_bytes()); // EXT4_EXTENTS_FL
-    let extent_header = &mut root_inode[40..100];
-    extent_header[0..2].copy_from_slice(&0xf30a_u16.to_le_bytes());
-    extent_header[2..4].copy_from_slice(&1_u16.to_le_bytes());
-    extent_header[4..6].copy_from_slice(&4_u16.to_le_bytes());
-    extent_header[6..8].copy_from_slice(&0_u16.to_le_bytes());
-    extent_header[12..16].copy_from_slice(&0_u32.to_le_bytes()); // logical block
-    extent_header[16..18].copy_from_slice(&1_u16.to_le_bytes()); // initialized len
-    extent_header[18..20].copy_from_slice(&0_u16.to_le_bytes()); // start_hi
-    extent_header[20..24].copy_from_slice(&4_u32.to_le_bytes()); // physical block
-    ext4_device
-        .write_block(6, &inode_sector)
-        .expect("ext4 ro fixture inode table write failed");
-
-    let mut dir_sector = [0_u8; 512];
-    dir_sector[0..4].copy_from_slice(&2_u32.to_le_bytes());
-    dir_sector[4..6].copy_from_slice(&12_u16.to_le_bytes());
-    dir_sector[6] = 1;
-    dir_sector[7] = 2;
-    dir_sector[8] = b'.';
-    dir_sector[12..16].copy_from_slice(&2_u32.to_le_bytes());
-    dir_sector[16..18].copy_from_slice(&12_u16.to_le_bytes());
-    dir_sector[18] = 2;
-    dir_sector[19] = 2;
-    dir_sector[20] = b'.';
-    dir_sector[21] = b'.';
-    ext4_device
-        .write_block(8, &dir_sector)
-        .expect("ext4 ro fixture directory write failed");
-
+        .expect("ext4 probe superblock write failed");
     crate::block::register_device("m15ext4", ext4_device.clone())
-        .expect("ext4 ro fixture device register failed");
+        .expect("ext4 probe device register failed");
     mkdir("/m15-ext4", 0o755).expect("ext4 mountpoint mkdir failed");
-    mount(Some("/dev/m15ext4"), "/m15-ext4", "ext4", 1).expect("ext4 ro mount failed");
-    assert_eq!(
-        open("/m15-ext4/new", OpenFlags::O_CREAT.union(OpenFlags::O_RDWR),).err(),
-        Some(Errno::Erofs),
-        "ext4 read-only root allowed tmpfs-style create",
-    );
+    mount(Some("/dev/m15ext4"), "/m15-ext4", "ext4", 1).expect("ext4 magic mount gate failed");
     let (mounts_after_ext4, sourced_after_ext4, ext4_after, flagged_after) = mount_table_counts();
     assert!(mounts_after_ext4 > mounts);
     assert!(sourced_after_ext4 > sourced);
     assert_eq!(ext4_after, 1);
     assert_eq!(flagged_after, 1);
-    umount("/m15-ext4", 0).expect("ext4 ro umount failed");
+    umount("/m15-ext4", 0).expect("ext4 magic umount failed");
     unlink("/m15-ext4", true).expect("ext4 mountpoint rmdir failed");
-    crate::block::unregister_device("m15ext4").expect("ext4 ro fixture unregister failed");
+    crate::block::unregister_device("m15ext4").expect("ext4 probe unregister failed");
 
     crate::println!("M11 VFS gate:");
     crate::println!("  tmpfs file ops       : verified");
