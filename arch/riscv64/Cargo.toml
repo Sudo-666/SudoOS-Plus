@@ -1,0 +1,21 @@
+[package]
+name = "arch-riscv64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+myos-boot = {
+    path = "../../boot",
+}
+
+myos-mm = {
+    path = "../../mm",
+}
+
+[lints]
+workspace = true

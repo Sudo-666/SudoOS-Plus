@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+# SUDOOS_M15A_EXT4_RO_PATCH_V1
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path.cwd()
+
+
+def read(path: str) -> str:
+    try:
+        return (ROOT / path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def require(name: str, ok: bool, detail: str) -> tuple[int, str]:
+    status = "PASS" if ok else "FAIL"
+    return (0 if ok else 1, f"{status:4} {name:<34} {detail}")
+
+
+def main() -> int:
+    ext4 = read("kernel/src/ext4.rs")
+    fs = read("kernel/src/fs/mod.rs")
+    main_rs = read("kernel/src/main.rs")
+    checks = []
+    checks.append(require("ext4 module wired", "mod ext4;" in main_rs, "kernel module is part of build graph"))
+    checks.append(require("native ext4 filesystem", ("pub struct Ext4FileSystem" in ext4 and ("pub struct Ext4Inode" in ext4 or "struct Ext4Inode" in ext4) and "pub struct Ext4File" in ext4), "super/inode/file surfaces exist"))
+    checks.append(require("superblock validation", "EXT4_SUPER_MAGIC" in ext4 and "0xef53" in ext4, "magic and feature checks are explicit"))
+    checks.append(require("extent-backed reads", "EXT4_EXTENT_MAGIC" in ext4 and "read_extent_bytes" in ext4 and "copy_extent" in ext4, "extent reader is present"))
+    checks.append(require("directory ingestion", "read_directory" in ext4 and "Ext4SnapshotDirEntry" in ext4, "directory entries become snapshot nodes"))
+    checks.append(require("vfs mount handoff", "install_ext4_snapshot" in fs and "load_root_snapshot" in fs, "mount path calls ext4 reader"))
+    checks.append(require("read-only node flag", "read_only: AtomicBool" in fs and "is_node_read_only" in fs, "mounted ext4 nodes cannot silently become tmpfs writes"))
+    checks.append(require("write guard", ("Err(Errno::Erofs)" in fs and ("read-only file" in fs or "is_node_read_only(&self.node)" in fs)), "writes/truncates/mutators fail closed"))
+
+    failures = 0
+    for code, line in checks:
+        failures += code
+        print(line)
+    if failures:
+        print(f"M15-A ext4-ro audit: FAIL={failures} PASS={len(checks)-failures}")
+        return 1
+    print(f"M15-A ext4-ro audit: PASS={len(checks)} FAIL=0")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

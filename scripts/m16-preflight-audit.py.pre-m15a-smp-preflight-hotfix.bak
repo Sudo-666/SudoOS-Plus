@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+# SUDOOS_M16_PRE_PATCH_V1
+"""
+Global M14/M15/M16 readiness audit for SudoOS-Plus.
+
+This is a static gate, not a substitute for QEMU smoke/stress. It catches
+architectural false-completion patterns that are easy to miss when individual
+smoke tests pass: ext4 probe mistaken for ext4 VFS, ET_EXEC-only ELF mistaken
+for dynamic userland, and minimal ppoll/pselect/signal behavior being counted
+as full BusyBox/musl support.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+
+
+@dataclass
+class Check:
+    name: str
+    status: str  # PASS / WARN / FAIL
+    detail: str
+    fix: str
+
+
+def read(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def has(text: str, *needles: str) -> bool:
+    return all(n in text for n in needles)
+
+
+def regex(text: str, pattern: str) -> bool:
+    return re.search(pattern, text, re.MULTILINE | re.DOTALL) is not None
+
+
+def check_docs() -> Check:
+    doc = read("docs/m14-m16-progress.md")
+    if not doc:
+        return Check(
+            "m14-m16 progress boundary doc",
+            "FAIL",
+            "docs/m14-m16-progress.md is missing, so the tree has no single truth source for what is complete vs provisional.",
+            "Restore or create docs/m14-m16-progress.md and keep it stricter than README badges.",
+        )
+    boundary_words = ["Not complete", "M16", "lwext4", "PT_INTERP"]
+    if all(w in doc for w in boundary_words):
+        return Check(
+            "m14-m16 progress boundary doc",
+            "PASS",
+            "The progress doc explicitly separates completed plumbing from incomplete ext4/dynamic-loader work.",
+            "Keep this doc updated whenever an M14/M15/M16 gate changes.",
+        )
+    return Check(
+        "m14-m16 progress boundary doc",
+        "WARN",
+        "The progress doc exists, but it does not clearly name all M15/M16 completion boundaries.",
+        "Mention ext4 VFS/lwext4 and dynamic ELF/PT_INTERP gates explicitly.",
+    )
+
+
+def check_elf_dynamic() -> Check:
+    elf = read("kernel/src/elf.rs")
+    if not elf:
+        return Check("dynamic ELF loader surface", "FAIL", "kernel/src/elf.rs is missing.", "Restore ELF loader source.")
+    missing = []
+    for token in ["ET_DYN", "PT_INTERP", "PT_PHDR", "PT_DYNAMIC"]:
+        if token not in elf:
+            missing.append(token)
+    load_bias = any(t in elf for t in ["load_bias", "load_base", "base_address"])
+    if not load_bias:
+        missing.append("load-bias calculation")
+    if not missing:
+        return Check(
+            "dynamic ELF loader surface",
+            "PASS",
+            "ELF code exposes ET_DYN/PT_INTERP/PT_DYNAMIC metadata and a load-bias concept.",
+            "QEMU-test this with a dynamically linked musl binary and assert auxv/loader handoff.",
+        )
+    return Check(
+        "dynamic ELF loader surface",
+        "FAIL",
+        "ELF parser still looks static/ET_EXEC-only or lacks dynamic-loader metadata: " + ", ".join(missing),
+        "Add ET_DYN, PT_INTERP, PT_PHDR/PT_DYNAMIC parsing, load-bias allocation, and pass loader metadata to exec.",
+    )
+
+
+def check_exec_auxv() -> Check:
+    ex = read("kernel/src/exec.rs")
+    if not ex:
+        return Check("initial stack and auxv", "FAIL", "kernel/src/exec.rs is missing.", "Restore exec source.")
+    required = ["AT_PHDR", "AT_PHENT", "AT_PHNUM", "AT_BASE", "AT_ENTRY", "AT_PAGESZ", "AT_RANDOM", "AT_EXECFN"]
+    missing = [t for t in required if t not in ex]
+    has_envp = any(t in ex for t in ["envp", "environment", "env"])
+    has_multi_argv = regex(ex, r"argv[^0-9A-Za-z_]|args|Vec<.*argv")
+    if not has_envp:
+        missing.append("envp layout")
+    if not has_multi_argv:
+        missing.append("full argv layout")
+    if not missing:
+        return Check(
+            "initial stack and auxv",
+            "PASS",
+            "exec stack appears to carry the auxv and argv/envp surface needed by a dynamic loader.",
+            "Add runtime asserts for stack alignment and auxv values in the musl smoke program.",
+        )
+    return Check(
+        "initial stack and auxv",
+        "FAIL",
+        "Initial user stack is not yet sufficient for musl ldso: " + ", ".join(missing),
+        "Build a Linux-like stack: argc, argv[], NULL, envp[], NULL, auxv[], strings, AT_RANDOM, and 16-byte alignment.",
+    )
+
+
+def check_ext4_vfs() -> Check:
+    fs = read("kernel/src/fs/mod.rs") + "\n" + read("kernel/src/fs/ext4.rs") + "\n" + read("kernel/src/fs/lwext4.rs")
+    cargo = read("kernel/Cargo.toml") + "\n" + read("Cargo.toml")
+    if not fs.strip():
+        return Check("ext4 VFS integration", "FAIL", "kernel fs source is missing.", "Restore kernel fs source.")
+    has_magic_gate = "verify_ext4_superblock" in fs or "0xef53" in fs
+    has_lwext4 = "lwext4" in fs.lower() or "lwext4" in cargo.lower()
+    has_native_ext4 = all(t in ext4 for t in ["Ext4Inode", "Ext4File", "Ext4FileSystem", "load_root_snapshot"])
+    has_inode_ops = any(t in fs for t in ["Ext4Inode", "Ext4File", "Ext4FileSystem", "lwext4_open", "lwext4_dir"])
+    has_vfs_handoff = "install_ext4_snapshot" in fs and "read_only: AtomicBool" in fs and "Errno::Erofs" in fs
+    if (has_lwext4 and has_inode_ops) or (has_native_ext4 and has_vfs_handoff):
+        return Check(
+            "ext4 VFS integration",
+            "PASS",
+            "The tree contains an ext4-backed inode/file layer and VFS handoff rather than only a mount probe.",
+            "Gate it with read/getdents/stat tests now; add persistent write/link/symlink/rename/fsync gates in M15-B.",
+        )
+    if has_magic_gate:
+        return Check(
+            "ext4 VFS integration",
+            "FAIL",
+            "ext4 still looks like a superblock-probe mount gate, not a persistent VFS implementation.",
+            "Wire virtio-blk -> lwext4 blockdev -> ext4 super/inode/dentry/file ops; then run persistent rootfs smoke.",
+        )
+    return Check(
+        "ext4 VFS integration",
+        "WARN",
+        "Could not identify ext4/lwext4 integration clearly.",
+        "Ensure ext4 mounts create real VFS nodes and do not bypass block/cache/locking layers.",
+    )
+
+
+def check_block_io_shape() -> Check:
+    text = "\n".join(read(p) for p in ["kernel/src/block.rs", "kernel/src/device/virtio_blk.rs", "kernel/src/drivers/virtio_blk.rs", "kernel/src/virtio_blk.rs"])
+    if not text.strip():
+        return Check("block IO shape", "WARN", "No obvious block/virtio-blk source files found by this audit.", "Keep block code discoverable or extend this audit with the actual paths.")
+    concerns = []
+    if not any(t in text.lower() for t in ["dma", "dma32", "phys_to_dma", "dma_addr"]):
+        concerns.append("DMA address/mask surface")
+    if not any(t in text.lower() for t in ["barrier", "fence", "ordering", "volatile"]):
+        concerns.append("MMIO/DMA ordering markers")
+    if not any(t in text.lower() for t in ["queue", "request", "bio", "submit"]):
+        concerns.append("request queue abstraction")
+    if concerns:
+        return Check(
+            "block IO shape",
+            "WARN",
+            "Block layer may be too QEMU-happy for real hardware: " + ", ".join(concerns),
+            "Keep a Linux-like split: request queue, DMA mapping, cache coherency/barriers, IRQ completion, bounded cache/writeback.",
+        )
+    return Check("block IO shape", "PASS", "Block source exposes queue/DMA/ordering concepts.", "Add SMP and low-memory stress gates.")
+
+
+def check_busybox_artifact() -> Check:
+    script = Path("scripts/build-static-busybox-initramfs.sh")
+    candidates = [Path("build/initramfs/busybox.cpio"), Path("build/busybox.cpio"), Path("initramfs/busybox.cpio")]
+    if any(p.exists() for p in candidates):
+        return Check("real BusyBox initramfs artifact", "PASS", "A BusyBox initramfs artifact exists in the tree/build output.", "Boot it in both arch QEMU smoke before closing M14.")
+    if script.exists():
+        return Check("real BusyBox initramfs artifact", "WARN", "Builder script exists, but no generated BusyBox cpio was found.", "Run `make busybox-initramfs BUSYBOX=/path/to/static/busybox` and boot it in smoke.")
+    return Check("real BusyBox initramfs artifact", "FAIL", "No static BusyBox initramfs artifact or builder was found.", "Add a reproducible builder and require QEMU smoke of real BusyBox applets.")
+
+
+def check_poll_signal_surface() -> Check:
+    user = read("kernel/src/user.rs")
+    syscall = read("kernel/src/syscall.rs")
+    concerns = []
+    if "SYS_PPOLL" not in syscall or "SYS_PPOLL" not in user:
+        concerns.append("ppoll dispatch missing")
+    if "SYS_PSELECT6" not in syscall or "SYS_PSELECT6" not in user:
+        concerns.append("pselect6 dispatch missing")
+    if "SYS_PSELECT6 => sys_pselect6(arguments[0], arguments[4])" in user.replace("\n", " "):
+        concerns.append("pselect6 ignores fdset arguments")
+    for token in ["siginfo", "ucontext", "sigaltstack", "restart"]:
+        if token not in user.lower():
+            concerns.append(token + " signal semantics")
+    if concerns:
+        return Check(
+            "poll/select/signal musl surface",
+            "WARN",
+            "Likely still minimal around: " + ", ".join(concerns),
+            "Before claiming full M14/musl compatibility, test fd readiness, timeout mutation rules, signal masks, rt_sigreturn, altstack, and restartable syscalls.",
+        )
+    return Check("poll/select/signal musl surface", "PASS", "Poll/select/signal keywords are present.", "Back with user-mode behavioral tests.")
+
+
+def check_makefile_gate() -> Check:
+    mk = read("Makefile")
+    if "m16-preflight:" in mk and "verify-m16-pre" in mk:
+        return Check("makefile convergence gates", "PASS", "Makefile has m16-preflight and verify-m16-pre targets.", "Keep these separate from fast verify until M15/M16 blockers pass.")
+    return Check("makefile convergence gates", "WARN", "Makefile does not expose m16-preflight/verify-m16-pre targets.", "Run the installer again or add those targets manually.")
+
+
+def run() -> list[Check]:
+    return [
+        check_docs(),
+        check_makefile_gate(),
+        check_elf_dynamic(),
+        check_exec_auxv(),
+        check_ext4_vfs(),
+        check_block_io_shape(),
+        check_busybox_artifact(),
+        check_poll_signal_surface(),
+    ]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    ap.add_argument("--no-fail", action="store_true", help="always exit 0; useful for exploratory local audits")
+    args = ap.parse_args()
+
+    checks = run()
+    if args.json:
+        print(json.dumps([asdict(c) for c in checks], indent=2, ensure_ascii=False))
+    else:
+        width = max(len(c.name) for c in checks)
+        for c in checks:
+            print(f"[{c.status:4}] {c.name:<{width}}  {c.detail}")
+            print(f"       fix: {c.fix}")
+        counts = {s: sum(1 for c in checks if c.status == s) for s in ["PASS", "WARN", "FAIL"]}
+        print(f"\nM16-preflight summary: PASS={counts['PASS']} WARN={counts['WARN']} FAIL={counts['FAIL']}")
+        if counts["FAIL"]:
+            print("This is intentional: do not mark M15/M16 complete until the failed global gates are real implementations and pass QEMU smoke/stress.")
+    return 0 if args.no_fail or all(c.status != "FAIL" for c in checks) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

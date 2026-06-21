@@ -1,0 +1,15 @@
+[package]
+name = "myos-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+myos-sync = { path = "../sync" }
+
+[lints]
+workspace = true

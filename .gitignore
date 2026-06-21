@@ -1,0 +1,41 @@
+# Rust / kernel build output
+/build/
+/target/
+**/target/
+
+# Runtime logs and crash artifacts
+*.log
+*.pid
+*.core
+core
+
+# Rust build config (generated from cargo-dot during build)
+.cargo/
+
+# Competition build artifacts
+/kernel-rv
+/kernel-la
+/*.img
+
+# Editor / IDE state
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS metadata
+.DS_Store
+._*
+__MACOSX/
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
+# Python generated cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+__pycache__/
