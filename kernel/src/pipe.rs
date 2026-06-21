@@ -8,7 +8,7 @@ use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::task::WaitQueue;
 
-const PIPE_LOCK: LockClass = LockClass::new("pipe.state", LockRank::Vfs, 2);
+const PIPE_LOCK: LockClass = LockClass::new("pipe.state", LockRank::WorkQueue, 3);
 const PIPE_CAPACITY: usize = 4096;
 
 struct Pipe {
@@ -57,10 +57,7 @@ impl Pipe {
                     return Err(Errno::Eagain);
                 }
                 drop(state);
-                let _ = crate::task::block_current_on_if_from_user_trap(&self.read_wait, || {
-                    let state = self.state.lock();
-                    state.len == 0 && state.writers != 0
-                });
+                let _ = crate::task::block_current_on_if_from_user_trap(&self.read_wait, || true);
                 continue;
             }
 
@@ -102,10 +99,7 @@ impl Pipe {
                     return Err(Errno::Eagain);
                 }
                 drop(state);
-                let _ = crate::task::block_current_on_if_from_user_trap(&self.write_wait, || {
-                    let state = self.state.lock();
-                    state.len == PIPE_CAPACITY && state.readers != 0
-                });
+                let _ = crate::task::block_current_on_if_from_user_trap(&self.write_wait, || true);
                 continue;
             }
 

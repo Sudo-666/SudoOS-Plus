@@ -25,6 +25,9 @@ pub mod number {
     pub const LSEEK: usize = 62;
     pub const READ: usize = 63;
     pub const WRITE: usize = 64;
+    pub const READV: usize = 65;
+    pub const WRITEV: usize = 66;
+    pub const PREAD64: usize = 67;
     pub const PSELECT6: usize = 72;
     pub const PPOLL: usize = 73;
     pub const READLINKAT: usize = 78;
@@ -46,9 +49,11 @@ pub mod number {
     pub const RT_SIGACTION: usize = 134;
     pub const RT_SIGPROCMASK: usize = 135;
     pub const RT_SIGRETURN: usize = 139;
+    pub const TIMES: usize = 153;
     pub const GETPGID: usize = 155;
     pub const GETSID: usize = 156;
     pub const UNAME: usize = 160;
+    pub const GETTIMEOFDAY: usize = 169;
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
     pub const GETUID: usize = 174;
@@ -66,6 +71,7 @@ pub mod number {
     pub const WAIT4: usize = 260;
     pub const PRLIMIT64: usize = 261;
     pub const GETRANDOM: usize = 278;
+    pub const STATX: usize = 291;
     pub const FTRUNCATE: usize = 46;
 }
 

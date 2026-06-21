@@ -25,9 +25,15 @@ for token in ["AT_PHDR", "AT_PHENT", "AT_PHNUM", "AT_BASE", "AT_RANDOM", "AT_EXE
     check(f"exec stack {token}", token in exec_rs, f"kernel/src/exec.rs should build Linux-like stack surface for {token}")
 
 check(
-    "dynamic fail-closed",
-    "DynamicInterpreterUnsupported" in exec_rs and "elf.interpreter.is_some() || elf.dynamic.is_some()" in exec_rs,
-    "M16-A must not jump into dynamic binaries before PT_INTERP/relocations/TLS exist",
+    "PT_INTERP fail-closed",
+    "DynamicInterpreterUnsupported" in exec_rs and "elf.interpreter.is_some()" in exec_rs,
+    "M16-A must not jump into interpreter-backed dynamic binaries before PT_INTERP/TLS/RELRO exist",
+)
+
+check(
+    "static PIE relative relocations",
+    all(token in exec_rs for token in ["apply_static_pie_relocations", "DT_RELA", "R_RELATIVE"]),
+    "M16-A should relocate no-interpreter static PIE binaries such as vendor BusyBox",
 )
 
 failures = 0

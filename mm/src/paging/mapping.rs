@@ -26,6 +26,10 @@ impl PagePermissions {
         Self(Self::READ.0 | Self::EXECUTE.0)
     }
 
+    pub const fn read_write_execute() -> Self {
+        Self(Self::READ.0 | Self::WRITE.0 | Self::EXECUTE.0)
+    }
+
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -145,7 +149,7 @@ impl MappingOptions {
             return Err(MappingOptionsError::UserGlobalMapping);
         }
 
-        if self.permissions.is_writable() && self.permissions.is_executable() {
+        if !self.user && self.permissions.is_writable() && self.permissions.is_executable() {
             return Err(MappingOptionsError::WritableExecutableMapping);
         }
 

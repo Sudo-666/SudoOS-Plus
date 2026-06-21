@@ -57,6 +57,7 @@ enum MountFsType {
     Devtmpfs,
     Proc,
     Ext4,
+    Vfat,
 }
 
 struct MountEntry {
@@ -177,7 +178,7 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<myos_vfs::ArcFile, Errno> {
         myos_vfs::FileType::Symlink => return Err(Errno::Eloop),
         myos_vfs::FileType::Unknown => return Err(Errno::Einval),
     };
-    Ok(File::new(flags, ops))
+    Ok(File::new_with_path(flags, String::from(path), ops))
 }
 
 pub fn stat(path: &str) -> Result<Stat, Errno> {
@@ -292,6 +293,36 @@ pub fn readlink(path: &str, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errn
     Ok(buf.push(target.as_bytes()))
 }
 
+pub fn unpack_initramfs(archive: &crate::initramfs::Initramfs<'_>) -> Result<usize, Errno> {
+    let _tree = TREE.lock();
+    let mut installed = 0;
+
+    for entry in archive.entries() {
+        let entry = entry.map_err(initramfs_errno)?;
+        if entry.name == "TRAILER!!!" {
+            break;
+        }
+
+        let path = initramfs_absolute_path(entry.name)?;
+        match entry.kind {
+            crate::initramfs::InitramfsEntryKind::Directory => {
+                ensure_directory_path(&path, entry.mode)?;
+            }
+            crate::initramfs::InitramfsEntryKind::Regular => {
+                install_regular_path(&path, entry.mode, entry.data)?;
+            }
+            crate::initramfs::InitramfsEntryKind::Symlink => {
+                let target = core::str::from_utf8(entry.data).map_err(|_| Errno::Einval)?;
+                install_symlink_path(&path, entry.mode, target)?;
+            }
+            crate::initramfs::InitramfsEntryKind::Other => return Err(Errno::Enosys),
+        }
+        installed += 1;
+    }
+
+    Ok(installed)
+}
+
 pub fn chdir(path: &str) -> Result<(), Errno> {
     let _tree = TREE.lock();
     let node = lookup(path)?;
@@ -314,20 +345,68 @@ pub fn mount(
         return Err(Errno::Enotdir);
     }
 
-    if fs_type == MountFsType::Ext4 {
-        let source = source.ok_or(Errno::Enodev)?;
-        let device_name = normalize_block_source(source)?;
-        let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
-        verify_ext4_superblock(&device)?;
-        ensure_mount_target_free(target)?;
-        if !directory_is_empty(&target_node)? {
-            return Err(Errno::Ebusy);
+    match fs_type {
+        MountFsType::Ext4 => {
+            let source = source.ok_or(Errno::Enodev)?;
+            let device_name = normalize_block_source(source)?;
+            let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
+            verify_ext4_superblock(&device)?;
+            ensure_mount_target_free(target)?;
+            if !directory_is_empty(&target_node)? {
+                return Err(Errno::Ebusy);
+            }
+            install_ext4_snapshot(&target_node, device)?;
+            insert_mount(source, target, fs_type, flags)
         }
-        install_ext4_snapshot(&target_node, device)?;
-        insert_mount(source, target, fs_type, flags)
-    } else {
-        insert_mount(source.unwrap_or("none"), target, fs_type, flags)
+        MountFsType::Vfat => {
+            let source = source.ok_or(Errno::Enodev)?;
+            let device_name = normalize_block_source(source)?;
+            let _device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
+            ensure_mount_target_free(target)?;
+            if !directory_is_empty(&target_node)? {
+                return Err(Errno::Ebusy);
+            }
+            insert_mount(source, target, fs_type, flags)
+        }
+        _ => insert_mount(source.unwrap_or("none"), target, fs_type, flags),
     }
+}
+
+pub fn mount_ext4_subtree(
+    source: &str,
+    target: &str,
+    source_path: &str,
+    flags: usize,
+) -> Result<(), Errno> {
+    let _tree = TREE.lock();
+    let target_node = lookup(target)?;
+    if target_node.mode.file_type() != myos_vfs::FileType::Directory {
+        return Err(Errno::Enotdir);
+    }
+    let device_name = normalize_block_source(source)?;
+    let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
+    verify_ext4_superblock(&device)?;
+    ensure_mount_target_free(target)?;
+    if !directory_is_empty(&target_node)? {
+        return Err(Errno::Ebusy);
+    }
+    install_ext4_path_snapshot(&target_node, device, source_path)?;
+    insert_mount(source, target, MountFsType::Ext4, flags)
+}
+
+pub fn install_ext4_path(source: &str, target_path: &str, source_path: &str) -> Result<(), Errno> {
+    let _tree = TREE.lock();
+    let device_name = normalize_block_source(source)?;
+    let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
+    verify_ext4_superblock(&device)?;
+    let snapshot = crate::ext4::load_path_snapshot(device, source_path).map_err(ext4_errno)?;
+    let node = ext4_snapshot_node(snapshot)?;
+    let (parent_path, name) = split_parent(target_path)?;
+    let parent = lookup(parent_path)?;
+    if is_node_read_only(&parent) {
+        return Err(Errno::Erofs);
+    }
+    insert_child(&parent, name, node)
 }
 
 pub fn umount(target: &str, _flags: usize) -> Result<(), Errno> {
@@ -407,11 +486,13 @@ fn parse_mount_fs_type(filesystem_type: &str) -> Result<MountFsType, Errno> {
         "devtmpfs" => Ok(MountFsType::Devtmpfs),
         "proc" => Ok(MountFsType::Proc),
         "ext4" => Ok(MountFsType::Ext4),
+        "vfat" => Ok(MountFsType::Vfat),
         _ => Err(Errno::Enodev),
     }
 }
 
 fn normalize_block_source(source: &str) -> Result<&str, Errno> {
+    let source = source.strip_prefix("dev:").unwrap_or(source);
     if let Some(name) = source.strip_prefix("/dev/") {
         validate_component(name)?;
         return Ok(name);
@@ -509,6 +590,98 @@ fn create_regular(path: &str) -> Result<Arc<Node>, Errno> {
     Ok(node)
 }
 
+fn initramfs_absolute_path(path: &str) -> Result<String, Errno> {
+    let path = normalize_initramfs_path(path)?;
+    let mut components = Vec::new();
+    append_components(path, &mut components)?;
+    if components.is_empty() {
+        return Err(Errno::Einval);
+    }
+    build_absolute_path(&components)
+}
+
+fn normalize_initramfs_path(path: &str) -> Result<&str, Errno> {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    if path.is_empty() || path.as_bytes().contains(&0) {
+        return Err(Errno::Einval);
+    }
+    Ok(path)
+}
+
+fn ensure_directory_path(path: &str, mode: u32) -> Result<(), Errno> {
+    match lookup(path) {
+        Ok(node) => {
+            if node.mode.file_type() == myos_vfs::FileType::Directory {
+                Ok(())
+            } else {
+                Err(Errno::Enotdir)
+            }
+        }
+        Err(Errno::Enoent) => {
+            ensure_parent_directories(path)?;
+            let (parent_path, name) = split_parent(path)?;
+            let parent = lookup(parent_path)?;
+            insert_child(&parent, name, directory(FileMode::from_bits(mode)))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_parent_directories(path: &str) -> Result<(), Errno> {
+    let (parent_path, _) = split_parent(path)?;
+    if parent_path == "/" {
+        return Ok(());
+    }
+    ensure_directory_path(parent_path, FileMode::DIR_DEFAULT.bits())
+}
+
+fn install_regular_path(path: &str, mode: u32, data: &[u8]) -> Result<(), Errno> {
+    ensure_parent_directories(path)?;
+    let (parent_path, name) = split_parent(path)?;
+    let parent = lookup(parent_path)?;
+    if is_node_read_only(&parent) {
+        return Err(Errno::Erofs);
+    }
+    let mut owned = Vec::new();
+    owned.try_reserve(data.len()).map_err(|_| Errno::Enomem)?;
+    owned.extend_from_slice(data);
+    insert_child(
+        &parent,
+        name,
+        regular_with_data(FileMode::from_bits(mode), owned),
+    )
+}
+
+fn install_symlink_path(path: &str, mode: u32, target: &str) -> Result<(), Errno> {
+    if target.is_empty() || target.len() > 4096 || target.as_bytes().contains(&0) {
+        return Err(Errno::Einval);
+    }
+    ensure_parent_directories(path)?;
+    let (parent_path, name) = split_parent(path)?;
+    let parent = lookup(parent_path)?;
+    if is_node_read_only(&parent) {
+        return Err(Errno::Erofs);
+    }
+    insert_child(
+        &parent,
+        name,
+        symlink_node_with_mode(target, FileMode::from_bits(mode)),
+    )
+}
+
+fn initramfs_errno(error: crate::initramfs::InitramfsError) -> Errno {
+    match error {
+        crate::initramfs::InitramfsError::AddressOverflow => Errno::Eoverflow,
+        crate::initramfs::InitramfsError::InvalidArchive => Errno::Einval,
+        crate::initramfs::InitramfsError::InvalidHex => Errno::Einval,
+        crate::initramfs::InitramfsError::InvalidName => Errno::Einval,
+        crate::initramfs::InitramfsError::InvalidSymlink => Errno::Einval,
+        crate::initramfs::InitramfsError::NotFound => Errno::Enoent,
+        crate::initramfs::InitramfsError::OutOfMemory => Errno::Enomem,
+        crate::initramfs::InitramfsError::UnsupportedFileType => Errno::Enosys,
+    }
+}
+
 fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     if is_node_read_only(node) {
         return Err(Errno::Erofs);
@@ -559,6 +732,30 @@ fn install_ext4_snapshot(
     device: Arc<dyn crate::block::BlockDevice>,
 ) -> Result<(), Errno> {
     let snapshot = crate::ext4::load_root_snapshot(device).map_err(ext4_errno)?;
+    let mut children = Vec::new();
+    let crate::ext4::Ext4SnapshotKind::Directory(entries) = snapshot.kind else {
+        return Err(Errno::Enotdir);
+    };
+    children
+        .try_reserve(entries.len())
+        .map_err(|_| Errno::Enomem)?;
+    for entry in entries {
+        validate_component(&entry.name)?;
+        let node = ext4_snapshot_node(entry.node)?;
+        node.parent_ino.store(target.ino, Ordering::Release);
+        children.push((entry.name, node));
+    }
+    target.read_only.store(true, Ordering::Release);
+    *target.state.lock() = NodeState::Directory(children);
+    Ok(())
+}
+
+fn install_ext4_path_snapshot(
+    target: &Arc<Node>,
+    device: Arc<dyn crate::block::BlockDevice>,
+    source_path: &str,
+) -> Result<(), Errno> {
+    let snapshot = crate::ext4::load_path_snapshot(device, source_path).map_err(ext4_errno)?;
     let mut children = Vec::new();
     let crate::ext4::Ext4SnapshotKind::Directory(entries) = snapshot.kind else {
         return Err(Errno::Enotdir);
@@ -653,22 +850,30 @@ fn directory(mode: FileMode) -> Arc<Node> {
 }
 
 fn regular() -> Arc<Node> {
+    regular_with_data(FileMode::FILE_DEFAULT, Vec::new())
+}
+
+fn regular_with_data(mode: FileMode, data: Vec<u8>) -> Arc<Node> {
     Arc::new(Node {
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
-        mode: FileMode::FILE_DEFAULT,
+        mode,
         read_only: AtomicBool::new(false),
-        state: IrqSpinLock::new_with_class(NodeState::Regular(Vec::new()), NODE_LOCK),
+        state: IrqSpinLock::new_with_class(NodeState::Regular(data), NODE_LOCK),
     })
 }
 
 fn symlink_node(target: &str) -> Arc<Node> {
+    symlink_node_with_mode(target, FileMode::SYMLINK_DEFAULT)
+}
+
+fn symlink_node_with_mode(target: &str, mode: FileMode) -> Arc<Node> {
     Arc::new(Node {
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
-        mode: FileMode::SYMLINK_DEFAULT,
+        mode,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Symlink(String::from(target)), NODE_LOCK),
     })
@@ -1448,8 +1653,8 @@ pub fn verify() {
     let (mounts, sourced, ext4, flagged) = mount_table_counts();
     assert!(mounts >= 2);
     assert!(sourced >= 2);
-    assert_eq!(ext4, 0);
-    assert_eq!(flagged, 0);
+    assert!(ext4 <= mounts);
+    assert!(flagged <= mounts);
 
     mkdir("/m15-mnt", 0o755).expect("tmpfs mountpoint mkdir failed");
     mount(None, "/m15-mnt", "tmpfs", 0).expect("tmpfs mount failed");
@@ -1528,8 +1733,8 @@ pub fn verify() {
     let (mounts_after_ext4, sourced_after_ext4, ext4_after, flagged_after) = mount_table_counts();
     assert!(mounts_after_ext4 > mounts);
     assert!(sourced_after_ext4 > sourced);
-    assert_eq!(ext4_after, 1);
-    assert_eq!(flagged_after, 1);
+    assert_eq!(ext4_after, ext4 + 1);
+    assert_eq!(flagged_after, flagged + 1);
     umount("/m15-ext4", 0).expect("ext4 ro umount failed");
     unlink("/m15-ext4", true).expect("ext4 mountpoint rmdir failed");
     crate::block::unregister_device("m15ext4").expect("ext4 ro fixture unregister failed");

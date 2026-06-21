@@ -473,9 +473,10 @@ false、mount、dmesg、ps。不要一开始启用所有网络工具。
 
 当前 M14 已完成其中的大部分基础 ABI，并额外补上 `symlinkat`、`linkat`、
 `readlinkat` 的 symlink 语义、`ppoll`、uid/gid/gettid、`faccessat`、`prlimit64`
-和 `sysinfo`。基础用户 handler delivery/`rt_sigreturn` 已由双架构 smoke 覆盖；仍需
-用真实静态 BusyBox initramfs 跑 applet 级 smoke，并补齐 `siginfo`/`ucontext`、
-altstack、syscall restart 等高级 signal 语义。
+和 `sysinfo`。基础用户 handler delivery/`rt_sigreturn` 已由双架构 smoke 覆盖；
+RISC-V 外部 vendor BusyBox initramfs 已能解包并执行 `/bin/busybox true`。后续
+仍需把 `/init` 发布为长驻用户态 init，扩大到 `sh`、`ls`、`ps` 等 applet 级
+smoke，并补齐 `siginfo`/`ucontext`、altstack、syscall restart 等高级 signal 语义。
 
 ### M15：块设备和 ext4
 
@@ -495,8 +496,10 @@ scatter-gather、IOMMU 后续支持、中断 affinity。
 
 ### M16：动态链接和 musl
 
-静态 BusyBox 通过后再做：PT_INTERP、动态链接器启动、shared object mmap、TLS、
-relocations、`mprotect` RELRO。`dlopen` 和 vDSO 可后置。
+当前已支持 `ET_DYN` metadata、Linux-like auxv、`argv/envp` 栈面，以及无
+`PT_INTERP` 的 static PIE `R_RELATIVE` 重定位。下一步是 PT_INTERP、动态链接器
+启动、shared object mmap、TLS、符号 relocations、`mprotect` RELRO。`dlopen`
+和 vDSO 可后置。
 
 ### M17：本地 Git
 

@@ -59,6 +59,68 @@ pub trait BlockDevice: Send + Sync + 'static {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockRequestOp {
+    Read,
+    Write,
+    Flush,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockRequest {
+    pub op: BlockRequestOp,
+    pub block: u64,
+    pub blocks: u32,
+}
+
+impl BlockRequest {
+    pub const fn new(op: BlockRequestOp, block: u64, blocks: u32) -> Self {
+        Self { op, block, blocks }
+    }
+}
+
+pub struct RequestQueue {
+    in_flight: Vec<BlockRequest>,
+    capacity: usize,
+}
+
+impl RequestQueue {
+    pub fn new(capacity: usize) -> Result<Self, BlockError> {
+        let mut in_flight = Vec::new();
+        in_flight
+            .try_reserve(capacity)
+            .map_err(|_| BlockError::MetadataOutOfMemory)?;
+        Ok(Self {
+            in_flight,
+            capacity,
+        })
+    }
+
+    pub fn submit(&mut self, request: BlockRequest) -> Result<(), BlockError> {
+        if request.blocks == 0 || self.in_flight.len() == self.capacity {
+            return Err(BlockError::InvalidArgument);
+        }
+        self.in_flight.push(request);
+        Ok(())
+    }
+
+    pub fn complete_next(&mut self) -> Option<BlockRequest> {
+        if self.in_flight.is_empty() {
+            None
+        } else {
+            Some(self.in_flight.remove(0))
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.in_flight.is_empty()
+    }
+}
+
 pub fn register_device(name: &str, device: Arc<dyn BlockDevice>) -> Result<(), BlockError> {
     validate_device_name(name)?;
     let mut stored_name = String::new();
@@ -505,6 +567,28 @@ pub fn verify() {
         8192,
     );
 
+    let mut queue = RequestQueue::new(2).expect("request queue allocation failed");
+    queue
+        .submit(BlockRequest::new(BlockRequestOp::Read, 2, 1))
+        .expect("request queue submit failed");
+    queue
+        .submit(BlockRequest::new(BlockRequestOp::Write, 3, 1))
+        .expect("request queue write submit failed");
+    assert_eq!(
+        queue.submit(BlockRequest::new(BlockRequestOp::Flush, 0, 1)),
+        Err(BlockError::InvalidArgument),
+    );
+    assert_eq!(queue.len(), 2);
+    assert_eq!(
+        queue.complete_next(),
+        Some(BlockRequest::new(BlockRequestOp::Read, 2, 1)),
+    );
+    assert_eq!(
+        queue.complete_next(),
+        Some(BlockRequest::new(BlockRequestOp::Write, 3, 1)),
+    );
+    assert!(queue.is_empty());
+
     let mut block = [0_u8; 512];
     block[0..8].copy_from_slice(b"blkcache");
     cache.write(2, &block).expect("buffer cache write failed");
@@ -576,6 +660,7 @@ pub fn verify() {
     crate::println!("  buffer cache         : verified");
     crate::println!("  page cache           : verified");
     crate::println!("  dirty flush          : verified");
+    crate::println!("  request queue        : verified");
     crate::println!("  byte range I/O       : verified");
     crate::println!("  block registry       : verified");
     crate::println!("  bounds checking      : verified");

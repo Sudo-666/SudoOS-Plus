@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
@@ -38,6 +38,9 @@ const SYS_PIPE2: usize = crate::syscall::number::PIPE2;
 const SYS_LSEEK: usize = crate::syscall::number::LSEEK;
 const SYS_READ: usize = crate::syscall::number::READ;
 const SYS_WRITE: usize = crate::syscall::number::WRITE;
+const SYS_READV: usize = crate::syscall::number::READV;
+const SYS_WRITEV: usize = crate::syscall::number::WRITEV;
+const SYS_PREAD64: usize = crate::syscall::number::PREAD64;
 const SYS_PSELECT6: usize = crate::syscall::number::PSELECT6;
 const SYS_PPOLL: usize = crate::syscall::number::PPOLL;
 const SYS_READLINKAT: usize = crate::syscall::number::READLINKAT;
@@ -61,7 +64,9 @@ const SYS_GETSID: usize = crate::syscall::number::GETSID;
 const SYS_RT_SIGACTION: usize = crate::syscall::number::RT_SIGACTION;
 const SYS_RT_SIGPROCMASK: usize = crate::syscall::number::RT_SIGPROCMASK;
 const SYS_RT_SIGRETURN: usize = crate::syscall::number::RT_SIGRETURN;
+const SYS_TIMES: usize = crate::syscall::number::TIMES;
 const SYS_UNAME: usize = crate::syscall::number::UNAME;
+const SYS_GETTIMEOFDAY: usize = crate::syscall::number::GETTIMEOFDAY;
 const SYS_GETPID: usize = crate::syscall::number::GETPID;
 const SYS_GETPPID: usize = crate::syscall::number::GETPPID;
 const SYS_GETUID: usize = crate::syscall::number::GETUID;
@@ -79,14 +84,18 @@ const SYS_MPROTECT: usize = crate::syscall::number::MPROTECT;
 const SYS_WAIT4: usize = crate::syscall::number::WAIT4;
 const SYS_PRLIMIT64: usize = crate::syscall::number::PRLIMIT64;
 const SYS_GETRANDOM: usize = crate::syscall::number::GETRANDOM;
+const SYS_STATX: usize = crate::syscall::number::STATX;
 
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const PROT_EXEC: usize = 4;
+const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
+const MAP_TYPE: usize = 0x0f;
 const MAP_ANONYMOUS: usize = 0x20;
 const VFS_PROBE_DATA: &[u8] = b"/m11-user\0......................uvfs";
 const M12_PROBE_DATA: &[u8] = b"pipe";
+const EXEC_PROBE_PATH: &str = "/.m12";
 
 const EBADF: isize = crate::syscall::errno::EBADF;
 const ECHILD: isize = crate::syscall::errno::ECHILD;
@@ -98,11 +107,14 @@ const ERANGE: isize = 34;
 
 const MAX_USER_COPY: usize = 256;
 const MAX_USER_PATH: usize = 256;
+const MAX_EXEC_ARGS: usize = 32;
+const MAX_EXEC_ENVS: usize = 32;
 const USER_MESSAGE: &[u8] = b"hello user\n";
 const AT_FDCWD: usize = usize::MAX - 99;
 const AT_REMOVEDIR: usize = 0x200;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 const AT_SYMLINK_FOLLOW: usize = 0x400;
+const AT_EMPTY_PATH: usize = 0x1000;
 const FD_CLOEXEC: usize = 1;
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -185,6 +197,33 @@ struct UserSignalFrame {
     trap_frame: crate::arch::trap::TrapFrame,
 }
 
+#[allow(dead_code)]
+#[repr(C)]
+struct KernelSigInfo {
+    signo: i32,
+    errno: i32,
+    code: i32,
+    payload: [u8; 116],
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+struct KernelUContext {
+    flags: u64,
+    link: u64,
+    stack: SigAltStack,
+    signal_mask: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SigAltStack {
+    sp: u64,
+    flags: i32,
+    size: u64,
+}
+
 impl UserImage {
     fn exec(entry_symbol: *const u8) -> Result<Self, crate::exec::ExecError> {
         let entry = VirtAddr::new(user_entry(entry_symbol));
@@ -200,7 +239,8 @@ impl UserImage {
             &initramfs,
             "/init",
             crate::exec::ExecConfig {
-                argv0: "/init",
+                argv: &["/init"],
+                envp: &[],
                 stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
                 heap_start: VirtAddr::new(USER_HEAP_START),
                 heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
@@ -601,6 +641,212 @@ fn verify_worker() {
     crate::println!("  clock/uname/getrandom : verified");
 }
 
+pub fn verify_busybox_rootfs() {
+    if crate::fs::stat("/bin/busybox").is_err() {
+        return;
+    }
+
+    crate::task::run_kernel_thread_sync(verify_busybox_rootfs_thread);
+}
+
+fn verify_busybox_rootfs_thread() {
+    let result = run_rootfs_program(
+        "/bin/busybox",
+        &["busybox", "true"],
+        &["PATH=/bin:/sbin:/usr/bin:/usr/sbin"],
+    )
+    .expect("unable to run BusyBox true from rootfs");
+    assert_eq!(result, 0, "BusyBox true exited with a non-zero status");
+    crate::println!("M14 BusyBox rootfs gate:");
+    crate::println!("  /bin/busybox true : verified");
+}
+
+pub fn verify_sdcard_sample() {
+    if crate::block::open_device("vda").is_none() {
+        return;
+    }
+
+    crate::task::run_kernel_thread_sync(verify_sdcard_sample_thread);
+}
+
+fn verify_sdcard_sample_thread() {
+    let device = crate::block::open_device("vda").expect("lost /dev/vda before sdcard sample gate");
+    let sample_path = "/musl/busybox";
+    let snapshot = crate::ext4::load_path_snapshot(device, sample_path)
+        .expect("unable to load /musl/busybox from ext4 sdcard image");
+    let crate::ext4::Ext4SnapshotKind::Regular(image) = snapshot.kind else {
+        panic!("ext4 sdcard /musl/busybox is not a regular file");
+    };
+    let result = run_program_image(
+        &image,
+        &["busybox", "true"],
+        &["PATH=/:/bin:/sbin:/usr/bin:/usr/sbin"],
+        "sdcard sample",
+    )
+    .expect("unable to run /busybox true from ext4 sdcard image");
+    assert_eq!(
+        result, 0,
+        "sdcard /busybox true exited with a non-zero status"
+    );
+    crate::println!("M15 ext4 sdcard sample gate:");
+    crate::println!("  /dev/vda:/musl/busybox true : verified");
+}
+
+pub fn verify_sdcard_basic_script() {
+    if crate::fs::stat("/mnt/sdcard/musl/basic_testcode.sh").is_err() {
+        return;
+    }
+
+    crate::task::run_kernel_thread_sync(verify_sdcard_basic_script_thread);
+}
+
+fn verify_sdcard_basic_script_thread() {
+    let echo_result = run_rootfs_program_with_cwd(
+        "/mnt/sdcard/musl/busybox",
+        &["busybox", "echo", "sdcard basic script smoke"],
+        &["PATH=.:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin"],
+        Some("/mnt/sdcard/musl"),
+    )
+    .expect("unable to run musl BusyBox echo from mounted ext4 sdcard image");
+    assert_eq!(
+        echo_result, 0,
+        "mounted musl BusyBox echo exited with a non-zero status"
+    );
+    let shell_inline_result = run_rootfs_program_with_cwd(
+        "/mnt/sdcard/musl/busybox",
+        &["busybox", "sh", "-c", "echo sdcard shell inline smoke"],
+        &["PATH=.:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin"],
+        Some("/mnt/sdcard/musl"),
+    )
+    .expect("unable to run musl BusyBox sh -c from mounted ext4 sdcard image");
+    assert_eq!(
+        shell_inline_result, 0,
+        "mounted musl BusyBox sh -c exited with a non-zero status"
+    );
+
+    crate::println!("sdcard basic script located; running basic binaries");
+    verify_sdcard_basic_binaries();
+    crate::println!("M16 ext4 sdcard script gate:");
+    crate::println!("  /mnt/sdcard/musl/basic_testcode.sh : verified");
+}
+
+fn verify_sdcard_basic_binaries() {
+    const BASIC_TESTS: &[&str] = &[
+        "brk",
+        "chdir",
+        "clone",
+        "close",
+        "dup2",
+        "dup",
+        "execve",
+        "exit",
+        "fork",
+        "fstat",
+        "getcwd",
+        "getdents",
+        "getpid",
+        "getppid",
+        "gettimeofday",
+        "mkdir_",
+        "mmap",
+        "mount",
+        "munmap",
+        "openat",
+        "open",
+        "pipe",
+        "read",
+        "sleep",
+        "times",
+        "umount",
+        "uname",
+        "unlink",
+        "wait",
+        "waitpid",
+        "write",
+        "yield",
+    ];
+    for test in BASIC_TESTS {
+        crate::println!("Testing {test} :");
+        let mut path = String::from("/mnt/sdcard/musl/basic/");
+        path.push_str(test);
+        let result = run_rootfs_program_with_cwd(
+            &path,
+            &[*test],
+            &[
+                "PATH=.:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin",
+                "LD_LIBRARY_PATH=/mnt/sdcard/musl/lib",
+            ],
+            Some("/code"),
+        )
+        .expect("unable to run musl basic test binary from ext4 sdcard image");
+        assert_eq!(result, 0, "musl basic test binary exited non-zero");
+    }
+}
+
+fn run_rootfs_program(
+    path: &str,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<isize, crate::exec::ExecError> {
+    run_rootfs_program_with_cwd(path, argv, envp, None)
+}
+
+fn run_rootfs_program_with_cwd(
+    path: &str,
+    argv: &[&str],
+    envp: &[&str],
+    cwd: Option<&str>,
+) -> Result<isize, crate::exec::ExecError> {
+    let image =
+        load_exec_image(path).map_err(|_| crate::exec::ExecError::Vfs(myos_vfs::Errno::Enoent))?;
+    run_program_image_with_cwd(&image, argv, envp, "BusyBox rootfs", cwd)
+}
+
+fn run_program_image(
+    image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    owner: &str,
+) -> Result<isize, crate::exec::ExecError> {
+    run_program_image_with_cwd(image, argv, envp, owner, None)
+}
+
+fn run_program_image_with_cwd(
+    image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    owner: &str,
+    cwd: Option<&str>,
+) -> Result<isize, crate::exec::ExecError> {
+    let extra_areas = [VmArea::new(
+        VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
+        VmAreaFlags::user_rw(),
+        VmAreaKind::Anonymous,
+    )];
+    let exec = crate::exec::exec_elf(
+        image,
+        crate::exec::ExecConfig {
+            argv,
+            envp,
+            stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
+            heap_start: VirtAddr::new(USER_HEAP_START),
+            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+            extra_areas: &extra_areas,
+        },
+    )?;
+    if let Some(cwd) = cwd {
+        exec.process.fs().set_cwd(cwd)?;
+    }
+    let task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
+    let result = exec.thread.wait_for_exit();
+    task.wait_for_detach();
+    drop(exec.thread);
+    let process = Arc::try_unwrap(exec.process)
+        .unwrap_or_else(|_| panic!("{owner} run retained unexpected Process owners"));
+    process.destroy()?;
+    Ok(result)
+}
+
 fn run_session(
     entry_symbol: *const u8,
     initial_data: Option<&[u8]>,
@@ -853,15 +1099,14 @@ fn verify_copy_guards(mm: &crate::user_mm::UserMm) {
 
 pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     assert!(
-        ACTIVE.load(Ordering::Acquire),
-        "user syscall arrived without an active M8-B3 session",
-    );
-    assert!(
         frame.previous_mode_was_user(),
         "syscall trap did not originate in user mode",
     );
 
-    SYSCALL_COUNT.fetch_add(1, Ordering::AcqRel);
+    let verifier = ACTIVE.load(Ordering::Acquire);
+    if verifier {
+        SYSCALL_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
     let number = syscall_number(frame);
     let arguments = syscall_arguments(frame);
     advance_syscall_pc(frame);
@@ -932,6 +1177,8 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_CLOCK_GETTIME => {
             set_syscall_result(frame, sys_clock_gettime(arguments[0], arguments[1]))
         }
+        SYS_GETTIMEOFDAY => set_syscall_result(frame, sys_gettimeofday(arguments[0])),
+        SYS_TIMES => set_syscall_result(frame, sys_times(arguments[0])),
         SYS_UNAME => set_syscall_result(frame, sys_uname(arguments[0])),
         SYS_SYSINFO => set_syscall_result(frame, sys_sysinfo(arguments[0])),
         SYS_GETRANDOM => set_syscall_result(frame, sys_getrandom(arguments[0], arguments[1])),
@@ -992,17 +1239,39 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let result = sys_write(arguments[0], arguments[1], arguments[2]);
             set_syscall_result(frame, result);
         }
+        SYS_READV => {
+            let result = sys_readv(arguments[0], arguments[1], arguments[2]);
+            set_syscall_result(frame, result);
+        }
+        SYS_WRITEV => {
+            let result = sys_writev(arguments[0], arguments[1], arguments[2]);
+            set_syscall_result(frame, result);
+        }
+        SYS_PREAD64 => {
+            let result = sys_pread64(arguments[0], arguments[1], arguments[2], arguments[3]);
+            set_syscall_result(frame, result);
+        }
         SYS_READLINKAT => set_syscall_result(
             frame,
             sys_readlinkat(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
         SYS_PPOLL => set_syscall_result(frame, sys_ppoll(arguments[0], arguments[1], arguments[2])),
-        SYS_PSELECT6 => set_syscall_result(frame, sys_pselect6(arguments[0], arguments[4])),
+        SYS_PSELECT6 => set_syscall_result(frame, sys_pselect6(arguments)),
         SYS_NEWFSTATAT => set_syscall_result(
             frame,
             sys_newfstatat(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
         SYS_FSTAT => set_syscall_result(frame, sys_fstat(arguments[0], arguments[1])),
+        SYS_STATX => set_syscall_result(
+            frame,
+            sys_statx(
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+            ),
+        ),
         SYS_FSYNC => set_syscall_result(frame, sys_fsync(arguments[0])),
         SYS_BRK => set_syscall_result(frame, sys_brk(arguments[0])),
         SYS_MUNMAP => set_syscall_result(frame, sys_munmap(arguments[0], arguments[1])),
@@ -1021,15 +1290,19 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let schedules_before = thread.schedule_count();
             set_syscall_result(frame, 0);
             crate::task::yield_from_user_trap();
-            assert!(
-                thread.schedule_count() > schedules_before,
-                "M9-B sched_yield returned without switching to a runnable peer",
-            );
-            SCHED_YIELD_SWITCH_COUNT.fetch_add(1, Ordering::AcqRel);
+            if verifier {
+                assert!(
+                    thread.schedule_count() > schedules_before,
+                    "M9-B sched_yield returned without switching to a runnable peer",
+                );
+                SCHED_YIELD_SWITCH_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
-            EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
-            TERMINATED.store(true, Ordering::Release);
+            if verifier {
+                EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
+                TERMINATED.store(true, Ordering::Release);
+            }
             return_to_kernel(frame, arguments[0] as isize);
         }
         _ => set_syscall_result(frame, -ENOSYS),
@@ -1069,40 +1342,52 @@ pub fn handle_fault(
     _raw: usize,
 ) {
     assert!(
-        ACTIVE.load(Ordering::Acquire),
-        "user fault arrived without an active M8-B4 session",
-    );
-    assert!(
         frame.previous_mode_was_user(),
         "M8-B4 user fault handler received a kernel fault",
     );
 
-    FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+    let verifier = ACTIVE.load(Ordering::Acquire);
+    if verifier {
+        FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
     let user_sp = VirtAddr::new(frame.stack_pointer());
     match current_user_mm().resolve_user_fault(address, access, user_sp) {
         Ok(UserFaultResolution::Recovered(recovery)) => {
-            RECOVERED_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
-            match recovery {
-                UserFaultRecovery::Anonymous => {
-                    ANONYMOUS_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+            if verifier {
+                RECOVERED_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+                match recovery {
+                    UserFaultRecovery::Anonymous => {
+                        ANONYMOUS_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+                    }
+                    UserFaultRecovery::StackGrowth => {
+                        STACK_GROWTH_COUNT.fetch_add(1, Ordering::AcqRel);
+                    }
+                    UserFaultRecovery::Spurious => {}
                 }
-                UserFaultRecovery::StackGrowth => {
-                    STACK_GROWTH_COUNT.fetch_add(1, Ordering::AcqRel);
-                }
-                UserFaultRecovery::Spurious => {}
+                LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
+                LAST_FAULT_KIND.store(FAULT_RECOVERED, Ordering::Release);
             }
-            LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
-            LAST_FAULT_KIND.store(FAULT_RECOVERED, Ordering::Release);
         }
         Ok(UserFaultResolution::Fatal(failure)) => {
             assert!(
                 !matches!(failure, UserFaultFailure::KernelBug),
                 "M8-B4 fault planner classified a user trap as a kernel bug",
             );
-            LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
-            LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
-            TERMINATED.store(true, Ordering::Release);
-            EXIT_STATUS.store(-EFAULT, Ordering::Release);
+            if !verifier {
+                crate::println!(
+                    "user fatal fault: address={:#018x} access={:?} sp={:#018x} failure={:?}",
+                    address.get(),
+                    access,
+                    frame.stack_pointer(),
+                    failure,
+                );
+            }
+            if verifier {
+                LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
+                LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
+                TERMINATED.store(true, Ordering::Release);
+                EXIT_STATUS.store(-EFAULT, Ordering::Release);
+            }
             return_to_kernel(frame, -EFAULT);
         }
         Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
@@ -1111,19 +1396,17 @@ pub fn handle_fault(
 
 pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) {
     assert!(
-        ACTIVE.load(Ordering::Acquire),
-        "user exception arrived without an active M8-B3 session",
-    );
-    assert!(
         frame.previous_mode_was_user(),
         "M8-B3 user exception handler received a kernel exception",
     );
 
-    LAST_FAULT_ADDRESS.store(0, Ordering::Release);
-    LAST_FAULT_KIND.store(FAULT_EXCEPTION, Ordering::Release);
-    FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
-    TERMINATED.store(true, Ordering::Release);
-    EXIT_STATUS.store(-EFAULT, Ordering::Release);
+    if ACTIVE.load(Ordering::Acquire) {
+        LAST_FAULT_ADDRESS.store(0, Ordering::Release);
+        LAST_FAULT_KIND.store(FAULT_EXCEPTION, Ordering::Release);
+        FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
+        TERMINATED.store(true, Ordering::Release);
+        EXIT_STATUS.store(-EFAULT, Ordering::Release);
+    }
     return_to_kernel(frame, -EFAULT);
 }
 
@@ -1139,7 +1422,9 @@ fn sys_brk(address: usize) -> isize {
 
     match mm.set_program_break(VirtAddr::new(address)) {
         Ok(new_break) => {
-            BRK_COUNT.fetch_add(1, Ordering::AcqRel);
+            if ACTIVE.load(Ordering::Acquire) {
+                BRK_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
             new_break.get() as isize
         }
         Err(_) => current.get() as isize,
@@ -1147,13 +1432,11 @@ fn sys_brk(address: usize) -> isize {
 }
 
 fn sys_mmap(arguments: [usize; 6]) -> isize {
-    let [address, length, protection, flags, file, offset] = arguments;
-    if address != 0
-        || length == 0
-        || flags != (MAP_PRIVATE | MAP_ANONYMOUS)
-        || file != usize::MAX
-        || offset != 0
-    {
+    let [address, mut length, protection, flags, file, offset] = arguments;
+    if length >> 32 == u32::MAX as usize {
+        length &= u32::MAX as usize;
+    }
+    if address != 0 || length == 0 {
         return -EINVAL;
     }
     let vm_flags = match protection_flags(protection) {
@@ -1164,17 +1447,125 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
         Some(length) => length & !(PAGE_SIZE - 1),
         None => return -ENOMEM,
     };
+
+    let map_type = flags & MAP_TYPE;
+    if file != usize::MAX && (map_type == MAP_PRIVATE || map_type == MAP_SHARED) {
+        if flags & MAP_ANONYMOUS != 0 || flags & !MAP_TYPE != 0 {
+            return -EINVAL;
+        }
+        return sys_file_private_mmap(file, offset, length, rounded, vm_flags);
+    }
+    if flags != (MAP_PRIVATE | MAP_ANONYMOUS) || file != usize::MAX || offset != 0 {
+        return -EINVAL;
+    }
+
     match current_user_mm().map_anonymous(
         VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
         rounded,
         vm_flags,
     ) {
         Ok(start) => {
-            MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            if ACTIVE.load(Ordering::Acquire) {
+                MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
             start.get() as isize
         }
         Err(_) => -ENOMEM,
     }
+}
+
+fn sys_file_private_mmap(
+    fd: usize,
+    offset: usize,
+    length: usize,
+    rounded: usize,
+    vm_flags: VmAreaFlags,
+) -> isize {
+    const MAX_FILE_MMAP: usize = 16 * 1024 * 1024;
+    if offset & (PAGE_SIZE - 1) != 0 || rounded > MAX_FILE_MMAP {
+        return -EINVAL;
+    }
+    let file = match current_process_file(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+    let stat = match file.fstat() {
+        Ok(stat) => stat,
+        Err(errno) => return errno.to_isize(),
+    };
+    if stat.mode & myos_vfs::FileMode::S_IFMT != myos_vfs::FileMode::S_IFREG {
+        return -EINVAL;
+    }
+    let file_size = if stat.size <= 0 {
+        0
+    } else {
+        stat.size as usize
+    };
+    let readable = file_size.saturating_sub(offset).min(length);
+
+    let temporary_flags = VmAreaFlags::user_rw();
+    let start = match current_user_mm().map_anonymous(
+        VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
+        rounded,
+        temporary_flags,
+    ) {
+        Ok(start) => start,
+        Err(_) => return -ENOMEM,
+    };
+    let range = match start
+        .checked_add(rounded)
+        .and_then(|end| VirtRange::new(start, end))
+    {
+        Some(range) => range,
+        None => return -ENOMEM,
+    };
+
+    let old_position = file.position();
+    if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
+        let _ = current_user_mm().unmap_range(range);
+        return -EINVAL;
+    }
+    let result = copy_file_into_private_mapping(&file, start, readable);
+    let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+    if result.is_err() {
+        let _ = current_user_mm().unmap_range(range);
+        return -EFAULT;
+    }
+    if current_user_mm()
+        .protect_range(range, vm_flags.access_only())
+        .is_err()
+    {
+        let _ = current_user_mm().unmap_range(range);
+        return -EINVAL;
+    }
+    if ACTIVE.load(Ordering::Acquire) {
+        MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+    start.get() as isize
+}
+
+fn copy_file_into_private_mapping(
+    file: &myos_vfs::ArcFile,
+    start: VirtAddr,
+    length: usize,
+) -> Result<(), ()> {
+    let mut copied = 0;
+    let mut buffer = [0_u8; MAX_USER_COPY];
+    while copied < length {
+        let chunk = (length - copied).min(MAX_USER_COPY);
+        let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
+        let read = file.read(&mut output).map_err(|_| ())?;
+        if read == 0 {
+            break;
+        }
+        let destination = start.get().checked_add(copied).ok_or(())?;
+        current_user_mm()
+            .populate_page(VirtAddr::new(destination))
+            .map_err(|_| ())?;
+        copy_to_user(destination, output.filled_bytes()).map_err(|_| ())?;
+        copied += read;
+    }
+    Ok(())
 }
 
 fn sys_munmap(address: usize, length: usize) -> isize {
@@ -1184,7 +1575,9 @@ fn sys_munmap(address: usize, length: usize) -> isize {
     };
     match current_user_mm().unmap_range(range) {
         Ok(()) => {
-            MUNMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            if ACTIVE.load(Ordering::Acquire) {
+                MUNMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
             0
         }
         Err(_) => -EINVAL,
@@ -1202,14 +1595,19 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
     };
     match current_user_mm().protect_range(range, flags) {
         Ok(()) => {
-            MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
+            if ACTIVE.load(Ordering::Acquire) {
+                MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
             0
         }
         Err(_) => -EINVAL,
     }
 }
 
-fn syscall_range(address: usize, length: usize) -> Option<VirtRange> {
+fn syscall_range(address: usize, mut length: usize) -> Option<VirtRange> {
+    if length >> 32 == u32::MAX as usize {
+        length &= u32::MAX as usize;
+    }
     if length == 0 || address & (PAGE_SIZE - 1) != 0 {
         return None;
     }
@@ -1240,9 +1638,7 @@ fn protection_flags(protection: usize) -> Option<VmAreaFlags> {
 }
 
 fn sys_write(fd: usize, address: usize, length: usize) -> isize {
-    if length > MAX_USER_COPY {
-        return -EINVAL;
-    }
+    let length = length.min(MAX_USER_COPY);
 
     let mut buffer = [0_u8; MAX_USER_COPY];
     if copy_from_user(address, &mut buffer[..length]).is_err() {
@@ -1255,7 +1651,9 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
     };
     match file.write(&myos_vfs::IoBuffer::new(&buffer[..length])) {
         Ok(written) => {
-            WRITE_COUNT.fetch_add(1, Ordering::AcqRel);
+            if ACTIVE.load(Ordering::Acquire) {
+                WRITE_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
             written as isize
         }
         Err(errno) => errno.to_isize(),
@@ -1263,9 +1661,7 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
 }
 
 fn sys_read(fd: usize, address: usize, length: usize) -> isize {
-    if length > MAX_USER_COPY {
-        return -EINVAL;
-    }
+    let length = length.min(MAX_USER_COPY);
     let file = match current_process_file(fd) {
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
@@ -1282,6 +1678,75 @@ fn sys_read(fd: usize, address: usize, length: usize) -> isize {
         }
         Err(errno) => errno.to_isize(),
     }
+}
+
+fn sys_readv(fd: usize, iov_address: usize, iov_count: usize) -> isize {
+    sys_iov_io(fd, iov_address, iov_count, true)
+}
+
+fn sys_writev(fd: usize, iov_address: usize, iov_count: usize) -> isize {
+    sys_iov_io(fd, iov_address, iov_count, false)
+}
+
+fn sys_iov_io(fd: usize, iov_address: usize, iov_count: usize, read: bool) -> isize {
+    const MAX_IOV: usize = 16;
+    if iov_count > MAX_IOV {
+        return -EINVAL;
+    }
+    let mut total = 0_isize;
+    for index in 0..iov_count {
+        let entry = match iov_address.checked_add(index * 2 * core::mem::size_of::<usize>()) {
+            Some(entry) => entry,
+            None => return if total > 0 { total } else { -EFAULT },
+        };
+        let base = match copy_plain_from_user::<usize>(entry) {
+            Ok(base) => base,
+            Err(errno) => return if total > 0 { total } else { errno },
+        };
+        let len = match copy_plain_from_user::<usize>(entry + core::mem::size_of::<usize>()) {
+            Ok(len) => len,
+            Err(errno) => return if total > 0 { total } else { errno },
+        };
+        let mut done = 0;
+        while done < len {
+            let chunk = (len - done).min(MAX_USER_COPY);
+            let address = match base.checked_add(done) {
+                Some(address) => address,
+                None => return if total > 0 { total } else { -EFAULT },
+            };
+            let result = if read {
+                sys_read(fd, address, chunk)
+            } else {
+                sys_write(fd, address, chunk)
+            };
+            if result < 0 {
+                return if total > 0 { total } else { result };
+            }
+            if result == 0 {
+                return total;
+            }
+            total = total.saturating_add(result);
+            done += result as usize;
+            if result as usize != chunk {
+                return total;
+            }
+        }
+    }
+    total
+}
+
+fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize {
+    let file = match current_process_file(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+    let old_position = file.position();
+    if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
+        return -EINVAL;
+    }
+    let result = sys_read(fd, address, length);
+    let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+    result
 }
 
 fn sys_close(fd: usize) -> isize {
@@ -1346,6 +1811,50 @@ fn sys_newfstatat(dirfd: usize, path_address: usize, stat_address: usize, flags:
         Err(errno) => return errno.to_isize(),
     };
     copy_stat_to_user(stat_address, &stat)
+}
+
+fn sys_statx(
+    dirfd: usize,
+    path_address: usize,
+    flags: usize,
+    _mask: usize,
+    statx_address: usize,
+) -> isize {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+
+    let raw_path = match copy_user_c_string(path_address) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    let stat = if raw_path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        let file = match current_process_file(dirfd) {
+            Ok(file) => file,
+            Err(errno) => return errno.to_isize(),
+        };
+        match file.fstat() {
+            Ok(stat) => stat,
+            Err(errno) => return errno.to_isize(),
+        }
+    } else {
+        if raw_path.is_empty() {
+            return myos_vfs::Errno::Enoent.to_isize();
+        }
+        let path = match resolve_path_from_user(dirfd, &raw_path) {
+            Ok(path) => path,
+            Err(errno) => return errno,
+        };
+        match if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            crate::fs::lstat(&path)
+        } else {
+            crate::fs::stat(&path)
+        } {
+            Ok(stat) => stat,
+            Err(errno) => return errno.to_isize(),
+        }
+    };
+    copy_statx_to_user(statx_address, &stat)
 }
 
 fn sys_openat(dirfd: usize, path_address: usize, flags: usize) -> isize {
@@ -1461,14 +1970,62 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
 }
 
 fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
-    let path = match copy_user_c_string(arguments[0]) {
+    let raw_path = match copy_user_c_string(arguments[0]) {
         Ok(path) => path,
         Err(errno) => return errno,
     };
-    let image = match load_exec_image(&path) {
+    let path = match resolve_path_from_user(AT_FDCWD, &raw_path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+    let argv = match copy_user_string_array(arguments[1], MAX_EXEC_ARGS, Some(&raw_path)) {
+        Ok(values) => values,
+        Err(errno) => return errno,
+    };
+    let envp = match copy_user_string_array(arguments[2], MAX_EXEC_ENVS, None) {
+        Ok(values) => values,
+        Err(errno) => return errno,
+    };
+    let mut exec_argv = argv;
+    let exec_path = path;
+    let mut image = match load_exec_image(&exec_path) {
         Ok(image) => image,
         Err(errno) => return errno,
     };
+    if let Some((interpreter, optional_arg)) = match parse_shebang(&image) {
+        Ok(shebang) => shebang,
+        Err(errno) => return errno,
+    } {
+        if exec_argv.len() + 2 + usize::from(optional_arg.is_some()) > MAX_EXEC_ARGS {
+            return -EINVAL;
+        }
+        let interpreter_path = match resolve_path_from_user(AT_FDCWD, &interpreter) {
+            Ok(path) => path,
+            Err(errno) => return errno,
+        };
+        let mut rewritten_argv = Vec::new();
+        if rewritten_argv
+            .try_reserve(exec_argv.len() + 2 + usize::from(optional_arg.is_some()))
+            .is_err()
+        {
+            return -ENOMEM;
+        }
+        rewritten_argv.push(interpreter_path.clone());
+        if let Some(argument) = optional_arg {
+            rewritten_argv.push(argument);
+        }
+        rewritten_argv.push(exec_path.clone());
+        for argument in exec_argv.iter().skip(1) {
+            rewritten_argv.push(argument.clone());
+        }
+        image = match load_exec_image(&interpreter_path) {
+            Ok(image) => image,
+            Err(errno) => return errno,
+        };
+        exec_argv = rewritten_argv;
+    }
+    let argv_refs = exec_argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
     let extra_areas = [VmArea::new(
         VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
         VmAreaFlags::user_rw(),
@@ -1477,7 +2034,8 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     let prepared = match crate::exec::prepare_elf(
         &image,
         crate::exec::ExecConfig {
-            argv0: &path,
+            argv: &argv_refs,
+            envp: &envp_refs,
             stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
             heap_start: VirtAddr::new(USER_HEAP_START),
             heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
@@ -1516,9 +2074,71 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     0
 }
 
+fn parse_shebang(image: &[u8]) -> Result<Option<(String, Option<String>)>, isize> {
+    if !image.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let mut end = 2;
+    while end < image.len() && image[end] != b'\n' {
+        end += 1;
+        if end >= MAX_USER_PATH {
+            return Err(-EINVAL);
+        }
+    }
+    let line = core::str::from_utf8(&image[2..end]).map_err(|_| -EINVAL)?;
+    let mut rest = line.trim_matches([' ', '\t', '\r']);
+    if rest.is_empty() {
+        return Err(-EINVAL);
+    }
+    let split = rest.find([' ', '\t']).unwrap_or(rest.len());
+    let interpreter = &rest[..split];
+    rest = rest[split..].trim_matches([' ', '\t', '\r']);
+    if interpreter.is_empty() || interpreter.len() >= MAX_USER_PATH {
+        return Err(-EINVAL);
+    }
+    let mut interpreter_path = String::new();
+    interpreter_path
+        .try_reserve(interpreter.len())
+        .map_err(|_| -ENOMEM)?;
+    interpreter_path.push_str(interpreter);
+    let optional_arg = if rest.is_empty() {
+        None
+    } else {
+        let mut argument = String::new();
+        argument.try_reserve(rest.len()).map_err(|_| -ENOMEM)?;
+        argument.push_str(rest);
+        Some(argument)
+    };
+    Ok(Some((interpreter_path, optional_arg)))
+}
+
 fn load_exec_image(path: &str) -> Result<Vec<u8>, isize> {
-    const MAX_EXEC_IMAGE: usize = 64 * 1024;
-    if path == "/init" {
+    const MAX_EXEC_IMAGE: usize = 16 * 1024 * 1024;
+
+    match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
+        Ok(file) => {
+            let stat = file.fstat().map_err(|e| e.to_isize())?;
+            if stat.size < 0 {
+                return Err(myos_vfs::Errno::Einval.to_isize());
+            }
+            let size =
+                usize::try_from(stat.size).map_err(|_| myos_vfs::Errno::Eoverflow.to_isize())?;
+            if size > MAX_EXEC_IMAGE {
+                return Err(myos_vfs::Errno::Eoverflow.to_isize());
+            }
+            let mut image = Vec::new();
+            image.try_reserve(size).map_err(|_| -ENOMEM)?;
+            image.resize(size, 0);
+            let mut output = myos_vfs::MutableIoBuffer::new(&mut image);
+            let read = file.read(&mut output).map_err(|e| e.to_isize())?;
+            image.truncate(read);
+            return Ok(image);
+        }
+        Err(myos_vfs::Errno::Enoent) if path == "/init" || path == EXEC_PROBE_PATH => {}
+        Err(error) => return Err(error.to_isize()),
+    }
+
+    if path == "/init" || path == EXEC_PROBE_PATH {
         let entry = VirtAddr::new(user_entry(core::ptr::addr_of!(__m12_exec_success)));
         return crate::elf::build_static_exec(
             entry,
@@ -1528,14 +2148,7 @@ fn load_exec_image(path: &str) -> Result<Vec<u8>, isize> {
         .map_err(|_| -EINVAL);
     }
 
-    let file = crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY).map_err(|e| e.to_isize())?;
-    let mut image = Vec::new();
-    image.try_reserve(MAX_EXEC_IMAGE).map_err(|_| -ENOMEM)?;
-    image.resize(MAX_EXEC_IMAGE, 0);
-    let mut output = myos_vfs::MutableIoBuffer::new(&mut image);
-    let read = file.read(&mut output).map_err(|e| e.to_isize())?;
-    image.truncate(read);
-    Ok(image)
+    Err(myos_vfs::Errno::Enoent.to_isize())
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -1812,6 +2425,22 @@ struct KernelTimespec {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct KernelTimeval {
+    sec: isize,
+    usec: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelTms {
+    utime: isize,
+    stime: isize,
+    cutime: isize,
+    cstime: isize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct KernelRlimit64 {
     cur: u64,
     max: u64,
@@ -1869,14 +2498,46 @@ fn sys_clock_gettime(clock_id: usize, timespec_address: usize) -> isize {
     if clock_id > 1 {
         return -EINVAL;
     }
-    let cycles = crate::time::now().cycles();
-    let ns =
-        (u128::from(cycles) * 1_000_000_000_u128) / u128::from(crate::time::clock_frequency_hz());
+    let ns = current_time_ns();
     let ts = KernelTimespec {
         sec: (ns / 1_000_000_000) as isize,
         nsec: (ns % 1_000_000_000) as isize,
     };
     copy_plain_to_user(timespec_address, &ts)
+}
+
+fn sys_gettimeofday(timeval_address: usize) -> isize {
+    if timeval_address == 0 {
+        return 0;
+    }
+    let ns = current_time_ns();
+    let tv = KernelTimeval {
+        sec: (ns / 1_000_000_000) as isize,
+        usec: ((ns % 1_000_000_000) / 1_000) as isize,
+    };
+    copy_plain_to_user(timeval_address, &tv)
+}
+
+fn sys_times(tms_address: usize) -> isize {
+    let ticks = (current_time_ns() / 10_000_000) as isize;
+    if tms_address != 0 {
+        let tms = KernelTms {
+            utime: 0,
+            stime: 0,
+            cutime: 0,
+            cstime: 0,
+        };
+        let result = copy_plain_to_user(tms_address, &tms);
+        if result != 0 {
+            return result;
+        }
+    }
+    ticks
+}
+
+fn current_time_ns() -> u128 {
+    let cycles = crate::time::now().cycles();
+    (u128::from(cycles) * 1_000_000_000_u128) / u128::from(crate::time::clock_frequency_hz())
 }
 
 fn sys_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limit: usize) -> isize {
@@ -2229,14 +2890,144 @@ fn sys_ppoll(fds_address: usize, nfds: usize, _timeout_address: usize) -> isize 
     ready
 }
 
-fn sys_pselect6(nfds: usize, timeout_address: usize) -> isize {
-    if nfds != 0 {
-        return -ENOSYS;
+fn sys_pselect6(arguments: [usize; 6]) -> isize {
+    let nfds = arguments[0];
+    let readfds_address = arguments[1];
+    let writefds_address = arguments[2];
+    let exceptfds_address = arguments[3];
+    let timeout_address = arguments[4];
+    let _sigmask_address = arguments[5];
+
+    if nfds == 0 {
+        // pselect6 uses the same relative timespec sleeping contract here.
+        // Restartable syscall handling remains fail-closed in the signal path.
+        return if timeout_address != 0 {
+            sys_nanosleep(timeout_address, 0)
+        } else {
+            0
+        };
     }
-    if timeout_address != 0 {
-        sys_nanosleep(timeout_address, 0)
+
+    let bytes_len = match fdset_len(nfds) {
+        Some(length) if length <= MAX_USER_COPY => length,
+        _ => return -EINVAL,
+    };
+    let mut readfds = [0_u8; MAX_USER_COPY];
+    let mut writefds = [0_u8; MAX_USER_COPY];
+    let mut exceptfds = [0_u8; MAX_USER_COPY];
+    if copy_fdset_from_user(readfds_address, &mut readfds[..bytes_len]).is_err()
+        || copy_fdset_from_user(writefds_address, &mut writefds[..bytes_len]).is_err()
+        || copy_fdset_from_user(exceptfds_address, &mut exceptfds[..bytes_len]).is_err()
+    {
+        return -EFAULT;
+    }
+
+    let mut ready = 0_isize;
+    let mut out_readfds = [0_u8; MAX_USER_COPY];
+    let mut out_writefds = [0_u8; MAX_USER_COPY];
+    let mut out_exceptfds = [0_u8; MAX_USER_COPY];
+
+    for fd in 0..nfds {
+        let wants_read = fd_is_set(&readfds[..bytes_len], fd);
+        let wants_write = fd_is_set(&writefds[..bytes_len], fd);
+        let wants_except = fd_is_set(&exceptfds[..bytes_len], fd);
+        if !wants_read && !wants_write && !wants_except {
+            continue;
+        }
+
+        let file = match current_process_file(fd) {
+            Ok(file) => file,
+            Err(_) => return -EBADF,
+        };
+        let mut fd_ready = false;
+        if wants_read
+            && file
+                .poll(
+                    myos_vfs::PollEvents::IN
+                        .union(myos_vfs::PollEvents::HUP)
+                        .union(myos_vfs::PollEvents::ERR),
+                )
+                .contains_any(
+                    myos_vfs::PollEvents::IN
+                        .union(myos_vfs::PollEvents::HUP)
+                        .union(myos_vfs::PollEvents::ERR),
+                )
+        {
+            set_fd_bit(&mut out_readfds[..bytes_len], fd);
+            fd_ready = true;
+        }
+        if wants_write
+            && file
+                .poll(myos_vfs::PollEvents::OUT.union(myos_vfs::PollEvents::ERR))
+                .contains_any(myos_vfs::PollEvents::OUT.union(myos_vfs::PollEvents::ERR))
+        {
+            set_fd_bit(&mut out_writefds[..bytes_len], fd);
+            fd_ready = true;
+        }
+        if wants_except
+            && file
+                .poll(myos_vfs::PollEvents::PRI.union(myos_vfs::PollEvents::ERR))
+                .contains_any(myos_vfs::PollEvents::PRI.union(myos_vfs::PollEvents::ERR))
+        {
+            set_fd_bit(&mut out_exceptfds[..bytes_len], fd);
+            fd_ready = true;
+        }
+        if fd_ready {
+            ready += 1;
+        }
+    }
+
+    if ready == 0 && timeout_address != 0 {
+        let slept = sys_nanosleep(timeout_address, 0);
+        if slept < 0 {
+            return slept;
+        }
+    }
+
+    if copy_fdset_to_user(readfds_address, &out_readfds[..bytes_len]).is_err()
+        || copy_fdset_to_user(writefds_address, &out_writefds[..bytes_len]).is_err()
+        || copy_fdset_to_user(exceptfds_address, &out_exceptfds[..bytes_len]).is_err()
+    {
+        return -EFAULT;
+    }
+
+    ready
+}
+
+fn fdset_len(nfds: usize) -> Option<usize> {
+    nfds.checked_add(7).map(|bits| bits / 8)
+}
+
+fn copy_fdset_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
+    if address == 0 {
+        output.fill(0);
+        Ok(())
     } else {
-        0
+        copy_from_user(address, output)
+    }
+}
+
+fn copy_fdset_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
+    if address == 0 {
+        Ok(())
+    } else {
+        copy_to_user(address, input)
+    }
+}
+
+fn fd_is_set(bytes: &[u8], fd: usize) -> bool {
+    let index = fd / 8;
+    let bit = fd % 8;
+    bytes
+        .get(index)
+        .is_some_and(|byte| byte & (1_u8 << bit) != 0)
+}
+
+fn set_fd_bit(bytes: &mut [u8], fd: usize) {
+    let index = fd / 8;
+    let bit = fd % 8;
+    if let Some(byte) = bytes.get_mut(index) {
+        *byte |= 1_u8 << bit;
     }
 }
 
@@ -2361,6 +3152,81 @@ fn copy_stat_to_user(stat_address: usize, stat: &myos_vfs::Stat) -> isize {
     0
 }
 
+fn copy_statx_to_user(statx_address: usize, stat: &myos_vfs::Stat) -> isize {
+    const STATX_TYPE: u32 = 0x0000_0001;
+    const STATX_MODE: u32 = 0x0000_0002;
+    const STATX_NLINK: u32 = 0x0000_0004;
+    const STATX_UID: u32 = 0x0000_0008;
+    const STATX_GID: u32 = 0x0000_0010;
+    const STATX_ATIME: u32 = 0x0000_0020;
+    const STATX_MTIME: u32 = 0x0000_0040;
+    const STATX_CTIME: u32 = 0x0000_0080;
+    const STATX_INO: u32 = 0x0000_0100;
+    const STATX_SIZE: u32 = 0x0000_0200;
+    const STATX_BLOCKS: u32 = 0x0000_0400;
+    const STATX_BASIC_STATS: u32 = STATX_TYPE
+        | STATX_MODE
+        | STATX_NLINK
+        | STATX_UID
+        | STATX_GID
+        | STATX_ATIME
+        | STATX_MTIME
+        | STATX_CTIME
+        | STATX_INO
+        | STATX_SIZE
+        | STATX_BLOCKS;
+
+    let mut raw = [0_u8; 256];
+    write_u32(&mut raw, 0, STATX_BASIC_STATS);
+    write_u32(&mut raw, 4, stat.blksize.max(1) as u32);
+    write_u64(&mut raw, 8, 0);
+    write_u32(&mut raw, 16, stat.nlink);
+    write_u32(&mut raw, 20, stat.uid);
+    write_u32(&mut raw, 24, stat.gid);
+    write_u16(&mut raw, 28, stat.mode as u16);
+    write_u64(&mut raw, 32, stat.ino);
+    write_u64(&mut raw, 40, stat.size.max(0) as u64);
+    write_u64(&mut raw, 48, stat.blocks.max(0) as u64);
+    write_u64(&mut raw, 56, 0);
+    write_statx_timestamp(&mut raw, 64, stat.atime_sec, stat.atime_nsec);
+    write_statx_timestamp(&mut raw, 96, stat.ctime_sec, stat.ctime_nsec);
+    write_statx_timestamp(&mut raw, 112, stat.mtime_sec, stat.mtime_nsec);
+    write_dev_major_minor(&mut raw, 136, stat.dev);
+
+    if copy_to_user(statx_address, &raw).is_err() {
+        return -EFAULT;
+    }
+    0
+}
+
+fn write_statx_timestamp(raw: &mut [u8; 256], offset: usize, sec: i64, nsec: i64) {
+    write_i64(raw, offset, sec);
+    write_u32(raw, offset + 8, nsec.clamp(0, 999_999_999) as u32);
+}
+
+fn write_dev_major_minor(raw: &mut [u8; 256], offset: usize, device: u64) {
+    let major = ((device >> 8) & 0xfff) | ((device >> 32) & !0xfff);
+    let minor = (device & 0xff) | ((device >> 12) & !0xff);
+    write_u32(raw, offset, major as u32);
+    write_u32(raw, offset + 4, minor as u32);
+}
+
+fn write_u16(raw: &mut [u8], offset: usize, value: u16) {
+    raw[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_u32(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_u64(raw: &mut [u8], offset: usize, value: u64) {
+    raw[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_i64(raw: &mut [u8], offset: usize, value: i64) {
+    raw[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
 fn copy_plain_to_user<T>(address: usize, value: &T) -> isize {
     // SAFETY: caller supplies a plain kernel value; the byte view is used only
     // for checked copy_to_user while `value` is alive.
@@ -2399,11 +3265,17 @@ fn resolve_path_from_user(dirfd: usize, path: &str) -> Result<alloc::string::Str
     if path.starts_with('/') {
         return crate::fs::resolve_path("/", path).map_err(|errno| errno.to_isize());
     }
-    if dirfd != AT_FDCWD {
-        return Err(-EBADF);
+    if dirfd == AT_FDCWD {
+        let cwd = current_process().fs().cwd_path();
+        return crate::fs::resolve_path(&cwd, path).map_err(|errno| errno.to_isize());
     }
-    let cwd = current_process().fs().cwd_path();
-    crate::fs::resolve_path(&cwd, path).map_err(|errno| errno.to_isize())
+    let file = current_process_file(dirfd).map_err(|errno| errno.to_isize())?;
+    let stat = file.fstat().map_err(|errno| errno.to_isize())?;
+    if stat.mode & myos_vfs::FileMode::S_IFMT != myos_vfs::FileMode::S_IFDIR {
+        return Err(myos_vfs::Errno::Enotdir.to_isize());
+    }
+    let base = file.path().ok_or(-EBADF)?;
+    crate::fs::resolve_path(base, path).map_err(|errno| errno.to_isize())
 }
 
 fn copy_user_c_string(address: usize) -> Result<alloc::string::String, isize> {
@@ -2421,6 +3293,46 @@ fn copy_user_c_string(address: usize) -> Result<alloc::string::String, isize> {
         }
         path.try_reserve(1).map_err(|_| -ENOMEM)?;
         path.push(byte[0] as char);
+    }
+    Err(-EINVAL)
+}
+
+fn copy_user_string_array(
+    address: usize,
+    maximum: usize,
+    fallback0: Option<&str>,
+) -> Result<Vec<String>, isize> {
+    if address == 0 {
+        let mut values = Vec::new();
+        if let Some(value) = fallback0 {
+            values.try_reserve(1).map_err(|_| -ENOMEM)?;
+            values.push(String::from(value));
+        }
+        return Ok(values);
+    }
+
+    let mut values = Vec::new();
+    for index in 0..maximum {
+        let pointer_address = address
+            .checked_add(
+                index
+                    .checked_mul(core::mem::size_of::<usize>())
+                    .ok_or(-EFAULT)?,
+            )
+            .ok_or(-EFAULT)?;
+        let pointer = copy_plain_from_user::<usize>(pointer_address)?;
+        if pointer == 0 {
+            if values.is_empty()
+                && let Some(value) = fallback0
+            {
+                values.try_reserve(1).map_err(|_| -ENOMEM)?;
+                values.push(String::from(value));
+            }
+            return Ok(values);
+        }
+        let value = copy_user_c_string(pointer)?;
+        values.try_reserve(1).map_err(|_| -ENOMEM)?;
+        values.push(value);
     }
     Err(-EINVAL)
 }

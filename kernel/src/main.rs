@@ -42,7 +42,7 @@ mod workqueue;
 extern crate alloc;
 
 use myos_boot::BootInfo;
-use myos_fdt::{DeviceTree, FdtBlob};
+use myos_fdt::{DeviceTree, FdtBlob, MemoryRegion};
 
 #[cfg(target_arch = "riscv64")]
 pub(crate) use arch_riscv64 as arch;
@@ -154,7 +154,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
 
-    let (memory_layout, firmware_timer_frequency, virtio_regions) = {
+    let (memory_layout, firmware_timer_frequency, virtio_regions, pci_hosts, initrd_range) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
@@ -172,9 +172,13 @@ fn kernel_main(boot: BootInfo) -> ! {
 
         inspect_device_tree(&boot, &blob, &tree);
         let virtio_regions = collect_virtio_mmio_regions(&tree);
+        let pci_hosts = collect_pci_host_bridges(&tree);
         smp::initialize(&tree, boot_hardware_cpu_id(&boot));
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
+        let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
+            panic!("failed to parse /chosen initrd range: {error}");
+        });
         let memory_layout = memory::build_boot_memory_layout(fdt_address, &blob, &tree)
             .unwrap_or_else(|error| {
                 panic!(
@@ -183,7 +187,13 @@ fn kernel_main(boot: BootInfo) -> ! {
                 );
             });
 
-        (memory_layout, firmware_timer_frequency, virtio_regions)
+        (
+            memory_layout,
+            firmware_timer_frequency,
+            virtio_regions,
+            pci_hosts,
+            initrd_range,
+        )
     };
 
     memory::print_boot_memory_map(memory_layout.free());
@@ -244,9 +254,11 @@ fn kernel_main(boot: BootInfo) -> ! {
     time::initialize(firmware_timer_frequency);
     timer::initialize();
     vm::initialize(kernel_memory);
-    virtio::initialize(&virtio_regions);
+    virtio::initialize(&virtio_regions, &pci_hosts);
     fault::initialize();
     fs::initialize();
+    install_external_initramfs(initrd_range);
+    mount_sdcard_if_present();
     tty::initialize();
 
     #[cfg(debug_assertions)]
@@ -289,11 +301,145 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(debug_assertions)]
     task::verify();
     user::verify();
+    if initrd_range.is_some() {
+        user::verify_busybox_rootfs();
+    }
+    user::verify_sdcard_sample();
+    user::verify_sdcard_basic_script();
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");
 
     task::boot_idle_loop()
+}
+
+fn mount_sdcard_if_present() {
+    if crate::block::open_device("vda").is_none() {
+        return;
+    }
+
+    match fs::mkdir("/mnt", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to create /mnt before sdcard mount: {error:?}"),
+    }
+    match fs::mkdir("/mnt/sdcard", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to create /mnt/sdcard before sdcard mount: {error:?}"),
+    }
+    match fs::mkdir("/mnt/sdcard/musl", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to create /mnt/sdcard/musl before sdcard mount: {error:?}"),
+    }
+    match fs::mkdir("/mnt/sdcard/musl/lib", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => {
+            panic!("failed to create /mnt/sdcard/musl/lib before sdcard mount: {error:?}")
+        }
+    }
+    match fs::mkdir("/bin", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to create /bin before sdcard userland setup: {error:?}"),
+    }
+    match fs::mkdir("/code", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to create /code before sdcard userland setup: {error:?}"),
+    }
+    match fs::mkdir("/code/mnt", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to create /code/mnt for sdcard tests: {error:?}"),
+    }
+    match fs::install_ext4_path("/dev/vda", "/bin/busybox", "/musl/busybox") {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /bin/busybox from sdcard: {error:?}"),
+    }
+    match fs::symlink("/bin/busybox", "/bin/sh") {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /bin/sh symlink for sdcard scripts: {error:?}"),
+    }
+    match fs::install_ext4_path("/dev/vda", "/mnt/sdcard/musl/busybox", "/musl/busybox") {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /musl/busybox from sdcard: {error:?}"),
+    }
+    match fs::install_ext4_path(
+        "/dev/vda",
+        "/mnt/sdcard/musl/basic_testcode.sh",
+        "/musl/basic_testcode.sh",
+    ) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /musl/basic_testcode.sh from sdcard: {error:?}"),
+    }
+    match fs::install_ext4_path(
+        "/dev/vda",
+        "/mnt/sdcard/musl/lib/libc.so",
+        "/musl/lib/libc.so",
+    ) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /musl/lib/libc.so from sdcard: {error:?}"),
+    }
+    match fs::install_ext4_path("/dev/vda", "/text.txt", "/musl/basic/text.txt") {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /musl/basic/text.txt from sdcard: {error:?}"),
+    }
+    match fs::install_ext4_path("/dev/vda", "/code/text.txt", "/musl/basic/text.txt") {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /code/text.txt from sdcard: {error:?}"),
+    }
+    match fs::install_ext4_path("/dev/vda", "/code/test_echo", "/musl/basic/test_echo") {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => panic!("failed to install /code/test_echo from sdcard: {error:?}"),
+    }
+    match fs::mkdir("/mnt/sdcard/musl/basic", 0o755) {
+        Ok(()) | Err(myos_vfs::Errno::Eexist) => {}
+        Err(error) => {
+            panic!("failed to create /mnt/sdcard/musl/basic before sdcard mount: {error:?}")
+        }
+    }
+    match fs::mount_ext4_subtree("/dev/vda", "/mnt/sdcard/musl/basic", "/musl/basic", 1) {
+        Ok(()) | Err(myos_vfs::Errno::Ebusy) => {}
+        Err(error) => {
+            panic!("failed to mount /dev/vda:/musl/basic on /mnt/sdcard/musl/basic: {error:?}")
+        }
+    }
+    println!("sdcard:");
+    println!("  mount         : /dev/vda:/musl/basic -> /mnt/sdcard/musl/basic (ext4 ro)");
+    println!(
+        "  files         : /bin/sh /musl/busybox /musl/basic_testcode.sh /musl/lib/libc.so /text.txt /code/text.txt /code/test_echo"
+    );
+}
+
+fn install_external_initramfs(range: Option<MemoryRegion>) {
+    let Some(range) = range else {
+        println!("initramfs:");
+        println!("  external      : unavailable");
+        return;
+    };
+
+    let pointer =
+        crate::arch::memory::phys_access::ram_ptr::<u8>(myos_mm::PhysAddr::new(range.start()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unable to map external initramfs at {:#018x}: {error:?}",
+                    range.start(),
+                );
+            });
+
+    // SAFETY: the initrd range comes from validated FDT `/chosen` properties
+    // and has been reserved from the page allocator before heap/page use.
+    let archive_bytes = unsafe { core::slice::from_raw_parts(pointer, range.size()) };
+    let archive = crate::initramfs::Initramfs::parse(archive_bytes).unwrap_or_else(|error| {
+        panic!("external initramfs is not a valid newc archive: {error:?}");
+    });
+    let installed = crate::fs::unpack_initramfs(&archive).unwrap_or_else(|error| {
+        panic!("failed to unpack external initramfs into rootfs: {error:?}");
+    });
+
+    println!("initramfs:");
+    println!(
+        "  external      : [{:#018x}, {:#018x})",
+        range.start(),
+        range.end().unwrap_or(usize::MAX),
+    );
+    println!("  rootfs entries: {installed}");
 }
 
 fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_>) {
@@ -342,6 +488,23 @@ fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_
         }
     }
 
+    match tree.linux_initrd_range() {
+        Ok(Some(region)) => {
+            println!(
+                "  initrd        : [{:#018x}, {:#018x}) {} KiB",
+                region.start(),
+                region.end().unwrap_or(usize::MAX),
+                region.size() / 1024,
+            );
+        }
+        Ok(None) => {
+            println!("  initrd        : unavailable");
+        }
+        Err(error) => {
+            println!("  initrd        : malformed ({error})");
+        }
+    }
+
     println!("  memory:");
 
     let mut memory_count = 0;
@@ -379,6 +542,29 @@ fn inspect_device_tree(boot: &BootInfo, blob: &FdtBlob<'_>, tree: &DeviceTree<'_
     if virtio_count == 0 {
         println!("    unavailable");
     }
+
+    println!("  pci-host:");
+
+    let mut pci_count = 0;
+    for host in tree.pci_host_bridges() {
+        pci_count += 1;
+        let ecam = host.ecam();
+        let mem32 = host.mem32();
+        println!(
+            "    {}: ecam=[{:#018x}, {:#018x}) mem32=[{:#018x}, {:#018x}) bus={}..{}",
+            host.name(),
+            ecam.start(),
+            ecam.end().unwrap_or(usize::MAX),
+            mem32.start(),
+            mem32.end().unwrap_or(usize::MAX),
+            host.first_bus(),
+            host.last_bus(),
+        );
+    }
+
+    if pci_count == 0 {
+        println!("    unavailable");
+    }
 }
 
 fn collect_virtio_mmio_regions(tree: &DeviceTree<'_>) -> virtio::MmioRegions {
@@ -389,4 +575,20 @@ fn collect_virtio_mmio_regions(tree: &DeviceTree<'_>) -> virtio::MmioRegions {
     }
 
     regions
+}
+
+fn collect_pci_host_bridges(tree: &DeviceTree<'_>) -> virtio::PciHostBridges {
+    let mut hosts = virtio::PciHostBridges::new();
+
+    for host in tree.pci_host_bridges() {
+        hosts.push(virtio::PciHostBridge::new(
+            host.name(),
+            host.ecam(),
+            host.mem32(),
+            host.first_bus(),
+            host.last_bus(),
+        ));
+    }
+
+    hosts
 }

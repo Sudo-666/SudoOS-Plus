@@ -23,7 +23,7 @@ const EXT4_S_IFREG: u16 = 0o100000;
 const EXT4_S_IFDIR: u16 = 0o040000;
 const EXT4_S_IFLNK: u16 = 0o120000;
 const MAX_EXT4_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_EXT4_NODES: usize = 4096;
+const MAX_EXT4_NODES: usize = 8192;
 const MAX_EXT4_DEPTH: usize = 16;
 const MAX_EXTENT_TREE_DEPTH: usize = 5;
 
@@ -68,6 +68,14 @@ pub fn load_root_snapshot(device: Arc<dyn BlockDevice>) -> Result<Ext4SnapshotNo
     let fs = Ext4FileSystem::open(device)?;
     let mut budget = NodeBudget::new(MAX_EXT4_NODES);
     fs.load_inode_tree(EXT4_ROOT_INO, 0, &mut budget)
+}
+
+pub fn load_path_snapshot(
+    device: Arc<dyn BlockDevice>,
+    path: &str,
+) -> Result<Ext4SnapshotNode, Ext4Error> {
+    let fs = Ext4FileSystem::open(device)?;
+    fs.load_path(path)
 }
 
 pub struct Ext4FileSystem {
@@ -252,6 +260,62 @@ impl Ext4FileSystem {
             offset += rec_len;
         }
         Ok(entries)
+    }
+
+    fn load_path(&self, path: &str) -> Result<Ext4SnapshotNode, Ext4Error> {
+        if path.is_empty() {
+            return Err(Ext4Error::BadDirectory);
+        }
+        let mut current = EXT4_ROOT_INO;
+        let mut saw_component = false;
+        for component in path.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            if component == "." || component == ".." || component.as_bytes().contains(&0) {
+                return Err(Ext4Error::BadDirectory);
+            }
+            saw_component = true;
+            current = self.lookup_child_ino(current, component)?;
+        }
+        if !saw_component {
+            return self.load_inode_tree_limited(EXT4_ROOT_INO);
+        }
+        self.load_inode_tree_limited(current)
+    }
+
+    fn load_inode_tree_limited(&self, ino: u32) -> Result<Ext4SnapshotNode, Ext4Error> {
+        let mut budget = NodeBudget::new(MAX_EXT4_NODES);
+        self.load_inode_tree(ino, 0, &mut budget)
+    }
+
+    fn lookup_child_ino(&self, parent: u32, name: &str) -> Result<u32, Ext4Error> {
+        let inode = self.read_inode(parent)?;
+        if inode.file_type() != EXT4_S_IFDIR {
+            return Err(Ext4Error::BadDirectory);
+        }
+        let data = self.read_inode_bytes(&inode)?;
+        let mut offset = 0_usize;
+        while offset < data.len() {
+            if data.len() - offset < 8 {
+                break;
+            }
+            let ino = le_u32(&data, offset)?;
+            let rec_len = usize::from(le_u16(&data, offset + 4)?);
+            let name_len = usize::from(*data.get(offset + 6).ok_or(Ext4Error::BadDirectory)?);
+            if rec_len == 0 || rec_len < 8 || rec_len % 4 != 0 || offset + rec_len > data.len() {
+                return Err(Ext4Error::BadDirectory);
+            }
+            if name_len > rec_len - 8 {
+                return Err(Ext4Error::BadDirectory);
+            }
+            let name_bytes = &data[offset + 8..offset + 8 + name_len];
+            if ino != 0 && name_bytes == name.as_bytes() {
+                return Ok(ino);
+            }
+            offset += rec_len;
+        }
+        Err(Ext4Error::BadDirectory)
     }
 
     fn read_symlink(&self, inode: &Ext4Inode) -> Result<String, Ext4Error> {

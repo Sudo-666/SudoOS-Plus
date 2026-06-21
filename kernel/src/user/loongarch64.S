@@ -561,13 +561,13 @@ __m12_m13_user_probe:
     addi.d $r12, $r12, 0x100
     addi.d $r13, $r0, 47
     st.b $r13, $r12, 0
-    addi.d $r13, $r0, 105
+    addi.d $r13, $r0, 46
     st.b $r13, $r12, 1
-    addi.d $r13, $r0, 110
+    addi.d $r13, $r0, 109
     st.b $r13, $r12, 2
-    addi.d $r13, $r0, 105
+    addi.d $r13, $r0, 49
     st.b $r13, $r12, 3
-    addi.d $r13, $r0, 116
+    addi.d $r13, $r0, 50
     st.b $r13, $r12, 4
     st.b $r0, $r12, 5
     or $r4, $r12, $r0

@@ -1,5 +1,8 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::ptr::NonNull;
+use core::{
+    ptr::NonNull,
+    sync::atomic::{Ordering, compiler_fence},
+};
 
 use myos_mm::{PAGE_SIZE, PageAllocation, PhysAddr, VirtAddr};
 use virtio_drivers::{
@@ -8,6 +11,14 @@ use virtio_drivers::{
     transport::{
         DeviceType, Transport,
         mmio::{MmioTransport, VirtIOHeader},
+        pci::{
+            PciTransport,
+            bus::{
+                BarInfo, Cam, Command, ConfigurationAccess, DeviceFunction, MemoryBarType, MmioCam,
+                PciRoot,
+            },
+            virtio_device_type,
+        },
     },
 };
 
@@ -19,6 +30,7 @@ use crate::{
 };
 
 const MAX_MMIO_REGIONS: usize = 32;
+const MAX_PCI_HOSTS: usize = 8;
 const DMA32_LIMIT: u64 = 0x1_0000_0000;
 
 const DMA_LOCK: LockClass = LockClass::new("virtio.dma", LockRank::Vfs, 1);
@@ -52,6 +64,94 @@ pub struct MmioRegions {
     entries: [Option<MmioRegion>; MAX_MMIO_REGIONS],
     len: usize,
     overflow: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciHostBridge {
+    name: &'static str,
+    ecam: myos_mm::PhysRange,
+    mem32: myos_mm::PhysRange,
+    first_bus: u8,
+    last_bus: u8,
+}
+
+impl PciHostBridge {
+    pub fn new(
+        name: &str,
+        ecam: myos_fdt::MemoryRegion,
+        mem32: myos_fdt::MemoryRegion,
+        first_bus: u8,
+        last_bus: u8,
+    ) -> Self {
+        let name = if name == "pcie" { "pcie" } else { "pci" };
+        Self {
+            name,
+            ecam: myos_mm::PhysRange::from_start_size(PhysAddr::new(ecam.start()), ecam.size())
+                .expect("FDT PCI ECAM range overflowed while collecting host bridges"),
+            mem32: myos_mm::PhysRange::from_start_size(PhysAddr::new(mem32.start()), mem32.size())
+                .expect("FDT PCI MEM32 range overflowed while collecting host bridges"),
+            first_bus,
+            last_bus,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    pub const fn ecam(self) -> myos_mm::PhysRange {
+        self.ecam
+    }
+
+    pub const fn mem32(self) -> myos_mm::PhysRange {
+        self.mem32
+    }
+
+    pub const fn first_bus(self) -> u8 {
+        self.first_bus
+    }
+
+    pub const fn last_bus(self) -> u8 {
+        self.last_bus
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciHostBridges {
+    entries: [Option<PciHostBridge>; MAX_PCI_HOSTS],
+    len: usize,
+    overflow: usize,
+}
+
+impl PciHostBridges {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_PCI_HOSTS],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    pub fn push(&mut self, host: PciHostBridge) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(host);
+            self.len += 1;
+        } else {
+            self.overflow += 1;
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = PciHostBridge> + '_ {
+        self.entries[..self.len].iter().filter_map(|entry| *entry)
+    }
+
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    pub const fn overflow(self) -> usize {
+        self.overflow
+    }
 }
 
 impl MmioRegions {
@@ -97,6 +197,8 @@ pub struct SudoHal;
 // pages from the DMA32 zone, tracked until virtio-drivers returns the exact
 // allocation tuple to dma_dealloc. QEMU virt machines are coherent for these
 // MMIO transports, so share/unshare can use direct physical translations.
+// Compiler fences document the DMA ordering boundary around descriptor-visible
+// memory: the transport driver still owns the device-specific MMIO barriers.
 unsafe impl Hal for SudoHal {
     fn dma_alloc(
         pages: usize,
@@ -160,6 +262,7 @@ unsafe impl Hal for SudoHal {
             });
         }
 
+        compiler_fence(Ordering::Release);
         (paddr, vaddr)
     }
 
@@ -181,6 +284,7 @@ unsafe impl Hal for SudoHal {
             allocations.swap_remove(index).allocation
         };
 
+        compiler_fence(Ordering::Acquire);
         match page_alloc::free(allocation) {
             Ok(()) => 0,
             Err(error) => {
@@ -230,14 +334,14 @@ unsafe impl Hal for SudoHal {
     }
 }
 
-struct VirtioBlockDevice {
-    driver: IrqSpinLock<VirtIOBlk<SudoHal, MmioTransport<'static>>>,
+struct VirtioBlockDevice<T: Transport + Send + 'static> {
+    driver: IrqSpinLock<VirtIOBlk<SudoHal, T>>,
     block_count: u64,
     read_only: bool,
-    _mapping: crate::vm::KernelIoMapping,
+    _mmio_mapping: Option<crate::vm::KernelIoMapping>,
 }
 
-impl BlockDevice for VirtioBlockDevice {
+impl<T: Transport + Send + 'static> BlockDevice for VirtioBlockDevice<T> {
     fn block_size(&self) -> usize {
         SECTOR_SIZE
     }
@@ -254,10 +358,17 @@ impl BlockDevice for VirtioBlockDevice {
             return Err(BlockError::OutOfRange);
         }
         let block = usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
-        self.driver
+        let (allocation, buffer) = dma_sector_buffer()?;
+        let result = self
+            .driver
             .lock()
-            .read_blocks(block, output)
-            .map_err(|_| BlockError::InvalidArgument)
+            .read_blocks(block, buffer)
+            .map_err(|_| BlockError::InvalidArgument);
+        if result.is_ok() {
+            output.copy_from_slice(buffer);
+        }
+        page_alloc::free(allocation).map_err(|_| BlockError::InvalidArgument)?;
+        result
     }
 
     fn write_block(&self, block: u64, input: &[u8]) -> Result<(), BlockError> {
@@ -271,14 +382,37 @@ impl BlockDevice for VirtioBlockDevice {
             return Err(BlockError::OutOfRange);
         }
         let block = usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
-        self.driver
+        let (allocation, buffer) = dma_sector_buffer()?;
+        buffer.copy_from_slice(input);
+        let result = self
+            .driver
             .lock()
-            .write_blocks(block, input)
-            .map_err(|_| BlockError::InvalidArgument)
+            .write_blocks(block, buffer)
+            .map_err(|_| BlockError::InvalidArgument);
+        page_alloc::free(allocation).map_err(|_| BlockError::InvalidArgument)?;
+        result
     }
 }
 
-pub fn initialize(regions: &MmioRegions) {
+fn dma_sector_buffer() -> Result<(PageAllocation, &'static mut [u8]), BlockError> {
+    let allocation = page_alloc::allocate(0, PageAllocationOptions::dma32_zeroed())
+        .map_err(|_| BlockError::MetadataOutOfMemory)?;
+    let pointer =
+        match crate::arch::memory::phys_access::ram_mut_ptr::<u8>(allocation.range().start()) {
+            Ok(pointer) => pointer,
+            Err(_) => {
+                let _ = page_alloc::free(allocation);
+                return Err(BlockError::InvalidArgument);
+            }
+        };
+    // SAFETY: the fresh DMA32 allocation owns at least one page, SECTOR_SIZE is
+    // smaller than a page, and the allocation is kept alive until the caller
+    // copies data and frees it after the virtio operation completes.
+    let buffer = unsafe { core::slice::from_raw_parts_mut(pointer, SECTOR_SIZE) };
+    Ok((allocation, buffer))
+}
+
+pub fn initialize(regions: &MmioRegions, pci_hosts: &PciHostBridges) {
     let mut probed = 0;
     let mut usable = 0;
 
@@ -293,9 +427,10 @@ pub fn initialize(regions: &MmioRegions) {
         match probe_mmio_region(region) {
             Ok(Some(device)) => {
                 let name = virtio_block_name(usable);
-                match block::register_device(&name, device) {
+                match block::register_device(&name, Arc::clone(&device)) {
                     Ok(()) => {
                         crate::println!("  block registry : /dev/{name}");
+                        register_compat_partition_alias(&name, &device);
                         usable += 1;
                     }
                     Err(error) => {
@@ -314,12 +449,37 @@ pub fn initialize(regions: &MmioRegions) {
         }
     }
 
+    if pci_hosts.overflow() != 0 {
+        crate::println!("  pci overflow   : {}", pci_hosts.overflow());
+    }
+    crate::println!("  pci hosts      : {}", pci_hosts.len());
+    for host in pci_hosts.iter() {
+        match probe_pci_host(host, usable) {
+            Ok(found) => {
+                usable += found;
+            }
+            Err(error) => {
+                crate::println!("  pci {}: ignored ({})", host.name(), error.as_str());
+            }
+        }
+    }
+
     if probed == 0 {
         crate::println!("  mmio probe     : no devices described");
     } else {
         crate::println!("  mmio probe     : {} region(s) checked", probed);
     }
     crate::println!("  block devices  : {}", usable);
+}
+
+fn register_compat_partition_alias(name: &str, device: &Arc<dyn BlockDevice>) {
+    if name != "vda" || block::open_device("vda2").is_some() {
+        return;
+    }
+    match block::register_device("vda2", Arc::clone(device)) {
+        Ok(()) => crate::println!("  block registry : /dev/vda2 -> /dev/vda"),
+        Err(error) => crate::println!("  block registry : /dev/vda2 alias failed ({error:?})"),
+    }
 }
 
 fn virtio_block_name(index: usize) -> alloc::string::String {
@@ -399,8 +559,168 @@ fn probe_mmio_region(region: MmioRegion) -> Result<Option<Arc<dyn BlockDevice>>,
         driver: IrqSpinLock::new_with_class(driver, BLK_LOCK),
         block_count,
         read_only,
-        _mapping: mapping,
+        _mmio_mapping: Some(mapping),
     })))
+}
+
+fn probe_pci_host(host: PciHostBridge, first_index: usize) -> Result<usize, VirtioProbeError> {
+    let ecam = host.ecam();
+    if ecam.size() < myos_mm::PAGE_SIZE {
+        return Err(VirtioProbeError::RegionTooSmall);
+    }
+    let ecam_base = crate::arch::memory::phys_access::mmio_virtual_address(
+        ecam.start(),
+        Cam::Ecam.size() as usize,
+    )
+    .map_err(|_| VirtioProbeError::MapFailed)?;
+    let mut root = PciRoot::new(
+        // SAFETY: the FDT `pci-host-ecam-generic` node declares an ECAM
+        // configuration window, and the architecture exposes it through an
+        // uncached MMIO alias for the lifetime of the kernel.
+        unsafe { MmioCam::new(ecam_base.get() as *mut u8, Cam::Ecam) },
+    );
+    let mut allocator = PciMemory32Allocator::new(host.mem32())?;
+    let mut found = 0;
+
+    crate::println!(
+        "  pci {}: ecam={:#018x} mem32={:#018x}..{:#018x} bus={}..{}",
+        host.name(),
+        ecam.start().get(),
+        host.mem32().start().get(),
+        host.mem32().end().get(),
+        host.first_bus(),
+        host.last_bus(),
+    );
+
+    for bus in host.first_bus()..=host.last_bus() {
+        for (device_function, info) in root.enumerate_bus(bus) {
+            let Some(device_type) = virtio_device_type(&info) else {
+                continue;
+            };
+            crate::println!("  pci {device_function}: virtio {device_type:?}");
+            allocate_bars(&mut root, device_function, &mut allocator)?;
+            if device_type != DeviceType::Block {
+                continue;
+            }
+            match probe_pci_block(&mut root, device_function) {
+                Ok(device) => {
+                    let name = virtio_block_name(first_index + found);
+                    match block::register_device(&name, Arc::clone(&device)) {
+                        Ok(()) => {
+                            crate::println!("  block registry : /dev/{name}");
+                            register_compat_partition_alias(&name, &device);
+                            found += 1;
+                        }
+                        Err(error) => {
+                            crate::println!("  block registry : failed ({error:?})");
+                        }
+                    }
+                }
+                Err(error) => {
+                    crate::println!("  pci {device_function}: ignored ({})", error.as_str());
+                }
+            }
+        }
+    }
+
+    Ok(found)
+}
+
+fn probe_pci_block(
+    root: &mut PciRoot<impl ConfigurationAccess>,
+    device_function: DeviceFunction,
+) -> Result<Arc<dyn BlockDevice>, VirtioProbeError> {
+    let transport = PciTransport::new::<SudoHal, _>(root, device_function)
+        .map_err(|_| VirtioProbeError::InvalidTransport)?;
+    let driver =
+        VirtIOBlk::<SudoHal, _>::new(transport).map_err(|_| VirtioProbeError::DriverFailed)?;
+    let block_count = driver.capacity();
+    let read_only = driver.readonly();
+    crate::println!(
+        "  block device   : {} sectors, readonly={}",
+        block_count,
+        read_only,
+    );
+
+    Ok(Arc::new(VirtioBlockDevice {
+        driver: IrqSpinLock::new_with_class(driver, BLK_LOCK),
+        block_count,
+        read_only,
+        _mmio_mapping: None,
+    }))
+}
+
+struct PciMemory32Allocator {
+    cursor: u32,
+    end: u32,
+}
+
+impl PciMemory32Allocator {
+    fn new(range: myos_mm::PhysRange) -> Result<Self, VirtioProbeError> {
+        let start = u32::try_from(range.start().get()).map_err(|_| VirtioProbeError::MapFailed)?;
+        let end_address = range.end().get();
+        let end = u32::try_from(end_address).map_err(|_| VirtioProbeError::MapFailed)?;
+        if start >= end {
+            return Err(VirtioProbeError::MapFailed);
+        }
+        Ok(Self { cursor: start, end })
+    }
+
+    fn allocate(&mut self, size: u32) -> Result<u32, VirtioProbeError> {
+        if size == 0 || !size.is_power_of_two() {
+            return Err(VirtioProbeError::InvalidTransport);
+        }
+        let address = align_up_u32(self.cursor, size).ok_or(VirtioProbeError::MapFailed)?;
+        let next = address
+            .checked_add(size)
+            .ok_or(VirtioProbeError::MapFailed)?;
+        if next > self.end {
+            return Err(VirtioProbeError::MapFailed);
+        }
+        self.cursor = next;
+        Ok(address)
+    }
+}
+
+fn align_up_u32(value: u32, alignment: u32) -> Option<u32> {
+    Some(value.checked_add(alignment.checked_sub(1)?)? & !(alignment - 1))
+}
+
+fn allocate_bars(
+    root: &mut PciRoot<impl ConfigurationAccess>,
+    device_function: DeviceFunction,
+    allocator: &mut PciMemory32Allocator,
+) -> Result<(), VirtioProbeError> {
+    let bars = root
+        .bars(device_function)
+        .map_err(|_| VirtioProbeError::InvalidTransport)?;
+    for (index, info) in bars.into_iter().enumerate() {
+        let Some(info) = info else {
+            continue;
+        };
+        let BarInfo::Memory {
+            address_type, size, ..
+        } = info
+        else {
+            continue;
+        };
+        if size == 0 {
+            continue;
+        }
+        let size = u32::try_from(size).map_err(|_| VirtioProbeError::MapFailed)?;
+        let address = allocator.allocate(size)?;
+        match address_type {
+            MemoryBarType::Width32 => root.set_bar_32(device_function, index as u8, address),
+            MemoryBarType::Width64 => root.set_bar_64(device_function, index as u8, address.into()),
+            MemoryBarType::Below1MiB => return Err(VirtioProbeError::InvalidTransport),
+        }
+    }
+
+    root.set_command(
+        device_function,
+        Command::IO_SPACE | Command::MEMORY_SPACE | Command::BUS_MASTER,
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,7 +752,23 @@ fn virtual_to_physical(address: VirtAddr, size: usize) -> Option<PhysAddr> {
     if range_fits(address, size, crate::arch::memory::layout::KERNEL_IMAGE) {
         return crate::arch::memory::layout::kernel_image_physical_address(address);
     }
-    None
+    translate_kernel_contiguous(address, size)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn translate_kernel_contiguous(address: VirtAddr, size: usize) -> Option<PhysAddr> {
+    if size == 0 {
+        return crate::vm::kernel_translate(address).ok().flatten();
+    }
+    let end = address.checked_add(size - 1)?;
+    let start_phys = crate::vm::kernel_translate(address).ok().flatten()?;
+    let end_phys = crate::vm::kernel_translate(end).ok().flatten()?;
+    let expected_end = start_phys.checked_add(size - 1)?;
+    if expected_end == end_phys {
+        Some(start_phys)
+    } else {
+        None
+    }
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -451,7 +787,23 @@ fn virtual_to_physical(address: VirtAddr, size: usize) -> Option<PhysAddr> {
     ) {
         return crate::arch::memory::layout::uncached_to_phys(address);
     }
-    None
+    translate_kernel_contiguous(address, size)
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn translate_kernel_contiguous(address: VirtAddr, size: usize) -> Option<PhysAddr> {
+    if size == 0 {
+        return crate::vm::kernel_translate(address).ok().flatten();
+    }
+    let end = address.checked_add(size - 1)?;
+    let start_phys = crate::vm::kernel_translate(address).ok().flatten()?;
+    let end_phys = crate::vm::kernel_translate(end).ok().flatten()?;
+    let expected_end = start_phys.checked_add(size - 1)?;
+    if expected_end == end_phys {
+        Some(start_phys)
+    } else {
+        None
+    }
 }
 
 fn range_fits(address: VirtAddr, size: usize, range: myos_mm::VirtRange) -> bool {

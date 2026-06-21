@@ -9,6 +9,6 @@ pub use blob::{FdtBlob, FdtHeader};
 
 pub use error::FdtError;
 
-pub use region::{MemoryRegion, VirtioMmioRegion};
+pub use region::{MemoryRegion, PciHostBridge, VirtioMmioRegion};
 
 pub use tree::DeviceTree;

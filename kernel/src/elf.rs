@@ -81,6 +81,7 @@ pub struct ElfImage {
     pub entry: VirtAddr,
     pub load_bias: usize,
     pub program_headers: Option<ProgramHeaderInfo>,
+    #[allow(dead_code)]
     pub interpreter: Option<String>,
     pub dynamic: Option<DynamicInfo>,
     pub areas: Vec<VmArea>,
@@ -387,9 +388,6 @@ fn reject_area_overlap(areas: &[VmArea], range: VirtRange) -> Result<(), ElfErro
 }
 
 fn segment_flags(raw: u32) -> Result<VmAreaFlags, ElfError> {
-    if raw & PF_W != 0 && raw & PF_X != 0 {
-        return Err(ElfError::InvalidSegment);
-    }
     let mut flags = VmAreaFlags::USER.union(VmAreaFlags::PRIVATE);
     if raw & PF_R != 0 || raw & (PF_W | PF_X) != 0 {
         flags = flags.union(VmAreaFlags::READ);

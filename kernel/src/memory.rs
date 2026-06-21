@@ -89,6 +89,10 @@ pub fn build_boot_memory_layout(
         return Err(error);
     }
 
+    if let Some(region) = tree.linux_initrd_range()? {
+        free.reserve(to_phys_range(region)?)?;
+    }
+
     crate::arch::memory::reserve_early_platform_memory(&mut free)?;
 
     free.reserve(crate::linker::kernel_image_range())?;

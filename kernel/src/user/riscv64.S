@@ -610,13 +610,13 @@ __m12_m13_user_probe:
     li t0, 0x401100
     li t1, 47
     sb t1, 0(t0)
-    li t1, 105
+    li t1, 46
     sb t1, 1(t0)
-    li t1, 110
+    li t1, 109
     sb t1, 2(t0)
-    li t1, 105
+    li t1, 49
     sb t1, 3(t0)
-    li t1, 116
+    li t1, 50
     sb t1, 4(t0)
     sb zero, 5(t0)
     mv a0, t0

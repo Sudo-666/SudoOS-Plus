@@ -332,15 +332,12 @@ m7-tag:
 	@./scripts/m7-tag.sh
 
 # SUDOOS_M16_PRE_PATCH_V1: global M14/M15/M16 convergence gates.
-.PHONY: m16-preflight verify-m16-pre busybox-initramfs
+.PHONY: m16-preflight verify-m16-pre
 m16-preflight:
 	python3 scripts/m16-preflight-audit.py
 
 verify-m16-pre: check smoke-all smoke-smp-all m16-preflight
 	@echo "M16-pre verifier complete"
-
-busybox-initramfs:
-	scripts/build-static-busybox-initramfs.sh
 
 # SUDOOS_M16A_ELF_AUXV_PATCH_V1: M16-A ELF metadata and auxv gate.
 .PHONY: m16a-audit
@@ -367,3 +364,57 @@ m14-busybox-artifact-audit:
 
 verify-m14-busybox: m14-busybox-artifact-audit busybox-initramfs
 	python3 scripts/m14-busybox-artifact-audit.py "$(BUSYBOX_INITRAMFS)"
+
+# SUDOOS_M14_DUAL_VENDOR_USERLAND_PATCH_V1: dual-arch vendor BusyBox artifact gates.
+.PHONY: m14-vendor-userland-audit m14-vendor-userland-audit-strict busybox-initramfs-vendor busybox-initramfs-vendor-all smoke-riscv64-vendor-initramfs smoke-riscv64-sdcard smoke-loongarch64-sdcard smoke-sdcard-all verify-m14-vendor-userland
+
+BUSYBOX_ARCH ?= riscv64
+VENDOR_BUSYBOX ?= vendor/userland/$(BUSYBOX_ARCH)/busybox-static
+VENDOR_BUSYBOX_INITRAMFS ?= build/initramfs/busybox-$(BUSYBOX_ARCH).cpio
+
+m14-vendor-userland-audit:
+	python3 scripts/m14-vendor-userland-audit.py
+
+m14-vendor-userland-audit-strict:
+	python3 scripts/m14-vendor-userland-audit.py --strict
+
+busybox-initramfs-vendor:
+	@test -x "$(VENDOR_BUSYBOX)" || (echo "error: missing executable $(VENDOR_BUSYBOX)" >&2; exit 2)
+	@mkdir -p build/initramfs
+	OUT="$(VENDOR_BUSYBOX_INITRAMFS)" BUSYBOX="$(VENDOR_BUSYBOX)" scripts/build-static-busybox-initramfs.sh
+	python3 scripts/m14-busybox-artifact-audit.py "$(VENDOR_BUSYBOX_INITRAMFS)"
+
+busybox-initramfs-vendor-all:
+	@set -e; \
+	found=0; \
+	for arch in riscv64 loongarch64; do \
+	  bb="vendor/userland/$$arch/busybox-static"; \
+	  out="build/initramfs/busybox-$$arch.cpio"; \
+	  if [ -x "$$bb" ]; then \
+	    found=1; \
+	    echo "building $$out from $$bb"; \
+	    mkdir -p build/initramfs; \
+	    OUT="$$out" BUSYBOX="$$bb" scripts/build-static-busybox-initramfs.sh; \
+	    python3 scripts/m14-busybox-artifact-audit.py "$$out"; \
+	  else \
+	    echo "warn: skipping $$arch BusyBox artifact; missing executable $$bb"; \
+	  fi; \
+	done; \
+	if [ "$$found" = 0 ]; then echo "error: no vendor BusyBox artifact found" >&2; exit 2; fi
+
+smoke-riscv64-vendor-initramfs:
+	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
+	QEMU_ARGS="-initrd build/initramfs/busybox-riscv64.cpio" $(MAKE) smoke-riscv64
+
+smoke-riscv64-sdcard:
+	@test -f sdcard-rv.img || (echo "error: missing sdcard-rv.img" >&2; exit 2)
+	QEMU_ARGS="-drive file=sdcard-rv.img,if=none,format=raw,id=hd0,readonly=on -device virtio-blk-device,drive=hd0" $(MAKE) smoke-riscv64
+
+smoke-loongarch64-sdcard:
+	@test -f sdcard-la.img || (echo "error: missing sdcard-la.img" >&2; exit 2)
+	QEMU_ARGS="-drive file=sdcard-la.img,if=none,format=raw,id=hd0,readonly=on -device virtio-blk-pci,drive=hd0" $(MAKE) smoke-loongarch64
+
+smoke-sdcard-all: smoke-riscv64-sdcard smoke-loongarch64-sdcard
+
+verify-m14-vendor-userland: m14-vendor-userland-audit busybox-initramfs-vendor check smoke-all smoke-smp-all smoke-riscv64-vendor-initramfs
+	@echo "M14 vendor userland verifier complete"

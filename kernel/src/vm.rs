@@ -212,7 +212,6 @@ pub(crate) fn kernel_page_table_root() -> Result<PhysFrame, KernelVmError> {
         .root_frame())
 }
 
-#[cfg(target_arch = "riscv64")]
 pub(crate) fn kernel_translate(address: VirtAddr) -> Result<Option<PhysAddr>, KernelVmError> {
     let slot = KERNEL_PAGE_TABLE.lock();
     Ok(slot

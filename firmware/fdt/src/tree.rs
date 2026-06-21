@@ -7,7 +7,7 @@ use fdt_parser::{
     properties::Compatible,
 };
 
-use crate::{FdtBlob, FdtError, MemoryRegion, VirtioMmioRegion};
+use crate::{FdtBlob, FdtError, MemoryRegion, PciHostBridge, VirtioMmioRegion};
 
 /// MyOS 对设备树的只读视图。
 ///
@@ -87,6 +87,36 @@ impl<'a> DeviceTree<'a> {
             .and_then(|property| property_string(property.value))
     }
 
+    /// Linux-compatible external initrd range from `/chosen`.
+    ///
+    /// QEMU publishes `linux,initrd-start` and `linux,initrd-end` when
+    /// launched with `-initrd`.  Treat a half-present pair as malformed rather
+    /// than silently booting without rootfs, because that usually means the
+    /// firmware handoff is corrupt.
+    pub fn linux_initrd_range(&self) -> Result<Option<MemoryRegion>, FdtError> {
+        let Some(chosen) = self.inner.find_node("/chosen") else {
+            return Ok(None);
+        };
+
+        let start = chosen.raw_property("linux,initrd-start");
+        let end = chosen.raw_property("linux,initrd-end");
+        let (Some(start), Some(end)) = (start, end) else {
+            if start.is_some() || end.is_some() {
+                return Err(FdtError::InvalidRegLength);
+            }
+            return Ok(None);
+        };
+
+        let start =
+            usize::try_from(read_cells(start.value)?).map_err(|_| FdtError::AddressOverflow)?;
+        let end = usize::try_from(read_cells(end.value)?).map_err(|_| FdtError::AddressOverflow)?;
+        if end <= start {
+            return Err(FdtError::InvalidRegLength);
+        }
+
+        Ok(Some(MemoryRegion::new(start, end - start)))
+    }
+
     /// 设备树中声明的全部可用物理内存区域。
     pub fn memory_regions(&self) -> impl Iterator<Item = MemoryRegion> + '_ {
         self.inner
@@ -126,6 +156,64 @@ impl<'a> DeviceTree<'a> {
             let size = usize::try_from(region.len).ok()?;
 
             Some(VirtioMmioRegion::new(node.name().name, base, size))
+        })
+    }
+
+    /// Discover generic ECAM PCI host bridges.
+    ///
+    /// This follows the Linux devicetree binding used by QEMU virt machines:
+    /// `compatible = "pci-host-ecam-generic"`, `reg` for the ECAM window,
+    /// `bus-range` for bus numbers, and `ranges` for PCI memory windows.
+    pub fn pci_host_bridges(&self) -> impl Iterator<Item = PciHostBridge<'a>> + '_ {
+        let root_address_cells = self
+            .inner
+            .find_node("/")
+            .and_then(|root| read_cell_count(root, "#address-cells"))
+            .unwrap_or(2);
+        let root_size_cells = self
+            .inner
+            .find_node("/")
+            .and_then(|root| read_cell_count(root, "#size-cells"))
+            .unwrap_or(1);
+
+        self.inner.all_nodes().filter_map(move |(_depth, node)| {
+            if !node_is_available(node) || !node_is_compatible(node, "pci-host-ecam-generic") {
+                return None;
+            }
+
+            let address_cells = read_cell_count(node, "#address-cells")?;
+            let size_cells = read_cell_count(node, "#size-cells")?;
+            if address_cells != 3 || !(1..=2).contains(&size_cells) {
+                return None;
+            }
+            if validate_cell_counts(root_address_cells, root_size_cells).is_err() {
+                return None;
+            }
+
+            let ecam = parse_first_region(
+                node.raw_property("reg")?.value,
+                root_address_cells,
+                root_size_cells,
+            )
+            .ok()?;
+            let mem32 = parse_pci_memory_range(
+                node.raw_property("ranges")?.value,
+                root_address_cells,
+                size_cells,
+            )
+            .ok()?;
+            let (first_bus, last_bus) = parse_bus_range(node.raw_property("bus-range")?.value)?;
+            if first_bus > last_bus {
+                return None;
+            }
+
+            Some(PciHostBridge::new(
+                node.name().name,
+                ecam,
+                mem32,
+                first_bus,
+                last_bus,
+            ))
         })
     }
 
@@ -305,6 +393,74 @@ fn parse_reg_property(
     }
 
     Ok(())
+}
+
+fn parse_first_region(
+    bytes: &[u8],
+    address_cells: u32,
+    size_cells: u32,
+) -> Result<MemoryRegion, FdtError> {
+    let mut first = None;
+    parse_reg_property(bytes, address_cells, size_cells, |region| {
+        if first.is_none() {
+            first = Some(region);
+        }
+    })?;
+    first.ok_or(FdtError::InvalidRegLength)
+}
+
+fn parse_pci_memory_range(
+    bytes: &[u8],
+    parent_address_cells: u32,
+    size_cells: u32,
+) -> Result<MemoryRegion, FdtError> {
+    validate_cell_counts(parent_address_cells, size_cells)?;
+    let parent_address_cells = parent_address_cells as usize;
+    let size_cells = size_cells as usize;
+    let child_address_cells = 3_usize;
+    let entry_cells = child_address_cells
+        .checked_add(parent_address_cells)
+        .and_then(|cells| cells.checked_add(size_cells))
+        .ok_or(FdtError::AddressOverflow)?;
+    let entry_size = entry_cells
+        .checked_mul(4)
+        .ok_or(FdtError::AddressOverflow)?;
+    if entry_size == 0 || bytes.is_empty() || !bytes.len().is_multiple_of(entry_size) {
+        return Err(FdtError::InvalidRegLength);
+    }
+
+    let mut best = None;
+    for entry in bytes.chunks_exact(entry_size) {
+        let child_hi = read_cells(&entry[..4])?;
+        let prefetchable = child_hi & 0x4000_0000 != 0;
+        let space = (child_hi >> 24) & 0x03;
+        let parent_start = read_cells(
+            &entry[child_address_cells * 4..(child_address_cells + parent_address_cells) * 4],
+        )?;
+        let size = read_cells(&entry[(child_address_cells + parent_address_cells) * 4..])?;
+        if prefetchable || !(space == 0x02 || space == 0x03) || size == 0 {
+            continue;
+        }
+
+        let start = usize::try_from(parent_start).map_err(|_| FdtError::AddressOverflow)?;
+        let size = usize::try_from(size).map_err(|_| FdtError::AddressOverflow)?;
+        start.checked_add(size).ok_or(FdtError::AddressOverflow)?;
+        let region = MemoryRegion::new(start, size);
+        if best.is_none_or(|old: MemoryRegion| region.size() > old.size()) {
+            best = Some(region);
+        }
+    }
+
+    best.ok_or(FdtError::InvalidRegLength)
+}
+
+fn parse_bus_range(bytes: &[u8]) -> Option<(u8, u8)> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let first = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let last = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    Some((u8::try_from(first).ok()?, u8::try_from(last).ok()?))
 }
 
 fn read_cells(bytes: &[u8]) -> Result<u64, FdtError> {

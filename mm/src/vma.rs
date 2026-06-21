@@ -120,6 +120,7 @@ impl VmArea {
             self.flags.is_writable(),
             self.flags.is_executable(),
         ) {
+            (true, true, true) => crate::PagePermissions::read_write_execute(),
             (true, true, false) => crate::PagePermissions::read_write(),
             (true, false, true) => crate::PagePermissions::read_execute(),
             (true, false, false) => crate::PagePermissions::read_only(),

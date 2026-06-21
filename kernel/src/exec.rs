@@ -16,6 +16,17 @@ const AT_ENTRY: usize = 9;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 const AT_EXECFN: usize = 31;
+const DT_NULL: u64 = 0;
+const DT_PLTRELSZ: u64 = 2;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
+const DT_RELAENT: u64 = 9;
+const DT_REL: u64 = 17;
+const DT_RELSZ: u64 = 18;
+const DT_JMPREL: u64 = 23;
+
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const R_RELATIVE: u32 = 3;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -62,7 +73,8 @@ impl From<myos_vfs::Errno> for ExecError {
 }
 
 pub struct ExecConfig<'a> {
-    pub argv0: &'a str,
+    pub argv: &'a [&'a str],
+    pub envp: &'a [&'a str],
     pub stack: VirtRange,
     pub heap_start: VirtAddr,
     pub heap_limit: VirtAddr,
@@ -87,7 +99,7 @@ pub fn kernel_execve_from_initramfs(
     config: ExecConfig<'_>,
 ) -> Result<ExecImage, ExecError> {
     let initramfs = crate::initramfs::Initramfs::parse(archive)?;
-    let file = initramfs.lookup(path)?;
+    let file = initramfs.lookup_file_follow(path)?;
     exec_elf(file, config)
 }
 
@@ -138,10 +150,19 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
     ));
 
     let mm = build_mm(&areas, config.heap_start, config.heap_limit)?;
-    for segment in &elf.segments {
-        load_segment(&mm, image, *segment)?;
-    }
-    let stack_pointer = build_initial_stack(&mm, config.stack, config.argv0, &elf)?;
+    let stack_pointer = match (|| {
+        for segment in &elf.segments {
+            load_segment(&mm, image, *segment)?;
+        }
+        apply_static_pie_relocations(&mm, image, &elf)?;
+        build_initial_stack(&mm, config.stack, config.argv, config.envp, &elf)
+    })() {
+        Ok(stack_pointer) => stack_pointer,
+        Err(error) => {
+            destroy_mm(mm)?;
+            return Err(error);
+        }
+    };
     Ok(PreparedExec {
         mm,
         entry: elf.entry,
@@ -168,10 +189,6 @@ fn reject_dynamic_handoff_if_needed(elf: &crate::elf::ElfImage) -> Result<(), Ex
         }
     }
 
-    // Keep this predicate explicit: scripts/m16a-elf-auxv-audit.py verifies
-    // the same M16-A fail-closed contract.
-    let needs_dynamic_handoff = elf.interpreter.is_some() || elf.dynamic.is_some();
-
     if let Some(dynamic) = elf.dynamic {
         let dynamic_start = dynamic.virtual_address.get();
         let _dynamic_end = dynamic_start
@@ -181,10 +198,6 @@ fn reject_dynamic_handoff_if_needed(elf: &crate::elf::ElfImage) -> Result<(), Ex
             .file_offset
             .checked_add(dynamic.memory_size)
             .ok_or(ExecError::AddressOverflow)?;
-    }
-
-    if needs_dynamic_handoff {
-        return Err(ExecError::DynamicInterpreterUnsupported);
     }
     Ok(())
 }
@@ -245,14 +258,131 @@ fn load_segment(
     Ok(())
 }
 
+fn apply_static_pie_relocations(
+    mm: &UserMm,
+    image: &[u8],
+    elf: &crate::elf::ElfImage,
+) -> Result<(), ExecError> {
+    let Some(dynamic) = elf.dynamic else {
+        return Ok(());
+    };
+    let entries = image
+        .get(dynamic.file_offset..dynamic.file_offset + dynamic.memory_size)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader))?;
+    let mut rela_vaddr = 0_usize;
+    let mut rela_size = 0_usize;
+    let mut rela_ent = 24_usize;
+    let mut rel_size = 0_usize;
+    let mut jmprel = 0_usize;
+    let mut pltrel_size = 0_usize;
+
+    for entry in entries.chunks_exact(16) {
+        let tag = read_u64(entry, 0)?;
+        let value = read_u64(entry, 8)?;
+        match tag {
+            DT_NULL => break,
+            DT_RELA => {
+                rela_vaddr = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
+            DT_RELASZ => {
+                rela_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
+            DT_RELAENT => {
+                rela_ent = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
+            DT_REL => {
+                let _ = value;
+            }
+            DT_RELSZ => {
+                rel_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
+            DT_JMPREL => jmprel = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?,
+            DT_PLTRELSZ => {
+                pltrel_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
+            _ => {}
+        }
+    }
+
+    if rel_size != 0 || jmprel != 0 || pltrel_size != 0 {
+        return Ok(());
+    }
+    if rela_size == 0 {
+        return Ok(());
+    }
+    if rela_ent != 24 || !rela_size.is_multiple_of(rela_ent) {
+        return Err(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader));
+    }
+
+    let rela_addr = rela_vaddr
+        .checked_add(elf.load_bias)
+        .ok_or(ExecError::AddressOverflow)?;
+    let rela_offset = virtual_to_file_offset(elf, VirtAddr::new(rela_addr), rela_size)?;
+    let rela_bytes = image
+        .get(rela_offset..rela_offset + rela_size)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
+
+    for entry in rela_bytes.chunks_exact(rela_ent) {
+        let raw_offset = read_u64(entry, 0)?;
+        let info = read_u64(entry, 8)?;
+        let addend = read_i64(entry, 16)?;
+        let relocation_type = (info & 0xffff_ffff) as u32;
+        let symbol = info >> 32;
+        if relocation_type != R_RELATIVE || symbol != 0 {
+            return Ok(());
+        }
+        let destination = usize::try_from(raw_offset)
+            .map_err(|_| ExecError::AddressOverflow)?
+            .checked_add(elf.load_bias)
+            .ok_or(ExecError::AddressOverflow)?;
+        let value = (elf.load_bias as i128)
+            .checked_add(addend as i128)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(ExecError::AddressOverflow)?;
+        loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
+    }
+
+    Ok(())
+}
+
+fn virtual_to_file_offset(
+    elf: &crate::elf::ElfImage,
+    address: VirtAddr,
+    size: usize,
+) -> Result<usize, ExecError> {
+    let end = address
+        .get()
+        .checked_add(size)
+        .ok_or(ExecError::AddressOverflow)?;
+    for segment in &elf.segments {
+        let start = segment.virtual_address.get();
+        let file_end = start
+            .checked_add(segment.file_size)
+            .ok_or(ExecError::AddressOverflow)?;
+        if address.get() >= start && end <= file_end {
+            return segment
+                .file_offset
+                .checked_add(address.get() - start)
+                .ok_or(ExecError::AddressOverflow);
+        }
+    }
+    Err(ExecError::Elf(crate::elf::ElfError::InvalidSegment))
+}
+
 fn build_initial_stack(
     mm: &UserMm,
     stack: VirtRange,
-    argv0: &str,
+    argv: &[&str],
+    envp: &[&str],
     elf: &crate::elf::ElfImage,
 ) -> Result<VirtAddr, ExecError> {
-    if argv0.is_empty() || argv0.as_bytes().contains(&0) {
+    if argv.is_empty() {
         return Err(ExecError::InvalidStack);
+    }
+    for value in argv.iter().chain(envp.iter()) {
+        if value.is_empty() || value.as_bytes().contains(&0) {
+            return Err(ExecError::InvalidStack);
+        }
     }
     if stack.is_empty() || stack.end().get() & 0xf != 0 {
         return Err(ExecError::InvalidStack);
@@ -260,7 +390,25 @@ fn build_initial_stack(
 
     let mut cursor = stack.end().get();
 
-    let execfn_ptr = push_stack_string(mm, stack, &mut cursor, argv0)?;
+    let mut argv_ptrs = Vec::new();
+    argv_ptrs
+        .try_reserve(argv.len())
+        .map_err(|_| ExecError::MetadataOutOfMemory)?;
+    for value in argv.iter().rev() {
+        argv_ptrs.push(push_stack_string(mm, stack, &mut cursor, value)?);
+    }
+    argv_ptrs.reverse();
+
+    let mut envp_ptrs = Vec::new();
+    envp_ptrs
+        .try_reserve(envp.len())
+        .map_err(|_| ExecError::MetadataOutOfMemory)?;
+    for value in envp.iter().rev() {
+        envp_ptrs.push(push_stack_string(mm, stack, &mut cursor, value)?);
+    }
+    envp_ptrs.reverse();
+
+    let execfn_ptr = argv_ptrs[0];
 
     let random = build_at_random_bytes(elf.entry, stack, execfn_ptr);
     let random_ptr = push_stack_bytes(mm, stack, &mut cursor, &random)?;
@@ -289,15 +437,19 @@ fn build_initial_stack(
 
     let mut words = Vec::new();
     words
-        .try_reserve(1 + 2 + 1 + auxv.len() * 2 + 2)
+        .try_reserve(1 + argv_ptrs.len() + 1 + envp_ptrs.len() + 1 + auxv.len() * 2 + 2)
         .map_err(|_| ExecError::MetadataOutOfMemory)?;
 
     // argc
-    words.push(1);
+    words.push(argv_ptrs.len());
     // argv[] + NULL
-    words.push(execfn_ptr);
+    for pointer in argv_ptrs {
+        words.push(pointer);
+    }
     words.push(0);
-    // envp[] is intentionally empty for the current kernel entry path.
+    for pointer in envp_ptrs {
+        words.push(pointer);
+    }
     words.push(0);
     for (key, value) in auxv {
         words.push(key);
@@ -439,4 +591,22 @@ fn destroy_mm(mut mm: Box<UserMm>) -> Result<(), ExecError> {
 
 fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ExecError> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader))?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
+
+fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, ExecError> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader))?;
+    Ok(i64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }

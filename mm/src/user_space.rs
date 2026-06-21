@@ -276,9 +276,22 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
             FaultOutcome::CopyOnWrite { area } => {
                 Ok(UserFaultPlan::CopyOnWriteUnsupported { area })
             }
-            FaultOutcome::LoadFile { .. } | FaultOutcome::MapDevice { .. } => {
-                Ok(UserFaultPlan::KernelBug)
+            FaultOutcome::LoadFile { area, .. } => {
+                // The kernel-side ELF loader currently pre-populates file
+                // bytes eagerly and leaves the VMA kind as FileBacked so later
+                // M16 work can grow into real filemap/page-cache faults. Any
+                // remaining non-present fault inside that VMA is therefore a
+                // zero-fill demand page, matching the already-eager loader
+                // contract instead of killing a valid static PIE on BSS.
+                Ok(UserFaultPlan::MapAnonymous {
+                    area,
+                    page: fault
+                        .address()
+                        .align_down(PAGE_SIZE)
+                        .ok_or(UserMmError::AddressOverflow)?,
+                })
             }
+            FaultOutcome::MapDevice { .. } => Ok(UserFaultPlan::KernelBug),
             FaultOutcome::ProtectionViolation { area } => {
                 Ok(UserFaultPlan::ProtectionViolation { area })
             }
@@ -334,16 +347,17 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
                 continue;
             }
 
-            let sp_matches = area.range().contains(user_sp) || user_sp == area.range().end();
-            if !sp_matches {
-                continue;
-            }
-
             let step_limit = area
                 .range()
                 .start()
                 .checked_sub(max_growth_step)
                 .ok_or(UserMmError::AddressOverflow)?;
+            let sp_matches = (user_sp >= step_limit && user_sp < area.range().start())
+                || area.range().contains(user_sp)
+                || user_sp == area.range().end();
+            if !sp_matches {
+                continue;
+            }
             if fault_page < step_limit {
                 continue;
             }

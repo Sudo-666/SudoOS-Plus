@@ -234,7 +234,7 @@ def check_ext4_vfs() -> Check:
     )
 
 def check_block_io_shape() -> Check:
-    text = "\n".join(read(p) for p in ["kernel/src/block.rs", "kernel/src/device/virtio_blk.rs", "kernel/src/drivers/virtio_blk.rs", "kernel/src/virtio_blk.rs"])
+    text = "\n".join(read(p) for p in ["kernel/src/block.rs", "kernel/src/virtio.rs", "kernel/src/device/virtio_blk.rs", "kernel/src/drivers/virtio_blk.rs", "kernel/src/virtio_blk.rs"])
     if not text.strip():
         return Check("block IO shape", "WARN", "No obvious block/virtio-blk source files found by this audit.", "Keep block code discoverable or extend this audit with the actual paths.")
     concerns = []
@@ -268,9 +268,9 @@ def check_poll_signal_surface() -> Check:
     user = read("kernel/src/user.rs")
     syscall = read("kernel/src/syscall.rs")
     concerns = []
-    if "SYS_PPOLL" not in syscall or "SYS_PPOLL" not in user:
+    if "PPOLL" not in syscall or "SYS_PPOLL" not in user:
         concerns.append("ppoll dispatch missing")
-    if "SYS_PSELECT6" not in syscall or "SYS_PSELECT6" not in user:
+    if "PSELECT6" not in syscall or "SYS_PSELECT6" not in user:
         concerns.append("pselect6 dispatch missing")
     if "SYS_PSELECT6 => sys_pselect6(arguments[0], arguments[4])" in user.replace("\n", " "):
         concerns.append("pselect6 ignores fdset arguments")

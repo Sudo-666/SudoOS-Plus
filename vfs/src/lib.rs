@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
+use alloc::{string::String, sync::Arc};
 use core::array;
 
 use myos_sync::SpinLock;
@@ -436,6 +436,7 @@ struct FileState {
 
 pub struct File {
     flags: OpenFlags,
+    path: Option<String>,
     ops: Arc<dyn FileOperations>,
     state: SpinLock<FileState>,
 }
@@ -446,6 +447,16 @@ impl File {
     pub fn new(flags: OpenFlags, ops: Arc<dyn FileOperations>) -> ArcFile {
         Arc::new(Self {
             flags,
+            path: None,
+            ops,
+            state: SpinLock::new(FileState { position: 0 }),
+        })
+    }
+
+    pub fn new_with_path(flags: OpenFlags, path: String, ops: Arc<dyn FileOperations>) -> ArcFile {
+        Arc::new(Self {
+            flags,
+            path: Some(path),
             ops,
             state: SpinLock::new(FileState { position: 0 }),
         })
@@ -453,6 +464,10 @@ impl File {
 
     pub const fn flags(&self) -> OpenFlags {
         self.flags
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
     pub fn read(&self, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {

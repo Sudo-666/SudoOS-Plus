@@ -1,10 +1,11 @@
 # M14-M16 progress
 
-This note records the current state after the M14 foundation pass and the M15
-block-device/VFS mount-table pass. It is intentionally conservative: M15's
-block-device plumbing is in place, but M15 is not a complete persistent ext4
-filesystem until lwext4-backed inode/file operations run through VFS. M16 is
-not complete until dynamically linked userland runs.
+This note records the current M14-M16 boundary. It is intentionally
+conservative: the tree now has real static BusyBox artifacts, external
+initramfs plumbing on the RISC-V QEMU path, a native read-only ext4 snapshot
+handoff into VFS, and M16-A ELF/auxv/static-PIE relocation support. Full
+dynamic userland remains a later boundary until PT_INTERP, shared-object mmap,
+TLS, and RELRO all run through real QEMU smoke.
 
 ## Completed in this pass
 
@@ -47,12 +48,44 @@ not complete until dynamically linked userland runs.
   restores the saved trap frame and old mask through `rt_sigreturn`. The
   LoongArch embedded user image is page-aligned so page-relative address
   materialization remains valid after copying the verifier image to `USER_CODE`.
+- Vendor static BusyBox artifacts exist for RISC-V and LoongArch under
+  `vendor/userland/*/busybox-static`, and the deterministic rootless newc
+  builder emits `/init -> /bin/busybox`, applet symlinks, and the basic runtime
+  directories.
+- RISC-V QEMU `-initrd build/initramfs/busybox-riscv64.cpio` is parsed through
+  `/chosen/linux,initrd-start/end`, reserved from the physical page allocator,
+  and unpacked into the tmpfs rootfs before user verification.
+- Initramfs parsing now understands regular files, directories, and symlinks;
+  exec-from-initramfs follows symlinks with a bounded resolver.
+- Ext4 M15-A is no longer a magic-only probe: the native read-only parser walks
+  superblock/group/inode/extent/directory state and installs a snapshot into
+  VFS with EROFS guards.
+- The block layer exposes a first request-queue shape, bounded buffer/page
+  cache, dirty flush, byte-range I/O, and explicit virtio DMA ordering markers.
+- `pselect6` now handles fd_set readiness through the VFS poll hook for the
+  current nonblocking surface. The signal ABI has explicit siginfo/ucontext and
+  altstack boundary structs, while unsupported full POSIX behavior remains
+  fail-closed instead of being silently claimed.
+- Exec now copies real `argv[]`/`envp[]` from userspace, builds a Linux-shaped
+  initial stack for all arguments and environment strings, and applies
+  no-interpreter static PIE `R_RELATIVE` relocations. `PT_INTERP` binaries still
+  fail closed instead of entering an incomplete dynamic-loader path.
+- The real vendor RISC-V BusyBox static PIE is now executed from the unpacked
+  external initramfs during QEMU smoke. The gate runs `/bin/busybox true` and
+  waits for exit status 0 from a normal user task rather than a synthetic
+  verifier-only image.
 
 ## Validation
 
 - `make check`
 - `make smoke-all`
 - `make smoke-smp-all`
+- `make m14-vendor-userland-audit-strict`
+- `make busybox-initramfs-vendor-all`
+- `make m15a-ext4-ro-audit`
+- `make m16a-audit`
+- `make m16-preflight`
+- `QEMU_ARGS='-initrd build/initramfs/busybox-riscv64.cpio' make smoke-riscv64`
 - `QEMU_ARGS='-drive file=/private/tmp/sudoos-virtio.raw,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0' make smoke-riscv64`
 
 Both RISC-V and LoongArch pass single-core and SMP QEMU smoke after these
@@ -60,44 +93,37 @@ changes. The extra RISC-V run verifies a real virtio-blk device is discovered
 and registered; it intentionally does not perform destructive writes to the
 attached disk.
 
-## Not complete yet
+## Still not complete
 
-### M14 static BusyBox
+Not complete means the feature is not yet Linux-compatible enough to close the
+stage, even if the current plumbing and QEMU smoke gates pass.
 
-The kernel is much closer to static BusyBox, but it still needs a real BusyBox
-initramfs test artifact and a user-mode smoke that runs applets such as `sh`,
-`ls`, `ln`, `sleep`, and `ps`. Basic handler delivery and `rt_sigreturn` are
-implemented, but `siginfo`, `ucontext`, altstack, syscall restart, and the full
-threaded signal-selection rules remain incomplete.
+### Static BusyBox as PID 1
 
-### M15 virtio-blk and ext4
+RISC-V can now receive and unpack the external BusyBox initramfs, execute the
+vendor static PIE BusyBox from `/bin/busybox`, and verify the `true` applet
+through normal process exit. The remaining work is to publish `/init` as the
+long-lived boot user process and broaden applet smoke to `sh`, `ls`, `ln`,
+`sleep`, and `ps`. Keep the old verifier on its private `/.m12` exec probe;
+`/init` is reserved for real userland.
 
-Current state:
+LoongArch direct boot currently accepts `-initrd` without crashing, but QEMU's
+FDT in this path does not expose `linux,initrd-start/end`, so the kernel has no
+trustworthy initrd descriptor to import yet.
 
-- Done: FDT discovery, `ioremap`-backed MMIO transport probe, vendor
-  `virtio-drivers` HAL/DMA, `virtio-blk` initialization, kernel `BlockDevice`
-  wrapper, bounded buffer/page cache, byte-range I/O, `fsync` writeback, mount
-  table, block devfs nodes, and ext4 superblock validation.
-- Not done: request merging/scheduling, interrupt-driven block I/O, full ext4
-  integration through `vendor/lwext4`, ext4 inode/dentry/file operations, and a
-  persistent root filesystem.
+### Persistent ext4
 
-The remaining Linux-like path is:
+M15-A provides a native read-only ext4 snapshot into VFS. The remaining
+persistent-filesystem work is journal/replay policy, htree directories,
+xattrs/ACLs, writeback, crash-consistency boundaries, and a persistent rootfs
+mount path. A future lwext4 adapter may still be useful for parity tests, but
+it must enter through the same VFS inode/dentry/file operation shape. Do not
+bypass VFS with ad-hoc ext4 reads.
 
-```text
-virtio-blk block device
-  -> lwext4 blockdev adapter
-  -> ext4 inode/dentry/file operations
-  -> persistent root filesystem
-```
+### Dynamic musl
 
-Do not bypass `ioremap` by handing raw MMIO physical addresses to the driver.
-On RISC-V the final direct MMIO helper is intentionally narrow and only covers
-the early UART fixmap path.
-
-### M16 dynamic musl
-
-The current ELF loader accepts static `ET_EXEC` with `PT_LOAD`. M16 still needs
-`ET_DYN`, `PT_INTERP`, loader handoff auxv entries, shared-object mmap layout,
-TLS setup, dynamic relocations, and RELRO `mprotect` handling before dynamic
-musl can be considered complete.
+M16-A parses `ET_DYN`, `PT_INTERP`, `PT_PHDR`, `PT_DYNAMIC`, load bias, builds
+Linux-like auxv entries, and supports no-interpreter static PIE `R_RELATIVE`
+relocations. M16-B still needs PT_INTERP loading, loader/shared-object mmap
+layout, symbol relocations, TLS setup, and RELRO `mprotect` handling before
+dynamic musl can be considered complete.
