@@ -54,3 +54,7 @@ oscomp-feature-gate-repair-audit:
 .PHONY: oscomp-virtio-letchains-audit
 oscomp-virtio-letchains-audit:
 	@./scripts/oscomp-virtio-letchains-audit.sh .
+
+.PHONY: oscomp-rust-src-audit
+oscomp-rust-src-audit:
+	@./scripts/oscomp-rust-src-audit.sh

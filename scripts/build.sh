@@ -2,6 +2,11 @@
 
 set -Eeuo pipefail
 
+# OSKernel2026: ensure -Z build-std has a complete rust-src in the active sysroot.
+if [ -x "./scripts/oscomp-prepare-rust-src.sh" ]; then
+    ./scripts/oscomp-prepare-rust-src.sh
+fi
+
 SCRIPT_DIR="$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
     pwd
