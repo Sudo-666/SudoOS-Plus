@@ -62,3 +62,7 @@ oscomp-rust-src-audit:
 .PHONY: oscomp-rust-src-repair-audit
 oscomp-rust-src-repair-audit:
 	@./scripts/oscomp-rust-src-repair-audit.sh
+
+.PHONY: oscomp-linker-align-audit
+oscomp-linker-align-audit:
+	@bash scripts/oscomp-linker-align-audit.sh
