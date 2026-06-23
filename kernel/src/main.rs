@@ -172,7 +172,7 @@ pub extern "C" fn __riscv_early_trap_panic() -> ! {
     }
 }
 
-fn kernel_main(boot: BootInfo) -> ! {
+ #[cfg(target_arch = "riscv64")] #[inline(always)] fn oscomp_riscv_raw_trace(bytes: &[u8]) { for &byte in bytes { arch::early_console::write_byte(byte); } } fn kernel_main(boot: BootInfo) -> ! {
     println!("kernel_main: initialization started");
 
     #[cfg(target_arch = "loongarch64")]
@@ -269,15 +269,11 @@ fn kernel_main(boot: BootInfo) -> ! {
          * 高半 kernel image 之前已经由
          * prepare_kernel_image() 写入正式页表。
          */
-        memory::install_riscv_final_page_table(&early_memory);
-    }
+        memory::install_riscv_final_page_table(&early_memory); #[cfg(target_arch = "riscv64")] oscomp_riscv_raw_trace(b"OSCOMP_RISCV_POST_FINAL_TRACE_R1\n");  }
 
     /*
      * 从此处开始，不再允许使用 EarlyFrameAllocator。
-     */
-    let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory);
-
-    #[cfg(debug_assertions)]
+     */  #[cfg(target_arch = "riscv64")] oscomp_riscv_raw_trace(b"OSCOMP_RISCV_POST_FINAL_TRACE_R2\n"); let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory); #[cfg(target_arch = "riscv64")] oscomp_riscv_raw_trace(b"OSCOMP_RISCV_POST_FINAL_TRACE_R3\n");  #[cfg(debug_assertions)]
     page_alloc::verify();
 
     /*

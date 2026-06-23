@@ -785,11 +785,27 @@ impl EarlyMemoryState {
     }
 }
 
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn oscomp_riscv_page_alloc_trace(label: &'static [u8]) {
+    for &byte in label {
+        crate::arch::early_console::write_byte(byte);
+    }
+}
+
 pub fn initialize_page_allocator(
     layout: &BootMemoryLayout,
     early_memory: EarlyMemoryState,
 ) -> KernelMemoryState {
+    // OSCOMP_RISCV_PAGE_ALLOC_TRACE
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P0:enter-page-allocator\n");
+
     let managed = managed_physical_span(layout.ram());
+
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P1:managed-span\n");
 
     let required_bytes =
         BuddyAllocator::required_metadata_bytes(managed).expect("invalid managed physical range");
@@ -799,7 +815,13 @@ pub fn initialize_page_allocator(
         .expect("page metadata size overflow")
         / myos_mm::PAGE_SIZE;
 
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P2:metadata-pages\n");
+
     let (mut early_allocator, boot_page_table) = early_memory.into_parts();
+
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P3:early-memory-split\n");
 
     /*
      * 元数据本身从 early allocator 分配，因此不会再被交给
@@ -814,6 +836,9 @@ pub fn initialize_page_allocator(
             );
         });
 
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P4:metadata-allocated\n");
+
     let metadata_range = metadata_block.range();
 
     let metadata_virtual = crate::arch::memory::phys_access::ram_virtual_address(
@@ -826,6 +851,9 @@ pub fn initialize_page_allocator(
                      {error:?}",
         );
     });
+
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P5:metadata-direct-map\n");
 
     /*
      * SAFETY:
@@ -849,6 +877,9 @@ pub fn initialize_page_allocator(
         );
     });
 
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P6:buddy-new\n");
+
     /*
      * 全部普通 RAM 先标记为 Reserved。
      *
@@ -865,9 +896,15 @@ pub fn initialize_page_allocator(
             });
     }
 
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P7:mark-present\n");
+
     let expected_free_pages = early_allocator
         .remaining_frames()
         .expect("early frame count overflow");
+
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P8:remaining-frames\n");
 
     /*
      * 只有 EarlyFrameAllocator 剩余的页面才进入 buddy。
@@ -881,11 +918,17 @@ pub fn initialize_page_allocator(
         });
     }
 
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P9:release-ranges\n");
+
     assert_eq!(
         page_allocator.total_free_pages(),
         expected_free_pages,
         "early-to-buddy handoff lost or duplicated pages",
     );
+
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P10:free-count-ok\n");
 
     crate::println!("physical page allocator:");
     crate::println!(
@@ -923,6 +966,9 @@ pub fn initialize_page_allocator(
              {error:?}",
         );
     });
+
+    #[cfg(target_arch = "riscv64")]
+    oscomp_riscv_page_alloc_trace(b"P11:global-page-alloc-installed\n");
 
     assert!(crate::page_alloc::is_initialized(),);
 

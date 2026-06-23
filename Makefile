@@ -100,3 +100,7 @@ oscomp-riscv-linuxlike-handoff-audit:
 .PHONY: oscomp-riscv-early-trap-audit
 oscomp-riscv-early-trap-audit:
 	@bash scripts/oscomp-riscv-early-trap-audit.sh
+
+.PHONY: oscomp-riscv-post-final-trace-audit
+oscomp-riscv-post-final-trace-audit:
+	@sh scripts/oscomp-riscv-post-final-trace-audit.sh
