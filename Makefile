@@ -122,3 +122,7 @@ oscomp-riscv-allocator-summary-audit:
 .PHONY: oscomp-riscv-allocator-preinstall-audit
 oscomp-riscv-allocator-preinstall-audit:
 	python3 scripts/oscomp-riscv-allocator-preinstall-audit.py
+
+.PHONY: oscomp-riscv-allocator-install-first-audit
+oscomp-riscv-allocator-install-first-audit:
+	python3 scripts/oscomp-riscv-allocator-install-first-audit.py
