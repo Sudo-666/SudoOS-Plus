@@ -881,12 +881,23 @@ unsafe impl Send for BuddyAllocator {}
 
 fn largest_block_order(pfn: usize, remaining_pages: usize) -> usize {
     debug_assert!(remaining_pages != 0);
+    if remaining_pages == 0 {
+        return 0;
+    }
 
-    let alignment_order = pfn.trailing_zeros() as usize;
-
-    let size_order = (usize::BITS - 1 - remaining_pages.leading_zeros()) as usize;
-
-    min(MAX_ORDER - 1, min(alignment_order, size_order))
+    let mut order = 0usize;
+    while order + 1 < MAX_ORDER {
+        let next_order = order + 1;
+        let block_pages = 1usize << next_order;
+        if block_pages > remaining_pages {
+            break;
+        }
+        if (pfn & (block_pages - 1)) != 0 {
+            break;
+        }
+        order = next_order;
+    }
+    order
 }
 
 fn frame_from_pfn(pfn: usize) -> Result<PhysFrame, BuddyError> {

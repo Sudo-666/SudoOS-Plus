@@ -112,3 +112,7 @@ oscomp-riscv-chunked-buddy-audit:
 .PHONY: oscomp-buddy-release-internal-trace-audit
 oscomp-buddy-release-internal-trace-audit:
 	bash scripts/oscomp-buddy-release-internal-trace-audit.sh
+
+.PHONY: oscomp-riscv-buddy-order-audit
+oscomp-riscv-buddy-order-audit:
+	@python3 scripts/oscomp-riscv-buddy-order-audit.py
