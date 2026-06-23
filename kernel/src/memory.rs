@@ -894,23 +894,39 @@ impl EarlyMemoryState {
         metadata_range.end().get(),
         metadata_range.size() / 1024,
     );
-    crate::println!(
-        "  DMA32 present: {} pages",
-        page_allocator.zone_present_pages(ZoneKind::Dma32,),
-    );
-    crate::println!(
-        "  DMA32 free   : {} pages",
-        page_allocator.zone_free_pages(ZoneKind::Dma32,),
-    );
-    crate::println!(
-        "  Normal free  : {} pages",
-        page_allocator.zone_free_pages(ZoneKind::Normal,),
-    );
-    crate::println!(
-        "  total free   : {} pages",
-        page_allocator.total_free_pages(),
-    );
-    crate::println!("  early handoff: complete",);
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        /*
+         * RISC-V reaches this point with the final Sv39 root active but before the
+         * global page allocator is installed.  Keep the pre-install summary bounded:
+         * the handoff invariant above already verified total_free_pages(), and the
+         * full allocator becomes globally visible immediately after this block.
+         */
+        crate::println!("  total free   : {} pages", expected_free_pages,);
+        crate::println!("  early handoff: complete",);
+    }
+
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        crate::println!(
+            "  DMA32 present: {} pages",
+            page_allocator.zone_present_pages(ZoneKind::Dma32,),
+        );
+        crate::println!(
+            "  DMA32 free   : {} pages",
+            page_allocator.zone_free_pages(ZoneKind::Dma32,),
+        );
+        crate::println!(
+            "  Normal free  : {} pages",
+            page_allocator.zone_free_pages(ZoneKind::Normal,),
+        );
+        crate::println!(
+            "  total free   : {} pages",
+            page_allocator.total_free_pages(),
+        );
+        crate::println!("  early handoff: complete",);
+    }
 
     crate::page_alloc::install(page_allocator).unwrap_or_else(|error| {
         panic!(

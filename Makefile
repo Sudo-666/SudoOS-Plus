@@ -114,3 +114,7 @@ oscomp-riscv-buddy-order-audit:
 	python3 scripts/oscomp-riscv-buddy-order-audit.py
 oscomp-riscv-chunked-buddy-audit:
 	python3 scripts/oscomp-riscv-chunked-buddy-audit.py
+
+.PHONY: oscomp-riscv-allocator-summary-audit
+oscomp-riscv-allocator-summary-audit:
+	python3 scripts/oscomp-riscv-allocator-summary-audit.py $(CURDIR)
