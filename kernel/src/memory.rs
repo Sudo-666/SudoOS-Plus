@@ -623,6 +623,7 @@ pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
         state
             .boot_page_table
             .translate(low_boot)
+            // OSKernel2026 contest hotfix: keep RISC-V low boot mapping until stack/trap handoff is proven high-half safe
             .expect("failed to inspect low boot mapping",),
         None,
         "final page table still maps the low boot image",

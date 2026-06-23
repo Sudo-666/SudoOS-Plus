@@ -75,3 +75,8 @@ oscomp-riscv-rw-segment-audit:
 .PHONY: oscomp-riscv-lowmap-audit
 oscomp-riscv-lowmap-audit:
 	@./scripts/oscomp-riscv-lowmap-audit.sh
+
+.PHONY: oscomp-riscv-highhalf-audit
+oscomp-riscv-highhalf-audit:
+	@python3 scripts/oscomp-riscv-highhalf-audit.py
+
