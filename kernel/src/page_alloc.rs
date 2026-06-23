@@ -87,28 +87,11 @@ pub fn install(allocator: BuddyAllocator) -> Result<(), GlobalPageAllocatorError
 /// normal allocation/free/reference operations continue to use the IRQ-safe
 /// lockdep-tracked PAGE_ALLOCATOR.lock() path.
 pub unsafe fn install_boot(allocator: BuddyAllocator) -> Result<(), GlobalPageAllocatorError> {
-    #[cfg(target_arch = "riscv64")]
-    crate::println!("riscv page_alloc install_boot: enter");
-
     let slot = unsafe { PAGE_ALLOCATOR.get_mut_unchecked() };
-
-    #[cfg(target_arch = "riscv64")]
-    crate::println!("riscv page_alloc install_boot: slot");
-
     if slot.is_some() {
-        #[cfg(target_arch = "riscv64")]
-        crate::println!("riscv page_alloc install_boot: already initialized");
         return Err(GlobalPageAllocatorError::AlreadyInitialized);
     }
-
-    #[cfg(target_arch = "riscv64")]
-    crate::println!("riscv page_alloc install_boot: empty");
-
     *slot = Some(allocator);
-
-    #[cfg(target_arch = "riscv64")]
-    crate::println!("riscv page_alloc install_boot: published");
-
     Ok(())
 }
 

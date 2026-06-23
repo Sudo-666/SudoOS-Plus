@@ -136,3 +136,7 @@ oscomp-riscv-boot-pagealloc-install-audit: oscomp-riscv-boot-pagealloc-chain-aud
 
 oscomp-riscv-boot-pagealloc-effective-audit:
 	python3 scripts/oscomp-riscv-boot-pagealloc-effective-audit.py
+
+.PHONY: oscomp-riscv-post-install-probe-cleanup-audit
+oscomp-riscv-post-install-probe-cleanup-audit:
+	python3 scripts/oscomp-riscv-post-install-probe-cleanup-audit.py

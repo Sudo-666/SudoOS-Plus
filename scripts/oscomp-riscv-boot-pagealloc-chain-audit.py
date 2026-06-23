@@ -1,48 +1,171 @@
 #!/usr/bin/env python3
-from pathlib import Path
+from __future__ import annotations
+
 import re
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-checks = []
 
-def text(rel):
-    p = ROOT / rel
-    if not p.exists():
-        print(f"FAIL missing {rel}")
-        sys.exit(1)
-    return p.read_text(encoding="utf-8")
 
-def ok(name, cond):
-    checks.append((name, bool(cond)))
+def read(rel: str) -> str:
+    return (ROOT / rel).read_text(encoding="utf-8")
 
-spin = text("sync/src/spin_lock.rs")
-irq = text("kernel/src/irq_lock.rs")
-pa = text("kernel/src/page_alloc.rs")
-mem = text("kernel/src/memory.rs")
 
-ok("SpinLock exposes boot-only unchecked access", "get_mut_unchecked" in spin and "self.value.get()" in spin)
-ok("IrqSpinLock forwards boot-only unchecked access", "get_mut_unchecked" in irq and "inner.get_mut_unchecked" in irq)
-ok("page allocator has boot installer", "install_boot" in pa and "PAGE_ALLOCATOR.get_mut_unchecked" in pa)
-ok("page allocator has boot init check", "is_initialized_boot" in pa and "PAGE_ALLOCATOR.get_mut_unchecked().is_some()" in pa)
-install_fn = re.search(r"pub\s+fn\s+install\s*\([^{}]*\)\s*->[^{}]*\{(?P<body>.*?)\n\}", pa, re.S)
-ok("runtime install still uses IRQ lock", install_fn and "PAGE_ALLOCATOR.lock()" in install_fn.group("body"))
-start = mem.find('#[cfg(target_arch = "riscv64")]')
-# choose the cfg block after physical page allocator summary, not earlier RISC-V helpers
-phys = mem.find('physical page allocator')
-start = mem.find('#[cfg(target_arch = "riscv64")]', phys)
-end = mem.find('#[cfg(not(target_arch = "riscv64"))]', start)
-riscv = mem[start:end] if start >= 0 and end > start else ""
-non = mem[end:mem.find('KernelMemoryState', end)] if end >= 0 else ""
-ok("RISC-V allocator path uses boot installer", "install_boot(page_allocator)" in riscv)
-ok("RISC-V allocator path avoids runtime install lock", "crate::page_alloc::install(page_allocator)" not in riscv)
-ok("RISC-V allocator init check avoids runtime lock", "is_initialized_boot" in riscv and "is_initialized()" not in riscv)
-ok("non-RISC-V allocator path keeps runtime install", "crate::page_alloc::install(page_allocator)" in non)
+def find_matching_brace(src: str, open_idx: int) -> int:
+    depth = 0
+    i = open_idx
+    n = len(src)
+    in_line_comment = False
+    in_block_comment = 0
+    in_str = False
+    in_char = False
+    raw_hashes = None
+    escape = False
+    while i < n:
+        ch = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "/" and nxt == "*":
+                in_block_comment += 1
+                i += 2
+                continue
+            if ch == "*" and nxt == "/":
+                in_block_comment -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+        if raw_hashes is not None:
+            if ch == '"' and src.startswith("#" * raw_hashes, i + 1):
+                i += 1 + raw_hashes
+                raw_hashes = None
+            else:
+                i += 1
+            continue
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = 1
+            i += 2
+            continue
+        if ch == "r":
+            j = i + 1
+            hashes = 0
+            while j < n and src[j] == "#":
+                hashes += 1
+                j += 1
+            if hashes and j < n and src[j] == '"':
+                raw_hashes = hashes
+                i = j + 1
+                continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise RuntimeError("unmatched brace")
 
-passed = sum(1 for _, c in checks if c)
-failed = len(checks) - passed
-for name, cond in checks:
-    print(("PASS" if cond else "FAIL") + f" {name}")
-print(f"oscomp-riscv-boot-pagealloc-chain-audit: PASS={passed} FAIL={failed}")
-if failed:
-    sys.exit(1)
+
+def extract_fn(src: str, name: str) -> str:
+    m = re.search(r"\b(?:pub\s+)?(?:unsafe\s+)?fn\s+" + re.escape(name) + r"(?:\s*<[^>{;]*>)?\s*\(", src)
+    if not m:
+        raise RuntimeError(f"function {name} not found")
+    open_idx = src.find("{", m.end())
+    if open_idx < 0:
+        raise RuntimeError(f"function {name} has no body")
+    close_idx = find_matching_brace(src, open_idx)
+    return src[m.start():close_idx + 1]
+
+
+def extract_cfg_block(src: str, cfg: str) -> str:
+    marker = f"#[cfg({cfg})]"
+    start = src.find(marker)
+    if start < 0:
+        raise RuntimeError(f"cfg block {cfg} not found")
+    open_idx = src.find("{", start)
+    if open_idx < 0:
+        raise RuntimeError(f"cfg block {cfg} has no body")
+    close_idx = find_matching_brace(src, open_idx)
+    return src[start:close_idx + 1]
+
+
+def main() -> int:
+    memory = read("kernel/src/memory.rs")
+    page_alloc = read("kernel/src/page_alloc.rs")
+    irq_lock = read("kernel/src/irq_lock.rs")
+    spin_lock = read("sync/src/spin_lock.rs")
+
+    results: list[tuple[bool, str]] = []
+    def check(cond: bool, msg: str) -> None:
+        results.append((cond, msg))
+
+    init_fn = extract_fn(memory, "initialize_page_allocator")
+    riscv_block = extract_cfg_block(init_fn, 'target_arch = "riscv64"')
+
+    check("unsafe" in riscv_block and "page_alloc::install_boot(page_allocator)" in riscv_block,
+          "RISC-V uses boot-only page allocator install")
+    check("page_alloc::install(page_allocator)" not in riscv_block,
+          "RISC-V allocator install avoids runtime IRQ lock")
+    check("zone_present_pages" not in riscv_block and "zone_free_pages" not in riscv_block,
+          "RISC-V allocator summary avoids verbose zone walk before/around install")
+    check("page_alloc::is_initialized()" not in riscv_block,
+          "RISC-V allocator init path avoids runtime is_initialized lock")
+    # Post-install boot reread was intentionally removed after tracing proved install_boot returns.
+    check("is_initialized_boot" not in riscv_block,
+          "RISC-V allocator init avoids post-install global reread")
+
+    check("pub unsafe fn install_boot" in page_alloc and "PAGE_ALLOCATOR.get_mut_unchecked()" in page_alloc,
+          "page_alloc exposes boot-only global publish path")
+    check("pub unsafe fn get_mut_unchecked" in irq_lock and ".get_mut_unchecked()" in irq_lock,
+          "IrqSpinLock forwards boot-only mutable access")
+    check("pub unsafe fn get_mut_unchecked" in spin_lock and "UnsafeCell" in spin_lock,
+          "SpinLock exposes explicit boot-only mutable access")
+    check("riscv page_alloc install_boot:" not in memory + page_alloc,
+          "temporary RISC-V install_boot trace removed")
+
+    ok = sum(1 for passed, _ in results if passed)
+    fail = len(results) - ok
+    for passed, msg in results:
+        print(("PASS" if passed else "FAIL") + f": {msg}")
+    print(f"oscomp-riscv-boot-pagealloc-chain-audit: PASS={ok}, FAIL={fail}")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
