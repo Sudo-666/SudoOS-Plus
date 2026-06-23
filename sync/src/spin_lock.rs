@@ -31,7 +31,7 @@ impl<T> SpinLock<T> {
     }
 }
 
-impl<T: ?Sized> SpinLock<T> {
+impl<T: ?Sized> SpinLock<T> { /// # Safety /// Caller must prove there is no concurrent locker or accessor. /// This is intended only for single-CPU boot-time publication before /// runtime locking is required. pub unsafe fn get_mut_unchecked(&self) -> &mut T { unsafe { &mut *self.value.get() } } } impl<T: ?Sized> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         loop {
             if self
