@@ -933,50 +933,39 @@ impl EarlyMemoryState {
 // bounded MAX_ORDER chunks instead of one huge silent range.  This preserves the
 // final-page-table/low-map invariants while making the RISC-V handoff finite,
 // observable, and equivalent to coalescing the same physical pages into buddy.
-fn release_early_ranges_to_buddy_chunked<const CAPACITY: usize>(
+
+  
+const MAX_ORDER_NR_PAGES: usize = 1_usize << (myos_mm::MAX_ORDER - 1);
+
+fn release_early_ranges_to_buddy_chunked(
     page_allocator: &mut BuddyAllocator,
-    early_allocator: &EarlyFrameAllocator<CAPACITY>,
+    early_allocator: &EarlyFrameAllocator<MEMORY_MAP_CAPACITY>,
 ) {
-    let mut range_index = 0_usize;
     for range in early_allocator.free_ranges() {
-        release_early_range_to_buddy_chunked(page_allocator, range).unwrap_or_else(|error| {
-            panic!(
-                "unable to release early memory range {range_index} to buddy: {error:?}",
-            );
-        });
-        range_index = range_index
-            .checked_add(1)
-            .expect("early memory range index overflow");
+        release_early_range_to_buddy_chunked(page_allocator, range)
+            .expect("unable to release early memory chunk to buddy");
     }
 }
 
-fn release_early_range_to_buddy_chunked(
-    page_allocator: &mut BuddyAllocator,
-    range: PhysRange,
-) -> Result<(), myos_mm::BuddyError> {
-    const RELEASE_CHUNK_PAGES: usize = myos_mm::MAX_ORDER_NR_PAGES;
-    const RELEASE_CHUNK_BYTES: usize = RELEASE_CHUNK_PAGES * myos_mm::PAGE_SIZE;
-
+fn release_early_range_to_buddy_chunked(page_allocator: &mut BuddyAllocator, range: PhysRange) -> Result<(), myos_mm::BuddyError> {
+    let max_chunk_bytes = MAX_ORDER_NR_PAGES * myos_mm::PAGE_SIZE;
     let mut start = range.start();
     while start < range.end() {
-        let remaining = range
-            .end()
-            .get()
-            .checked_sub(start.get())
-            .ok_or(myos_mm::BuddyError::AddressOverflow)?;
-        let size = core::cmp::min(remaining, RELEASE_CHUNK_BYTES);
-        let end = start
-            .checked_add(size)
-            .ok_or(myos_mm::BuddyError::AddressOverflow)?;
-        let chunk = PhysRange::new(start, end).ok_or(myos_mm::BuddyError::AddressOverflow)?;
+        let remaining_bytes = range.end().get() - start.get();
+        let chunk_bytes = if remaining_bytes > max_chunk_bytes {
+            max_chunk_bytes
+        } else {
+            remaining_bytes
+        };
+        let chunk = PhysRange::from_start_size(start, chunk_bytes)
+            .expect("early buddy handoff chunk range overflow");
         page_allocator.release_range(chunk)?;
-        start = end;
+        start = chunk.end();
     }
-
     Ok(())
 }
 
-  fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
+fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
     let first = ram.iter().next().expect("firmware reported no RAM");
 
     let last = ram.iter().last().expect("firmware reported no RAM");

@@ -838,7 +838,6 @@ impl BuddyAllocator {
 
 // SAFETY: metadata 指针指向永久页元数据；并发访问由外部锁保证。
 unsafe impl Send for BuddyAllocator {}
-
 fn largest_block_order(pfn: usize, remaining_pages: usize) -> usize {
     if remaining_pages == 0 {
         return 0;
@@ -848,15 +847,15 @@ fn largest_block_order(pfn: usize, remaining_pages: usize) -> usize {
     while order + 1 < MAX_ORDER {
         let next_order = order + 1;
         let block_pages = 1_usize << next_order;
-        if block_pages > remaining_pages {
+        let alignment_mask = block_pages - 1;
+        if remaining_pages < block_pages {
             break;
         }
-        if (pfn & (block_pages - 1)) != 0 {
+        if (pfn & alignment_mask) != 0 {
             break;
         }
         order = next_order;
     }
-
     order
 }
 

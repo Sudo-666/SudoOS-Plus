@@ -106,5 +106,11 @@ oscomp-riscv-post-final-trace-audit:
 	@sh scripts/oscomp-riscv-post-final-trace-audit.sh
 
 .PHONY: oscomp-riscv-chunked-buddy-audit
+
+.PHONY: oscomp-riscv-final-clean-audit oscomp-riscv-buddy-order-audit oscomp-riscv-chunked-buddy-audit
+oscomp-riscv-final-clean-audit:
+	python3 scripts/oscomp-riscv-final-clean-audit.py
+oscomp-riscv-buddy-order-audit:
+	python3 scripts/oscomp-riscv-buddy-order-audit.py
 oscomp-riscv-chunked-buddy-audit:
-	bash scripts/oscomp-riscv-chunked-buddy-audit.sh
+	python3 scripts/oscomp-riscv-chunked-buddy-audit.py
