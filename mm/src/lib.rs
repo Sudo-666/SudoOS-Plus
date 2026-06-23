@@ -45,7 +45,7 @@ pub use paging::{
 pub use virtual_page::VirtPage;
 
 pub use buddy::{
-    AllocationClass, BuddyAllocator, BuddyError, DMA32_LIMIT, MAX_ORDER, PageAllocation, PageState,
+    AllocationClass, BuddyAllocator, BuddyError, DMA32_LIMIT, MAX_ORDER, MAX_ORDER_NR_PAGES, PageAllocation, PageState,
     ZoneKind,
 };
 

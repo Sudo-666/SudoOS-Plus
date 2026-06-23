@@ -6,6 +6,7 @@ use crate::PAGE_SIZE;
 ///
 /// 2^10 × 4 KiB = 4 MiB。
 pub const MAX_ORDER: usize = 11;
+pub const MAX_ORDER_NR_PAGES: usize = 1_usize << (MAX_ORDER - 1);
 
 pub const DMA32_LIMIT: usize = 0x1_0000_0000;
 

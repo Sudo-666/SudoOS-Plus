@@ -909,14 +909,7 @@ pub fn initialize_page_allocator(
     /*
      * 只有 EarlyFrameAllocator 剩余的页面才进入 buddy。
      */
-    for range in early_allocator.free_ranges() {
-        page_allocator.release_range(range).unwrap_or_else(|error| {
-            panic!(
-                "unable to release early memory \
-                     to buddy: {error:?}",
-            );
-        });
-    }
+    release_early_ranges_to_buddy_chunked(&mut page_allocator, &early_allocator);
 
     #[cfg(target_arch = "riscv64")]
     oscomp_riscv_page_alloc_trace(b"P9:release-ranges\n");
@@ -977,6 +970,81 @@ pub fn initialize_page_allocator(
         _metadata_range: metadata_range,
     }
 }
+
+
+
+// OSCOMP_RISCV_CHUNKED_BUDDY_HANDOFF: begin
+// Linux-like early memory handoff: release bootmem into the buddy allocator in
+// bounded MAX_ORDER chunks instead of one huge silent range.  This preserves the
+// final-page-table/low-map invariants while making the RISC-V handoff finite,
+// observable, and equivalent to coalescing the same physical pages into buddy.
+fn release_early_ranges_to_buddy_chunked<const CAPACITY: usize>(
+    page_allocator: &mut BuddyAllocator,
+    early_allocator: &EarlyFrameAllocator<CAPACITY>,
+) {
+    let mut range_index = 0_usize;
+
+    for range in early_allocator.free_ranges() {
+        release_early_range_to_buddy_chunked(page_allocator, range, range_index).unwrap_or_else(
+            |error| {
+                panic!(
+                    "unable to release early memory range {range_index} to buddy: {error:?}",
+                );
+            },
+        );
+        range_index = range_index
+            .checked_add(1)
+            .expect("early memory range index overflow");
+    }
+}
+
+fn release_early_range_to_buddy_chunked(
+    page_allocator: &mut BuddyAllocator,
+    range: PhysRange,
+    range_index: usize,
+) -> Result<(), myos_mm::BuddyError> {
+    const RELEASE_CHUNK_PAGES: usize = myos_mm::MAX_ORDER_NR_PAGES;
+    const RELEASE_CHUNK_BYTES: usize = RELEASE_CHUNK_PAGES * myos_mm::PAGE_SIZE;
+
+    let mut start = range.start();
+    let mut chunk_index = 0_usize;
+
+    while start < range.end() {
+        let remaining = range
+            .end()
+            .get()
+            .checked_sub(start.get())
+            .ok_or(myos_mm::BuddyError::AddressOverflow)?;
+        let size = core::cmp::min(remaining, RELEASE_CHUNK_BYTES);
+        let end = start
+            .checked_add(size)
+            .ok_or(myos_mm::BuddyError::AddressOverflow)?;
+        let chunk = PhysRange::new(start, end).ok_or(myos_mm::BuddyError::AddressOverflow)?;
+
+        oscomp_riscv_chunked_buddy_trace(b"P8R:release-chunk-begin\n");
+        page_allocator.release_range(chunk)?;
+        oscomp_riscv_chunked_buddy_trace(b"P8S:release-chunk-done\n");
+
+        start = end;
+        chunk_index = chunk_index
+            .checked_add(1)
+            .ok_or(myos_mm::BuddyError::AddressOverflow)?;
+    }
+
+    let _ = range_index;
+    Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn oscomp_riscv_chunked_buddy_trace(message: &[u8]) {
+    for byte in message {
+        crate::arch::early_console::write_byte(*byte);
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+fn oscomp_riscv_chunked_buddy_trace(_message: &[u8]) {}
+// OSCOMP_RISCV_CHUNKED_BUDDY_HANDOFF: end
 
 fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
     let first = ram.iter().next().expect("firmware reported no RAM");

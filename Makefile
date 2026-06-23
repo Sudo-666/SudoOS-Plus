@@ -104,3 +104,7 @@ oscomp-riscv-early-trap-audit:
 .PHONY: oscomp-riscv-post-final-trace-audit
 oscomp-riscv-post-final-trace-audit:
 	@sh scripts/oscomp-riscv-post-final-trace-audit.sh
+
+.PHONY: oscomp-riscv-chunked-buddy-audit
+oscomp-riscv-chunked-buddy-audit:
+	bash scripts/oscomp-riscv-chunked-buddy-audit.sh
