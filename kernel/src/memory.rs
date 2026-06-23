@@ -798,7 +798,6 @@ pub fn initialize_page_allocator(
     layout: &BootMemoryLayout,
     early_memory: EarlyMemoryState,
 ) -> KernelMemoryState {
-    // OSCOMP_RISCV_PAGE_ALLOC_TRACE
     #[cfg(target_arch = "riscv64")]
     oscomp_riscv_page_alloc_trace(b"P0:enter-page-allocator\n");
 
@@ -973,7 +972,6 @@ pub fn initialize_page_allocator(
 
 
 
-// OSCOMP_RISCV_CHUNKED_BUDDY_HANDOFF: begin
 // Linux-like early memory handoff: release bootmem into the buddy allocator in
 // bounded MAX_ORDER chunks instead of one huge silent range.  This preserves the
 // final-page-table/low-map invariants while making the RISC-V handoff finite,
@@ -1022,7 +1020,15 @@ fn release_early_range_to_buddy_chunked(
         let chunk = PhysRange::new(start, end).ok_or(myos_mm::BuddyError::AddressOverflow)?;
 
         oscomp_riscv_chunked_buddy_trace(b"P8R:release-chunk-begin\n");
-        page_allocator.release_range(chunk)?;
+        
+#[cfg(target_arch = "riscv64")]
+{
+    page_allocator.release_range_with_trace(chunk, oscomp_riscv_chunked_buddy_trace)?;
+}
+#[cfg(not(target_arch = "riscv64"))]
+{
+    page_allocator.release_range(chunk)?;
+}
         oscomp_riscv_chunked_buddy_trace(b"P8S:release-chunk-done\n");
 
         start = end;
@@ -1044,7 +1050,6 @@ fn oscomp_riscv_chunked_buddy_trace(message: &[u8]) {
 
 #[cfg(not(target_arch = "riscv64"))]
 fn oscomp_riscv_chunked_buddy_trace(_message: &[u8]) {}
-// OSCOMP_RISCV_CHUNKED_BUDDY_HANDOFF: end
 
 fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
     let first = ram.iter().next().expect("firmware reported no RAM");
