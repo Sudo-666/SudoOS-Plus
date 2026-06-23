@@ -143,7 +143,7 @@ impl BuddyAllocator {
             return Err(BuddyError::MetadataPointerIsNull);
         }
 
-        if !(metadata_pointer as usize).is_multiple_of(align_of::<Page>()) {
+        if ((metadata_pointer as usize) % align_of::<Page>() != 0) {
             return Err(BuddyError::MetadataMisaligned {
                 required_alignment: align_of::<Page>(),
             });

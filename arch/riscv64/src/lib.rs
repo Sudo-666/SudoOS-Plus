@@ -1,3 +1,4 @@
+#![feature(unsigned_is_multiple_of)]
 #![no_std]
 
 #[cfg(not(target_arch = "riscv64"))]

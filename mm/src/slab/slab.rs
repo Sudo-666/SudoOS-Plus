@@ -107,7 +107,7 @@ impl SlabHeader {
             },
         };
 
-        if !(base.as_ptr() as usize).is_multiple_of(PAGE_SIZE) {
+        if ((base.as_ptr() as usize) % PAGE_SIZE != 0) {
             provider
                 .free_slab_page(allocation)
                 .map_err(SlabError::Provider)?;
@@ -360,7 +360,7 @@ impl SlabHeader {
 
         let relative = address - object_start;
 
-        if !relative.is_multiple_of(class.size()) {
+        if (relative % class.size() != 0) {
             return Err(SlabError::InvalidObjectPointer);
         }
 

@@ -1,21 +1,14 @@
+# Copied to .cargo/config.toml by scripts/oscomp-build.sh.
+# Keep this directory non-hidden because the contest clone filter removes hidden dirs.
+
 [build]
-target-dir = "build/cargo"
+target-dir = "target/oscomp"
 
-[term]
-color = "auto"
+[net]
+git-fetch-with-cli = true
 
-[target.riscv64imac-unknown-none-elf]
-linker = "rust-lld"
+[source.crates-io]
+replace-with = "vendored-sources"
 
-rustflags = [
-    "-C", "relocation-model=static",
-    "-C", "force-frame-pointers=yes",
-]
-
-[target.loongarch64-unknown-none-softfloat]
-linker = "rust-lld"
-
-rustflags = [
-    "-C", "relocation-model=static",
-    "-C", "force-frame-pointers=yes",
-]
+[source.vendored-sources]
+directory = "vendor/cargo"

@@ -9,11 +9,7 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-fdt-parser = {
-    package = "fdt",
-    path = "../../vendor/fdt-reader",
-    default-features = false,
-}
+fdt-parser = { package = "fdt", path = "../../vendor/fdt-reader", default-features = false}
 
 [lints]
 workspace = true

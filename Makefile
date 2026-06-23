@@ -1,435 +1,56 @@
-ARCH ?= riscv64
-PROFILE ?= debug
+# OSKernel2026 submission wrapper.
+# The judge runs exactly: make all
+# Keep local smoke/stress/soak/QEMU out of `all`.
 
-SMP ?= 1
-MEM ?= 256M
-SMOKE_TIMEOUT ?= 120
-SMP_SMOKE_TIMEOUT ?= 240
-STRESS_ARCHES ?= $(ARCH)
-STRESS_SMPS ?= $(SMP)
-STRESS_MEMS ?= $(MEM)
-STRESS_PROFILES ?= $(PROFILE)
-STRESS_LOOPS ?= 1
-STRESS_TIMEOUT ?= $(SMP_SMOKE_TIMEOUT)
-M5_SOAK_LOOPS ?= 200
-M5_RELEASE_SOAK_LOOPS ?= 20
+.PHONY: all oscomp-all oscomp-audit oscomp-vendor oscomp-clean oscomp-local help
 
-KERNEL_PACKAGE ?= myos-kernel
-KERNEL_BINARY ?= myos-kernel
+all: oscomp-all
 
-QEMU_ARGS ?=
+oscomp-all:
+	@bash scripts/oscomp-build.sh
 
-export ARCH
-export PROFILE
-export SMP
-export MEM
-export KERNEL_PACKAGE
-export KERNEL_BINARY
-export QEMU_ARGS
-export STRESS_ARCHES
-export STRESS_SMPS
-export STRESS_MEMS
-export STRESS_PROFILES
-export STRESS_LOOPS
-export STRESS_TIMEOUT
-export M5_SOAK_LOOPS
-export M5_RELEASE_SOAK_LOOPS
+oscomp-audit:
+	@python3 scripts/oscomp-audit.py
 
-# ============================================================================
-# Competition submission targets
-# ============================================================================
-.PHONY: all kernel-rv kernel-la
-all: kernel-rv kernel-la
-	@echo "=== Competition artifacts ==="
-	@ls -lh kernel-rv kernel-la 2>/dev/null || true
-	@echo "all: done"
+oscomp-vendor:
+	@bash scripts/oscomp-vendor.sh
 
-kernel-rv:
-	@ARCH=riscv64 PROFILE=release ./scripts/build.sh
-	@cp build/riscv64/cargo/riscv64imac-unknown-none-elf/release/myos-kernel kernel-rv
+oscomp-clean:
+	@rm -f kernel-rv kernel-la disk-rv.img
+	@$(MAKE) -f Makefile.project clean || true
 
-kernel-la:
-	@ARCH=loongarch64 PROFILE=release ./scripts/build.sh
-	@cp build/loongarch64/cargo/loongarch64-unknown-none-softfloat/release/myos-kernel kernel-la
+oscomp-local:
+	@bash scripts/oscomp-local-eval.sh
 
-# Original build target (single architecture)
-.PHONY: build
-build:
-	@./scripts/build.sh
-
-.PHONY: run
-run:
-	@./scripts/run-qemu.sh
-
-.PHONY: debug
-debug:
-	@QEMU_DEBUG=1 ./scripts/run-qemu.sh
-
-.PHONY: build-riscv64
-build-riscv64:
-	@ARCH=riscv64 ./scripts/build.sh
-
-.PHONY: build-loongarch64
-build-loongarch64:
-	@ARCH=loongarch64 ./scripts/build.sh
-
-.PHONY: run-riscv64
-run-riscv64:
-	@ARCH=riscv64 ./scripts/run-qemu.sh
-
-.PHONY: run-loongarch64
-run-loongarch64:
-	@ARCH=loongarch64 ./scripts/run-qemu.sh
-
-.PHONY: smoke
-smoke:
-	@./scripts/smoke.py --arch "$(ARCH)" --profile "$(PROFILE)" --timeout "$(SMOKE_TIMEOUT)"
-
-.PHONY: smoke-riscv64
-smoke-riscv64:
-	@./scripts/smoke.py --arch riscv64 --profile "$(PROFILE)" --timeout "$(SMOKE_TIMEOUT)"
-
-.PHONY: smoke-loongarch64
-smoke-loongarch64:
-	@./scripts/smoke.py --arch loongarch64 --profile "$(PROFILE)" --timeout "$(SMOKE_TIMEOUT)"
-
-.PHONY: smoke-all
-smoke-all: smoke-riscv64 smoke-loongarch64
-
-.PHONY: smoke-smp-riscv64
-smoke-smp-riscv64:
-	@SMP=4 ./scripts/smoke.py --arch riscv64 --profile "$(PROFILE)" --timeout "$(SMP_SMOKE_TIMEOUT)"
-
-.PHONY: smoke-smp-loongarch64
-smoke-smp-loongarch64:
-	@SMP=4 ./scripts/smoke.py --arch loongarch64 --profile "$(PROFILE)" --timeout "$(SMP_SMOKE_TIMEOUT)"
-
-.PHONY: smoke-smp-all
-smoke-smp-all: smoke-smp-riscv64 smoke-smp-loongarch64
-
-.PHONY: stress-smp
-stress-smp:
-	@./scripts/stress-smp.sh
-
-.PHONY: fmt
-fmt:
-	@cargo fmt --all
-
-.PHONY: fmt-check
-fmt-check:
-	@cargo fmt --all -- --check
-
-.PHONY: test
-test:
-	@cargo test \
-		-p myos-boot \
-		-p myos-runtime \
-		-p myos-fdt \
-		-p myos-mm \
-		-p myos-vfs \
-		-p myos-sync
-
-.PHONY: clippy
-clippy: clippy-riscv64 clippy-loongarch64 clippy-host
-
-.PHONY: clippy-riscv64
-clippy-riscv64:
-	@cargo clippy \
-		--manifest-path Cargo.toml \
-		--package "$(KERNEL_PACKAGE)" \
-		--bin "$(KERNEL_BINARY)" \
-		--target riscv64imac-unknown-none-elf \
-		-Z build-std=core,alloc \
-		-Z build-std-features=compiler-builtins-mem \
-		-- -D warnings
-
-.PHONY: clippy-loongarch64
-clippy-loongarch64:
-	@cargo clippy \
-		--manifest-path Cargo.toml \
-		--package "$(KERNEL_PACKAGE)" \
-		--bin "$(KERNEL_BINARY)" \
-		--target loongarch64-unknown-none-softfloat \
-		-Z build-std=core,alloc \
-		-Z build-std-features=compiler-builtins-mem \
-		-- -D warnings
-
-.PHONY: clippy-host
-clippy-host:
-	@cargo clippy \
-		-p myos-boot \
-		-p myos-runtime \
-		-p myos-fdt \
-		-p myos-mm \
-		-p myos-vfs \
-		-p myos-sync \
-		--all-targets \
-		-- -D warnings
-
-.PHONY: source-tree-check
-source-tree-check:
-	@./scripts/check-source-tree.sh
-
-.PHONY: m9-audit
-m9-audit:
-	@python3 scripts/m8-audit.py
-	@python3 scripts/m8b3-audit.py
-	@python3 scripts/m8b4-audit.py
-	@python3 scripts/m8-linuxlike-audit.py "$(CURDIR)"
-	@python3 scripts/m9a-audit.py
-	@python3 scripts/m9b-audit.py
-
-.PHONY: check
-check: source-tree-check fmt-check test harness-test m9-audit build-riscv64 build-loongarch64 clippy
-
-.PHONY: verify
-verify: check smoke-all smoke-smp-all
-
-.PHONY: harness-test
-harness-test:
-	@python3 scripts/test-smoke-harness.py
-
-.PHONY: m5-quick
-m5-quick:
-	@python3 scripts/m5-verify.py --level quick
-
-.PHONY: m5-full
-m5-full:
-	@python3 scripts/m5-verify.py --level full
-
-.PHONY: m5-release
-m5-release:
-	@M5_SOAK_LOOPS="$(M5_SOAK_LOOPS)" M5_RELEASE_SOAK_LOOPS="$(M5_RELEASE_SOAK_LOOPS)" python3 scripts/m5-verify.py --level soak --require-clean
-
-.PHONY: m5-tag
-m5-tag:
-	@./scripts/m5-tag.sh
-
-.PHONY: clean
-clean:
-	@rm -rf build
-	@echo "Removed build directory"
-
-.PHONY: doctor
-doctor:
-	@echo "Checking Rust toolchain..."
-	@command -v rustup >/dev/null || \
-		(echo "error: rustup is not installed" && exit 1)
-	@command -v cargo >/dev/null || \
-		(echo "error: cargo is not installed" && exit 1)
-	@command -v rustc >/dev/null || \
-		(echo "error: rustc is not installed" && exit 1)
-	@command -v python3 >/dev/null || \
-		(echo "error: python3 is not installed" && exit 1)
-
-	@echo "Checking QEMU..."
-	@command -v qemu-system-riscv64 >/dev/null || \
-		echo "warning: qemu-system-riscv64 was not found"
-	@command -v qemu-system-loongarch64 >/dev/null || \
-		echo "warning: qemu-system-loongarch64 was not found"
-
-	@echo "Checking project scripts..."
-	@test -x scripts/build.sh || \
-		echo "warning: scripts/build.sh is not executable"
-	@test -x scripts/run-qemu.sh || \
-		echo "warning: scripts/run-qemu.sh is not executable"
-	@test -x scripts/smoke.py || \
-		echo "warning: scripts/smoke.py is not executable"
-	@test -x scripts/stress-smp.sh || \
-		echo "warning: scripts/stress-smp.sh is not executable"
-	@test -x scripts/check-source-tree.sh || \
-		echo "warning: scripts/check-source-tree.sh is not executable"
-
-	@echo "Doctor check completed"
-
-.PHONY: help
 help:
-	@echo "SudoOS build commands"
-	@echo ""
-	@echo "  make build ARCH=riscv64"
-	@echo "  make build ARCH=loongarch64"
-	@echo ""
-	@echo "  make run ARCH=riscv64"
-	@echo "  make run ARCH=loongarch64"
-	@echo ""
-	@echo "  make smoke ARCH=riscv64"
-	@echo "  make smoke-all"
-	@echo "  make smoke-smp-all"
-	@echo "  make stress-smp"
-	@echo "  make check"
-	@echo "  make verify"
-	@echo ""
-	@echo "  make debug ARCH=riscv64"
-	@echo "  make debug ARCH=loongarch64"
-	@echo ""
-	@echo "Variables:"
-	@echo "  ARCH=riscv64|loongarch64"
-	@echo "  PROFILE=debug|release"
-	@echo "  SMP=<cpu count>"
-	@echo "  MEM=<memory size>"
-	@echo "  SMOKE_TIMEOUT=<seconds>"
-	@echo "  SMP_SMOKE_TIMEOUT=<seconds>"
-	@echo "  STRESS_ARCHES='<arch list>'"
-	@echo "  STRESS_SMPS='<cpu count list>'"
-	@echo "  STRESS_MEMS='<memory size list>'"
-	@echo "  STRESS_PROFILES='<profile list>'"
-	@echo "  STRESS_LOOPS=<count>"
-	@echo "  STRESS_TIMEOUT=<seconds>"
-	@echo "  QEMU_ARGS='<additional arguments>'"
+	@echo "Contest targets: make all | make oscomp-audit | make oscomp-vendor | make oscomp-local"
+	@echo "Original project targets are forwarded to Makefile.project."
 
-# M6-C closure: reproducible local release gate.
-M6_SOAK_LOOPS ?= 50
-M6_RELEASE_SOAK_LOOPS ?= 10
-export M6_SOAK_LOOPS
-export M6_RELEASE_SOAK_LOOPS
+# Forward ordinary developer targets to the original Makefile.
+%:
+	@$(MAKE) -f Makefile.project $@
 
-.PHONY: m6-audit
-m6-audit:
-	@python3 scripts/m6-audit.py
+.PHONY: oscomp-buildstd-audit
+oscomp-buildstd-audit:
+	@./scripts/oscomp-buildstd-audit.sh
 
-.PHONY: m6-quick
-m6-quick:
-	@python3 scripts/m6-verify.py --level quick
+.PHONY: oscomp-rust2025-compat-audit
+oscomp-rust2025-compat-audit:
+	@./scripts/oscomp-rust2025-compat-audit.sh
 
-.PHONY: m6-full
-m6-full:
-	@python3 scripts/m6-verify.py --level full
+.PHONY: oscomp-rust2025-global-audit
+oscomp-rust2025-global-audit:
+	@scripts/oscomp-rust2025-global-audit.sh
 
-.PHONY: m6-soak
-m6-soak:
-	@M6_SOAK_LOOPS="$(M6_SOAK_LOOPS)" \
-	 M6_RELEASE_SOAK_LOOPS="$(M6_RELEASE_SOAK_LOOPS)" \
-	 python3 scripts/m6-verify.py --level soak
+.PHONY: oscomp-feature-gate-repair oscomp-feature-gate-repair-audit
+oscomp-feature-gate-repair:
+	@python3 scripts/oscomp-rust2025-feature-gate-repair.py
 
-.PHONY: m6-release
-m6-release:
-	@M6_SOAK_LOOPS="$(M6_SOAK_LOOPS)" \
-	 M6_RELEASE_SOAK_LOOPS="$(M6_RELEASE_SOAK_LOOPS)" \
-	 python3 scripts/m6-verify.py --level release
+oscomp-feature-gate-repair-audit:
+	@python3 scripts/oscomp-rust2025-feature-gate-repair.py
 
-.PHONY: m6-tag
-m6-tag:
-	@./scripts/m6-tag.sh
 
-# M7-B closure: privilege, syscall, checked-copy and user-fault release gate.
-M7_SOAK_LOOPS ?= 50
-M7_RELEASE_SOAK_LOOPS ?= 10
 
-export M7_SOAK_LOOPS
-export M7_RELEASE_SOAK_LOOPS
-
-.PHONY: m7-audit
-m7-audit:
-	@python3 scripts/m7-audit.py
-
-.PHONY: m7-quick
-m7-quick:
-	@python3 scripts/m7-verify.py --level quick
-
-.PHONY: m7-full
-m7-full:
-	@python3 scripts/m7-verify.py --level full
-
-.PHONY: m7-soak
-m7-soak:
-	@M7_SOAK_LOOPS="$(M7_SOAK_LOOPS)" \
-		M7_RELEASE_SOAK_LOOPS="$(M7_RELEASE_SOAK_LOOPS)" \
-		python3 scripts/m7-verify.py --level soak
-
-.PHONY: m7-release
-m7-release:
-	@M7_SOAK_LOOPS="$(M7_SOAK_LOOPS)" \
-		M7_RELEASE_SOAK_LOOPS="$(M7_RELEASE_SOAK_LOOPS)" \
-		python3 scripts/m7-verify.py --level release
-
-.PHONY: m7-tag
-m7-tag:
-	@./scripts/m7-tag.sh
-
-# SUDOOS_M16_PRE_PATCH_V1: global M14/M15/M16 convergence gates.
-.PHONY: m16-preflight verify-m16-pre
-m16-preflight:
-	python3 scripts/m16-preflight-audit.py
-
-verify-m16-pre: check smoke-all smoke-smp-all m16-preflight
-	@echo "M16-pre verifier complete"
-
-# SUDOOS_M16A_ELF_AUXV_PATCH_V1: M16-A ELF metadata and auxv gate.
-.PHONY: m16a-audit
-m16a-audit:
-	python3 scripts/m16a-elf-auxv-audit.py
-
-# SUDOOS_M15A_EXT4_RO_PATCH_V1: read-only ext4 VFS snapshot gate.
-.PHONY: m15a-ext4-ro-audit verify-m15a-ext4-ro
-m15a-ext4-ro-audit:
-	python3 scripts/m15a-ext4-ro-audit.py
-
-verify-m15a-ext4-ro: m15a-ext4-ro-audit check smoke-all smoke-smp-all m16-preflight
-	@echo "M15-A ext4 read-only verifier complete"
-
-.PHONY: busybox-initramfs m14-busybox-artifact-audit verify-m14-busybox
-BUSYBOX_INITRAMFS ?= build/initramfs/busybox.cpio
-
-busybox-initramfs:
-	@test -n "$(BUSYBOX)" || (echo "error: BUSYBOX=/absolute/path/to/static/busybox is required" >&2; exit 2)
-	OUT="$(BUSYBOX_INITRAMFS)" BUSYBOX="$(BUSYBOX)" scripts/build-static-busybox-initramfs.sh
-
-m14-busybox-artifact-audit:
-	python3 scripts/m14-busybox-artifact-audit.py
-
-verify-m14-busybox: m14-busybox-artifact-audit busybox-initramfs
-	python3 scripts/m14-busybox-artifact-audit.py "$(BUSYBOX_INITRAMFS)"
-
-# SUDOOS_M14_DUAL_VENDOR_USERLAND_PATCH_V1: dual-arch vendor BusyBox artifact gates.
-.PHONY: m14-vendor-userland-audit m14-vendor-userland-audit-strict busybox-initramfs-vendor busybox-initramfs-vendor-all smoke-riscv64-vendor-initramfs smoke-riscv64-sdcard smoke-loongarch64-sdcard smoke-sdcard-all verify-m14-vendor-userland
-
-BUSYBOX_ARCH ?= riscv64
-VENDOR_BUSYBOX ?= vendor/userland/$(BUSYBOX_ARCH)/busybox-static
-VENDOR_BUSYBOX_INITRAMFS ?= build/initramfs/busybox-$(BUSYBOX_ARCH).cpio
-
-m14-vendor-userland-audit:
-	python3 scripts/m14-vendor-userland-audit.py
-
-m14-vendor-userland-audit-strict:
-	python3 scripts/m14-vendor-userland-audit.py --strict
-
-busybox-initramfs-vendor:
-	@test -x "$(VENDOR_BUSYBOX)" || (echo "error: missing executable $(VENDOR_BUSYBOX)" >&2; exit 2)
-	@mkdir -p build/initramfs
-	OUT="$(VENDOR_BUSYBOX_INITRAMFS)" BUSYBOX="$(VENDOR_BUSYBOX)" scripts/build-static-busybox-initramfs.sh
-	python3 scripts/m14-busybox-artifact-audit.py "$(VENDOR_BUSYBOX_INITRAMFS)"
-
-busybox-initramfs-vendor-all:
-	@set -e; \
-	found=0; \
-	for arch in riscv64 loongarch64; do \
-	  bb="vendor/userland/$$arch/busybox-static"; \
-	  out="build/initramfs/busybox-$$arch.cpio"; \
-	  if [ -x "$$bb" ]; then \
-	    found=1; \
-	    echo "building $$out from $$bb"; \
-	    mkdir -p build/initramfs; \
-	    OUT="$$out" BUSYBOX="$$bb" scripts/build-static-busybox-initramfs.sh; \
-	    python3 scripts/m14-busybox-artifact-audit.py "$$out"; \
-	  else \
-	    echo "warn: skipping $$arch BusyBox artifact; missing executable $$bb"; \
-	  fi; \
-	done; \
-	if [ "$$found" = 0 ]; then echo "error: no vendor BusyBox artifact found" >&2; exit 2; fi
-
-smoke-riscv64-vendor-initramfs:
-	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
-	QEMU_ARGS="-initrd build/initramfs/busybox-riscv64.cpio" $(MAKE) smoke-riscv64
-
-smoke-riscv64-sdcard:
-	@test -f sdcard-rv.img || (echo "error: missing sdcard-rv.img" >&2; exit 2)
-	QEMU_ARGS="-drive file=sdcard-rv.img,if=none,format=raw,id=hd0,readonly=on -device virtio-blk-device,drive=hd0" $(MAKE) smoke-riscv64
-
-smoke-loongarch64-sdcard:
-	@test -f sdcard-la.img || (echo "error: missing sdcard-la.img" >&2; exit 2)
-	QEMU_ARGS="-drive file=sdcard-la.img,if=none,format=raw,id=hd0,readonly=on -device virtio-blk-pci,drive=hd0" $(MAKE) smoke-loongarch64
-
-smoke-sdcard-all: smoke-riscv64-sdcard smoke-loongarch64-sdcard
-
-verify-m14-vendor-userland: m14-vendor-userland-audit busybox-initramfs-vendor check smoke-all smoke-smp-all smoke-riscv64-vendor-initramfs
-	@echo "M14 vendor userland verifier complete"
+.PHONY: oscomp-virtio-letchains-audit
+oscomp-virtio-letchains-audit:
+	@./scripts/oscomp-virtio-letchains-audit.sh .

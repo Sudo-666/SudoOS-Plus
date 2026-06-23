@@ -1,3 +1,5 @@
+#![feature(let_chains)]
+#![feature(unsigned_is_multiple_of)]
 #![no_std]
 #![no_main]
 

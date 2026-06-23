@@ -1,6 +1,6 @@
+#![feature(abi_x86_interrupt)]
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
 
 #[macro_use]
 extern crate log;

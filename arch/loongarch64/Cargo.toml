@@ -14,13 +14,9 @@ default = ["platform-qemu-virt"]
 platform-qemu-virt = []
 
 [dependencies]
-myos-boot = {
-    path = "../../boot",
-}
+myos-boot = { path = "../../boot"}
 
-myos-mm = {
-    path = "../../mm",
-}
+myos-mm = { path = "../../mm"}
 
 [lints]
 workspace = true

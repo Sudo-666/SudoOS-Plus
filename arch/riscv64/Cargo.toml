@@ -9,13 +9,9 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-myos-boot = {
-    path = "../../boot",
-}
+myos-boot = { path = "../../boot"}
 
-myos-mm = {
-    path = "../../mm",
-}
+myos-mm = { path = "../../mm"}
 
 [lints]
 workspace = true
