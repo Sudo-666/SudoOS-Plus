@@ -225,6 +225,25 @@ impl SignalState {
         }
     }
 
+    pub fn take_matching_unblocked(&self, wanted: u64, blocked: u64) -> Option<u32> {
+        loop {
+            let pending = self.pending.load(Ordering::Acquire);
+            let available = pending & !blocked & wanted;
+            if available == 0 {
+                return None;
+            }
+            let signal = available.trailing_zeros() + 1;
+            let bit = 1_u64 << (signal - 1);
+            if self
+                .pending
+                .compare_exchange(pending, pending & !bit, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(signal);
+            }
+        }
+    }
+
     pub fn take_unblocked(&self, blocked: u64) -> Option<u32> {
         loop {
             let pending = self.pending.load(Ordering::Acquire);

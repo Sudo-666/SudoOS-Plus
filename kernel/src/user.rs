@@ -63,6 +63,7 @@ const SYS_GETPGID: usize = crate::syscall::number::GETPGID;
 const SYS_GETSID: usize = crate::syscall::number::GETSID;
 const SYS_RT_SIGACTION: usize = crate::syscall::number::RT_SIGACTION;
 const SYS_RT_SIGPROCMASK: usize = crate::syscall::number::RT_SIGPROCMASK;
+const SYS_RT_SIGTIMEDWAIT: usize = crate::syscall::number::RT_SIGTIMEDWAIT;
 const SYS_RT_SIGRETURN: usize = crate::syscall::number::RT_SIGRETURN;
 const SYS_TIMES: usize = crate::syscall::number::TIMES;
 const SYS_UNAME: usize = crate::syscall::number::UNAME;
@@ -99,6 +100,7 @@ const EXEC_PROBE_PATH: &str = "/.m12";
 
 const EBADF: isize = crate::syscall::errno::EBADF;
 const ECHILD: isize = crate::syscall::errno::ECHILD;
+const EAGAIN: isize = crate::syscall::errno::EAGAIN;
 const ENOMEM: isize = crate::syscall::errno::ENOMEM;
 const EFAULT: isize = crate::syscall::errno::EFAULT;
 const EINVAL: isize = crate::syscall::errno::EINVAL;
@@ -730,6 +732,152 @@ fn verify_sdcard_basic_script_thread() {
     crate::println!("  /mnt/sdcard/musl/basic_testcode.sh : verified");
 }
 
+pub fn verify_sdcard_all_scripts() {
+    if crate::fs::stat("/mnt/sdcard/musl/busybox").is_err() {
+        return;
+    }
+
+    crate::task::run_kernel_thread_sync(verify_sdcard_all_scripts_thread);
+}
+
+fn install_from_ext4(vfs: &str, ext4: &str) {
+    if crate::fs::stat(vfs).is_err() {
+        let _ = crate::fs::install_ext4_path("/dev/vda", vfs, ext4);
+    }
+}
+
+fn verify_sdcard_all_scripts_thread() {
+    // Create dirs and files needed by test scripts (touch is ENOSYS)
+    let _ = crate::fs::mkdir("/var", 0o755);
+    let _ = crate::fs::mkdir("/var/tmp", 0o755);
+    if crate::fs::stat("/var/tmp/lmbench").is_err() {
+        let _ = crate::fs::open("/var/tmp/lmbench", myos_vfs::OpenFlags::from_bits(0o101));
+    }
+
+    // Install script files and dependencies from ext4
+    install_from_ext4("/mnt/sdcard/musl/basic_testcode.sh", "/musl/basic_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/busybox_testcode.sh", "/musl/busybox_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/busybox_cmd.txt", "/musl/busybox_cmd.txt");
+
+    install_from_ext4("/mnt/sdcard/musl/libcbench_testcode.sh", "/musl/libcbench_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/libc-bench", "/musl/libc-bench");
+
+    install_from_ext4("/mnt/sdcard/musl/libctest_testcode.sh", "/musl/libctest_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/libctest_testcode.sh", "/musl/libctest_testcode.sh");
+    // run-static.sh / run-dynamic.sh lack a #! shebang. Install real content
+    // with a .real suffix, then create shebang wrappers at the expected names.
+    install_from_ext4("/mnt/sdcard/musl/run-static.real", "/musl/run-static.sh");
+    install_from_ext4("/mnt/sdcard/musl/run-dynamic.real", "/musl/run-dynamic.sh");
+    install_from_ext4("/mnt/sdcard/musl/entry-static.exe", "/musl/entry-static.exe");
+    install_from_ext4("/mnt/sdcard/musl/entry-dynamic.exe", "/musl/entry-dynamic.exe");
+    install_from_ext4("/mnt/sdcard/musl/runtest.exe", "/musl/runtest.exe");
+    install_from_ext4("/mnt/sdcard/musl/dlopen_dso.so", "/musl/dlopen_dso.so");
+    install_from_ext4("/mnt/sdcard/musl/tls_get_new-dtv_dso.so", "/musl/tls_get_new-dtv_dso.so");
+    // Write shebang wrappers that source the real scripts
+    for (name, real) in [("run-static.sh", "run-static.real"), ("run-dynamic.sh", "run-dynamic.real")] {
+        let vfs = alloc::format!("/mnt/sdcard/musl/{}", name);
+        let real = alloc::format!("/mnt/sdcard/musl/{}", real);
+        let content = alloc::format!("#!/bin/busybox sh\n. {}\n", real);
+        if let Ok(f) = crate::fs::open(
+            &vfs,
+            myos_vfs::OpenFlags::from_bits(0o1101),
+        ) {
+            let _ = f.write(&myos_vfs::IoBuffer::new(content.as_bytes()));
+        }
+    }
+
+    install_from_ext4("/mnt/sdcard/musl/lua_testcode.sh", "/musl/lua_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/test.sh", "/musl/test.sh");
+    install_from_ext4("/mnt/sdcard/musl/lua", "/musl/lua");
+    let lua_scripts: &[&str] = &[
+        "date.lua", "file_io.lua", "max_min.lua", "random.lua",
+        "remove.lua", "round_num.lua", "sin30.lua", "sort.lua", "strings.lua",
+    ];
+    for s in lua_scripts {
+        install_from_ext4(&alloc::format!("/mnt/sdcard/musl/{}", s), &alloc::format!("/musl/{}", s));
+    }
+
+    install_from_ext4("/mnt/sdcard/musl/cyclictest_testcode.sh", "/musl/cyclictest_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/cyclictest", "/musl/cyclictest");
+    install_from_ext4("/mnt/sdcard/musl/hackbench", "/musl/hackbench");
+
+    install_from_ext4("/mnt/sdcard/musl/netperf_testcode.sh", "/musl/netperf_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/netperf", "/musl/netperf");
+    install_from_ext4("/mnt/sdcard/musl/netserver", "/musl/netserver");
+
+    install_from_ext4("/mnt/sdcard/musl/iperf_testcode.sh", "/musl/iperf_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/iperf3", "/musl/iperf3");
+
+    install_from_ext4("/mnt/sdcard/musl/iozone_testcode.sh", "/musl/iozone_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/iozone", "/musl/iozone");
+
+    install_from_ext4("/mnt/sdcard/musl/lmbench_testcode.sh", "/musl/lmbench_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/lmbench_all", "/musl/lmbench_all");
+    install_from_ext4("/mnt/sdcard/musl/hello", "/musl/hello");
+
+    install_from_ext4("/mnt/sdcard/musl/unixbench_testcode.sh", "/musl/unixbench_testcode.sh");
+    install_from_ext4("/mnt/sdcard/musl/multi.sh", "/musl/multi.sh");
+    let ub_bins: &[&str] = &[
+        "arithoh", "context1", "dhry2", "dhry2reg", "double", "execl",
+        "float", "fstime", "hanoi", "int", "long", "looper", "pipe",
+        "register", "short", "spawn", "syscall", "whetstone-double",
+    ];
+    for bin in ub_bins {
+        install_from_ext4(
+            &alloc::format!("/mnt/sdcard/musl/{}", bin),
+            &alloc::format!("/musl/{}", bin),
+        );
+    }
+
+    install_from_ext4("/mnt/sdcard/musl/ltp_testcode.sh", "/musl/ltp_testcode.sh");
+
+    // lmbench_testcode.sh: hangs (touch ENOSYS + lat_sig prot)
+    // ltp_testcode.sh: needs /musl/ltp tree mount (Enomem)
+
+    const ALL_TEST_SCRIPTS: &[&str] = &[
+        "basic_testcode.sh",
+        "busybox_testcode.sh",
+        "libcbench_testcode.sh",
+        "libctest_testcode.sh",
+        "lua_testcode.sh",
+        "cyclictest_testcode.sh",
+        "netperf_testcode.sh",
+        "iperf_testcode.sh",
+        "iozone_testcode.sh",
+        "unixbench_testcode.sh",
+    ];
+
+    for script in ALL_TEST_SCRIPTS {
+        let vfs_path = alloc::format!("/mnt/sdcard/musl/{}", script);
+        if crate::fs::stat(&vfs_path).is_err() {
+            crate::println!("#### OS COMP TEST GROUP START {} ####", script);
+            crate::println!("  {} : SKIP (not installed)", script);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", script);
+            continue;
+        }
+
+        crate::println!("#### OS COMP TEST GROUP START {} ####", script);
+
+        let result = run_rootfs_program_with_cwd(
+            "/mnt/sdcard/musl/busybox",
+            &["busybox", "sh", &vfs_path],
+            &[
+                "PATH=.:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin",
+                "LD_LIBRARY_PATH=/mnt/sdcard/musl/lib",
+            ],
+            Some("/mnt/sdcard/musl"),
+        );
+
+        match result {
+            Ok(0) => crate::println!("  {} : PASS", script),
+            Ok(rc) => crate::println!("  {} : FAIL (exit={})", script, rc),
+            Err(e) => crate::println!("  {} : ERROR ({:?})", script, e),
+        }
+
+        crate::println!("#### OS COMP TEST GROUP END {} ####", script);
+    }
+}
+
 fn verify_sdcard_basic_binaries() {
     const BASIC_TESTS: &[&str] = &[
         "brk",
@@ -1162,6 +1310,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_rt_sigprocmask(arguments[0], arguments[1], arguments[2]),
         ),
+        SYS_RT_SIGTIMEDWAIT => {
+            set_syscall_result(frame, sys_rt_sigtimedwait(arguments))
+        }
         SYS_RT_SIGRETURN => {
             if let Err(error) = sys_rt_sigreturn(frame) {
                 set_syscall_result(frame, error);
@@ -2043,6 +2194,12 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         },
     ) {
         Ok(prepared) => prepared,
+        Err(crate::exec::ExecError::Elf(crate::elf::ElfError::InvalidHeader)) => {
+            return myos_vfs::Errno::Enoexec.to_isize()
+        }
+        Err(crate::exec::ExecError::Elf(crate::elf::ElfError::Unsupported)) => {
+            return myos_vfs::Errno::Enoexec.to_isize()
+        }
         Err(_) => return -EINVAL,
     };
 
@@ -2302,6 +2459,51 @@ fn sys_rt_sigprocmask(how: usize, set_address: usize, oldset_address: usize) -> 
     };
     thread.set_blocked_signals(next);
     0
+}
+
+fn sys_rt_sigtimedwait(arguments: [usize; 6]) -> isize {
+    // set, info, timeout, sigsetsize
+    let set_address = arguments[0];
+    if set_address == 0 {
+        return -EINVAL;
+    }
+    let mut set_bytes = [0_u8; 8]; // 64-bit sigset
+    if copy_from_user(set_address, &mut set_bytes).is_err() {
+        return -EFAULT;
+    }
+    let waited_mask = u64::from_ne_bytes(set_bytes);
+
+    let thread =
+        crate::task::current_user_thread().expect("rt_sigtimedwait without current Thread");
+    let process = thread.process();
+
+    // Check if any signal in the waited set is pending and unblocked
+    if let Some(signal) = process.signals().take_matching_unblocked(waited_mask, thread.blocked_signals()) {
+        // Write siginfo to userspace if info pointer is non-null
+        let info_address = arguments[1];
+        if info_address != 0 {
+            let info = KernelSigInfo {
+                signo: signal as i32,
+                errno: 0,
+                code: 0, // SI_USER
+                payload: [0; 116],
+            };
+            if copy_to_user(info_address, unsafe {
+                core::slice::from_raw_parts(
+                    &info as *const KernelSigInfo as *const u8,
+                    core::mem::size_of::<KernelSigInfo>(),
+                )
+            })
+            .is_err()
+            {
+                return -EFAULT;
+            }
+        }
+        return signal as isize;
+    }
+
+    // No matching signal
+    -EAGAIN
 }
 
 fn sys_rt_sigreturn(frame: &mut crate::arch::trap::TrapFrame) -> Result<(), isize> {

@@ -305,10 +305,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         user::verify_busybox_rootfs();
     }
     user::verify_sdcard_sample();
-
-    println!("#### OS COMP TEST GROUP START basic ####");
-    user::verify_sdcard_basic_script();
-    println!("#### OS COMP TEST GROUP END basic ####");
+    user::verify_sdcard_all_scripts();
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");

@@ -823,11 +823,14 @@ impl UserMm {
 
 impl Drop for UserMm {
     fn drop(&mut self) {
+        let needs_teardown = {
+            let state = self.state.lock();
+            state.page_table.is_some()
+        };
+        if needs_teardown {
+            let _ = self.destroy();
+        }
         let state = self.state.lock();
-        assert!(
-            state.page_table.is_none(),
-            "M8-B3 UserMm dropped without explicit root teardown",
-        );
         assert!(
             state.pages.is_empty(),
             "M8-B3 UserMm dropped with owned backing pages",

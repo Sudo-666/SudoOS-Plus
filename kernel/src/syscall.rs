@@ -48,6 +48,7 @@ pub mod number {
     pub const SETPGID: usize = 133;
     pub const RT_SIGACTION: usize = 134;
     pub const RT_SIGPROCMASK: usize = 135;
+    pub const RT_SIGTIMEDWAIT: usize = 137;
     pub const RT_SIGRETURN: usize = 139;
     pub const TIMES: usize = 153;
     pub const GETPGID: usize = 155;

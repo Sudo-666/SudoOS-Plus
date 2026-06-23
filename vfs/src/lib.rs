@@ -25,6 +25,7 @@ pub enum Errno {
     Ebusy = 16,
     Enotdir = 20,
     Eisdir = 21,
+    Enoexec = 8,
     Einval = 22,
     Emfile = 24,
     Enotty = 25,
