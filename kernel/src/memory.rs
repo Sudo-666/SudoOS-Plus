@@ -898,42 +898,39 @@ impl EarlyMemoryState {
     #[cfg(target_arch = "riscv64")]
     {
         let total_free_pages = expected_free_pages;
-        crate::println!(" total free   : {} pages", total_free_pages,);
+        crate::println!("  total free   : {} pages", total_free_pages);
         unsafe { crate::page_alloc::install_boot(page_allocator) }.unwrap_or_else(|error| {
             panic!(
                 "unable to install global page allocator:                  {error:?}",
             );
         });
-        crate::println!(" early handoff: complete",);
+        crate::println!("  early handoff: complete");
     }
 
     #[cfg(not(target_arch = "riscv64"))]
     {
         crate::println!(
             "  DMA32 present: {} pages",
-            page_allocator.zone_present_pages(ZoneKind::Dma32,),
+            page_allocator.zone_present_pages(ZoneKind::Dma32),
         );
         crate::println!(
             "  DMA32 free   : {} pages",
-            page_allocator.zone_free_pages(ZoneKind::Dma32,),
+            page_allocator.zone_free_pages(ZoneKind::Dma32),
         );
         crate::println!(
             "  Normal free  : {} pages",
-            page_allocator.zone_free_pages(ZoneKind::Normal,),
+            page_allocator.zone_free_pages(ZoneKind::Normal),
         );
-        crate::println!(
-            "  total free   : {} pages",
-            page_allocator.total_free_pages(),
-        );
-        crate::println!("  early handoff: complete",);
+        crate::println!("  total free   : {} pages", page_allocator.total_free_pages());
+        crate::println!("  early handoff: complete");
         crate::page_alloc::install(page_allocator).unwrap_or_else(|error| {
             panic!(
-                "unable to install global page allocator: \
-                 {error:?}",
+                "unable to install global page allocator:                  {error:?}",
             );
         });
-        assert!(crate::page_alloc::is_initialized(),);
+        assert!(crate::page_alloc::is_initialized());
     }
+
     KernelMemoryState {
         boot_page_table,
         _metadata_range: metadata_range,
