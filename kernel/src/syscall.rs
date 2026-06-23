@@ -74,6 +74,19 @@ pub mod number {
     pub const GETRANDOM: usize = 278;
     pub const STATX: usize = 291;
     pub const FTRUNCATE: usize = 46;
+    // Socket syscalls (Linux asm-generic)
+    pub const SOCKET: usize = 198;
+    pub const BIND: usize = 200;
+    pub const LISTEN: usize = 201;
+    pub const ACCEPT: usize = 202;
+    pub const CONNECT: usize = 203;
+    pub const GETSOCKNAME: usize = 204;
+    pub const GETPEERNAME: usize = 205;
+    pub const SENDTO: usize = 206;
+    pub const RECVFROM: usize = 207;
+    pub const SHUTDOWN: usize = 210;
+    pub const SETSOCKOPT: usize = 208;
+    pub const GETSOCKOPT: usize = 209;
 }
 
 pub mod errno {

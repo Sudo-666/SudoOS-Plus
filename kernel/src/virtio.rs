@@ -26,6 +26,7 @@ use crate::{
     block::{self, BlockDevice, BlockError},
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
+    net::NetDevice,
     page_alloc::{self, PageAllocationOptions},
 };
 
@@ -539,28 +540,69 @@ fn probe_mmio_region(region: MmioRegion) -> Result<Option<Arc<dyn BlockDevice>>,
         transport.version(),
     );
 
-    if device_type != DeviceType::Block {
-        drop(transport);
-        crate::vm::iounmap(mapping).map_err(|_| VirtioProbeError::UnmapFailed)?;
-        return Ok(None);
+    match device_type {
+        DeviceType::Block => {
+            let driver = VirtIOBlk::<SudoHal, _>::new(transport)
+                .map_err(|_| VirtioProbeError::DriverFailed)?;
+            let block_count = driver.capacity();
+            let read_only = driver.readonly();
+            crate::println!(
+                "  block device   : {} sectors, readonly={}",
+                block_count,
+                read_only,
+            );
+            Ok(Some(Arc::new(VirtioBlockDevice {
+                driver: IrqSpinLock::new_with_class(driver, BLK_LOCK),
+                block_count,
+                read_only,
+                _mmio_mapping: Some(mapping),
+            })))
+        }
+        DeviceType::EntropySource => {
+            let driver = virtio_drivers::device::rng::VirtIORng::<SudoHal, _>::new(transport)
+                .map_err(|_| VirtioProbeError::DriverFailed)?;
+            let rng_device = Arc::new(IrqSpinLock::new_with_class(
+                driver,
+                crate::lockdep::LockClass::new("virtio.rng", crate::lockdep::LockRank::Vfs, 22),
+            ));
+            crate::rng::register_hardware_source(alloc::boxed::Box::new(
+                move |buf: &mut [u8]| -> usize {
+                    rng_device
+                        .lock()
+                        .request_entropy(buf)
+                        .unwrap_or(0)
+                },
+            ));
+            crate::println!("  rng device     : registered");
+            Ok(None)
+        }
+        DeviceType::Network => {
+            let raw = virtio_drivers::device::net::VirtIONetRaw::<
+                SudoHal,
+                MmioTransport,
+                { crate::net::virtio_net::NET_QUEUE_SIZE },
+            >::new(transport)
+                .map_err(|_| VirtioProbeError::DriverFailed)?;
+            let net_dev = crate::net::virtio_net::from_raw(raw, Some(mapping));
+            let mac = net_dev.mac_address();
+            let name = alloc::format!(
+                "eth{}",
+                crate::net::registered_interfaces().len()
+            );
+            crate::net::register_interface(&name, net_dev)
+                .map_err(|_| VirtioProbeError::DriverFailed)?;
+            crate::println!(
+                "  net device     : {name} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            );
+            Ok(None)
+        }
+        _ => {
+            drop(transport);
+            crate::vm::iounmap(mapping).map_err(|_| VirtioProbeError::UnmapFailed)?;
+            Ok(None)
+        }
     }
-
-    let driver =
-        VirtIOBlk::<SudoHal, _>::new(transport).map_err(|_| VirtioProbeError::DriverFailed)?;
-    let block_count = driver.capacity();
-    let read_only = driver.readonly();
-    crate::println!(
-        "  block device   : {} sectors, readonly={}",
-        block_count,
-        read_only,
-    );
-
-    Ok(Some(Arc::new(VirtioBlockDevice {
-        driver: IrqSpinLock::new_with_class(driver, BLK_LOCK),
-        block_count,
-        read_only,
-        _mmio_mapping: Some(mapping),
-    })))
 }
 
 fn probe_pci_host(host: PciHostBridge, first_index: usize) -> Result<usize, VirtioProbeError> {
@@ -599,26 +641,43 @@ fn probe_pci_host(host: PciHostBridge, first_index: usize) -> Result<usize, Virt
             };
             crate::println!("  pci {device_function}: virtio {device_type:?}");
             allocate_bars(&mut root, device_function, &mut allocator)?;
-            if device_type != DeviceType::Block {
-                continue;
-            }
-            match probe_pci_block(&mut root, device_function) {
-                Ok(device) => {
-                    let name = virtio_block_name(first_index + found);
-                    match block::register_device(&name, Arc::clone(&device)) {
-                        Ok(()) => {
-                            crate::println!("  block registry : /dev/{name}");
-                            register_compat_partition_alias(&name, &device);
-                            found += 1;
+            match device_type {
+                DeviceType::Block => {
+                    match probe_pci_block(&mut root, device_function) {
+                        Ok(device) => {
+                            let name = virtio_block_name(first_index + found);
+                            match block::register_device(&name, Arc::clone(&device)) {
+                                Ok(()) => {
+                                    crate::println!("  block registry : /dev/{name}");
+                                    register_compat_partition_alias(&name, &device);
+                                    found += 1;
+                                }
+                                Err(error) => {
+                                    crate::println!("  block registry : failed ({error:?})");
+                                }
+                            }
                         }
                         Err(error) => {
-                            crate::println!("  block registry : failed ({error:?})");
+                            crate::println!("  pci {device_function}: ignored ({})", error.as_str());
                         }
                     }
                 }
-                Err(error) => {
-                    crate::println!("  pci {device_function}: ignored ({})", error.as_str());
+                DeviceType::EntropySource => {
+                    if probe_pci_rng(&mut root, device_function).is_ok() {
+                        crate::println!("  rng device     : registered");
+                    }
                 }
+                DeviceType::Network => {
+                    match probe_pci_net(&mut root, device_function) {
+                        Ok(name) => {
+                            crate::println!("  net device     : {name} registered");
+                        }
+                        Err(error) => {
+                            crate::println!("  pci {device_function}: net probe failed ({})", error.as_str());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -648,6 +707,56 @@ fn probe_pci_block(
         read_only,
         _mmio_mapping: None,
     }))
+}
+
+fn probe_pci_rng(
+    root: &mut PciRoot<impl ConfigurationAccess>,
+    device_function: DeviceFunction,
+) -> Result<(), VirtioProbeError> {
+    let transport = PciTransport::new::<SudoHal, _>(root, device_function)
+        .map_err(|_| VirtioProbeError::InvalidTransport)?;
+    let driver = virtio_drivers::device::rng::VirtIORng::<SudoHal, _>::new(transport)
+        .map_err(|_| VirtioProbeError::DriverFailed)?;
+    let rng_device = Arc::new(IrqSpinLock::new_with_class(
+        driver,
+        crate::lockdep::LockClass::new("virtio.rng", crate::lockdep::LockRank::Vfs, 22),
+    ));
+    crate::rng::register_hardware_source(alloc::boxed::Box::new(
+        move |buf: &mut [u8]| -> usize {
+            rng_device
+                .lock()
+                .request_entropy(buf)
+                .unwrap_or(0)
+        },
+    ));
+    Ok(())
+}
+
+fn probe_pci_net(
+    root: &mut PciRoot<impl ConfigurationAccess>,
+    device_function: DeviceFunction,
+) -> Result<alloc::string::String, VirtioProbeError> {
+    let transport = PciTransport::new::<SudoHal, _>(root, device_function)
+        .map_err(|_| VirtioProbeError::InvalidTransport)?;
+    let raw = virtio_drivers::device::net::VirtIONetRaw::<
+        SudoHal,
+        PciTransport,
+        { crate::net::virtio_net::NET_QUEUE_SIZE },
+    >::new(transport)
+        .map_err(|_| VirtioProbeError::DriverFailed)?;
+    let net_dev = crate::net::virtio_net::from_raw(raw, None);
+    let mac = net_dev.mac_address();
+    let name = alloc::format!(
+        "eth{}",
+        crate::net::registered_interfaces().len()
+    );
+    crate::net::register_interface(&name, net_dev)
+        .map_err(|_| VirtioProbeError::DriverFailed)?;
+    crate::println!(
+        "  net device     : {name} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+    );
+    Ok(name)
 }
 
 struct PciMemory32Allocator {

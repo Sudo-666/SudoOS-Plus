@@ -42,6 +42,7 @@ enum NodeState {
         device: Arc<dyn crate::block::BlockDevice>,
         cache: Arc<crate::block::BufferCache>,
     },
+    ProcFile(Arc<dyn crate::procfs::ProcFileGenerator>),
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +50,10 @@ enum DeviceKind {
     Null,
     Zero,
     Console,
+    Random,
+    Urandom,
+    Ptmx,
+    Rtc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +61,7 @@ enum MountFsType {
     Tmpfs,
     Devtmpfs,
     Proc,
+    Sysfs,
     Ext4,
     Vfat,
 }
@@ -76,13 +82,24 @@ pub fn initialize() {
     insert_child(&dev, "zero", device(DeviceKind::Zero)).expect("unable to install /dev/zero");
     insert_child(&dev, "console", device(DeviceKind::Console))
         .expect("unable to install /dev/console");
+    insert_child(&dev, "random", device(DeviceKind::Random))
+        .expect("unable to install /dev/random");
+    insert_child(&dev, "urandom", device(DeviceKind::Urandom))
+        .expect("unable to install /dev/urandom");
+    insert_child(&dev, "ptmx", device(DeviceKind::Ptmx))
+        .expect("unable to install /dev/ptmx");
+    insert_child(&dev, "rtc", device(DeviceKind::Rtc))
+        .expect("unable to install /dev/rtc");
+    let pts = directory(FileMode::DIR_DEFAULT);
+    insert_child(&dev, "pts", pts)
+        .expect("unable to install /dev/pts");
     install_registered_block_devices(&dev).expect("unable to install block devices");
     *ROOT.lock() = Some(root);
     initialize_mount_table().expect("unable to initialize mount table");
 
     crate::println!("vfs:");
     crate::println!("  root fs       : tmpfs");
-    crate::println!("  devfs         : /dev/null /dev/zero /dev/console + block devices");
+    crate::println!("  devfs         : /dev/null /dev/zero /dev/console /dev/random /dev/urandom /dev/rtc /dev/ptmx /dev/pts + block devices");
     crate::println!("  fd table      : per-process");
 }
 
@@ -157,6 +174,12 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<myos_vfs::ArcFile, Errno> {
                 NodeState::Device(kind) => *kind,
                 _ => return Err(Errno::Enodev),
             };
+            if let DeviceKind::Ptmx = kind {
+                // 每次 open /dev/ptmx 创建新的 PTY 对
+                let (master, _slave, _index) = crate::devpts::create_pty_pair(flags)?;
+                // slave 应注册到 /dev/pts/<N>，此处简化处理
+                return Ok(master);
+            }
             Arc::new(DeviceFile { node, kind })
         }
         myos_vfs::FileType::BlockDevice => {
@@ -368,6 +391,22 @@ pub fn mount(
             }
             insert_mount(source, target, fs_type, flags)
         }
+        MountFsType::Proc => {
+            ensure_mount_target_free(target)?;
+            if !directory_is_empty(&target_node)? {
+                return Err(Errno::Ebusy);
+            }
+            populate_proc_root(&target_node)?;
+            insert_mount(source.unwrap_or("proc"), target, fs_type, flags)
+        }
+        MountFsType::Sysfs => {
+            ensure_mount_target_free(target)?;
+            if !directory_is_empty(&target_node)? {
+                return Err(Errno::Ebusy);
+            }
+            populate_sysfs_root(&target_node)?;
+            insert_mount(source.unwrap_or("sysfs"), target, fs_type, flags)
+        }
         _ => insert_mount(source.unwrap_or("none"), target, fs_type, flags),
     }
 }
@@ -428,6 +467,49 @@ pub fn umount(target: &str, _flags: usize) -> Result<(), Errno> {
     Ok(())
 }
 
+fn populate_proc_root(parent: &Arc<Node>) -> Result<(), Errno> {
+    let entries = crate::procfs::root_entries();
+    for (name, generator) in entries {
+        let node = proc_file_node(generator);
+        insert_child(parent, name, node)?;
+    }
+    // /proc/self — 符号链接到当前 PID
+    let self_node = symlink_node("1");
+    insert_child(parent, "self", self_node)?;
+    Ok(())
+}
+
+fn populate_sysfs_root(parent: &Arc<Node>) -> Result<(), Errno> {
+    // /sys/kernel/
+    let kernel_dir = directory(FileMode::DIR_DEFAULT);
+    let kernel_entries = crate::sysfs::kernel_entries();
+    for (name, generator) in kernel_entries {
+        let node = proc_file_node(generator);
+        insert_child(&kernel_dir, name, node)?;
+    }
+    insert_child(parent, "kernel", kernel_dir)?;
+
+    // /sys/devices/
+    let devices_dir = directory(FileMode::DIR_DEFAULT);
+    let devices_entries = crate::sysfs::devices_entries();
+    for (name, generator) in devices_entries {
+        let node = proc_file_node(generator);
+        insert_child(&devices_dir, name, node)?;
+    }
+    insert_child(parent, "devices", devices_dir)?;
+
+    // /sys/class/
+    let class_dir = directory(FileMode::DIR_DEFAULT);
+    let class_entries = crate::sysfs::class_entries();
+    for (name, generator) in class_entries {
+        let node = proc_file_node(generator);
+        insert_child(&class_dir, name, node)?;
+    }
+    insert_child(parent, "class", class_dir)?;
+
+    Ok(())
+}
+
 fn initialize_mount_table() -> Result<(), Errno> {
     let mut mounts = MOUNTS.lock();
     mounts.clear();
@@ -445,6 +527,32 @@ fn initialize_mount_table() -> Result<(), Errno> {
         flags: 0,
     });
     Ok(())
+}
+
+pub fn format_mounts() -> Result<alloc::vec::Vec<u8>, Errno> {
+    let mounts = MOUNTS.lock();
+    let mut output = alloc::string::String::new();
+    for entry in mounts.iter() {
+        let source = entry.source.as_deref().unwrap_or("none");
+        let fs_type = match entry.fs_type {
+            MountFsType::Tmpfs => "tmpfs",
+            MountFsType::Devtmpfs => "devtmpfs",
+            MountFsType::Proc => "proc",
+            MountFsType::Sysfs => "sysfs",
+            MountFsType::Ext4 => "ext4",
+            MountFsType::Vfat => "vfat",
+        };
+        let flags = if entry.flags != 0 {
+            alloc::format!(",flags=0x{:x}", entry.flags)
+        } else {
+            alloc::string::String::new()
+        };
+        output.push_str(&alloc::format!(
+            "{source} {target} {fs_type} rw,relatime{flags} 0 0\n",
+            target = entry.target,
+        ));
+    }
+    Ok(output.into_bytes())
 }
 
 fn insert_mount(
@@ -485,6 +593,7 @@ fn parse_mount_fs_type(filesystem_type: &str) -> Result<MountFsType, Errno> {
         "tmpfs" => Ok(MountFsType::Tmpfs),
         "devtmpfs" => Ok(MountFsType::Devtmpfs),
         "proc" => Ok(MountFsType::Proc),
+        "sysfs" => Ok(MountFsType::Sysfs),
         "ext4" => Ok(MountFsType::Ext4),
         "vfat" => Ok(MountFsType::Vfat),
         _ => Err(Errno::Enodev),
@@ -701,6 +810,7 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
         NodeState::Symlink(_) => Err(Errno::Einval),
         NodeState::Device(_) => Ok(()),
         NodeState::BlockDevice { .. } => Err(Errno::Einval),
+        NodeState::ProcFile(_) => Err(Errno::Erofs),
     }
 }
 
@@ -887,6 +997,17 @@ fn device(kind: DeviceKind) -> Arc<Node> {
         mode: FileMode::CHAR_DEFAULT,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Device(kind), NODE_LOCK),
+    })
+}
+
+fn proc_file_node(generator: Arc<dyn crate::procfs::ProcFileGenerator>) -> Arc<Node> {
+    Arc::new(Node {
+        ino: allocate_inode(),
+        parent_ino: AtomicU64::new(0),
+        nlink: AtomicU64::new(1),
+        mode: FileMode::from_bits(FileMode::S_IFREG | 0o444),
+        read_only: AtomicBool::new(true),
+        state: IrqSpinLock::new_with_class(NodeState::ProcFile(generator), NODE_LOCK),
     })
 }
 
@@ -1223,25 +1344,42 @@ impl FileOperations for RegularFile {
     fn read(&self, file: &File, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         file.with_position(|position| {
             let state = self.node.state.lock();
-            let NodeState::Regular(data) = &*state else {
-                return Err(Errno::Einval);
-            };
-            let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
-            if start >= data.len() {
-                return Ok(0);
+            match &*state {
+                NodeState::Regular(data) => {
+                    let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
+                    if start >= data.len() {
+                        return Ok(0);
+                    }
+                    let count = buf.push(&data[start..]);
+                    *position = (*position)
+                        .checked_add(count as u64)
+                        .ok_or(Errno::Eoverflow)?;
+                    Ok(count)
+                }
+                NodeState::ProcFile(generator) => {
+                    // 每次 read 生成内容（简化实现：忽略位置，完整返回）
+                    let data = generator.generate()?;
+                    if *position >= data.len() as u64 {
+                        return Ok(0);
+                    }
+                    let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
+                    let count = buf.push(&data[start..]);
+                    *position = (*position)
+                        .checked_add(count as u64)
+                        .ok_or(Errno::Eoverflow)?;
+                    Ok(count)
+                }
+                _ => Err(Errno::Einval),
             }
-            let count = buf.push(&data[start..]);
-            *position = (*position)
-                .checked_add(count as u64)
-                .ok_or(Errno::Eoverflow)?;
-            Ok(count)
         })
     }
 
     fn write(&self, file: &File, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
         if is_node_read_only(&self.node) {
-            // M15-A ext4 mounts are a read-only file snapshot. Never let writes
-            // silently mutate the tmpfs mirror and pretend persistence works.
+            return Err(Errno::Erofs);
+        }
+        // Proc files are always read-only
+        if matches!(&*self.node.state.lock(), NodeState::ProcFile(_)) {
             return Err(Errno::Erofs);
         }
         file.with_position(|position| {
@@ -1270,6 +1408,9 @@ impl FileOperations for RegularFile {
             let state = self.node.state.lock();
             match &*state {
                 NodeState::Regular(data) => data.len() as u64,
+                NodeState::ProcFile(generator) => {
+                    generator.generate().map(|d| d.len() as u64).unwrap_or(0)
+                }
                 _ => return Err(Errno::Einval),
             }
         };
@@ -1281,6 +1422,9 @@ impl FileOperations for RegularFile {
     }
 
     fn truncate(&self, _file: &File, length: u64) -> Result<(), Errno> {
+        if matches!(&*self.node.state.lock(), NodeState::ProcFile(_)) {
+            return Err(Errno::Erofs);
+        }
         truncate_node(&self.node, length)
     }
 }
@@ -1361,13 +1505,48 @@ impl FileOperations for DeviceFile {
                 }
                 Ok(total)
             }
+            DeviceKind::Random => {
+                let mut scratch = [0_u8; 64];
+                let mut total = 0;
+                while buf.remaining() > 0 {
+                    let chunk = scratch.len().min(buf.remaining());
+                    crate::rng::fill_random(&mut scratch[..chunk]);
+                    total += buf.push(&scratch[..chunk]);
+                }
+                Ok(total)
+            }
+            DeviceKind::Urandom => {
+                let mut scratch = [0_u8; 64];
+                let mut total = 0;
+                while buf.remaining() > 0 {
+                    let chunk = scratch.len().min(buf.remaining());
+                    crate::rng::fill_random(&mut scratch[..chunk]);
+                    total += buf.push(&scratch[..chunk]);
+                }
+                Ok(total)
+            }
+            DeviceKind::Rtc => {
+                if let Some(time) = crate::rtc::read_rtc_time() {
+                    let time_str = alloc::format!("{}\n", time.unix_seconds);
+                    Ok(buf.push(time_str.as_bytes()))
+                } else {
+                    Err(Errno::Eio)
+                }
+            }
+            // Ptmx is intercepted in open(), never reaches here
+            DeviceKind::Ptmx => Err(Errno::Einval),
         }
     }
 
     fn write(&self, _file: &File, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
         match self.kind {
-            DeviceKind::Null | DeviceKind::Zero => Ok(buf.len()),
+            DeviceKind::Null | DeviceKind::Zero | DeviceKind::Random | DeviceKind::Urandom
+            | DeviceKind::Rtc => {
+                Ok(buf.len())
+            }
             DeviceKind::Console => Ok(crate::tty::write_console(buf.as_bytes())),
+            // Ptmx handled before DeviceFile creation
+            _ => Ok(buf.len()),
         }
     }
 
@@ -1383,6 +1562,8 @@ impl FileOperations for DeviceFile {
         match self.kind {
             DeviceKind::Console => crate::tty::ioctl(cmd, arg),
             DeviceKind::Null | DeviceKind::Zero => Err(Errno::Enotty),
+            // Ptmx, Random, Urandom, Rtc — no ioctl support
+            _ => Err(Errno::Enotty),
         }
     }
 
@@ -1398,7 +1579,19 @@ impl FileOperations for DeviceFile {
                 }
                 ready.intersect(requested)
             }
-            DeviceKind::Null | DeviceKind::Zero => {
+            DeviceKind::Null | DeviceKind::Zero | DeviceKind::Random | DeviceKind::Urandom
+            | DeviceKind::Rtc => {
+                let mut ready = PollEvents::empty();
+                if file.flags().access_mode().is_readable() {
+                    ready = ready.union(PollEvents::IN);
+                }
+                if file.flags().access_mode().is_writable() {
+                    ready = ready.union(PollEvents::OUT);
+                }
+                ready.intersect(requested)
+            }
+            // Ptmx handled before DeviceFile creation
+            _ => {
                 let mut ready = PollEvents::empty();
                 if file.flags().access_mode().is_readable() {
                     ready = ready.union(PollEvents::IN);
@@ -1517,6 +1710,9 @@ fn stat_for_node(node: &Arc<Node>) -> Result<Stat, Errno> {
         NodeState::Symlink(target) => target.len() as i64,
         NodeState::Device(_) => 0,
         NodeState::BlockDevice { device, .. } => device.size_bytes().unwrap_or(0) as i64,
+        NodeState::ProcFile(generator) => {
+            generator.generate().map(|d| d.len() as i64).unwrap_or(0)
+        }
     };
     stat.nlink = node.nlink.load(Ordering::Acquire) as u32;
     stat.blocks = (stat.size.saturating_add(511)) / 512;

@@ -38,6 +38,8 @@ pub enum Errno {
     Eloop = 40,
     Enametoolong = 36,
     Eoverflow = 75,
+    Eafnosupport = 97,
+    Enotsock = 88,
 }
 
 impl Errno {
