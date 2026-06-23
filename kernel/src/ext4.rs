@@ -64,6 +64,22 @@ pub struct Ext4SnapshotDirEntry {
     pub node: Ext4SnapshotNode,
 }
 
+/// 轻量级列出 ext4 根目录条目（仅名字和 inode 号，不递归）。
+pub struct Ext4DirEntry {
+    pub name: String,
+    pub ino: u32,
+    pub file_type: u16,
+}
+
+pub fn list_root_directory(
+    device: Arc<dyn BlockDevice>,
+) -> Result<alloc::vec::Vec<Ext4DirEntry>, Ext4Error> {
+    let fs = Ext4FileSystem::open(device)?;
+    let mut entries = alloc::vec::Vec::new();
+    fs.read_root_dir_entries(&mut entries)?;
+    Ok(entries)
+}
+
 pub fn load_root_snapshot(device: Arc<dyn BlockDevice>) -> Result<Ext4SnapshotNode, Ext4Error> {
     let fs = Ext4FileSystem::open(device)?;
     let mut budget = NodeBudget::new(MAX_EXT4_NODES);
@@ -260,6 +276,54 @@ impl Ext4FileSystem {
             offset += rec_len;
         }
         Ok(entries)
+    }
+
+    /// 读取根目录条目列表（仅名字、inode 号和文件类型，不递归加载）。
+    fn read_root_dir_entries(
+        &self,
+        output: &mut alloc::vec::Vec<Ext4DirEntry>,
+    ) -> Result<(), Ext4Error> {
+        let inode = self.read_inode(EXT4_ROOT_INO)?;
+        if inode.file_type() != EXT4_S_IFDIR {
+            return Err(Ext4Error::BadDirectory);
+        }
+        let data = self.read_inode_bytes(&inode)?;
+        let mut offset = 0_usize;
+        while offset < data.len() {
+            if data.len() - offset < 8 {
+                break;
+            }
+            let ino = le_u32(&data, offset)?;
+            let rec_len = usize::from(le_u16(&data, offset + 4)?);
+            let name_len_raw = *data.get(offset + 6).ok_or(Ext4Error::BadDirectory)?;
+            let file_type_raw = *data.get(offset + 7).ok_or(Ext4Error::BadDirectory)?;
+            if rec_len == 0 || rec_len < 8 || offset + rec_len > data.len() {
+                return Err(Ext4Error::BadDirectory);
+            }
+            let name_len = usize::from(name_len_raw);
+            if name_len > rec_len - 8 {
+                return Err(Ext4Error::BadDirectory);
+            }
+            if ino != 0 {
+                let name_bytes = &data[offset + 8..offset + 8 + name_len];
+                if name_bytes != b"."
+                    && name_bytes != b".."
+                    && !name_bytes.contains(&0)
+                    && !name_bytes.contains(&b'/')
+                {
+                    let name = String::from_utf8(name_bytes.to_vec())
+                        .map_err(|_| Ext4Error::BadDirectory)?;
+                    output.try_reserve(1).map_err(|_| Ext4Error::OutOfMemory)?;
+                    output.push(Ext4DirEntry {
+                        name,
+                        ino,
+                        file_type: u16::from(file_type_raw),
+                    });
+                }
+            }
+            offset += rec_len;
+        }
+        Ok(())
     }
 
     fn load_path(&self, path: &str) -> Result<Ext4SnapshotNode, Ext4Error> {

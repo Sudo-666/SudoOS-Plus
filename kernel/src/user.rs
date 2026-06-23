@@ -750,139 +750,66 @@ fn verify_sdcard_basic_script_thread() {
 }
 
 pub fn verify_sdcard_all_scripts() {
-    if crate::fs::stat("/mnt/sdcard/musl/busybox").is_err() {
+    if crate::block::open_device("vda").is_none() {
         return;
     }
 
     crate::task::run_kernel_thread_sync(verify_sdcard_all_scripts_thread);
 }
 
-fn install_from_ext4(vfs: &str, ext4: &str) {
-    if crate::fs::stat(vfs).is_err() {
-        let _ = crate::fs::install_ext4_path("/dev/vda", vfs, ext4);
-    }
-}
-
 fn verify_sdcard_all_scripts_thread() {
-    // Create dirs and files needed by test scripts (touch is ENOSYS)
+    // Create dirs needed by test scripts
     let _ = crate::fs::mkdir("/var", 0o755);
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
-    if crate::fs::stat("/var/tmp/lmbench").is_err() {
-        let _ = crate::fs::open("/var/tmp/lmbench", myos_vfs::OpenFlags::from_bits(0o101));
+    let _ = crate::fs::mkdir("/tmp", 0o755);
+
+    // Locate busybox for script execution
+    let busybox_path = if crate::fs::stat("/bin/busybox").is_ok() {
+        "/bin/busybox"
+    } else if crate::fs::stat("/bin/sh").is_ok() {
+        "/bin/sh"
+    } else {
+        crate::println!("sdcard scripts: no shell found — skipping");
+        return;
+    };
+
+    // Get the dynamically scanned test script list
+    let scripts = {
+        let guard = crate::SCANNED_TEST_SCRIPTS.lock();
+        guard.clone()
+    };
+
+    if scripts.is_empty() {
+        crate::println!("sdcard scripts: no test scripts found on disk");
+        return;
     }
 
-    // Install script files and dependencies from ext4
-    install_from_ext4("/mnt/sdcard/musl/basic_testcode.sh", "/musl/basic_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/busybox_testcode.sh", "/musl/busybox_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/busybox_cmd.txt", "/musl/busybox_cmd.txt");
-
-    install_from_ext4("/mnt/sdcard/musl/libcbench_testcode.sh", "/musl/libcbench_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/libc-bench", "/musl/libc-bench");
-
-    install_from_ext4("/mnt/sdcard/musl/libctest_testcode.sh", "/musl/libctest_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/libctest_testcode.sh", "/musl/libctest_testcode.sh");
-    // run-static.sh / run-dynamic.sh lack a #! shebang. Install real content
-    // with a .real suffix, then create shebang wrappers at the expected names.
-    install_from_ext4("/mnt/sdcard/musl/run-static.real", "/musl/run-static.sh");
-    install_from_ext4("/mnt/sdcard/musl/run-dynamic.real", "/musl/run-dynamic.sh");
-    install_from_ext4("/mnt/sdcard/musl/entry-static.exe", "/musl/entry-static.exe");
-    install_from_ext4("/mnt/sdcard/musl/entry-dynamic.exe", "/musl/entry-dynamic.exe");
-    install_from_ext4("/mnt/sdcard/musl/runtest.exe", "/musl/runtest.exe");
-    install_from_ext4("/mnt/sdcard/musl/dlopen_dso.so", "/musl/dlopen_dso.so");
-    install_from_ext4("/mnt/sdcard/musl/tls_get_new-dtv_dso.so", "/musl/tls_get_new-dtv_dso.so");
-    // Write shebang wrappers that source the real scripts
-    for (name, real) in [("run-static.sh", "run-static.real"), ("run-dynamic.sh", "run-dynamic.real")] {
-        let vfs = alloc::format!("/mnt/sdcard/musl/{}", name);
-        let real = alloc::format!("/mnt/sdcard/musl/{}", real);
-        let content = alloc::format!("#!/bin/busybox sh\n. {}\n", real);
-        if let Ok(f) = crate::fs::open(
-            &vfs,
-            myos_vfs::OpenFlags::from_bits(0o1101),
-        ) {
-            let _ = f.write(&myos_vfs::IoBuffer::new(content.as_bytes()));
-        }
+    // Install all root-level ext4 entries into VFS as needed
+    for script in &scripts {
+        let ext4_path = alloc::format!("/{}", script);
+        let vfs_path = alloc::format!("/{}", script);
+        let _ = crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path);
     }
 
-    install_from_ext4("/mnt/sdcard/musl/lua_testcode.sh", "/musl/lua_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/test.sh", "/musl/test.sh");
-    install_from_ext4("/mnt/sdcard/musl/lua", "/musl/lua");
-    let lua_scripts: &[&str] = &[
-        "date.lua", "file_io.lua", "max_min.lua", "random.lua",
-        "remove.lua", "round_num.lua", "sin30.lua", "sort.lua", "strings.lua",
-    ];
-    for s in lua_scripts {
-        install_from_ext4(&alloc::format!("/mnt/sdcard/musl/{}", s), &alloc::format!("/musl/{}", s));
-    }
+    // Run each test script in order
+    for script in &scripts {
+        let vfs_path = alloc::format!("/{}", script);
 
-    install_from_ext4("/mnt/sdcard/musl/cyclictest_testcode.sh", "/musl/cyclictest_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/cyclictest", "/musl/cyclictest");
-    install_from_ext4("/mnt/sdcard/musl/hackbench", "/musl/hackbench");
+        crate::println!("#### OS COMP TEST GROUP START {} ####", script);
 
-    install_from_ext4("/mnt/sdcard/musl/netperf_testcode.sh", "/musl/netperf_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/netperf", "/musl/netperf");
-    install_from_ext4("/mnt/sdcard/musl/netserver", "/musl/netserver");
-
-    install_from_ext4("/mnt/sdcard/musl/iperf_testcode.sh", "/musl/iperf_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/iperf3", "/musl/iperf3");
-
-    install_from_ext4("/mnt/sdcard/musl/iozone_testcode.sh", "/musl/iozone_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/iozone", "/musl/iozone");
-
-    install_from_ext4("/mnt/sdcard/musl/lmbench_testcode.sh", "/musl/lmbench_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/lmbench_all", "/musl/lmbench_all");
-    install_from_ext4("/mnt/sdcard/musl/hello", "/musl/hello");
-
-    install_from_ext4("/mnt/sdcard/musl/unixbench_testcode.sh", "/musl/unixbench_testcode.sh");
-    install_from_ext4("/mnt/sdcard/musl/multi.sh", "/musl/multi.sh");
-    let ub_bins: &[&str] = &[
-        "arithoh", "context1", "dhry2", "dhry2reg", "double", "execl",
-        "float", "fstime", "hanoi", "int", "long", "looper", "pipe",
-        "register", "short", "spawn", "syscall", "whetstone-double",
-    ];
-    for bin in ub_bins {
-        install_from_ext4(
-            &alloc::format!("/mnt/sdcard/musl/{}", bin),
-            &alloc::format!("/musl/{}", bin),
-        );
-    }
-
-    install_from_ext4("/mnt/sdcard/musl/ltp_testcode.sh", "/musl/ltp_testcode.sh");
-
-    // lmbench_testcode.sh: hangs (touch ENOSYS + lat_sig prot)
-    // ltp_testcode.sh: needs /musl/ltp tree mount (Enomem)
-
-    const ALL_TEST_SCRIPTS: &[&str] = &[
-        "basic_testcode.sh",
-        "busybox_testcode.sh",
-        "libcbench_testcode.sh",
-        "libctest_testcode.sh",
-        "lua_testcode.sh",
-        "cyclictest_testcode.sh",
-        "netperf_testcode.sh",
-        "iperf_testcode.sh",
-        "iozone_testcode.sh",
-        "unixbench_testcode.sh",
-    ];
-
-    for script in ALL_TEST_SCRIPTS {
-        let vfs_path = alloc::format!("/mnt/sdcard/musl/{}", script);
         if crate::fs::stat(&vfs_path).is_err() {
-            crate::println!("#### OS COMP TEST GROUP START {} ####", script);
-            crate::println!("  {} : SKIP (not installed)", script);
+            crate::println!("  {} : SKIP (not found)", script);
             crate::println!("#### OS COMP TEST GROUP END {} ####", script);
             continue;
         }
 
-        crate::println!("#### OS COMP TEST GROUP START {} ####", script);
-
         let result = run_rootfs_program_with_cwd(
-            "/mnt/sdcard/musl/busybox",
+            busybox_path,
             &["busybox", "sh", &vfs_path],
             &[
-                "PATH=.:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin",
-                "LD_LIBRARY_PATH=/mnt/sdcard/musl/lib",
+                "PATH=.:/:/bin:/sbin:/usr/bin:/usr/sbin",
             ],
-            Some("/mnt/sdcard/musl"),
+            Some("/"),
         );
 
         match result {

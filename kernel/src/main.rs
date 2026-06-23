@@ -408,49 +408,69 @@ fn mount_sdcard_if_present() {
         }
     };
 
-    // Check ext4 magic gently — if it's not ext4, just skip
     let mut magic = [0_u8; 2];
     if crate::block::read_at(&device, 1024 + 56, &mut magic).is_err()
-        || magic.len() != 2
         || u16::from_le_bytes(magic) != 0xef53
     {
         crate::println!("sdcard: not an ext4 filesystem — skipping mount");
         return;
     }
 
-    // Try to find competition test files; skip missing ones gracefully.
+    // Dynamically scan the ext4 root directory for test scripts and binaries.
+    let root_entries = match crate::ext4::list_root_directory(device) {
+        Ok(entries) => entries,
+        Err(error) => {
+            crate::println!("sdcard: failed to list ext4 root directory: {error:?}");
+            return;
+        }
+    };
+
     let _ = fs::mkdir("/mnt", 0o755);
     let _ = fs::mkdir("/mnt/sdcard", 0o755);
+    let _ = fs::mkdir("/bin", 0o755);
+
+    // Find and install busybox (try common names)
+    for entry in &root_entries {
+        if entry.name == "busybox" || entry.name == "busybox-static" {
+            let ext4_path = alloc::format!("/{}", entry.name);
+            let _ = fs::install_ext4_path("/dev/vda", "/bin/busybox", &ext4_path);
+            let _ = fs::symlink("/bin/busybox", "/bin/sh");
+        }
+    }
+
+    // Collect all test scripts
+    let mut test_scripts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for entry in &root_entries {
+        if entry.name.ends_with("_testcode.sh") {
+            test_scripts.push(entry.name.clone());
+        }
+    }
+
+    // Also try to install libc.so if present
     let _ = fs::mkdir("/mnt/sdcard/musl", 0o755);
     let _ = fs::mkdir("/mnt/sdcard/musl/lib", 0o755);
-    let _ = fs::mkdir("/bin", 0o755);
-    let _ = fs::mkdir("/code", 0o755);
-    let _ = fs::mkdir("/code/mnt", 0o755);
-
-    // Install files if they exist; ignore errors for missing paths
-    let _ = fs::install_ext4_path("/dev/vda", "/bin/busybox", "/musl/busybox");
-    let _ = fs::symlink("/bin/busybox", "/bin/sh");
-    let _ = fs::install_ext4_path("/dev/vda", "/mnt/sdcard/musl/busybox", "/musl/busybox");
-    let _ = fs::install_ext4_path(
-        "/dev/vda",
-        "/mnt/sdcard/musl/basic_testcode.sh",
-        "/musl/basic_testcode.sh",
-    );
-    let _ = fs::install_ext4_path(
-        "/dev/vda",
-        "/mnt/sdcard/musl/lib/libc.so",
-        "/musl/lib/libc.so",
-    );
-    let _ = fs::install_ext4_path("/dev/vda", "/text.txt", "/musl/basic/text.txt");
-    let _ = fs::install_ext4_path("/dev/vda", "/code/text.txt", "/musl/basic/text.txt");
-    let _ = fs::install_ext4_path("/dev/vda", "/code/test_echo", "/musl/basic/test_echo");
-    let _ = fs::mkdir("/mnt/sdcard/musl/basic", 0o755);
-    let _ = fs::mount_ext4_subtree("/dev/vda", "/mnt/sdcard/musl/basic", "/musl/basic", 1);
+    let _ = fs::install_ext4_path("/dev/vda", "/mnt/sdcard/musl/lib/libc.so", "/lib/libc.so");
 
     println!("sdcard:");
-    println!("  mount         : /dev/vda -> /mnt/sdcard (ext4)");
-    println!("  files         : populated from ext4 (where available)");
+    println!("  mount         : /dev/vda (ext4)");
+    println!(
+        "  root entries  : {}",
+        root_entries.len(),
+    );
+    println!(
+        "  test scripts  : {}",
+        test_scripts.len(),
+    );
+
+    // Expose the test script list for verify_sdcard_all_scripts
+    SCANNED_TEST_SCRIPTS.lock().clone_from(&test_scripts);
 }
+
+pub(crate) static SCANNED_TEST_SCRIPTS: crate::irq_lock::IrqSpinLock<alloc::vec::Vec<alloc::string::String>> =
+    crate::irq_lock::IrqSpinLock::new_with_class(
+        alloc::vec::Vec::new(),
+        crate::lockdep::LockClass::new("sdcard.scripts", crate::lockdep::LockRank::Vfs, 4),
+    );
 
 fn install_external_initramfs(range: Option<MemoryRegion>) {
     let Some(range) = range else {
