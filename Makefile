@@ -96,3 +96,7 @@ oscomp-full-contest-preflight:
 .PHONY: oscomp-riscv-linuxlike-handoff-audit
 oscomp-riscv-linuxlike-handoff-audit:
 	@bash scripts/oscomp-riscv-linuxlike-handoff-audit.sh .
+
+.PHONY: oscomp-riscv-early-trap-audit
+oscomp-riscv-early-trap-audit:
+	@bash scripts/oscomp-riscv-early-trap-audit.sh

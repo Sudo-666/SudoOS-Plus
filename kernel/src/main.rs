@@ -136,6 +136,42 @@ fn print_boot_info(boot: &BootInfo) {
     println!("entered Rust kernel successfully");
 }
 
+
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+pub extern "C" fn __riscv_early_trap_panic() -> ! {
+    let scause: usize;
+    let sepc: usize;
+    let stval: usize;
+    let stvec: usize;
+    let satp: usize;
+    let sp: usize;
+
+    unsafe {
+        core::arch::asm!("csrr {out}, scause", out = out(reg) scause, options(nomem, nostack));
+        core::arch::asm!("csrr {out}, sepc", out = out(reg) sepc, options(nomem, nostack));
+        core::arch::asm!("csrr {out}, stval", out = out(reg) stval, options(nomem, nostack));
+        core::arch::asm!("csrr {out}, stvec", out = out(reg) stvec, options(nomem, nostack));
+        core::arch::asm!("csrr {out}, satp", out = out(reg) satp, options(nomem, nostack));
+        core::arch::asm!("mv {out}, sp", out = out(reg) sp, options(nomem, nostack));
+    }
+
+    crate::println!();
+    crate::println!("================ RISC-V EARLY TRAP ================");
+    crate::println!("trap subsystem not installed yet");
+    crate::println!("  scause : {:#018x}", scause);
+    crate::println!("  sepc   : {:#018x}", sepc);
+    crate::println!("  stval  : {:#018x}", stval);
+    crate::println!("  stvec  : {:#018x}", stvec);
+    crate::println!("  satp   : {:#018x}", satp);
+    crate::println!("  sp     : {:#018x}", sp);
+    crate::println!("===================================================");
+
+    loop {
+        arch::cpu::wait_for_interrupt();
+    }
+}
+
 fn kernel_main(boot: BootInfo) -> ! {
     println!("kernel_main: initialization started");
 

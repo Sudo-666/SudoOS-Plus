@@ -433,7 +433,15 @@ __riscv_high_entry:
     call rust_entry
 
 .Lhigh_fault:
+    /*
+     * High-half early trap vector.  The full trap subsystem is not
+     * installed yet, so do not silently WFI here.  Hand off to a
+     * minimal Rust reporter that only reads CSRs and prints static
+     * diagnostic lines via the already-live early console.
+     */
+    call __riscv_early_trap_panic
+1:
     wfi
-    j .Lhigh_fault
+    j 1b
 
 .size __riscv_high_entry, . - __riscv_high_entry

@@ -68,6 +68,22 @@ pub unsafe fn switch_sv39_root(root: PhysFrame) -> Result<(), ActivateError> {
 
     let satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | root_ppn;
 
+    /*
+     * Preserve the caller's early high-half trap vector.  During the
+     * SATP transition we temporarily point stvec at a local landing pad,
+     * but that vector must not remain installed after success: before
+     * trap::initialize(), leaving stvec at a WFI loop turns real faults
+     * into silent hangs.
+     */
+    let old_stvec: usize;
+    unsafe {
+        asm!(
+            "csrr {old}, stvec",
+            old = out(reg) old_stvec,
+            options(nomem, nostack),
+        );
+    }
+
     // SAFETY: 新页表映射当前执行地址和 trap landing，root 已经通过范围校验。
     unsafe {
         asm!(
@@ -105,6 +121,14 @@ pub unsafe fn switch_sv39_root(root: PhysFrame) -> Result<(), ActivateError> {
             satp = in(reg) satp,
             lateout("t0") _,
             options(nostack),
+        );
+    }
+
+    unsafe {
+        asm!(
+            "csrw stvec, {old}",
+            old = in(reg) old_stvec,
+            options(nomem, nostack),
         );
     }
 
