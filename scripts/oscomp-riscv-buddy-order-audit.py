@@ -1,31 +1,22 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import re
-import sys
-
-root = Path(__file__).resolve().parents[1]
-alloc = root / "mm/src/buddy/allocator.rs"
-text = alloc.read_text()
-
+ROOT = Path(__file__).resolve().parents[1]
+text = (ROOT / "mm/src/buddy/allocator.rs").read_text(encoding="utf-8")
 m = re.search(r"fn\s+largest_block_order\s*\([^)]*\)\s*->\s*usize\s*\{(?P<body>.*?)\n\}", text, re.S)
-if not m:
-    print("FAIL: largest_block_order() missing")
-    sys.exit(1)
-body = m.group("body")
-checks = [
-    ("no trailing_zeros in early buddy order", "trailing_zeros" not in body),
-    ("no leading_zeros in early buddy order", "leading_zeros" not in body),
-    ("bounded by MAX_ORDER loop", "while order + 1 < MAX_ORDER" in body),
-    ("bounded by remaining_pages", "block_pages > remaining_pages" in body),
-    ("alignment mask check", "pfn & (block_pages - 1)" in body),
-    ("zero remaining defensive guard", "remaining_pages == 0" in body),
-]
+body = m.group("body") if m else ""
+checks = []
+def add(name, ok): checks.append((name, bool(ok)))
+add("largest_block_order exists", bool(m))
+add("zero guard", "remaining_pages == 0" in body and "return 0" in body)
+add("MAX_ORDER bounded loop", "while order + 1 < MAX_ORDER" in body)
+add("remaining_pages limit", "block_pages > remaining_pages" in body)
+add("alignment mask", "pfn & (block_pages - 1)" in body or "pfn % block_pages" in body)
+add("no trailing_zeros", "trailing_zeros" not in body)
+add("no leading_zeros", "leading_zeros" not in body)
 fail = 0
 for name, ok in checks:
     print(("PASS" if ok else "FAIL") + f": {name}")
-    if not ok:
-        fail += 1
-if fail:
-    print(f"oscomp-riscv-buddy-order-audit: FAIL={fail}")
-    sys.exit(1)
-print(f"oscomp-riscv-buddy-order-audit: PASS={len(checks)} FAIL=0")
+    fail += 0 if ok else 1
+print(f"oscomp-riscv-buddy-order-audit: PASS={len(checks)-fail} FAIL={fail}")
+raise SystemExit(1 if fail else 0)

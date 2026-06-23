@@ -786,25 +786,12 @@ impl EarlyMemoryState {
 }
 
 
-#[cfg(target_arch = "riscv64")]
-#[inline(always)]
-fn oscomp_riscv_page_alloc_trace(label: &'static [u8]) {
-    for &byte in label {
-        crate::arch::early_console::write_byte(byte);
-    }
-}
-
-pub fn initialize_page_allocator(
+ pub fn initialize_page_allocator(
     layout: &BootMemoryLayout,
     early_memory: EarlyMemoryState,
-) -> KernelMemoryState {
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P0:enter-page-allocator\n");
+) -> KernelMemoryState { 
 
-    let managed = managed_physical_span(layout.ram());
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P1:managed-span\n");
+    let managed = managed_physical_span(layout.ram()); 
 
     let required_bytes =
         BuddyAllocator::required_metadata_bytes(managed).expect("invalid managed physical range");
@@ -812,15 +799,9 @@ pub fn initialize_page_allocator(
     let metadata_pages = required_bytes
         .checked_add(myos_mm::PAGE_SIZE - 1)
         .expect("page metadata size overflow")
-        / myos_mm::PAGE_SIZE;
+        / myos_mm::PAGE_SIZE; 
 
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P2:metadata-pages\n");
-
-    let (mut early_allocator, boot_page_table) = early_memory.into_parts();
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P3:early-memory-split\n");
+    let (mut early_allocator, boot_page_table) = early_memory.into_parts(); 
 
     /*
      * 元数据本身从 early allocator 分配，因此不会再被交给
@@ -833,10 +814,7 @@ pub fn initialize_page_allocator(
                 "unable to allocate page metadata: \
                      {error:?}",
             );
-        });
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P4:metadata-allocated\n");
+        }); 
 
     let metadata_range = metadata_block.range();
 
@@ -849,10 +827,7 @@ pub fn initialize_page_allocator(
             "page metadata is not direct-mapped: \
                      {error:?}",
         );
-    });
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P5:metadata-direct-map\n");
+    }); 
 
     /*
      * SAFETY:
@@ -874,10 +849,7 @@ pub fn initialize_page_allocator(
             "unable to initialize buddy metadata: \
              {error:?}",
         );
-    });
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P6:buddy-new\n");
+    }); 
 
     /*
      * 全部普通 RAM 先标记为 Reserved。
@@ -893,34 +865,22 @@ pub fn initialize_page_allocator(
                      {error:?}",
                 );
             });
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P7:mark-present\n");
+    } 
 
     let expected_free_pages = early_allocator
         .remaining_frames()
-        .expect("early frame count overflow");
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P8:remaining-frames\n");
+        .expect("early frame count overflow"); 
 
     /*
      * 只有 EarlyFrameAllocator 剩余的页面才进入 buddy。
      */
-    release_early_ranges_to_buddy_chunked(&mut page_allocator, &early_allocator);
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P9:release-ranges\n");
+    release_early_ranges_to_buddy_chunked(&mut page_allocator, &early_allocator); 
 
     assert_eq!(
         page_allocator.total_free_pages(),
         expected_free_pages,
         "early-to-buddy handoff lost or duplicated pages",
-    );
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P10:free-count-ok\n");
+    ); 
 
     crate::println!("physical page allocator:");
     crate::println!(
@@ -957,10 +917,7 @@ pub fn initialize_page_allocator(
             "unable to install global page allocator: \
              {error:?}",
         );
-    });
-
-    #[cfg(target_arch = "riscv64")]
-    oscomp_riscv_page_alloc_trace(b"P11:global-page-alloc-installed\n");
+    }); 
 
     assert!(crate::page_alloc::is_initialized(),);
 
@@ -981,15 +938,12 @@ fn release_early_ranges_to_buddy_chunked<const CAPACITY: usize>(
     early_allocator: &EarlyFrameAllocator<CAPACITY>,
 ) {
     let mut range_index = 0_usize;
-
     for range in early_allocator.free_ranges() {
-        release_early_range_to_buddy_chunked(page_allocator, range, range_index).unwrap_or_else(
-            |error| {
-                panic!(
-                    "unable to release early memory range {range_index} to buddy: {error:?}",
-                );
-            },
-        );
+        release_early_range_to_buddy_chunked(page_allocator, range).unwrap_or_else(|error| {
+            panic!(
+                "unable to release early memory range {range_index} to buddy: {error:?}",
+            );
+        });
         range_index = range_index
             .checked_add(1)
             .expect("early memory range index overflow");
@@ -999,14 +953,11 @@ fn release_early_ranges_to_buddy_chunked<const CAPACITY: usize>(
 fn release_early_range_to_buddy_chunked(
     page_allocator: &mut BuddyAllocator,
     range: PhysRange,
-    range_index: usize,
 ) -> Result<(), myos_mm::BuddyError> {
     const RELEASE_CHUNK_PAGES: usize = myos_mm::MAX_ORDER_NR_PAGES;
     const RELEASE_CHUNK_BYTES: usize = RELEASE_CHUNK_PAGES * myos_mm::PAGE_SIZE;
 
     let mut start = range.start();
-    let mut chunk_index = 0_usize;
-
     while start < range.end() {
         let remaining = range
             .end()
@@ -1018,40 +969,14 @@ fn release_early_range_to_buddy_chunked(
             .checked_add(size)
             .ok_or(myos_mm::BuddyError::AddressOverflow)?;
         let chunk = PhysRange::new(start, end).ok_or(myos_mm::BuddyError::AddressOverflow)?;
-
-        oscomp_riscv_chunked_buddy_trace(b"P8R:release-chunk-begin\n");
-        
-#[cfg(target_arch = "riscv64")]
-{
-    page_allocator.release_range_with_trace(chunk, oscomp_riscv_chunked_buddy_trace)?;
-}
-#[cfg(not(target_arch = "riscv64"))]
-{
-    page_allocator.release_range(chunk)?;
-}
-        oscomp_riscv_chunked_buddy_trace(b"P8S:release-chunk-done\n");
-
+        page_allocator.release_range(chunk)?;
         start = end;
-        chunk_index = chunk_index
-            .checked_add(1)
-            .ok_or(myos_mm::BuddyError::AddressOverflow)?;
     }
 
-    let _ = range_index;
     Ok(())
 }
 
-#[cfg(target_arch = "riscv64")]
-fn oscomp_riscv_chunked_buddy_trace(message: &[u8]) {
-    for byte in message {
-        crate::arch::early_console::write_byte(*byte);
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn oscomp_riscv_chunked_buddy_trace(_message: &[u8]) {}
-
-fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
+  fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
     let first = ram.iter().next().expect("firmware reported no RAM");
 
     let last = ram.iter().last().expect("firmware reported no RAM");

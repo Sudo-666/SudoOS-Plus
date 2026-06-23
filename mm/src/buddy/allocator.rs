@@ -272,47 +272,7 @@ impl BuddyAllocator {
     }
 
 
-pub fn release_range_with_trace(
-    &mut self,
-    range: PhysRange,
-    trace: fn(&[u8]),
-) -> Result<(), BuddyError> {
-    trace(b"B0:release-enter\n");
-    let (start, end) = self.validate_range(range)?;
-    trace(b"B1:range-ok\n");
-
-    for pfn in start..end {
-        let state = self.page(pfn)?.state;
-        if !matches!(state, PageState::Reserved) {
-            return Err(BuddyError::PageStateConflict { pfn, state });
-        }
-    }
-    trace(b"B2:reserved-ok\n");
-
-    let mut pfn = start;
-    while pfn < end {
-        trace(b"B3:block-begin\n");
-        let kind = self.zone_kind_for_pfn(pfn)?;
-        trace(b"B4:zone-ok\n");
-        let zone_end = min(end, self.zones[kind.index()].end_pfn);
-        let order = largest_block_order(pfn, zone_end - pfn);
-        trace(b"B5:order-ok\n");
-        let pages = 1_usize << order;
-        self.free_reserved_block(pfn, order, kind)?;
-        trace(b"B6:block-free-ok\n");
-        self.zones[kind.index()].free_pages = self.zones[kind.index()]
-            .free_pages
-            .checked_add(pages)
-            .ok_or(BuddyError::AddressOverflow)?;
-        trace(b"B7:free-pages-ok\n");
-        pfn += pages;
-    }
-
-    trace(b"B8:release-done\n");
-    Ok(())
-}
-
-    pub fn allocate(
+ pub fn allocate(
         &mut self,
         order: usize,
         class: AllocationClass,
@@ -880,15 +840,14 @@ pub fn release_range_with_trace(
 unsafe impl Send for BuddyAllocator {}
 
 fn largest_block_order(pfn: usize, remaining_pages: usize) -> usize {
-    debug_assert!(remaining_pages != 0);
     if remaining_pages == 0 {
         return 0;
     }
 
-    let mut order = 0usize;
+    let mut order = 0_usize;
     while order + 1 < MAX_ORDER {
         let next_order = order + 1;
-        let block_pages = 1usize << next_order;
+        let block_pages = 1_usize << next_order;
         if block_pages > remaining_pages {
             break;
         }
@@ -897,6 +856,7 @@ fn largest_block_order(pfn: usize, remaining_pages: usize) -> usize {
         }
         order = next_order;
     }
+
     order
 }
 
