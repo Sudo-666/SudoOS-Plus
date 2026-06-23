@@ -628,6 +628,8 @@ pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
         None,
         "final page table still maps the low boot image",
     );
+            // OSKernel2026: Linux-like RISC-V high-half stack handoff
+            oscomp_rebase_boot_stack_to_direct_map_once();
 
     crate::println!("RISC-V final address space:");
     crate::println!("  current PC      : {:#018x}", current_pc.get(),);
@@ -939,3 +941,44 @@ fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
 
     PhysRange::new(first.start(), last.end()).expect("invalid managed RAM span")
 }
+
+// OSKernel2026: Linux-like RISC-V high-half stack handoff
+#[cfg(target_arch = "riscv64")]
+core::arch::global_asm!(
+    r#"
+    .section .text.oscomp_riscv_stack_handoff,"ax"
+    .globl oscomp_riscv_switch_stack_to
+    .type oscomp_riscv_switch_stack_to, @function
+oscomp_riscv_switch_stack_to:
+    mv sp, a0
+    ret
+    .size oscomp_riscv_switch_stack_to, . - oscomp_riscv_switch_stack_to
+"#
+);
+
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    fn oscomp_riscv_switch_stack_to(new_sp: usize);
+}
+
+// OSKernel2026: Linux-like RISC-V high-half stack handoff
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+fn oscomp_rebase_boot_stack_to_direct_map_once() {
+    const LOW_DRAM_START: usize = 0x8000_0000;
+    const LOW_DRAM_END: usize = 0x1_0000_0000;
+    const DIRECT_MAP_BASE: usize = 0xffffffd600000000;
+
+    let sp: usize;
+    unsafe {
+        core::arch::asm!("mv {0}, sp", out(reg) sp);
+    }
+
+    if sp >= LOW_DRAM_START && sp < LOW_DRAM_END {
+        let high_sp = DIRECT_MAP_BASE.wrapping_add(sp);
+        unsafe {
+            oscomp_riscv_switch_stack_to(high_sp);
+        }
+    }
+}
+

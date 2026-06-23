@@ -80,3 +80,15 @@ oscomp-riscv-lowmap-audit:
 oscomp-riscv-highhalf-audit:
 	@python3 scripts/oscomp-riscv-highhalf-audit.py
 
+.PHONY: oscomp-riscv-stack-handoff-audit
+oscomp-riscv-stack-handoff-audit:
+	@./scripts/oscomp-riscv-stack-handoff-audit.sh
+
+.PHONY: oscomp-riscv-highhalf-linuxlike-audit
+oscomp-riscv-highhalf-linuxlike-audit:
+	@python3 scripts/oscomp-riscv-highhalf-linuxlike-audit.py
+
+.PHONY: oscomp-full-contest-preflight
+oscomp-full-contest-preflight:
+	@./scripts/oscomp-full-contest-preflight.sh
+
