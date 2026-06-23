@@ -94,6 +94,8 @@ const SYS_CONNECT: usize = crate::syscall::number::CONNECT;
 const SYS_SENDTO: usize = crate::syscall::number::SENDTO;
 const SYS_RECVFROM: usize = crate::syscall::number::RECVFROM;
 const SYS_SHUTDOWN: usize = crate::syscall::number::SHUTDOWN;
+const SYS_FUTEX: usize = crate::syscall::number::FUTEX;
+const SYS_MKNODAT: usize = crate::syscall::number::MKNODAT;
 
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
@@ -758,23 +760,17 @@ pub fn verify_sdcard_all_scripts() {
 }
 
 fn verify_sdcard_all_scripts_thread() {
-    // Create dirs needed by test scripts
+    // Create common dirs needed by test scripts
     let _ = crate::fs::mkdir("/var", 0o755);
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
     let _ = crate::fs::mkdir("/tmp", 0o755);
-
-    // Locate busybox for script execution
-    let busybox_path = if crate::fs::stat("/bin/busybox").is_ok() {
-        "/bin/busybox"
-    } else if crate::fs::stat("/bin/sh").is_ok() {
-        "/bin/sh"
-    } else {
-        crate::println!("sdcard scripts: no shell found — skipping");
-        return;
-    };
+    let _ = crate::fs::mkdir("/dev", 0o755);
+    let _ = crate::fs::mkdir("/proc", 0o755);
+    let _ = crate::fs::mkdir("/sys", 0o755);
+    let _ = crate::fs::mkdir("/etc", 0o755);
 
     // Get the dynamically scanned test script list
-    let scripts = {
+    let scripts: alloc::vec::Vec<alloc::string::String> = {
         let guard = crate::SCANNED_TEST_SCRIPTS.lock();
         guard.clone()
     };
@@ -784,12 +780,43 @@ fn verify_sdcard_all_scripts_thread() {
         return;
     }
 
-    // Install all root-level ext4 entries into VFS as needed
-    for script in &scripts {
-        let ext4_path = alloc::format!("/{}", script);
-        let vfs_path = alloc::format!("/{}", script);
+    // Re-scan ext4 root to get ALL entries (not just scripts) for dependency installation
+    let device = match crate::block::open_device("vda") {
+        Some(d) => d,
+        None => return,
+    };
+    let all_entries = match crate::ext4::list_root_directory(device) {
+        Ok(e) => e,
+        Err(_) => {
+            crate::println!("sdcard scripts: failed to list ext4 directory");
+            return;
+        }
+    };
+
+    // Install ALL root-level files from ext4 to VFS root
+    for entry in &all_entries {
+        let ext4_path = alloc::format!("/{}", entry.name);
+        let vfs_path = alloc::format!("/{}", entry.name);
         let _ = crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path);
     }
+
+    // Also look for libc.so in common locations
+    for lib_path in &["/lib/libc.so", "/usr/lib/libc.so", "/lib/ld-musl-riscv64-sf.so"] {
+        let _ = crate::fs::install_ext4_path("/dev/vda", lib_path, lib_path);
+    }
+
+    // Locate busybox for script execution
+    let busybox_path = if crate::fs::stat("/bin/busybox").is_ok() {
+        "/bin/busybox"
+    } else if crate::fs::stat("/busybox").is_ok() {
+        "/busybox"
+    } else if crate::fs::stat("/bin/sh").is_ok() {
+        "/bin/sh"
+    } else {
+        crate::println!("sdcard scripts: no shell found — skipping (checked /bin/busybox /busybox /bin/sh)");
+        return;
+    };
+    crate::println!("sdcard scripts: using shell {}", busybox_path);
 
     // Run each test script in order
     for script in &scripts {
@@ -807,7 +834,9 @@ fn verify_sdcard_all_scripts_thread() {
             busybox_path,
             &["busybox", "sh", &vfs_path],
             &[
-                "PATH=.:/:/bin:/sbin:/usr/bin:/usr/sbin",
+                "PATH=.:/:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
+                "LD_LIBRARY_PATH=.:/:/lib:/usr/lib:/usr/local/lib",
+                "HOME=/",
             ],
             Some("/"),
         );
@@ -1379,6 +1408,22 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_prlimit64(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
+        SYS_FUTEX => {
+            set_syscall_result(
+                frame,
+                sys_futex(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                    arguments[5],
+                ),
+            );
+        }
+        SYS_MKNODAT => {
+            set_syscall_result(frame, sys_mknodat(arguments[0], arguments[1], arguments[2], arguments[3]));
+        }
         SYS_SCHED_YIELD => {
             let thread = crate::task::current_user_thread()
                 .expect("M9-B sched_yield arrived without a current user Thread");
@@ -2806,6 +2851,77 @@ fn sys_getrandom(address: usize, length: usize) -> isize {
         return -EFAULT;
     }
     length as isize
+}
+
+// ---------------------------------------------------------------------------
+// Futex — 轻量级用户空间互斥锁支持
+// ---------------------------------------------------------------------------
+
+const FUTEX_WAIT: usize = 0;
+const FUTEX_WAKE: usize = 1;
+const FUTEX_PRIVATE_FLAG: usize = 128;
+
+static FUTEX_QUEUES: crate::irq_lock::IrqSpinLock<
+    alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::task::WaitQueue>>,
+> = crate::irq_lock::IrqSpinLock::new_with_class(
+    alloc::collections::BTreeMap::new(),
+    crate::lockdep::LockClass::new("futex.queues", crate::lockdep::LockRank::WaitQueue, 5),
+);
+
+fn get_futex_queue(uaddr: usize) -> alloc::sync::Arc<crate::task::WaitQueue> {
+    let mut queues = FUTEX_QUEUES.lock();
+    if let Some(q) = queues.get(&uaddr) {
+        alloc::sync::Arc::clone(q)
+    } else {
+        let q = alloc::sync::Arc::new(crate::task::WaitQueue::new());
+        queues.insert(uaddr, alloc::sync::Arc::clone(&q));
+        q
+    }
+}
+
+fn sys_futex(
+    uaddr: usize,
+    futex_op: usize,
+    val: usize,
+    _timeout: usize,
+    _uaddr2: usize,
+    _val3: usize,
+) -> isize {
+    let op = futex_op & !FUTEX_PRIVATE_FLAG;
+
+    match op {
+        FUTEX_WAIT => {
+            let current_val = match copy_plain_from_user::<u32>(uaddr) {
+                Ok(v) => v as usize,
+                Err(e) => return e,
+            };
+            if current_val != val {
+                return -(crate::syscall::errno::EAGAIN);
+            }
+            let queue = get_futex_queue(uaddr);
+            let _ = crate::task::block_current_on_if_from_user_trap(
+                &queue,
+                || {
+                    // Re-check: if value changed between check and block, don't sleep
+                    match copy_plain_from_user::<u32>(uaddr) {
+                        Ok(v) => v as usize == val,
+                        Err(_) => false,
+                    }
+                },
+            );
+            0
+        }
+        FUTEX_WAKE => {
+            let queue = get_futex_queue(uaddr);
+            let woken = if val >= 1 { queue.wake_all() } else { 0 };
+            woken as isize
+        }
+        _ => -(crate::syscall::errno::ENOSYS),
+    }
+}
+
+fn sys_mknodat(_dirfd: usize, _path: usize, _mode: usize, _dev: usize) -> isize {
+    -(crate::syscall::errno::ENOSYS)
 }
 
 fn sys_uname(address: usize) -> isize {

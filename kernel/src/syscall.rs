@@ -74,6 +74,8 @@ pub mod number {
     pub const GETRANDOM: usize = 278;
     pub const STATX: usize = 291;
     pub const FTRUNCATE: usize = 46;
+    pub const FUTEX: usize = 98;
+    pub const MKNODAT: usize = 33;
     // Socket syscalls (Linux asm-generic)
     pub const SOCKET: usize = 198;
     pub const BIND: usize = 200;
