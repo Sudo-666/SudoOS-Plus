@@ -58,3 +58,7 @@ oscomp-virtio-letchains-audit:
 .PHONY: oscomp-rust-src-audit
 oscomp-rust-src-audit:
 	@./scripts/oscomp-rust-src-audit.sh
+
+.PHONY: oscomp-rust-src-repair-audit
+oscomp-rust-src-repair-audit:
+	@./scripts/oscomp-rust-src-repair-audit.sh
