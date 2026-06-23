@@ -126,3 +126,10 @@ oscomp-riscv-allocator-preinstall-audit:
 .PHONY: oscomp-riscv-allocator-install-first-audit
 oscomp-riscv-allocator-install-first-audit:
 	python3 scripts/oscomp-riscv-allocator-install-first-audit.py
+
+.PHONY: oscomp-riscv-boot-pagealloc-chain-audit
+oscomp-riscv-boot-pagealloc-chain-audit:
+	@python3 scripts/oscomp-riscv-boot-pagealloc-chain-audit.py
+
+.PHONY: oscomp-riscv-boot-pagealloc-install-audit
+oscomp-riscv-boot-pagealloc-install-audit: oscomp-riscv-boot-pagealloc-chain-audit

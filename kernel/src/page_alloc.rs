@@ -77,6 +77,33 @@ pub fn install(allocator: BuddyAllocator) -> Result<(), GlobalPageAllocatorError
     Ok(())
 }
 
+
+/// Install the global page allocator during the single-CPU boot handoff.
+///
+/// # Safety
+///
+/// This must be called only before runtime allocator users, interrupt handlers,
+/// and secondary CPUs can race with PAGE_ALLOCATOR. After this publication,
+/// normal allocation/free/reference operations continue to use the IRQ-safe
+/// lockdep-tracked PAGE_ALLOCATOR.lock() path.
+pub unsafe fn install_boot(allocator: BuddyAllocator) -> Result<(), GlobalPageAllocatorError> {
+    let slot = unsafe { PAGE_ALLOCATOR.get_mut_unchecked() };
+    if slot.is_some() {
+        return Err(GlobalPageAllocatorError::AlreadyInitialized);
+    }
+    *slot = Some(allocator);
+    Ok(())
+}
+
+/// Inspect boot-time publication without entering the runtime IRQ lock path.
+///
+/// # Safety
+///
+/// Same contract as install_boot(): single-CPU boot phase only.
+pub unsafe fn is_initialized_boot() -> bool {
+    unsafe { PAGE_ALLOCATOR.get_mut_unchecked().is_some() }
+}
+
 pub fn is_initialized() -> bool {
     PAGE_ALLOCATOR.lock().is_some()
 }
