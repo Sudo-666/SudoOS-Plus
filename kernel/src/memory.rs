@@ -632,7 +632,7 @@ pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
     crate::println!("  current PC      : {:#018x}", current_pc.get(),);
     crate::println!("  high text       : {:#018x}", high_address.get(),);
     crate::println!("  direct map      : verified",);
-    crate::println!("  low boot mapping: removed",);
+    crate::println!("  low boot mapping: retained (contest boot-stack safety)",);
 }
 
 #[cfg(target_arch = "loongarch64")]

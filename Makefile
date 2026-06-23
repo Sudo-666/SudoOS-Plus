@@ -71,3 +71,7 @@ oscomp-linker-align-audit:
 .PHONY: oscomp-riscv-rw-segment-audit
 oscomp-riscv-rw-segment-audit:
 	@./scripts/oscomp-riscv-rw-segment-audit.sh kernel-rv
+
+.PHONY: oscomp-riscv-lowmap-audit
+oscomp-riscv-lowmap-audit:
+	@./scripts/oscomp-riscv-lowmap-audit.sh
