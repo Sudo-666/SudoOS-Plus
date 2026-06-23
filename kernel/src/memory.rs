@@ -576,6 +576,7 @@ pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
         );
     });
     crate::arch::early_console::activate_runtime_mapping();
+    rebase_riscv_boot_stack_to_kernel_alias();
 
     let current_pc: usize;
 
@@ -623,19 +624,16 @@ pub fn install_riscv_final_page_table(state: &EarlyMemoryState) {
         state
             .boot_page_table
             .translate(low_boot)
-            // OSKernel2026 contest hotfix: keep RISC-V low boot mapping until stack/trap handoff is proven high-half safe
             .expect("failed to inspect low boot mapping",),
         None,
         "final page table still maps the low boot image",
     );
-            // OSKernel2026: Linux-like RISC-V high-half stack handoff
-            oscomp_rebase_boot_stack_to_direct_map_once();
 
     crate::println!("RISC-V final address space:");
     crate::println!("  current PC      : {:#018x}", current_pc.get(),);
     crate::println!("  high text       : {:#018x}", high_address.get(),);
     crate::println!("  direct map      : verified",);
-    crate::println!("  low boot mapping: retained (contest boot-stack safety)",);
+    crate::println!("  low boot mapping: removed",);
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -942,43 +940,64 @@ fn managed_physical_span(ram: &BootMemoryMap) -> PhysRange {
     PhysRange::new(first.start(), last.end()).expect("invalid managed RAM span")
 }
 
-// OSKernel2026: Linux-like RISC-V high-half stack handoff
-#[cfg(target_arch = "riscv64")]
-core::arch::global_asm!(
-    r#"
-    .section .text.oscomp_riscv_stack_handoff,"ax"
-    .globl oscomp_riscv_switch_stack_to
-    .type oscomp_riscv_switch_stack_to, @function
-oscomp_riscv_switch_stack_to:
-    mv sp, a0
-    ret
-    .size oscomp_riscv_switch_stack_to, . - oscomp_riscv_switch_stack_to
-"#
-);
-
-#[cfg(target_arch = "riscv64")]
-unsafe extern "C" {
-    fn oscomp_riscv_switch_stack_to(new_sp: usize);
-}
-
-// OSKernel2026: Linux-like RISC-V high-half stack handoff
 #[cfg(target_arch = "riscv64")]
 #[inline(never)]
-fn oscomp_rebase_boot_stack_to_direct_map_once() {
-    const LOW_DRAM_START: usize = 0x8000_0000;
-    const LOW_DRAM_END: usize = 0x1_0000_0000;
-    const DIRECT_MAP_BASE: usize = 0xffffffd600000000;
+fn rebase_riscv_boot_stack_to_kernel_alias() {
+    let sp = riscv_current_stack_pointer();
 
-    let sp: usize;
+    /*
+     * Linux-like handoff invariant:
+     *
+     * Once the final Sv39 root is active, the current stack must not depend on
+     * any low identity mapping.  If early assembly entered Rust on a low
+     * physical boot-stack alias, move sp to the direct-map alias of the same
+     * physical stack.  The direct-map aliases the same memory, so all existing
+     * Rust stack frames remain byte-for-byte valid after the sp rewrite.
+     *
+     * If entry.S already installed a high-half stack, leave it unchanged.
+     */
+    if sp >= crate::arch::memory::layout::KERNEL_LINK_BASE.get() {
+        return;
+    }
+
+    let physical = myos_mm::PhysAddr::new(sp);
+    let high = crate::arch::memory::layout::phys_to_direct(physical)
+        .unwrap_or_else(|| {
+            panic!(
+                "RISC-V boot stack {sp:#018x} is neither high-half nor direct-mappable"
+            );
+        });
+
+    let high_sp = high.get();
+
     unsafe {
-        core::arch::asm!("mv {0}, sp", out(reg) sp);
+        core::arch::asm!(
+            "mv sp, {new_sp}",
+            new_sp = in(reg) high_sp,
+            options(nomem, preserves_flags),
+        );
     }
 
-    if sp >= LOW_DRAM_START && sp < LOW_DRAM_END {
-        let high_sp = DIRECT_MAP_BASE.wrapping_add(sp);
-        unsafe {
-            oscomp_riscv_switch_stack_to(high_sp);
-        }
+    let confirmed = riscv_current_stack_pointer();
+    assert_eq!(
+        confirmed, high_sp,
+        "RISC-V stack handoff did not install the direct-map stack alias",
+    );
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn riscv_current_stack_pointer() -> usize {
+    let sp: usize;
+
+    unsafe {
+        core::arch::asm!(
+            "mv {out}, sp",
+            out = out(reg) sp,
+            options(nomem, nostack, preserves_flags),
+        );
     }
+
+    sp
 }
 
