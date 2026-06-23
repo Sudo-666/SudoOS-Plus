@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# OS COMP note: run `make oscomp-riscv-rw-segment-audit` after build to verify RISC-V writable LOAD alignment.
 
 set -Eeuo pipefail
 

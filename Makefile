@@ -66,3 +66,8 @@ oscomp-rust-src-repair-audit:
 .PHONY: oscomp-linker-align-audit
 oscomp-linker-align-audit:
 	@bash scripts/oscomp-linker-align-audit.sh
+
+
+.PHONY: oscomp-riscv-rw-segment-audit
+oscomp-riscv-rw-segment-audit:
+	@./scripts/oscomp-riscv-rw-segment-audit.sh kernel-rv

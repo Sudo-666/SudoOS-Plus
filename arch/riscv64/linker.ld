@@ -102,6 +102,7 @@ SECTIONS
         __rodata_end = .;
     }
 
+    . = ALIGN(0x1000); /* OSKernel2026: page-align first writable RISC-V PT_LOAD */
     .data : AT(
         KERNEL_PHYS_BASE
         + (ADDR(.data) - KERNEL_VIRT_BASE)

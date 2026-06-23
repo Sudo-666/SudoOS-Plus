@@ -24,6 +24,7 @@ SECTIONS
         erodata = .;
     }
 
+    . = ALIGN(0x1000); /* OSKernel2026: page-align first writable RISC-V PT_LOAD */
     .data : {
         sdata = .;
         *(.data .data.*)
