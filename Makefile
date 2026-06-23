@@ -118,3 +118,7 @@ oscomp-riscv-chunked-buddy-audit:
 .PHONY: oscomp-riscv-allocator-summary-audit
 oscomp-riscv-allocator-summary-audit:
 	python3 scripts/oscomp-riscv-allocator-summary-audit.py $(CURDIR)
+
+.PHONY: oscomp-riscv-allocator-preinstall-audit
+oscomp-riscv-allocator-preinstall-audit:
+	python3 scripts/oscomp-riscv-allocator-preinstall-audit.py

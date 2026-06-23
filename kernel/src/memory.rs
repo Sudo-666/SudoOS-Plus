@@ -889,24 +889,19 @@ impl EarlyMemoryState {
         managed.end().get(),
     );
     crate::println!(
-        "  page metadata: [{:#018x}, {:#018x})  {} KiB",
+        "  page metadata: [{:#018x}, {:#018x}) {} KiB",
         metadata_range.start().get(),
         metadata_range.end().get(),
         metadata_range.size() / 1024,
     );
-
     #[cfg(target_arch = "riscv64")]
     {
-        /*
-         * RISC-V reaches this point with the final Sv39 root active but before the
-         * global page allocator is installed.  Keep the pre-install summary bounded:
-         * the handoff invariant above already verified total_free_pages(), and the
-         * full allocator becomes globally visible immediately after this block.
-         */
-        crate::println!("  total free   : {} pages", expected_free_pages,);
+        crate::println!(
+            "  total free   : {} pages",
+            page_allocator.total_free_pages(),
+        );
         crate::println!("  early handoff: complete",);
     }
-
     #[cfg(not(target_arch = "riscv64"))]
     {
         crate::println!(
@@ -927,7 +922,6 @@ impl EarlyMemoryState {
         );
         crate::println!("  early handoff: complete",);
     }
-
     crate::page_alloc::install(page_allocator).unwrap_or_else(|error| {
         panic!(
             "unable to install global page allocator: \
