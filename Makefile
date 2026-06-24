@@ -147,3 +147,7 @@ oscomp-riscv-boot-to-runtime-big-repair-audit:
 .PHONY: oscomp-riscv-kernel-image-gap-audit
 oscomp-riscv-kernel-image-gap-audit:
 	python3 scripts/oscomp-riscv-kernel-image-gap-audit.py
+
+.PHONY: oscomp-sdcard-test-discovery-exec-audit
+oscomp-sdcard-test-discovery-exec-audit:
+	python3 scripts/oscomp-sdcard-test-discovery-exec-audit.py

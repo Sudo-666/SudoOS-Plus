@@ -760,94 +760,99 @@ pub fn verify_sdcard_all_scripts() {
 }
 
 fn verify_sdcard_all_scripts_thread() {
-    // Create common dirs needed by test scripts
+    // Create common dirs needed by test scripts.
     let _ = crate::fs::mkdir("/var", 0o755);
-    let _ = crate::fs::mkdir("/var/tmp", 0o755);
-    let _ = crate::fs::mkdir("/tmp", 0o755);
+    let _ = crate::fs::mkdir("/var/tmp", 0o777);
+    let _ = crate::fs::mkdir("/tmp", 0o777);
     let _ = crate::fs::mkdir("/dev", 0o755);
     let _ = crate::fs::mkdir("/proc", 0o755);
     let _ = crate::fs::mkdir("/sys", 0o755);
     let _ = crate::fs::mkdir("/etc", 0o755);
+    let _ = crate::fs::mkdir("/bin", 0o755);
+    let _ = crate::fs::mkdir("/lib", 0o755);
+    let _ = crate::fs::mkdir("/usr", 0o755);
+    let _ = crate::fs::mkdir("/usr/lib", 0o755);
 
-    // Get the dynamically scanned test script list
     let scripts: alloc::vec::Vec<alloc::string::String> = {
         let guard = crate::SCANNED_TEST_SCRIPTS.lock();
         guard.clone()
     };
-
     if scripts.is_empty() {
         crate::println!("sdcard scripts: no test scripts found on disk");
         return;
     }
 
-    // Re-scan ext4 root to get ALL entries (not just scripts) for dependency installation
-    let device = match crate::block::open_device("vda") {
-        Some(d) => d,
-        None => return,
-    };
-    let all_entries = match crate::ext4::list_root_directory(device) {
-        Ok(e) => e,
-        Err(_) => {
-            crate::println!("sdcard scripts: failed to list ext4 directory");
-            return;
-        }
-    };
-
-    // Install ALL root-level files from ext4 to VFS root
-    for entry in &all_entries {
-        let ext4_path = alloc::format!("/{}", entry.name);
-        let vfs_path = alloc::format!("/{}", entry.name);
-        let _ = crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path);
-    }
-
-    // Also look for libc.so in common locations
-    for lib_path in &["/lib/libc.so", "/usr/lib/libc.so", "/lib/ld-musl-riscv64-sf.so"] {
-        let _ = crate::fs::install_ext4_path("/dev/vda", lib_path, lib_path);
-    }
-
-    // Locate busybox for script execution
-    let busybox_path = if crate::fs::stat("/bin/busybox").is_ok() {
+    let shell_path = if crate::fs::stat("/bin/busybox").is_ok() {
         "/bin/busybox"
-    } else if crate::fs::stat("/busybox").is_ok() {
-        "/busybox"
     } else if crate::fs::stat("/bin/sh").is_ok() {
         "/bin/sh"
+    } else if crate::fs::stat("/mnt/sdcard/busybox").is_ok() {
+        "/mnt/sdcard/busybox"
+    } else if crate::fs::stat("/mnt/sdcard/musl/busybox").is_ok() {
+        "/mnt/sdcard/musl/busybox"
+    } else if crate::fs::stat("/busybox").is_ok() {
+        "/busybox"
     } else {
-        crate::println!("sdcard scripts: no shell found — skipping (checked /bin/busybox /busybox /bin/sh)");
+        crate::println!("sdcard scripts: no shell found — skipping (checked /bin/busybox /bin/sh /mnt/sdcard/busybox /mnt/sdcard/musl/busybox /busybox)");
         return;
     };
-    crate::println!("sdcard scripts: using shell {}", busybox_path);
 
-    // Run each test script in order
+    crate::println!("sdcard scripts: discovered {}", scripts.len());
+    crate::println!("sdcard scripts: using shell {}", shell_path);
+
     for script in &scripts {
-        let vfs_path = alloc::format!("/{}", script);
-
-        crate::println!("#### OS COMP TEST GROUP START {} ####", script);
-
+        let vfs_path = if script.starts_with('/') {
+            script.clone()
+        } else {
+            let mut path = alloc::string::String::from("/");
+            path.push_str(script);
+            path
+        };
+        crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
         if crate::fs::stat(&vfs_path).is_err() {
-            crate::println!("  {} : SKIP (not found)", script);
-            crate::println!("#### OS COMP TEST GROUP END {} ####", script);
+            crate::println!("{} : SKIP (not found)", vfs_path);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }
-
-        let result = run_rootfs_program_with_cwd(
-            busybox_path,
-            &["busybox", "sh", &vfs_path],
-            &[
-                "PATH=.:/:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
-                "LD_LIBRARY_PATH=.:/:/lib:/usr/lib:/usr/local/lib",
-                "HOME=/",
-            ],
-            Some("/"),
-        );
-
+        let cwd = sdcard_script_cwd(&vfs_path);
+        let env = [
+            "PATH=.:/mnt/sdcard:/mnt/sdcard/bin:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
+            "LD_LIBRARY_PATH=.:/mnt/sdcard/lib:/mnt/sdcard/usr/lib:/mnt/sdcard/musl/lib:/lib:/usr/lib:/usr/local/lib",
+            "HOME=/",
+            "TERM=vt100",
+        ];
+        let result = if shell_path.ends_with("busybox") {
+            run_rootfs_program_with_cwd(
+                shell_path,
+                &["busybox", "sh", &vfs_path],
+                &env,
+                Some(cwd.as_str()),
+            )
+        } else {
+            run_rootfs_program_with_cwd(
+                shell_path,
+                &["sh", &vfs_path],
+                &env,
+                Some(cwd.as_str()),
+            )
+        };
         match result {
-            Ok(0) => crate::println!("  {} : PASS", script),
-            Ok(rc) => crate::println!("  {} : FAIL (exit={})", script, rc),
-            Err(e) => crate::println!("  {} : ERROR ({:?})", script, e),
+            Ok(0) => crate::println!("{} : PASS", vfs_path),
+            Ok(rc) => crate::println!("{} : FAIL (exit={})", vfs_path, rc),
+            Err(error) => crate::println!("{} : ERROR ({:?})", vfs_path, error),
         }
+        crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+    }
+}
 
-        crate::println!("#### OS COMP TEST GROUP END {} ####", script);
+fn sdcard_script_cwd(path: &str) -> alloc::string::String {
+    match path.rfind('/') {
+        Some(0) | None => alloc::string::String::from("/"),
+        Some(index) => {
+            let mut cwd = alloc::string::String::new();
+            cwd.push_str(&path[..index]);
+            cwd
+        }
     }
 }
 
