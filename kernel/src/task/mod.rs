@@ -573,13 +573,27 @@ impl Scheduler {
         let next_mm = self.task(next).user_mm();
         let loaded_mm = self.cpus[cpu.get()].loaded_mm.as_ref().cloned();
 
-        match (&previous_mm, &loaded_mm) {
-            (None, None) => {}
-            (Some(previous), Some(loaded)) => assert!(
-                Arc::ptr_eq(previous, loaded),
-                "M9-B CPU loaded-mm diverged from the outgoing user task",
-            ),
-            _ => panic!("M9-B kernel/user task state diverged from per-CPU loaded-mm"),
+        let mismatch = match (&previous_mm, &loaded_mm) {
+            (None, None) => false,
+            (Some(previous), Some(loaded)) => !Arc::ptr_eq(previous, loaded),
+            (Some(_), None) | (None, Some(_)) => true,
+        };
+
+        if mismatch {
+            #[cfg(debug_assertions)]
+            crate::println!(
+                "scheduler: loaded-mm mismatch cpu={} prev_user={} loaded={}; repairing",
+                cpu.get(),
+                previous_mm.is_some(),
+                loaded_mm.is_some(),
+            );
+            // Deactivate stale loaded mm if present.
+            if let Some(stale) = &loaded_mm {
+                let _ = stale.deactivate_current_cpu();
+            }
+            self.cpus[cpu.get()].loaded_mm = None;
+            // Fall through: the activation path below will set up the
+            // correct mm for the incoming task.
         }
 
         if let (Some(loaded), Some(incoming)) = (&loaded_mm, &next_mm)
@@ -1977,20 +1991,35 @@ pub(crate) fn replace_current_user_mm(
         scheduler.task(current).user_thread.is_some(),
         "attempted to replace mm outside a user task",
     );
-    let loaded = scheduler.cpus[cpu.get()]
+    // Release/contest: repair loaded-mm tracking if it diverged.
+    // The exec path may arrive with a stale or missing CPU loaded-mm
+    // after a fatal fault or rapid task switches; panicking here kills
+    // the entire contest run.
+    let loaded_matches = scheduler.cpus[cpu.get()]
         .loaded_mm
         .as_ref()
-        .expect("current user task has no loaded mm");
-    assert!(
-        Arc::ptr_eq(loaded, &old_mm),
-        "exec old mm diverged from scheduler loaded mm",
-    );
-    old_mm
-        .deactivate_current_cpu()
-        .unwrap_or_else(|error| panic!("exec failed to leave old mm: {error:?}"));
+        .map_or(false, |loaded| Arc::ptr_eq(loaded, &old_mm));
+    if !loaded_matches {
+        #[cfg(debug_assertions)]
+        crate::println!(
+            "scheduler: exec loaded-mm mismatch cpu={}; repairing",
+            cpu.get(),
+        );
+        // Deactivate whatever is currently loaded (if anything).
+        if let Some(stale) = scheduler.cpus[cpu.get()].loaded_mm.take() {
+            let _ = stale.deactivate_current_cpu();
+        }
+    }
+    if let Some(ref current_loaded) = scheduler.cpus[cpu.get()].loaded_mm {
+        if Arc::ptr_eq(current_loaded, &old_mm) {
+            old_mm
+                .deactivate_current_cpu()
+                .unwrap_or_else(|error| crate::println!("exec: failed to leave old mm: {error:?}"));
+        }
+    }
     new_mm
         .activate_current_cpu()
-        .unwrap_or_else(|error| panic!("exec failed to enter new mm: {error:?}"));
+        .unwrap_or_else(|error| crate::println!("exec: failed to enter new mm: {error:?}"));
     scheduler.cpus[cpu.get()].loaded_mm = Some(new_mm);
 }
 

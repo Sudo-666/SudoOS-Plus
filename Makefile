@@ -183,3 +183,7 @@ oscomp-newtest-p6-network-audit:
 .PHONY: oscomp-newtest-full-audit
 oscomp-newtest-full-audit: oscomp-newtest-p0-abi-audit oscomp-newtest-p2-vfs-audit oscomp-newtest-p3-sched-audit oscomp-newtest-p4-dynamic-elf-audit oscomp-newtest-p5-clone-futex-audit oscomp-newtest-p6-network-audit
 	@echo "newtest full audit: all milestones passed"
+
+.PHONY: oscomp-final-p1-runtime-audit
+oscomp-final-p1-runtime-audit:
+	python3 scripts/oscomp-final-p1-runtime-audit.py

@@ -53,8 +53,6 @@ extern crate alloc;
 use myos_boot::BootInfo;
 use myos_fdt::{DeviceTree, FdtBlob, MemoryRegion};
 
-use alloc::collections::BTreeSet;
-
 #[cfg(target_arch = "riscv64")]
 pub(crate) use arch_riscv64 as arch;
 
@@ -465,14 +463,15 @@ fn mount_sdcard_if_present() {
     let _ = fs::mkdir("/usr", 0o755);
     let _ = fs::mkdir("/usr/lib", 0o755);
     let _ = fs::mkdir("/usr/lib64", 0o755);
-    // /lib64 is commonly a symlink to /lib on many Linux distributions.
-    let _ = fs::symlink("/lib", "/lib64");
+    // NOTE: /lib64 is a real directory under tmpfs, not a symlink to /lib.
+    // ld-linux PT_INTERP paths like /lib64/ld-linux-... must resolve to real
+    // files installed from ext4 sdcard; a symlink would break that when /lib
+    // entries are materialized independently.
 
     for busybox_ext4 in &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"] {
         oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
         if fs::stat("/bin/busybox").is_ok() {
             let _ = fs::symlink("/bin/busybox", "/bin/sh");
-            // Create /usr/bin/env for scripts that use #!/usr/bin/env.
             let _ = fs::mkdir("/usr/bin", 0o755);
             let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
             for applet in &[
@@ -488,52 +487,11 @@ fn mount_sdcard_if_present() {
         }
     }
 
-    // Install musl/glibc dynamic linker and libc from ext4 sdcard.
-    // The dynamic linker path must match what PT_INTERP encodes in the ELF.
-    for lib_path in &[
-        // musl
-        "/lib/libc.so", "/usr/lib/libc.so", "/musl/lib/libc.so",
-        "/lib/ld-musl-riscv64-sf.so", "/lib/ld-musl-loongarch64-sf.so",
-        "/lib/ld-musl-riscv64.so.1", "/lib/ld-musl-loongarch64.so.1",
-        // glibc
-        "/lib/ld-linux-riscv64-lp64d.so.1", "/lib/ld-linux-riscv64-lp64.so.1",
-        "/lib/ld-linux-loongarch64-lp64d.so.1", "/lib/ld-linux-loongarch64-lp64.so.1",
-        "/lib/libc.so.6", "/lib/libpthread.so.0", "/lib/libdl.so.2",
-        "/lib/librt.so.1", "/lib/libm.so.6", "/lib/libresolv.so.2",
-        "/lib/libutil.so.1", "/lib/libnsl.so.1", "/lib/libcrypt.so.1",
-        // Extra glibc paths
-        "/usr/lib/libc.so.6", "/usr/lib/libpthread.so.0",
-        "/lib64/ld-linux-riscv64-lp64d.so.1",
-        "/lib64/ld-linux-loongarch64-lp64d.so.1",
-    ] {
-        let vfs_path = if lib_path.starts_with("/musl/") {
-            alloc::format!("/mnt/sdcard{}", lib_path)
-        } else {
-            alloc::string::String::from(*lib_path)
-        };
-        oscomp_sdcard_install_ext4_path(lib_path, &vfs_path);
-    }
-
-    // Create /lib → /mnt/sdcard/glibc/lib fallback symlinks for
-    // dynamically-linked glibc programs whose PT_INTERP points to
-    // paths under /lib or /lib64.
-    let glibc_lib_paths = ["/glibc/lib", "/musl/lib"];
-    for glibc_dir in &glibc_lib_paths {
-        let src = alloc::format!("/mnt/sdcard{}", glibc_dir);
-        if fs::stat(&src).is_ok() {
-            // For each .so file in the glibc/musl lib dir, create a symlink
-            // under /lib if it doesn't already exist.
-            if let Ok(file) = fs::open(&src, myos_vfs::OpenFlags::O_RDONLY | myos_vfs::OpenFlags::O_DIRECTORY) {
-                let mut buf = [0_u8; 4096];
-                let mut output = myos_vfs::MutableIoBuffer::new(&mut buf);
-                if let Ok(_) = file.readdir(&mut output) {
-                    // readdir fills the buffer; we could parse and create symlinks.
-                    // For now, rely on the explicit path list above.
-                }
-            }
-            break;
-        }
-    }
+    // P1-A: install ld-linux / ld-musl interpreters from their real ext4
+    // source paths (/glibc/lib/... or /musl/lib/...) into the canonical
+    // VFS paths that PT_INTERP encodes (/lib/..., /lib64/...).
+    oscomp_install_runtime_loader_aliases();
+    oscomp_install_runtime_lib_aliases();
 
     const EXT4_FT_DIR: u16 = 2;
     const MAX_SCAN_DIRS: usize = 96;
@@ -572,49 +530,32 @@ fn mount_sdcard_if_present() {
     }
 
     let mut installed_scripts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    // Track which ext4 directories we have already expanded to avoid
-    // redundant materialization.
-    let mut expanded_dirs: alloc::collections::BTreeSet<alloc::string::String> =
-        alloc::collections::BTreeSet::new();
-    let mut total_expanded: usize = 0;
-    const MAX_TOTAL_EXPAND: usize = 2048;
 
+    // Install each test script individually.
     for ext4_path in &test_scripts {
         let vfs_path = alloc::format!("/mnt/sdcard{}", ext4_path);
         oscomp_sdcard_install_ext4_path(ext4_path, &vfs_path);
         if fs::stat(&vfs_path).is_ok() {
             installed_scripts.push(vfs_path.trim_start_matches('/').into());
         }
-        // Expand the script's parent directory so ./busybox etc. resolve.
-        if let Some(slash) = ext4_path.rfind('/') {
-            let parent = &ext4_path[..slash];
-            if parent.len() > 1 && !expanded_dirs.contains(parent) {
-                expanded_dirs.insert(alloc::string::String::from(parent));
-                if total_expanded < MAX_TOTAL_EXPAND {
-                    let count = expand_ext4_directory(parent, MAX_TOTAL_EXPAND - total_expanded);
-                    total_expanded += count;
-                }
-            }
-        }
     }
 
-    // Expand additional commonly-needed directories under /glibc and /musl.
-    for common_dir in &[
-        "/glibc", "/glibc/basic", "/glibc/lib", "/glibc/lua",
-        "/glibc/ltp", "/glibc/lmbench", "/musl", "/musl/basic",
-        "/musl/lib", "/musl/lua", "/musl/ltp", "/musl/lmbench",
-    ] {
-        if total_expanded >= MAX_TOTAL_EXPAND {
-            break;
-        }
-        if expanded_dirs.contains(*common_dir) {
-            continue;
-        }
-        // Try expanding; skip silently if the dir doesn't exist on ext4.
-        expanded_dirs.insert(alloc::string::String::from(*common_dir));
-        let count = expand_ext4_directory(common_dir, MAX_TOTAL_EXPAND - total_expanded);
-        total_expanded += count;
-    }
+    // P1-B: materialize key ext4 directories into VFS so scripts can
+    // find ./busybox, ./lua, ./lmbench_all, ./iperf3 etc.
+    // Must happen *after* /mnt/sdcard skeleton exists but *before*
+    // any script runs.
+    oscomp_materialize_ext4_dir_flat("/glibc", "/mnt/sdcard/glibc", 512);
+    oscomp_materialize_ext4_dir_flat("/glibc/lib", "/mnt/sdcard/glibc/lib", 256);
+    oscomp_materialize_ext4_dir_flat("/glibc/basic", "/mnt/sdcard/glibc/basic", 256);
+    oscomp_materialize_ext4_dir_flat("/glibc/lua", "/mnt/sdcard/glibc/lua", 128);
+    oscomp_materialize_ext4_dir_flat("/glibc/ltp", "/mnt/sdcard/glibc/ltp", 256);
+    oscomp_materialize_ext4_dir_flat("/glibc/lmbench", "/mnt/sdcard/glibc/lmbench", 128);
+    oscomp_materialize_ext4_dir_flat("/musl", "/mnt/sdcard/musl", 512);
+    oscomp_materialize_ext4_dir_flat("/musl/lib", "/mnt/sdcard/musl/lib", 256);
+    oscomp_materialize_ext4_dir_flat("/musl/basic", "/mnt/sdcard/musl/basic", 256);
+    oscomp_materialize_ext4_dir_flat("/musl/lua", "/mnt/sdcard/musl/lua", 128);
+    oscomp_materialize_ext4_dir_flat("/musl/ltp", "/mnt/sdcard/musl/ltp", 256);
+    oscomp_materialize_ext4_dir_flat("/musl/lmbench", "/mnt/sdcard/musl/lmbench", 128);
 
     println!("sdcard:");
     println!("  mount         : /dev/vda (ext4)");
@@ -646,66 +587,163 @@ fn oscomp_sdcard_install_ext4_path(ext4_path: &str, vfs_path: &str) {
     let _ = fs::install_ext4_path("/dev/vda", vfs_path, ext4_path);
 }
 
-/// Expand an ext4 directory and its first-level children into VFS.
-/// This ensures scripts can find `./busybox`, `./lua`, `./lmbench_all` etc.
-/// Limits prevent OOM on large sdcard images.
-fn expand_ext4_directory(ext4_dir: &str, max_files: usize) -> usize {
-    const MAX_EXPAND: usize = 512;
+/// P1-B: materialize an ext4 directory flat into VFS (files only; subdirs
+/// created as empty directories).  Returns the number of regular files installed.
+fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: usize) -> usize {
+    oscomp_sdcard_ensure_parent_dirs(vfs_dir);
+    let _ = fs::mkdir(vfs_dir, 0o755);
+
+    let Some(device) = crate::block::open_device("vda") else {
+        crate::println!("sdcard: expand {} — no device", ext4_dir);
+        return 0;
+    };
+
     const EXT4_FT_DIR: u16 = 2;
-    let limit = core::cmp::min(max_files, MAX_EXPAND);
-
-    let device = match crate::block::open_device("vda") {
-        Some(d) => d,
-        None => return 0,
-    };
-    let entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir) {
-        Ok(e) => e,
-        Err(_) => return 0,
+    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir) else {
+        crate::println!("sdcard: expand failed {} -> {}", ext4_dir, vfs_dir);
+        return 0;
     };
 
-    let vfs_dir = alloc::format!("/mnt/sdcard{}", ext4_dir);
-    let _ = fs::mkdir(&vfs_dir, 0o755);
     let mut installed: usize = 0;
-
-    for entry in &entries {
-        if installed >= limit {
+    for entry in entries {
+        if installed >= max_files {
             break;
         }
-        let ext4_path = alloc::format!("{}/{}", ext4_dir.trim_end_matches('/'), entry.name);
-        let vfs_path = alloc::format!("/mnt/sdcard{}", ext4_path);
+        let ext4_child = alloc::format!("{}/{}", ext4_dir.trim_end_matches('/'), entry.name);
+        let vfs_child = alloc::format!("{}/{}", vfs_dir.trim_end_matches('/'), entry.name);
 
         if entry.file_type == EXT4_FT_DIR {
-            // Create directory in VFS and expand one level deeper.
-            let _ = fs::mkdir(&vfs_path, 0o755);
-            // Expand subdir entries (files only, one level).
-            if let Ok(sub_entries) =
-                crate::ext4::list_directory(alloc::sync::Arc::clone(&device), &ext4_path)
-            {
-                for sub in &sub_entries {
-                    if installed >= limit {
-                        break;
-                    }
-                    let sub_ext4 = alloc::format!("{}/{}", ext4_path.trim_end_matches('/'), sub.name);
-                    let sub_vfs = alloc::format!("{}/{}", vfs_path.trim_end_matches('/'), sub.name);
-                    if sub.file_type != EXT4_FT_DIR {
-                        oscomp_sdcard_ensure_parent_dirs(&sub_vfs);
-                        if fs::install_ext4_path("/dev/vda", &sub_vfs, &sub_ext4).is_ok() {
-                            installed += 1;
-                        }
-                    } else {
-                        let _ = fs::mkdir(&sub_vfs, 0o755);
-                    }
-                }
-            }
-        } else {
-            // Regular file or symlink: install into VFS.
-            oscomp_sdcard_ensure_parent_dirs(&vfs_path);
-            if fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
-                installed += 1;
-            }
+            oscomp_sdcard_ensure_parent_dirs(&vfs_child);
+            let _ = fs::mkdir(&vfs_child, 0o755);
+            continue;
+        }
+
+        oscomp_sdcard_install_ext4_path(&ext4_child, &vfs_child);
+        if fs::stat(&vfs_child).is_ok() {
+            installed += 1;
         }
     }
+
+    crate::println!(
+        "sdcard: expanded {} -> {} : {} files installed",
+        ext4_dir, vfs_dir, installed,
+    );
     installed
+}
+
+/// P1-A: install ELF dynamic linker (ld-linux / ld-musl) from their real
+/// ext4 source paths into the canonical /lib and /lib64 VFS paths that
+/// PT_INTERP encodes.
+fn oscomp_install_runtime_loader_aliases() {
+    const ALIASES: &[(&str, &[&str])] = &[
+        (
+            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
+            &[
+                "/lib/ld-linux-riscv64-lp64d.so.1",
+                "/lib64/ld-linux-riscv64-lp64d.so.1",
+            ],
+        ),
+        (
+            "/glibc/lib/ld-linux-riscv64-lp64.so.1",
+            &[
+                "/lib/ld-linux-riscv64-lp64.so.1",
+                "/lib64/ld-linux-riscv64-lp64.so.1",
+            ],
+        ),
+        (
+            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
+            &[
+                "/lib/ld-linux-loongarch-lp64d.so.1",
+                "/lib64/ld-linux-loongarch-lp64d.so.1",
+                "/lib64/ld-linux-loongarch64-lp64d.so.1",
+            ],
+        ),
+        (
+            "/glibc/lib/ld-linux-loongarch-lp64.so.1",
+            &[
+                "/lib/ld-linux-loongarch-lp64.so.1",
+                "/lib64/ld-linux-loongarch-lp64.so.1",
+                "/lib64/ld-linux-loongarch64-lp64.so.1",
+            ],
+        ),
+        (
+            "/musl/lib/ld-musl-riscv64.so.1",
+            &[
+                "/lib/ld-musl-riscv64.so.1",
+                "/lib64/ld-musl-riscv64.so.1",
+            ],
+        ),
+        (
+            "/musl/lib/ld-musl-riscv64-sf.so.1",
+            &[
+                "/lib/ld-musl-riscv64-sf.so.1",
+                "/lib64/ld-musl-riscv64-sf.so.1",
+            ],
+        ),
+        (
+            "/musl/lib/ld-musl-loongarch64.so.1",
+            &[
+                "/lib/ld-musl-loongarch64.so.1",
+                "/lib64/ld-musl-loongarch64.so.1",
+            ],
+        ),
+        (
+            "/musl/lib/ld-musl-loongarch64-sf.so.1",
+            &[
+                "/lib/ld-musl-loongarch64-sf.so.1",
+                "/lib64/ld-musl-loongarch64-sf.so.1",
+            ],
+        ),
+    ];
+
+    for (src, dsts) in ALIASES {
+        for dst in *dsts {
+            oscomp_sdcard_install_ext4_path(src, dst);
+        }
+    }
+    crate::println!("sdcard: installed runtime loader aliases");
+}
+
+/// P1-A: install common glibc/musl shared libraries from ext4 /glibc/lib
+/// and /musl/lib into /lib, /lib64, and /usr/lib so ld-linux can find
+/// them via openat.
+fn oscomp_install_runtime_lib_aliases() {
+    const LIBS: &[&str] = &[
+        "libc.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1",
+        "libm.so.6", "libresolv.so.2", "libutil.so.1", "libnsl.so.1",
+        "libcrypt.so.1", "libgcc_s.so.1", "libstdc++.so.6",
+        "libc.so", "libm.so", "libpthread.so",
+    ];
+
+    let mut installed: usize = 0;
+    for name in LIBS {
+        let glibc_src = alloc::format!("/glibc/lib/{}", name);
+        let musl_src  = alloc::format!("/musl/lib/{}", name);
+
+        let lib_dst    = alloc::format!("/lib/{}", name);
+        let lib64_dst  = alloc::format!("/lib64/{}", name);
+        let usr_dst    = alloc::format!("/usr/lib/{}", name);
+
+        // Prefer glibc; fall back to musl only if glibc source is absent.
+        oscomp_sdcard_install_ext4_path(&glibc_src, &lib_dst);
+        oscomp_sdcard_install_ext4_path(&glibc_src, &lib64_dst);
+        oscomp_sdcard_install_ext4_path(&glibc_src, &usr_dst);
+
+        if fs::stat(&lib_dst).is_err() {
+            oscomp_sdcard_install_ext4_path(&musl_src, &lib_dst);
+        }
+        if fs::stat(&lib64_dst).is_err() {
+            oscomp_sdcard_install_ext4_path(&musl_src, &lib64_dst);
+        }
+        if fs::stat(&usr_dst).is_err() {
+            oscomp_sdcard_install_ext4_path(&musl_src, &usr_dst);
+        }
+
+        if fs::stat(&lib_dst).is_ok() || fs::stat(&lib64_dst).is_ok() {
+            installed += 1;
+        }
+    }
+    crate::println!("sdcard: installed {} runtime library aliases", installed);
 }
 
 fn oscomp_sdcard_ensure_parent_dirs(path: &str) {

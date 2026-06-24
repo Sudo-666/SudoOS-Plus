@@ -2353,7 +2353,7 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
         return -(crate::syscall::errno::EINVAL);
     }
 
-    let exit_signal = flags & CSIGNAL_MASK;
+    let _exit_signal = flags & CSIGNAL_MASK;
     let parent = current_process();
     let current_thread =
         crate::task::current_user_thread().expect("clone arrived without a current user Thread");
