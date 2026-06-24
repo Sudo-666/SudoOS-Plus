@@ -1,3 +1,4 @@
+// SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: richer auxv for libc startup probes.
 // SUDOOS_M16A_ELF_AUXV_PATCH_V1
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use myos_mm::{PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
@@ -13,7 +14,7 @@ const AT_PAGESZ: usize = 6;
 const AT_BASE: usize = 7;
 const AT_FLAGS: usize = 8;
 const AT_ENTRY: usize = 9;
-const AT_SECURE: usize = 23;
+const AT_UID: usize = 11; const AT_EUID: usize = 12; const AT_GID: usize = 13; const AT_EGID: usize = 14; const AT_CLKTCK: usize = 17; const AT_PLATFORM: usize = 15; const AT_HWCAP: usize = 16; const AT_HWCAP2: usize = 26; const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 const AT_EXECFN: usize = 31;
 const DT_NULL: u64 = 0;
@@ -418,7 +419,7 @@ fn build_initial_stack(
     let execfn_ptr = argv_ptrs[0];
 
     let random = build_at_random_bytes(elf.entry, stack, execfn_ptr);
-    let random_ptr = push_stack_bytes(mm, stack, &mut cursor, &random)?;
+    let random_ptr = push_stack_bytes(mm, stack, &mut cursor, &random)?; let platform = if cfg!(target_arch = "riscv64") { "riscv64" } else if cfg!(target_arch = "loongarch64") { "loongarch64" } else { "unknown" }; let platform_ptr = push_stack_string(mm, stack, &mut cursor, platform)?;
 
     cursor = align_down(cursor, 16);
 
@@ -437,7 +438,7 @@ fn build_initial_stack(
         (AT_FLAGS, 0),
         (AT_ENTRY, elf.entry.get()),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_SECURE, 0),
+        (AT_UID, 0), (AT_EUID, 0), (AT_GID, 0), (AT_EGID, 0), (AT_CLKTCK, 100), (AT_PLATFORM, platform_ptr), (AT_HWCAP, 0), (AT_HWCAP2, 0), (AT_SECURE, 0),
         (AT_RANDOM, random_ptr),
         (AT_EXECFN, execfn_ptr),
     ];

@@ -1,3 +1,4 @@
+// SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: uname release is Linux-compatible for contest libc startup.
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
@@ -3156,8 +3157,8 @@ fn sys_uname(address: usize) -> isize {
     let mut raw = [0_u8; 65 * 6];
     write_uts_field(&mut raw, 0, b"Linux");
     write_uts_field(&mut raw, 1, b"sudoos");
-    write_uts_field(&mut raw, 2, b"5.4.0");
-    write_uts_field(&mut raw, 3, b"#1 SMP");
+    write_uts_field(&mut raw, 2, b"6.12.0");
+    write_uts_field(&mut raw, 3, b"#1 SMP PREEMPT_DYNAMIC");
     write_uts_field(&mut raw, 4, crate::arch::ARCH_NAME.as_bytes());
     write_uts_field(&mut raw, 5, b"unknown");
     if copy_to_user(address, &raw).is_err() {

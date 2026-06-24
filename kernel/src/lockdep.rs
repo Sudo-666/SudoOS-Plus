@@ -1,3 +1,4 @@
+// SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: console locks are diagnostics/I-O, not scheduler-order roots.
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -170,6 +171,10 @@ pub fn before_lock(class: LockClass, instance: LockInstanceId, owner: usize, cur
             );
         }
 
+        // console/tty may block or wake scheduler while printing user output; do not make it a global lock-order root.
+        if held.class.rank == LockRank::Console || class.rank == LockRank::Console {
+            continue;
+        }
         let held_key = held.class.key();
         let new_key = class.key();
 

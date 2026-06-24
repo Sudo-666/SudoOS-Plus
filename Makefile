@@ -155,3 +155,7 @@ oscomp-sdcard-test-discovery-exec-audit:
 .PHONY: oscomp-sdcard-bounded-discovery-exec-audit
 oscomp-sdcard-bounded-discovery-exec-audit:
 	python3 scripts/oscomp-sdcard-bounded-discovery-exec-audit.py
+
+.PHONY: oscomp-newtest-p0-abi-audit
+oscomp-newtest-p0-abi-audit:
+	python3 scripts/oscomp-newtest-p0-abi-audit.py
