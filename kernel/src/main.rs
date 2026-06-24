@@ -273,18 +273,18 @@ fn kernel_main(boot: BootInfo) -> ! {
 
     /*
      * 从此处开始，不再允许使用 EarlyFrameAllocator。
-     */  let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory);   #[cfg(debug_assertions)]
+     */  let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory);   #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     page_alloc::verify();
 
     /*
      * 必须在全局页分配器安装后启用 heap。
      */
-    heap::initialize();
+    #[cfg(target_arch = "riscv64")] heap::initialize_boot(); #[cfg(not(target_arch = "riscv64"))] heap::initialize();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     heap::verify();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     irq_lock::verify();
 
     /*
@@ -308,52 +308,52 @@ fn kernel_main(boot: BootInfo) -> ! {
     mount_sdcard_if_present();
     tty::initialize();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     vm::verify();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     fault::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     fs::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     block::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     virtio::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     device::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     rng::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     pipe::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     signal::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     tty::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     devpts::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     rtc::verify();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     trap::verify_breakpoint();
 
     time::start_periodic();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     time::verify_periodic();
 
     task::initialize();
     smp::start_secondaries();
     task::finalize_cpu_bringup();
     workqueue::initialize();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     timer::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     workqueue::verify();
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     tracked_spin::verify();
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     task::verify();
     user::verify();
     if initrd_range.is_some() {

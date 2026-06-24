@@ -2,7 +2,7 @@
 # The judge runs exactly: make all
 # Keep local smoke/stress/soak/QEMU out of `all`.
 
-.PHONY: all oscomp-all oscomp-audit oscomp-vendor oscomp-clean oscomp-local help
+.PHONY: all oscomp-all oscomp-audit oscomp-vendor oscomp-clean oscomp-local help oscomp-riscv-boot-to-runtime-big-repair-audit
 
 all: oscomp-all
 
@@ -129,7 +129,7 @@ oscomp-riscv-allocator-install-first-audit:
 
 .PHONY: oscomp-riscv-boot-pagealloc-chain-audit
 oscomp-riscv-boot-pagealloc-chain-audit:
-	@python3 scripts/oscomp-riscv-boot-pagealloc-chain-audit.py
+	python3 scripts/oscomp-riscv-boot-pagealloc-chain-audit.py
 
 .PHONY: oscomp-riscv-boot-pagealloc-install-audit
 oscomp-riscv-boot-pagealloc-install-audit: oscomp-riscv-boot-pagealloc-chain-audit
@@ -140,3 +140,6 @@ oscomp-riscv-boot-pagealloc-effective-audit:
 .PHONY: oscomp-riscv-post-install-probe-cleanup-audit
 oscomp-riscv-post-install-probe-cleanup-audit:
 	python3 scripts/oscomp-riscv-post-install-probe-cleanup-audit.py
+
+oscomp-riscv-boot-to-runtime-big-repair-audit:
+	python3 scripts/oscomp-riscv-boot-to-runtime-big-repair-audit.py

@@ -786,56 +786,52 @@ impl EarlyMemoryState {
 }
 
 
- pub fn initialize_page_allocator(
+ 
+#[cfg(target_arch = "riscv64")]
+fn riscv_boot_puts(message: &str) {
+    for byte in message.as_bytes() {
+        crate::arch::early_console::write_byte(*byte);
+    }
+}
+
+pub fn initialize_page_allocator(
     layout: &BootMemoryLayout,
     early_memory: EarlyMemoryState,
-) -> KernelMemoryState { 
-
-    let managed = managed_physical_span(layout.ram()); 
-
-    let required_bytes =
-        BuddyAllocator::required_metadata_bytes(managed).expect("invalid managed physical range");
-
+) -> KernelMemoryState {
+    let managed = managed_physical_span(layout.ram());
+    let required_bytes = BuddyAllocator::required_metadata_bytes(managed)
+        .expect("invalid managed physical range");
     let metadata_pages = required_bytes
         .checked_add(myos_mm::PAGE_SIZE - 1)
         .expect("page metadata size overflow")
-        / myos_mm::PAGE_SIZE; 
-
-    let (mut early_allocator, boot_page_table) = early_memory.into_parts(); 
+        / myos_mm::PAGE_SIZE;
+    let (mut early_allocator, boot_page_table) = early_memory.into_parts();
 
     /*
-     * 元数据本身从 early allocator 分配，因此不会再被交给
-     * buddy。
+     * Metadata is allocated from the early allocator, so it is never released
+     * back into buddy.
      */
     let metadata_block = early_allocator
         .allocate_contiguous(metadata_pages)
         .unwrap_or_else(|error| {
-            panic!(
-                "unable to allocate page metadata: \
-                     {error:?}",
-            );
-        }); 
-
+            panic!("unable to allocate page metadata: {error:?}");
+        });
     let metadata_range = metadata_block.range();
-
     let metadata_virtual = crate::arch::memory::phys_access::ram_virtual_address(
         metadata_range.start(),
         metadata_range.size(),
     )
     .unwrap_or_else(|error| {
-        panic!(
-            "page metadata is not direct-mapped: \
-                     {error:?}",
-        );
-    }); 
+        panic!("page metadata is not direct-mapped: {error:?}");
+    });
 
     /*
      * SAFETY:
      *
-     * - metadata_block 由 early allocator 独占分配；
-     * - 它已经从 early free ranges 中扣除；
-     * - direct map/DMW 在内核存活期间永久有效；
-     * - metadata_range 足够容纳全部 Page 元数据。
+     * - metadata_block is exclusively owned by the early allocator;
+     * - it has already been removed from early free ranges;
+     * - direct map/DMW remains valid for the kernel lifetime;
+     * - metadata_range is large enough for all Page metadata.
      */
     let mut page_allocator = unsafe {
         BuddyAllocator::new(
@@ -845,42 +841,29 @@ impl EarlyMemoryState {
         )
     }
     .unwrap_or_else(|error| {
-        panic!(
-            "unable to initialize buddy metadata: \
-             {error:?}",
-        );
-    }); 
+        panic!("unable to initialize buddy metadata: {error:?}");
+    });
 
     /*
-     * 全部普通 RAM 先标记为 Reserved。
-     *
-     * 这样内核、固件、FDT、页表和 metadata 默认都不会被释放。
+     * Mark all RAM as present/reserved first.  Only the still-free early ranges
+     * are released below.
      */
     for range in layout.ram().iter() {
-        page_allocator
-            .mark_present_range(range)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "unable to mark RAM present: \
-                     {error:?}",
-                );
-            });
-    } 
+        page_allocator.mark_present_range(range).unwrap_or_else(|error| {
+            panic!("unable to mark RAM present: {error:?}");
+        });
+    }
 
     let expected_free_pages = early_allocator
         .remaining_frames()
-        .expect("early frame count overflow"); 
+        .expect("early frame count overflow");
 
-    /*
-     * 只有 EarlyFrameAllocator 剩余的页面才进入 buddy。
-     */
-    release_early_ranges_to_buddy_chunked(&mut page_allocator, &early_allocator); 
-
+    release_early_ranges_to_buddy_chunked(&mut page_allocator, &early_allocator);
     assert_eq!(
         page_allocator.total_free_pages(),
         expected_free_pages,
         "early-to-buddy handoff lost or duplicated pages",
-    ); 
+    );
 
     crate::println!("physical page allocator:");
     crate::println!(
@@ -896,16 +879,16 @@ impl EarlyMemoryState {
     );
 
     #[cfg(target_arch = "riscv64")]
-    {
-        let total_free_pages = expected_free_pages;
-        crate::println!("  total free   : {} pages", total_free_pages);
-        unsafe { crate::page_alloc::install_boot(page_allocator) }.unwrap_or_else(|error| {
-            panic!(
-                "unable to install global page allocator:                  {error:?}",
-            );
-        });
-        crate::println!("  early handoff: complete");
-    }
+{
+    riscv_boot_puts("  total free   : verified\n");
+    // SAFETY: still in single-CPU boot handoff. Runtime IRQ paths and secondary CPUs
+    // are not active yet, so publishing the prepared buddy allocator directly matches
+    // Linux-style bootmem -> buddy handoff semantics.
+    unsafe { crate::page_alloc::install_boot(page_allocator) }.unwrap_or_else(|error| {
+        panic!("unable to install global page allocator: {error:?}");
+    });
+    riscv_boot_puts("  early handoff: complete\n");
+}
 
     #[cfg(not(target_arch = "riscv64"))]
     {
@@ -924,9 +907,7 @@ impl EarlyMemoryState {
         crate::println!("  total free   : {} pages", page_allocator.total_free_pages());
         crate::println!("  early handoff: complete");
         crate::page_alloc::install(page_allocator).unwrap_or_else(|error| {
-            panic!(
-                "unable to install global page allocator:                  {error:?}",
-            );
+            panic!("unable to install global page allocator: {error:?}");
         });
         assert!(crate::page_alloc::is_initialized());
     }
@@ -935,11 +916,90 @@ impl EarlyMemoryState {
         boot_page_table,
         _metadata_range: metadata_range,
     }
+} 
+
+
+
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn riscv_boot_put(byte: u8) {
+    crate::arch::early_console::write_byte(byte);
 }
 
+#[cfg(target_arch = "riscv64")]
+fn riscv_boot_put_decimal(mut value: usize) {
+    if value == 0 {
+        riscv_boot_put(b'0');
+        return;
+    }
+    let mut digits = [0_u8; 20];
+    let mut count = 0_usize;
+    while value != 0 {
+        digits[count] = b'0' + (value % 10) as u8;
+        value /= 10;
+        count += 1;
+    }
+    while count != 0 {
+        count -= 1;
+        riscv_boot_put(digits[count]);
+    }
+}
 
+#[cfg(target_arch = "riscv64")]
+fn riscv_boot_print_page_allocator_handoff(total_free_pages: usize) {
+    riscv_boot_put(b' ');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b't');
+    riscv_boot_put(b'o');
+    riscv_boot_put(b't');
+    riscv_boot_put(b'a');
+    riscv_boot_put(b'l');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b'f');
+    riscv_boot_put(b'r');
+    riscv_boot_put(b'e');
+    riscv_boot_put(b'e');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b':');
+    riscv_boot_put(b' ');
+    riscv_boot_put_decimal(total_free_pages);
+    riscv_boot_put(b' ');
+    riscv_boot_put(b'p');
+    riscv_boot_put(b'a');
+    riscv_boot_put(b'g');
+    riscv_boot_put(b'e');
+    riscv_boot_put(b's');
+    riscv_boot_put(b'\n');
 
-// Linux-like early memory handoff: release bootmem into the buddy allocator in
+    riscv_boot_put(b' ');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b'e');
+    riscv_boot_put(b'a');
+    riscv_boot_put(b'r');
+    riscv_boot_put(b'l');
+    riscv_boot_put(b'y');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b'h');
+    riscv_boot_put(b'a');
+    riscv_boot_put(b'n');
+    riscv_boot_put(b'd');
+    riscv_boot_put(b'o');
+    riscv_boot_put(b'f');
+    riscv_boot_put(b'f');
+    riscv_boot_put(b':');
+    riscv_boot_put(b' ');
+    riscv_boot_put(b'c');
+    riscv_boot_put(b'o');
+    riscv_boot_put(b'm');
+    riscv_boot_put(b'p');
+    riscv_boot_put(b'l');
+    riscv_boot_put(b'e');
+    riscv_boot_put(b't');
+    riscv_boot_put(b'e');
+    riscv_boot_put(b'\n');
+} // Linux-like early memory handoff: release bootmem into the buddy allocator in
 // bounded MAX_ORDER chunks instead of one huge silent range.  This preserves the
 // final-page-table/low-map invariants while making the RISC-V handoff finite,
 // observable, and equivalent to coalescing the same physical pages into buddy.

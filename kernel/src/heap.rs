@@ -65,6 +65,16 @@ impl KernelGlobalAllocator {
         Ok(())
     }
 
+    
+    #[cfg(target_arch = "riscv64")]
+    pub unsafe fn install_boot(&self) -> Result<(), HeapInstallError> {
+        let heap = unsafe { self.heap.get_mut_unchecked() };
+        if heap.is_some() {
+            return Err(HeapInstallError::AlreadyInitialized);
+        }
+        *heap = Some(HeapAllocator::new(KernelPageProvider));
+        Ok(())
+    }
     pub fn is_initialized(&self) -> bool {
         self.heap.lock().is_some()
     }
@@ -162,7 +172,113 @@ pub fn initialize() {
     crate::println!("  global allocator: installed",);
 }
 
-/// allocator 损坏时不能 panic：panic 路径可能再次分配并导致递归。
+#[cfg(target_arch = "riscv64")]
+#[inline(always)]
+fn riscv_heap_put(byte: u8) {
+    crate::arch::early_console::write_byte(byte);
+}
+
+#[cfg(target_arch = "riscv64")]
+fn riscv_heap_print_installed() {
+    riscv_heap_put(b'k');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b'r');
+    riscv_heap_put(b'n');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'h');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'p');
+    riscv_heap_put(b':');
+    riscv_heap_put(b'\n');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b's');
+    riscv_heap_put(b'm');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'o');
+    riscv_heap_put(b'b');
+    riscv_heap_put(b'j');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b'c');
+    riscv_heap_put(b't');
+    riscv_heap_put(b's');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b':');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b's');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'b');
+    riscv_heap_put(b'\n');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'r');
+    riscv_heap_put(b'g');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'o');
+    riscv_heap_put(b'b');
+    riscv_heap_put(b'j');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b'c');
+    riscv_heap_put(b't');
+    riscv_heap_put(b's');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b':');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'b');
+    riscv_heap_put(b'u');
+    riscv_heap_put(b'd');
+    riscv_heap_put(b'd');
+    riscv_heap_put(b'y');
+    riscv_heap_put(b'\n');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'g');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'o');
+    riscv_heap_put(b'b');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'o');
+    riscv_heap_put(b'c');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b't');
+    riscv_heap_put(b'o');
+    riscv_heap_put(b'r');
+    riscv_heap_put(b':');
+    riscv_heap_put(b' ');
+    riscv_heap_put(b'i');
+    riscv_heap_put(b'n');
+    riscv_heap_put(b's');
+    riscv_heap_put(b't');
+    riscv_heap_put(b'a');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'l');
+    riscv_heap_put(b'e');
+    riscv_heap_put(b'd');
+    riscv_heap_put(b'\n');
+}
+
+#[cfg(target_arch = "riscv64")]
+pub fn initialize_boot() {
+    unsafe { GLOBAL_HEAP.install_boot() }.unwrap_or_else(|error| {
+        panic!("unable to install kernel heap through boot path: {error:?}");
+    });
+    riscv_heap_print_installed();
+} /// allocator 损坏时不能 panic：panic 路径可能再次分配并导致递归。
 fn fatal_heap_corruption() -> ! {
     /*
      * 这里只输出静态字符串，不构造任何堆对象。
