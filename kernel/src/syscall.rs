@@ -89,6 +89,20 @@ pub mod number {
     pub const SHUTDOWN: usize = 210;
     pub const SETSOCKOPT: usize = 208;
     pub const GETSOCKOPT: usize = 209;
+    pub const UTIMENSAT: usize = 88;
+    pub const STATFS: usize = 43;
+    pub const FSTATFS: usize = 44;
+    pub const SYSLOG: usize = 116;
+    pub const SCHED_GETAFFINITY: usize = 123;
+    pub const SCHED_SETAFFINITY: usize = 122;
+    pub const SCHED_SETSCHEDULER: usize = 119;
+    pub const RENAMEAT2: usize = 276;
+    pub const PRCTL: usize = 167;
+    pub const SETITIMER: usize = 103;
+    pub const GETITIMER: usize = 102;
+    pub const GETRUSAGE: usize = 165;
+    pub const RT_SIGPENDING: usize = 136;
+    pub const RT_SIGSUSPEND: usize = 133;
 }
 
 pub mod errno {

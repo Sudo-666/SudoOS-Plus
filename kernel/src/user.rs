@@ -96,6 +96,20 @@ const SYS_RECVFROM: usize = crate::syscall::number::RECVFROM;
 const SYS_SHUTDOWN: usize = crate::syscall::number::SHUTDOWN;
 const SYS_FUTEX: usize = crate::syscall::number::FUTEX;
 const SYS_MKNODAT: usize = crate::syscall::number::MKNODAT;
+const SYS_UTIMENSAT: usize = crate::syscall::number::UTIMENSAT;
+const SYS_STATFS: usize = crate::syscall::number::STATFS;
+const SYS_FSTATFS: usize = crate::syscall::number::FSTATFS;
+const SYS_SYSLOG: usize = crate::syscall::number::SYSLOG;
+const SYS_SCHED_GETAFFINITY: usize = crate::syscall::number::SCHED_GETAFFINITY;
+const SYS_SCHED_SETAFFINITY: usize = crate::syscall::number::SCHED_SETAFFINITY;
+const SYS_SCHED_SETSCHEDULER: usize = crate::syscall::number::SCHED_SETSCHEDULER;
+const SYS_RENAMEAT2: usize = crate::syscall::number::RENAMEAT2;
+const SYS_PRCTL: usize = crate::syscall::number::PRCTL;
+const SYS_SETITIMER: usize = crate::syscall::number::SETITIMER;
+const SYS_GETITIMER: usize = crate::syscall::number::GETITIMER;
+const SYS_GETRUSAGE: usize = crate::syscall::number::GETRUSAGE;
+const SYS_RT_SIGPENDING: usize = crate::syscall::number::RT_SIGPENDING;
+const SYS_RT_SIGSUSPEND: usize = crate::syscall::number::RT_SIGSUSPEND;
 
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
@@ -907,6 +921,7 @@ fn sdcard_vfs_to_ext4_dir(vfs_path: &str) -> alloc::string::String {
 fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
     const EXT4_FT_REG_FILE: u16 = 1;
     const EXT4_FT_DIR: u16 = 2;
+    const EXT4_FT_SYMLINK: u16 = 7;
     let device = match crate::block::open_device("vda") {
         Some(d) => d,
         None => return,
@@ -930,6 +945,18 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
             };
             let vfs_path = alloc::format!("{}/{}", vfs_dir, entry.name);
             // Skip if already present (e.g. scripts already installed by mount phase)
+            if crate::fs::stat(&vfs_path).is_err() {
+                if crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
+                    installed += 1;
+                }
+            }
+        } else if entry.file_type == EXT4_FT_SYMLINK {
+            let ext4_path = if ext4_dir == "/" {
+                alloc::format!("/{}", entry.name)
+            } else {
+                alloc::format!("{}/{}", ext4_dir, entry.name)
+            };
+            let vfs_path = alloc::format!("{}/{}", vfs_dir, entry.name);
             if crate::fs::stat(&vfs_path).is_err() {
                 if crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
                     installed += 1;
@@ -1529,6 +1556,22 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_MKNODAT => {
             set_syscall_result(frame, sys_mknodat(arguments[0], arguments[1], arguments[2], arguments[3]));
         }
+        SYS_UTIMENSAT => set_syscall_result(frame, sys_utimensat(arguments[0], arguments[1], arguments[2])),
+        SYS_STATFS => set_syscall_result(frame, sys_statfs(arguments[0], arguments[1])),
+        SYS_FSTATFS => set_syscall_result(frame, sys_statfs(arguments[0], arguments[1])),
+        SYS_SYSLOG => set_syscall_result(frame, sys_syslog(arguments[0], arguments[1], arguments[2])),
+        SYS_SCHED_GETAFFINITY => set_syscall_result(frame, sys_sched_getaffinity(arguments[0], arguments[1], arguments[2])),
+        SYS_SCHED_SETAFFINITY => set_syscall_result(frame, 0),
+        SYS_SCHED_SETSCHEDULER => set_syscall_result(frame, 0),
+        SYS_RENAMEAT2 => {
+            set_syscall_result(frame,
+                sys_renameat2(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]))
+        }
+        SYS_PRCTL => set_syscall_result(frame, sys_prctl(arguments[0], arguments[1], arguments[2])),
+        SYS_SETITIMER => set_syscall_result(frame, sys_setitimer(arguments[0], arguments[1], arguments[2])),
+        SYS_GETITIMER => set_syscall_result(frame, sys_getitimer(arguments[0], arguments[1])),
+        SYS_GETRUSAGE => set_syscall_result(frame, sys_getrusage(arguments[0], arguments[1])),
+        SYS_RT_SIGPENDING => set_syscall_result(frame, 0),
         SYS_SCHED_YIELD => {
             let thread = crate::task::current_user_thread()
                 .expect("M9-B sched_yield arrived without a current user Thread");
@@ -3027,6 +3070,86 @@ fn sys_futex(
 
 fn sys_mknodat(_dirfd: usize, _path: usize, _mode: usize, _dev: usize) -> isize {
     -(crate::syscall::errno::ENOSYS)
+}
+
+fn sys_utimensat(_dirfd: usize, _path: usize, _times: usize) -> isize {
+    // Stub: enough to unblock `touch` without full nanosecond timestamp support.
+    // Busybox `touch` calls utimensat(AT_FDCWD, path, NULL, 0) to set mtime/atime
+    // to "now". Accepting NULL times with success makes touch work; the VFS
+    // does not track timestamps yet.
+    0
+}
+
+fn sys_statfs(_fd_or_path: usize, buf: usize) -> isize {
+    // Return a minimal statfs so `df` doesn't fail with ENOSYS.
+    // struct statfs: 64-bit f_type/f_bsize/f_blocks/f_bfree/f_bavail/f_files/f_ffree/f_fsid/f_namelen/f_frsize/f_flags/f_spare[4]
+    let raw = [0_u8; 112];
+    // f_bsize = 4096, f_namelen = 255
+    let mut data = raw;
+    data[8..16].copy_from_slice(&4096_u64.to_ne_bytes());   // f_bsize
+    data[16..24].copy_from_slice(&1000000_u64.to_ne_bytes()); // f_blocks
+    data[24..32].copy_from_slice(&900000_u64.to_ne_bytes());  // f_bfree
+    data[32..40].copy_from_slice(&900000_u64.to_ne_bytes());  // f_bavail
+    data[72..80].copy_from_slice(&255_u64.to_ne_bytes());     // f_namelen
+    if copy_to_user(buf, &data).is_err() {
+        return -EFAULT;
+    }
+    0
+}
+
+fn sys_syslog(action: usize, _buf: usize, _len: usize) -> isize {
+    // SYSLOG_ACTION_SIZE_BUFFER(10) — report ring buffer size
+    // SYSLOG_ACTION_READ_ALL(3)   — return 0 (no messages)
+    match action {
+        10 => 0,   // size of kernel log buffer = 0
+        3 => 0,    // 0 bytes read
+        _ => -(crate::syscall::errno::EINVAL),
+    }
+}
+
+fn sys_sched_getaffinity(_pid: usize, _cpusetsize: usize, mask: usize) -> isize {
+    // Return affinity mask with all CPUs set.
+    let cpu_count = crate::smp::scheduler_active_cpu_count().min(64);
+    let bits = if cpu_count >= 64 { !0_u64 } else { (1_u64 << cpu_count) - 1 };
+    let raw = bits.to_ne_bytes();
+    if copy_to_user(mask, &raw[..core::mem::size_of::<u64>().min(8)]).is_err() {
+        return -EFAULT;
+    }
+    0
+}
+
+fn sys_renameat2(
+    olddirfd: usize, oldpath: usize,
+    newdirfd: usize, newpath: usize,
+    _flags: usize,
+) -> isize {
+    // Delegate to renameat for now; flags (RENAME_NOREPLACE etc.) are ignored.
+    sys_renameat(olddirfd, oldpath, newdirfd, newpath)
+}
+
+fn sys_prctl(_option: usize, _arg2: usize, _arg3: usize) -> isize {
+    // Most PR_* options are not needed by test workloads.
+    // Return 0 for PR_SET_NAME / PR_GET_NAME and friends.
+    0
+}
+
+fn sys_setitimer(_which: usize, _new_value: usize, _old_value: usize) -> isize {
+    // Stub: busybox `sleep` and some benchmarks use setitimer(ITIMER_REAL).
+    // Accept the call without implementing interval timers yet.
+    0
+}
+
+fn sys_getitimer(_which: usize, _old_value: usize) -> isize {
+    0
+}
+
+fn sys_getrusage(_who: usize, usage: usize) -> isize {
+    // Return a zeroed rusage struct (144 bytes on Linux 64-bit).
+    let raw = [0_u8; 144];
+    if copy_to_user(usage, &raw).is_err() {
+        return -EFAULT;
+    }
+    0
 }
 
 fn sys_uname(address: usize) -> isize {

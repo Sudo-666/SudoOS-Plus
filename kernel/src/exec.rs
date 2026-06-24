@@ -176,6 +176,13 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
 // dynamic executables; this kernel must therefore fail closed until M16-B can
 // load PT_INTERP, apply relocations, set up TLS, and seal RELRO.
 fn reject_dynamic_handoff_if_needed(elf: &crate::elf::ElfImage) -> Result<(), ExecError> {
+    // Reject dynamically-linked binaries: the kernel does not yet load the
+    // ELF interpreter (ld.so), so any binary with PT_INTERP would crash
+    // with a segfault at address 0x0 (uninitialized GOT).
+    if elf.interpreter.is_some() {
+        return Err(ExecError::DynamicInterpreterUnsupported);
+    }
+
     match elf.kind {
         crate::elf::ElfKind::Executable => {
             if elf.load_bias != 0 {
