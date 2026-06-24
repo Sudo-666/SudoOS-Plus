@@ -768,6 +768,21 @@ fn verify_sdcard_all_scripts_thread() {
     let _ = crate::fs::mkdir("/sys", 0o755);
     let _ = crate::fs::mkdir("/etc", 0o755);
 
+    // Ensure busybox applet symlinks exist (fallback if not done at mount time)
+    if crate::fs::stat("/bin/busybox").is_ok() {
+        for applet in &[
+            "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
+            "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
+            "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
+            "basename", "dirname", "readlink", "stat", "getopt",
+        ] {
+            let target = alloc::format!("/bin/{}", applet);
+            if crate::fs::stat(&target).is_err() {
+                let _ = crate::fs::symlink("/bin/busybox", &target);
+            }
+        }
+    }
+
     let scripts: alloc::vec::Vec<alloc::string::String> = {
         let guard = crate::SCANNED_TEST_SCRIPTS.lock();
         guard.clone()
@@ -790,18 +805,16 @@ fn verify_sdcard_all_scripts_thread() {
     crate::println!("sdcard scripts: discovered {}", scripts.len());
     crate::println!("sdcard scripts: using shell {}", busybox_path);
 
+    // Track which ext4 directories have been expanded with all sibling files
+    let mut expanded_dirs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+
     for script in &scripts {
         let vfs_path = if script.starts_with('/') {
             script.clone()
         } else {
             alloc::format!("/{}", script)
         };
-        crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
-        if crate::fs::stat(&vfs_path).is_err() {
-            crate::println!("{} : SKIP (not found)", vfs_path);
-            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
-            continue;
-        }
+        // Determine CWD from the script path (both for expansion and execution)
         let mut cwd = alloc::string::String::from("/");
         if let Some(pos) = vfs_path.rfind('/') {
             if pos > 0 {
@@ -809,12 +822,58 @@ fn verify_sdcard_all_scripts_thread() {
                 cwd.push_str(&vfs_path[..pos]);
             }
         }
+        // Expand ext4 directory: install all regular files from the
+        // script's ext4 parent directory into VFS so that ./busybox,
+        // ./dhry2reg, ./lmbench_all etc. resolve at runtime.
+        let ext4_dir = sdcard_vfs_to_ext4_dir(&vfs_path);
+        if !expanded_dirs.contains(&ext4_dir) {
+            sdcard_install_ext4_dir_files(&ext4_dir);
+            expanded_dirs.push(ext4_dir);
+        }
+
+        crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
+        if crate::fs::stat(&vfs_path).is_err() {
+            crate::println!("{} : SKIP (not found)", vfs_path);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+            continue;
+        }
+        // Build a PATH that covers: CWD, common system dirs, and the
+        // expanded ext4 directories under /mnt/sdcard.
+        let cwd_path = if cwd == "/" {
+            alloc::string::String::from("/")
+        } else {
+            alloc::format!("{}:", cwd)
+        };
+        let mut path_env = alloc::string::String::with_capacity(256);
+        path_env.push_str("PATH=.:");
+        path_env.push_str(&cwd_path);
+        path_env.push_str("/:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin");
+        // Also sniff whether common ext4 dirs exist so scripts can find
+        // binaries without the ./ prefix.
+        for sniff in &["/mnt/sdcard/musl", "/mnt/sdcard/glibc", "/mnt/sdcard/lmbench", "/mnt/sdcard", "/mnt/sdcard/lib", "/mnt/sdcard/usr/lib"] {
+            if crate::fs::stat(sniff).is_ok() {
+                path_env.push(':');
+                path_env.push_str(sniff);
+            }
+        }
+
+        let mut ld_env = alloc::string::String::with_capacity(256);
+        ld_env.push_str("LD_LIBRARY_PATH=.:");
+        ld_env.push_str(&cwd_path);
+        ld_env.push_str("/:/lib:/usr/lib:/usr/local/lib");
+        for sniff in &["/mnt/sdcard/lib", "/mnt/sdcard/usr/lib", "/mnt/sdcard/musl/lib", "/mnt/sdcard/musl"] {
+            if crate::fs::stat(sniff).is_ok() {
+                ld_env.push(':');
+                ld_env.push_str(sniff);
+            }
+        }
+
         let result = run_rootfs_program_with_cwd(
             busybox_path,
             &["busybox", "sh", &vfs_path],
             &[
-                "PATH=.:/:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/mnt/sdcard:/mnt/sdcard/musl",
-                "LD_LIBRARY_PATH=.:/:/lib:/usr/lib:/usr/local/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib:/mnt/sdcard/musl/lib",
+                &path_env,
+                &ld_env,
                 "HOME=/",
             ],
             Some(&cwd),
@@ -828,16 +887,58 @@ fn verify_sdcard_all_scripts_thread() {
     }
 }
 
-fn sdcard_script_cwd(path: &str) -> alloc::string::String {
-    match path.rfind('/') {
+/// Strip the /mnt/sdcard VFS prefix to recover the ext4 source path,
+/// then return the parent directory portion.
+fn sdcard_vfs_to_ext4_dir(vfs_path: &str) -> alloc::string::String {
+    let ext4_path = vfs_path.strip_prefix("/mnt/sdcard").unwrap_or(vfs_path);
+    match ext4_path.rfind('/') {
         Some(0) | None => alloc::string::String::from("/"),
-        Some(index) => {
-            let mut cwd = alloc::string::String::new();
-            cwd.push_str(&path[..index]);
-            cwd
+        Some(pos) => {
+            let mut dir = alloc::string::String::with_capacity(pos);
+            dir.push_str(&ext4_path[..pos]);
+            dir
         }
     }
 }
+
+/// Install every regular file from an ext4 directory into the
+/// corresponding VFS mount point, so that scripts can find
+/// sibling binaries (./busybox, ./dhry2reg, etc.) at runtime.
+fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
+    const EXT4_FT_REG_FILE: u16 = 1;
+    let device = match crate::block::open_device("vda") {
+        Some(d) => d,
+        None => return,
+    };
+    let entries = match crate::ext4::list_directory(device, ext4_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let vfs_dir = if ext4_dir == "/" {
+        alloc::string::String::from("/mnt/sdcard")
+    } else {
+        alloc::format!("/mnt/sdcard{}", ext4_dir)
+    };
+    let mut installed = 0_usize;
+    for entry in &entries {
+        if entry.file_type == EXT4_FT_REG_FILE {
+            let ext4_path = if ext4_dir == "/" {
+                alloc::format!("/{}", entry.name)
+            } else {
+                alloc::format!("{}/{}", ext4_dir, entry.name)
+            };
+            let vfs_path = alloc::format!("{}/{}", vfs_dir, entry.name);
+            // Skip if already present (e.g. scripts already installed by mount phase)
+            if crate::fs::stat(&vfs_path).is_err() {
+                if crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
+                    installed += 1;
+                }
+            }
+        }
+    }
+    crate::println!("sdcard: expanded {} -> {} : {} files", ext4_dir, vfs_dir, installed);
+}
+
 
 fn verify_sdcard_basic_binaries() {
     const BASIC_TESTS: &[&str] = &[

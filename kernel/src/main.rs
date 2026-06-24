@@ -466,6 +466,14 @@ fn mount_sdcard_if_present() {
         oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
         if fs::stat("/bin/busybox").is_ok() {
             let _ = fs::symlink("/bin/busybox", "/bin/sh");
+            for applet in &[
+                "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
+                "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
+                "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
+                "basename", "dirname", "readlink", "stat", "getopt",
+            ] {
+                let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
+            }
             break;
         }
     }
