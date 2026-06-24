@@ -492,7 +492,7 @@ impl Process {
         // Share the parent's mm (CLONE_VM).
         let shared_mm = self.mm_arc();
         // Create a new Process wrapper that shares the same UserMm.
-        let child = Self::create_from_shared_mm(shared_mm)?;
+        let child = self.create_from_shared_mm(shared_mm)?;
         // Share file descriptor table (CLONE_FILES).
         {
             let mut child_files = child.files.table.lock();

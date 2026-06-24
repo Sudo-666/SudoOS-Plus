@@ -1,7 +1,7 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: richer auxv for libc startup probes.
 // SUDOOS_M16A_ELF_AUXV_PATCH_V1
 // SUDOOS_M16B_DYNAMIC_ELF: PT_INTERP interpreter loading and dynamic-linker handoff.
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use myos_mm::{PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 
 use crate::process::{Process, Thread};
@@ -167,7 +167,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
     let interp_base: Option<VirtAddr>;
     let main_phdr: Option<(VirtAddr, usize, usize)>;
 
-    if let Some(ref interpreter_path) = elf.interpreter {
+    if let Some(interpreter_path) = elf.interpreter.as_ref() {
         // Read the interpreter binary from the VFS.
         let interp_bytes = load_exec_image_from_vfs(interpreter_path)?;
         // Parse interpreter ELF with its own load bias.
@@ -208,7 +208,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         .try_reserve(area_count)
         .map_err(|_| ExecError::MetadataOutOfMemory)?;
     areas.extend_from_slice(&elf.areas);
-    if let Some(ref interp) = interp_elf {
+    if let Some(interp) = interp_elf.as_ref() {
         areas.extend_from_slice(&interp.areas);
     }
     areas.extend_from_slice(config.extra_areas);
@@ -229,7 +229,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         // Apply static PIE relocations on main ELF.
         apply_static_pie_relocations(&mm, image, &elf)?;
         // Load interpreter segments if present.
-        if let (Some(ref interp_data), Some(ref interp)) = (&interp_image, &interp_elf) {
+        if let (Some(interp_data), Some(interp)) = (interp_image.as_ref(), interp_elf.as_ref()) {
             for segment in &interp.segments {
                 load_segment(&mm, interp_data, *segment)?;
             }

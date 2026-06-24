@@ -2340,24 +2340,22 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     let current_thread =
         crate::task::current_user_thread().expect("clone arrived without a current user Thread");
 
-    let (child, child_mm_opt) = if wants_vm_share {
+    let child = if wants_vm_share {
         // Thread: share the parent's address space and file table.
-        let child = match parent.fork_child_thread() {
+        match parent.fork_child_thread() {
             Ok(child) => child,
             Err(_) => return -ENOMEM,
-        };
-        (child, None)
+        }
     } else {
         // Process: copy address space and file table.
         let child_mm = match parent.mm().fork_clone_eager() {
             Ok(mm) => mm,
             Err(_) => return -ENOMEM,
         };
-        let child = match parent.fork_child(child_mm) {
+        match parent.fork_child(child_mm) {
             Ok(child) => child,
             Err(_) => return -ENOMEM,
-        };
-        (child, None)
+        }
     };
 
     let child_thread =
