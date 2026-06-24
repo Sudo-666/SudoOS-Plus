@@ -44,6 +44,24 @@ pub enum ExecError {
     Vfs(myos_vfs::Errno),
 }
 
+impl ExecError {
+    /// Human-readable diagnostic tag for rate-limited execve tracing.
+    /// Returns a short static string suitable for contest logs.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ExecError::AddressOverflow => "address-overflow",
+            ExecError::DynamicInterpreterUnsupported => "dynamic-interpreter-unsupported",
+            ExecError::Elf(e) => e.reason(),
+            ExecError::Initramfs(_) => "initramfs-error",
+            ExecError::InvalidStack => "invalid-stack",
+            ExecError::MetadataOutOfMemory => "metadata-out-of-memory",
+            ExecError::Process(_) => "process-error",
+            ExecError::UserMm(_) => "user-mm-error",
+            ExecError::Vfs(_) => "vfs-error",
+        }
+    }
+}
+
 impl From<crate::elf::ElfError> for ExecError {
     fn from(error: crate::elf::ElfError) -> Self {
         Self::Elf(error)
@@ -169,13 +187,26 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
 
     if let Some(interpreter_path) = elf.interpreter.as_ref() {
         // Read the interpreter binary from the VFS.
-        let interp_bytes = load_exec_image_from_vfs(interpreter_path)?;
+        let interp_bytes = match load_exec_image_from_vfs(interpreter_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::println!(
+                    "exec: interp={} open-failed reason={}",
+                    interpreter_path, e.reason(),
+                );
+                return Err(e);
+            }
+        };
         // Parse interpreter ELF with its own load bias.
         let mut parsed = crate::elf::parse_with_bias(&interp_bytes, INTERP_LOAD_BIAS)?;
         // Validate: interpreter must be ET_DYN (PIE) or ET_EXEC.
         match parsed.kind {
             crate::elf::ElfKind::Executable | crate::elf::ElfKind::PositionIndependent => {}
         }
+        crate::println!(
+            "exec: interp={} kind={:?} entry={:#x} bias={:#x}",
+            interpreter_path, parsed.kind, parsed.entry.get(), INTERP_LOAD_BIAS,
+        );
         interp_entry = Some(parsed.entry);
         main_entry = Some(elf.entry);
         interp_base = Some(VirtAddr::new(INTERP_LOAD_BIAS));

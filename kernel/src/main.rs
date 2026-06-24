@@ -53,6 +53,8 @@ extern crate alloc;
 use myos_boot::BootInfo;
 use myos_fdt::{DeviceTree, FdtBlob, MemoryRegion};
 
+use alloc::collections::BTreeSet;
+
 #[cfg(target_arch = "riscv64")]
 pub(crate) use arch_riscv64 as arch;
 
@@ -470,11 +472,15 @@ fn mount_sdcard_if_present() {
         oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
         if fs::stat("/bin/busybox").is_ok() {
             let _ = fs::symlink("/bin/busybox", "/bin/sh");
+            // Create /usr/bin/env for scripts that use #!/usr/bin/env.
+            let _ = fs::mkdir("/usr/bin", 0o755);
+            let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
             for applet in &[
                 "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
                 "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
                 "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
-                "basename", "dirname", "readlink", "stat", "getopt",
+                "basename", "dirname", "readlink", "stat", "getopt", "env",
+                "sh", "id", "uname", "df",
             ] {
                 let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
             }
@@ -566,12 +572,48 @@ fn mount_sdcard_if_present() {
     }
 
     let mut installed_scripts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    // Track which ext4 directories we have already expanded to avoid
+    // redundant materialization.
+    let mut expanded_dirs: alloc::collections::BTreeSet<alloc::string::String> =
+        alloc::collections::BTreeSet::new();
+    let mut total_expanded: usize = 0;
+    const MAX_TOTAL_EXPAND: usize = 2048;
+
     for ext4_path in &test_scripts {
         let vfs_path = alloc::format!("/mnt/sdcard{}", ext4_path);
         oscomp_sdcard_install_ext4_path(ext4_path, &vfs_path);
         if fs::stat(&vfs_path).is_ok() {
             installed_scripts.push(vfs_path.trim_start_matches('/').into());
         }
+        // Expand the script's parent directory so ./busybox etc. resolve.
+        if let Some(slash) = ext4_path.rfind('/') {
+            let parent = &ext4_path[..slash];
+            if parent.len() > 1 && !expanded_dirs.contains(parent) {
+                expanded_dirs.insert(alloc::string::String::from(parent));
+                if total_expanded < MAX_TOTAL_EXPAND {
+                    let count = expand_ext4_directory(parent, MAX_TOTAL_EXPAND - total_expanded);
+                    total_expanded += count;
+                }
+            }
+        }
+    }
+
+    // Expand additional commonly-needed directories under /glibc and /musl.
+    for common_dir in &[
+        "/glibc", "/glibc/basic", "/glibc/lib", "/glibc/lua",
+        "/glibc/ltp", "/glibc/lmbench", "/musl", "/musl/basic",
+        "/musl/lib", "/musl/lua", "/musl/ltp", "/musl/lmbench",
+    ] {
+        if total_expanded >= MAX_TOTAL_EXPAND {
+            break;
+        }
+        if expanded_dirs.contains(*common_dir) {
+            continue;
+        }
+        // Try expanding; skip silently if the dir doesn't exist on ext4.
+        expanded_dirs.insert(alloc::string::String::from(*common_dir));
+        let count = expand_ext4_directory(common_dir, MAX_TOTAL_EXPAND - total_expanded);
+        total_expanded += count;
     }
 
     println!("sdcard:");
@@ -602,6 +644,68 @@ fn oscomp_sdcard_is_test_script(path: &str) -> bool {
 fn oscomp_sdcard_install_ext4_path(ext4_path: &str, vfs_path: &str) {
     oscomp_sdcard_ensure_parent_dirs(vfs_path);
     let _ = fs::install_ext4_path("/dev/vda", vfs_path, ext4_path);
+}
+
+/// Expand an ext4 directory and its first-level children into VFS.
+/// This ensures scripts can find `./busybox`, `./lua`, `./lmbench_all` etc.
+/// Limits prevent OOM on large sdcard images.
+fn expand_ext4_directory(ext4_dir: &str, max_files: usize) -> usize {
+    const MAX_EXPAND: usize = 512;
+    const EXT4_FT_DIR: u16 = 2;
+    let limit = core::cmp::min(max_files, MAX_EXPAND);
+
+    let device = match crate::block::open_device("vda") {
+        Some(d) => d,
+        None => return 0,
+    };
+    let entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let vfs_dir = alloc::format!("/mnt/sdcard{}", ext4_dir);
+    let _ = fs::mkdir(&vfs_dir, 0o755);
+    let mut installed: usize = 0;
+
+    for entry in &entries {
+        if installed >= limit {
+            break;
+        }
+        let ext4_path = alloc::format!("{}/{}", ext4_dir.trim_end_matches('/'), entry.name);
+        let vfs_path = alloc::format!("/mnt/sdcard{}", ext4_path);
+
+        if entry.file_type == EXT4_FT_DIR {
+            // Create directory in VFS and expand one level deeper.
+            let _ = fs::mkdir(&vfs_path, 0o755);
+            // Expand subdir entries (files only, one level).
+            if let Ok(sub_entries) =
+                crate::ext4::list_directory(alloc::sync::Arc::clone(&device), &ext4_path)
+            {
+                for sub in &sub_entries {
+                    if installed >= limit {
+                        break;
+                    }
+                    let sub_ext4 = alloc::format!("{}/{}", ext4_path.trim_end_matches('/'), sub.name);
+                    let sub_vfs = alloc::format!("{}/{}", vfs_path.trim_end_matches('/'), sub.name);
+                    if sub.file_type != EXT4_FT_DIR {
+                        oscomp_sdcard_ensure_parent_dirs(&sub_vfs);
+                        if fs::install_ext4_path("/dev/vda", &sub_vfs, &sub_ext4).is_ok() {
+                            installed += 1;
+                        }
+                    } else {
+                        let _ = fs::mkdir(&sub_vfs, 0o755);
+                    }
+                }
+            }
+        } else {
+            // Regular file or symlink: install into VFS.
+            oscomp_sdcard_ensure_parent_dirs(&vfs_path);
+            if fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
+                installed += 1;
+            }
+        }
+    }
+    installed
 }
 
 fn oscomp_sdcard_ensure_parent_dirs(path: &str) {

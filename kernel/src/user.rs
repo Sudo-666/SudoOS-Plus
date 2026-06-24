@@ -187,6 +187,24 @@ static SCHEDULER_PEER_STOP: AtomicBool = AtomicBool::new(false);
 static SCHEDULER_PEER_READY: crate::task::Completion = crate::task::Completion::new();
 static SCHEDULER_PEER_DONE: crate::task::Completion = crate::task::Completion::new();
 
+// Rate-limited execve tracing for diagnostic purposes.
+// Each failed exec prints path + errno + reason; first 32 successful
+// dynamic execs also print a one-line summary. Capped at 256 total to
+// avoid flooding the contest serial log.
+static EXEC_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+const EXEC_TRACE_LIMIT: usize = 256;
+const EXEC_TRACE_SUCCESS_LIMIT: usize = 32;
+
+fn exec_trace_allow() -> bool {
+    let prev = EXEC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    prev < EXEC_TRACE_LIMIT
+}
+
+fn exec_trace_success_allow() -> bool {
+    let prev = EXEC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    prev < EXEC_TRACE_SUCCESS_LIMIT
+}
+
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!("user/riscv64.S"));
 
@@ -2464,14 +2482,85 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             extra_areas: &extra_areas,
         },
     ) {
-        Ok(prepared) => prepared,
-        Err(crate::exec::ExecError::Elf(crate::elf::ElfError::InvalidHeader)) => {
+        Ok(prepared) => {
+            // Trace successful dynamic execs (first 32 only).
+            if prepared.interp_base.is_some() && exec_trace_success_allow() {
+                crate::println!(
+                    "execve: path={} kind=dynamic interp_base={:#x} main_entry={:#x}",
+                    exec_path,
+                    prepared.interp_base.map(|b| b.get()).unwrap_or(0),
+                    prepared.main_entry.map(|e| e.get()).unwrap_or(0),
+                );
+            }
+            prepared
+        }
+        Err(ref e @ crate::exec::ExecError::Elf(crate::elf::ElfError::InvalidHeader)) => {
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno=ENOEXEC reason={}",
+                    exec_path, e.reason(),
+                );
+            }
             return myos_vfs::Errno::Enoexec.to_isize()
         }
-        Err(crate::exec::ExecError::Elf(crate::elf::ElfError::Unsupported)) => {
+        Err(ref e @ crate::exec::ExecError::Elf(crate::elf::ElfError::Unsupported)) => {
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno=ENOEXEC reason={}",
+                    exec_path, e.reason(),
+                );
+            }
             return myos_vfs::Errno::Enoexec.to_isize()
         }
-        Err(_) => return -EINVAL,
+        Err(ref e @ crate::exec::ExecError::Elf(crate::elf::ElfError::InvalidMachine)) => {
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno=ENOEXEC reason={}",
+                    exec_path, e.reason(),
+                );
+            }
+            return myos_vfs::Errno::Enoexec.to_isize()
+        }
+        Err(ref e @ crate::exec::ExecError::DynamicInterpreterUnsupported) => {
+            // ENOEXEC lets shell fallback; EINVAL would be wrong here.
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno=ENOEXEC reason={}",
+                    exec_path, e.reason(),
+                );
+            }
+            return myos_vfs::Errno::Enoexec.to_isize()
+        }
+        Err(ref e @ crate::exec::ExecError::Vfs(eno)) => {
+            let errno: isize = eno.to_isize();
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno={} reason={}",
+                    exec_path, errno, e.reason(),
+                );
+            }
+            return errno
+        }
+        Err(ref e @ crate::exec::ExecError::MetadataOutOfMemory) |
+        Err(ref e @ crate::exec::ExecError::UserMm(_)) |
+        Err(ref e @ crate::exec::ExecError::AddressOverflow) => {
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno=ENOMEM reason={}",
+                    exec_path, e.reason(),
+                );
+            }
+            return -ENOMEM
+        }
+        Err(ref e) => {
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve: path={} failed errno=EINVAL reason={}",
+                    exec_path, e.reason(),
+                );
+            }
+            return -EINVAL
+        }
     };
 
     let process = current_process();

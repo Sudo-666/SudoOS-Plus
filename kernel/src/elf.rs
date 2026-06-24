@@ -35,7 +35,7 @@ const MAX_INTERP_PATH: usize = 256;
 // linker, main PIE, stack, brk, and shared objects cannot collide.
 const ET_DYN_LOAD_BIAS: usize = 0x4000_0000;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ElfError {
     AddressOverflow,
     InvalidAlignment,
@@ -46,6 +46,23 @@ pub enum ElfError {
     NoLoadSegments,
     OutOfMemory,
     Unsupported,
+}
+
+impl ElfError {
+    /// Short diagnostic tag for rate-limited execve tracing.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            ElfError::AddressOverflow => "elf-address-overflow",
+            ElfError::InvalidAlignment => "elf-invalid-alignment",
+            ElfError::InvalidHeader => "elf-invalid-header",
+            ElfError::InvalidMachine => "elf-invalid-machine",
+            ElfError::InvalidProgramHeader => "elf-bad-program-header",
+            ElfError::InvalidSegment => "elf-invalid-segment",
+            ElfError::NoLoadSegments => "elf-no-load-segments",
+            ElfError::OutOfMemory => "elf-out-of-memory",
+            ElfError::Unsupported => "elf-unsupported",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
