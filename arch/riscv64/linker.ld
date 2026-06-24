@@ -92,14 +92,13 @@ SECTIONS
     .rodata : AT(
         KERNEL_PHYS_BASE
         + (ADDR(.rodata) - KERNEL_VIRT_BASE)
-    )
+    ) ALIGN(4K)
     {
         __rodata_start = .;
 
-        *(.rodata .rodata.*)
+        *(.rodata .rodata.*) *(.srodata .srodata.*) *(.srodata.cst* .srodata.cst.*) *(.sdata2 .sdata2.*) *(.data.rel.ro .data.rel.ro.*) *(.gnu.linkonce.r.*)
 
-        . = ALIGN(4K);
-        __rodata_end = .;
+        . = ALIGN(4K); __rodata_end = .;
     }
 
     . = ALIGN(0x1000); /* OSKernel2026: page-align first writable RISC-V PT_LOAD */

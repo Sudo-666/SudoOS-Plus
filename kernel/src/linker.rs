@@ -71,7 +71,7 @@ pub fn kernel_image_layout() -> KernelImageLayout {
 
     let rodata = riscv_kernel_symbol_range(
         core::ptr::addr_of!(__rodata_start),
-        core::ptr::addr_of!(__rodata_end),
+        core::ptr::addr_of!(__data_start),
         "rodata",
     );
 

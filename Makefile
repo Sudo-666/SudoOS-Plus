@@ -143,3 +143,7 @@ oscomp-riscv-post-install-probe-cleanup-audit:
 
 oscomp-riscv-boot-to-runtime-big-repair-audit:
 	python3 scripts/oscomp-riscv-boot-to-runtime-big-repair-audit.py
+
+.PHONY: oscomp-riscv-kernel-image-gap-audit
+oscomp-riscv-kernel-image-gap-audit:
+	python3 scripts/oscomp-riscv-kernel-image-gap-audit.py
