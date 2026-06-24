@@ -151,3 +151,7 @@ oscomp-riscv-kernel-image-gap-audit:
 .PHONY: oscomp-sdcard-test-discovery-exec-audit
 oscomp-sdcard-test-discovery-exec-audit:
 	python3 scripts/oscomp-sdcard-test-discovery-exec-audit.py
+
+.PHONY: oscomp-sdcard-bounded-discovery-exec-audit
+oscomp-sdcard-bounded-discovery-exec-audit:
+	python3 scripts/oscomp-sdcard-bounded-discovery-exec-audit.py

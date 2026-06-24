@@ -79,6 +79,17 @@ pub fn list_root_directory(
     fs.read_root_dir_entries(&mut entries)?;
     Ok(entries)
 }
+pub fn list_directory(
+    device: Arc<dyn BlockDevice>,
+    path: &str,
+) -> Result<Vec<Ext4DirEntry>, Ext4Error> {
+    let fs = Ext4FileSystem::open(device)?;
+    let ino = fs.lookup_path_ino(path)?;
+    let mut entries = alloc::vec::Vec::new();
+    fs.read_dir_entries_for_ino(ino, &mut entries)?;
+    Ok(entries)
+}
+
 
 pub fn load_root_snapshot(device: Arc<dyn BlockDevice>) -> Result<Ext4SnapshotNode, Ext4Error> {
     let fs = Ext4FileSystem::open(device)?;
@@ -278,7 +289,68 @@ impl Ext4FileSystem {
         Ok(entries)
     }
 
-    /// 读取根目录条目列表（仅名字、inode 号和文件类型，不递归加载）。
+    fn lookup_path_ino(&self, path: &str) -> Result<u32, Ext4Error> {
+    if path.is_empty() || path == "/" {
+        return Ok(EXT4_ROOT_INO);
+    }
+    let mut current = EXT4_ROOT_INO;
+    let mut saw_component = false;
+    for component in path.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        if component == "." || component == ".." || component.as_bytes().contains(&0) {
+            return Err(Ext4Error::BadDirectory);
+        }
+        saw_component = true;
+        current = self.lookup_child_ino(current, component)?;
+    }
+    if saw_component { Ok(current) } else { Ok(EXT4_ROOT_INO) }
+}
+
+fn read_dir_entries_for_ino(
+    &self,
+    ino: u32,
+    output: &mut alloc::vec::Vec<Ext4DirEntry>,
+) -> Result<(), Ext4Error> {
+    let inode = self.read_inode(ino)?;
+    if inode.file_type() != EXT4_S_IFDIR {
+        return Err(Ext4Error::BadDirectory);
+    }
+    let data = self.read_inode_bytes(&inode)?;
+    let mut offset = 0_usize;
+    while offset < data.len() {
+        if data.len() - offset < 8 {
+            break;
+        }
+        let child_ino = le_u32(&data, offset)?;
+        let rec_len = usize::from(le_u16(&data, offset + 4)?);
+        let name_len_raw = *data.get(offset + 6).ok_or(Ext4Error::BadDirectory)?;
+        let file_type_raw = *data.get(offset + 7).ok_or(Ext4Error::BadDirectory)?;
+        if rec_len == 0 || rec_len < 8 || offset + rec_len > data.len() {
+            return Err(Ext4Error::BadDirectory);
+        }
+        let name_len = usize::from(name_len_raw);
+        if name_len > rec_len - 8 {
+            return Err(Ext4Error::BadDirectory);
+        }
+        if child_ino != 0 {
+            let name_bytes = &data[offset + 8..offset + 8 + name_len];
+            if name_bytes != b"." && name_bytes != b".." && !name_bytes.contains(&0) && !name_bytes.contains(&b'/') {
+                let name = String::from_utf8(name_bytes.to_vec()).map_err(|_| Ext4Error::BadDirectory)?;
+                output.try_reserve(1).map_err(|_| Ext4Error::OutOfMemory)?;
+                output.push(Ext4DirEntry {
+                    name,
+                    ino: child_ino,
+                    file_type: u16::from(file_type_raw),
+                });
+            }
+        }
+        offset += rec_len;
+    }
+    Ok(())
+}
+/// 读取根目录条目列表（仅名字、inode 号和文件类型，不递归加载）。
     fn read_root_dir_entries(
         &self,
         output: &mut alloc::vec::Vec<Ext4DirEntry>,

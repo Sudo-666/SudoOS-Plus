@@ -760,18 +760,13 @@ pub fn verify_sdcard_all_scripts() {
 }
 
 fn verify_sdcard_all_scripts_thread() {
-    // Create common dirs needed by test scripts.
     let _ = crate::fs::mkdir("/var", 0o755);
-    let _ = crate::fs::mkdir("/var/tmp", 0o777);
-    let _ = crate::fs::mkdir("/tmp", 0o777);
+    let _ = crate::fs::mkdir("/var/tmp", 0o755);
+    let _ = crate::fs::mkdir("/tmp", 0o755);
     let _ = crate::fs::mkdir("/dev", 0o755);
     let _ = crate::fs::mkdir("/proc", 0o755);
     let _ = crate::fs::mkdir("/sys", 0o755);
     let _ = crate::fs::mkdir("/etc", 0o755);
-    let _ = crate::fs::mkdir("/bin", 0o755);
-    let _ = crate::fs::mkdir("/lib", 0o755);
-    let _ = crate::fs::mkdir("/usr", 0o755);
-    let _ = crate::fs::mkdir("/usr/lib", 0o755);
 
     let scripts: alloc::vec::Vec<alloc::string::String> = {
         let guard = crate::SCANNED_TEST_SCRIPTS.lock();
@@ -782,31 +777,24 @@ fn verify_sdcard_all_scripts_thread() {
         return;
     }
 
-    let shell_path = if crate::fs::stat("/bin/busybox").is_ok() {
+    let busybox_path = if crate::fs::stat("/bin/busybox").is_ok() {
         "/bin/busybox"
-    } else if crate::fs::stat("/bin/sh").is_ok() {
-        "/bin/sh"
-    } else if crate::fs::stat("/mnt/sdcard/busybox").is_ok() {
-        "/mnt/sdcard/busybox"
-    } else if crate::fs::stat("/mnt/sdcard/musl/busybox").is_ok() {
-        "/mnt/sdcard/musl/busybox"
     } else if crate::fs::stat("/busybox").is_ok() {
         "/busybox"
+    } else if crate::fs::stat("/bin/sh").is_ok() {
+        "/bin/sh"
     } else {
-        crate::println!("sdcard scripts: no shell found — skipping (checked /bin/busybox /bin/sh /mnt/sdcard/busybox /mnt/sdcard/musl/busybox /busybox)");
+        crate::println!("sdcard scripts: no shell found — skipping (checked /bin/busybox /busybox /bin/sh)");
         return;
     };
-
     crate::println!("sdcard scripts: discovered {}", scripts.len());
-    crate::println!("sdcard scripts: using shell {}", shell_path);
+    crate::println!("sdcard scripts: using shell {}", busybox_path);
 
     for script in &scripts {
         let vfs_path = if script.starts_with('/') {
             script.clone()
         } else {
-            let mut path = alloc::string::String::from("/");
-            path.push_str(script);
-            path
+            alloc::format!("/{}", script)
         };
         crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
         if crate::fs::stat(&vfs_path).is_err() {
@@ -814,28 +802,23 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }
-        let cwd = sdcard_script_cwd(&vfs_path);
-        let env = [
-            "PATH=.:/mnt/sdcard:/mnt/sdcard/bin:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
-            "LD_LIBRARY_PATH=.:/mnt/sdcard/lib:/mnt/sdcard/usr/lib:/mnt/sdcard/musl/lib:/lib:/usr/lib:/usr/local/lib",
-            "HOME=/",
-            "TERM=vt100",
-        ];
-        let result = if shell_path.ends_with("busybox") {
-            run_rootfs_program_with_cwd(
-                shell_path,
-                &["busybox", "sh", &vfs_path],
-                &env,
-                Some(cwd.as_str()),
-            )
-        } else {
-            run_rootfs_program_with_cwd(
-                shell_path,
-                &["sh", &vfs_path],
-                &env,
-                Some(cwd.as_str()),
-            )
-        };
+        let mut cwd = alloc::string::String::from("/");
+        if let Some(pos) = vfs_path.rfind('/') {
+            if pos > 0 {
+                cwd.clear();
+                cwd.push_str(&vfs_path[..pos]);
+            }
+        }
+        let result = run_rootfs_program_with_cwd(
+            busybox_path,
+            &["busybox", "sh", &vfs_path],
+            &[
+                "PATH=.:/:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/mnt/sdcard:/mnt/sdcard/musl",
+                "LD_LIBRARY_PATH=.:/:/lib:/usr/lib:/usr/local/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib:/mnt/sdcard/musl/lib",
+                "HOME=/",
+            ],
+            Some(&cwd),
+        );
         match result {
             Ok(0) => crate::println!("{} : PASS", vfs_path),
             Ok(rc) => crate::println!("{} : FAIL (exit={})", vfs_path, rc),

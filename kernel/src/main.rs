@@ -429,10 +429,16 @@ fn mount_sys() {
 }
 
 fn mount_sdcard_if_present() {
-    let Some(device) = crate::block::open_device("vda") else {
+    if crate::block::open_device("vda").is_none() {
         return;
+    }
+    let device = match crate::block::open_device("vda") {
+        Some(device) => device,
+        None => {
+            crate::println!("sdcard: /dev/vda open failed — skipping mount");
+            return;
+        }
     };
-
     let mut magic = [0_u8; 2];
     if crate::block::read_at(&device, 1024 + 56, &mut magic).is_err()
         || u16::from_le_bytes(magic) != 0xef53
@@ -441,7 +447,7 @@ fn mount_sdcard_if_present() {
         return;
     }
 
-    let root_entries = match crate::ext4::list_root_directory(alloc::sync::Arc::clone(&device)) {
+    let root_entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(&device), "/") {
         Ok(entries) => entries,
         Err(error) => {
             crate::println!("sdcard: failed to list ext4 root directory: {error:?}");
@@ -455,83 +461,114 @@ fn mount_sdcard_if_present() {
     let _ = fs::mkdir("/lib", 0o755);
     let _ = fs::mkdir("/usr", 0o755);
     let _ = fs::mkdir("/usr/lib", 0o755);
-    let _ = fs::mkdir("/tmp", 0o777);
-    let _ = fs::mkdir("/var", 0o755);
-    let _ = fs::mkdir("/var/tmp", 0o777);
 
-    match fs::mount_ext4_subtree("/dev/vda", "/mnt/sdcard", "/", 0) {
-        Ok(()) | Err(myos_vfs::Errno::Ebusy) => {}
-        Err(error) => {
-            crate::println!("sdcard: /dev/vda ext4 subtree mount failed: {error:?}");
-        }
-    }
-
-    // Install a rootfs-visible shell.  Test scripts are executed by
-    // user::verify_sdcard_all_scripts(), so /bin/busybox or /bin/sh must exist
-    // in the VFS namespace, not merely under /mnt/sdcard.
-    let mut shell_installed = false;
-    for source in &[
-        "/busybox",
-        "/busybox-static",
-        "/musl/busybox",
-        "/bin/busybox",
-        "/usr/bin/busybox",
-    ] {
-        if fs::install_ext4_path("/dev/vda", "/bin/busybox", source).is_ok() {
-            shell_installed = true;
+    for busybox_ext4 in &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"] {
+        oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
+        if fs::stat("/bin/busybox").is_ok() {
+            let _ = fs::symlink("/bin/busybox", "/bin/sh");
             break;
         }
     }
-    if shell_installed {
-        let _ = fs::symlink("/bin/busybox", "/bin/sh");
-    } else {
-        let _ = fs::install_ext4_path("/dev/vda", "/bin/sh", "/bin/sh");
-    }
-
-    // Make common dynamic-loader/libc locations visible at their Linux paths.
-    for path in &[
-        "/lib/libc.so",
-        "/usr/lib/libc.so",
-        "/lib/ld-musl-riscv64-sf.so.1",
-        "/lib/ld-musl-riscv64.so.1",
-        "/lib/ld-musl-loongarch64.so.1",
-        "/musl/lib/libc.so",
-    ] {
-        let target = if let Some(stripped) = path.strip_prefix("/musl") {
-            stripped
+    for lib_path in &["/lib/libc.so", "/usr/lib/libc.so", "/musl/lib/libc.so", "/lib/ld-musl-riscv64-sf.so", "/lib/ld-musl-loongarch64-sf.so"] {
+        let vfs_path = if lib_path.starts_with("/musl/") {
+            alloc::format!("/mnt/sdcard{}", lib_path)
         } else {
-            path
+            alloc::string::String::from(*lib_path)
         };
-        let _ = fs::install_ext4_path("/dev/vda", target, path);
+        oscomp_sdcard_install_ext4_path(lib_path, &vfs_path);
     }
 
+    const EXT4_FT_DIR: u16 = 2;
+    const MAX_SCAN_DIRS: usize = 96;
+    const MAX_TEST_SCRIPTS: usize = 128;
+    let mut dirs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
     let mut test_scripts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
-    match crate::ext4::load_path_snapshot(alloc::sync::Arc::clone(&device), "/") {
-        Ok(root) => {
-            let mut visited = 0_usize;
-            collect_sdcard_test_scripts("", &root, &mut test_scripts, &mut visited);
+
+    for entry in &root_entries {
+        let path = alloc::format!("/{}", entry.name);
+        if entry.file_type == EXT4_FT_DIR {
+            if dirs.len() < MAX_SCAN_DIRS {
+                dirs.push(path.clone());
+            }
+        } else if oscomp_sdcard_is_test_script(&path) && test_scripts.len() < MAX_TEST_SCRIPTS {
+            test_scripts.push(path);
         }
-        Err(error) => {
-            crate::println!("sdcard: recursive ext4 test discovery failed: {error:?}");
+    }
+
+    let mut index = 0_usize;
+    while index < dirs.len() && index < MAX_SCAN_DIRS {
+        let dir = dirs[index].clone();
+        index += 1;
+        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), &dir) else {
+            continue;
+        };
+        for entry in entries {
+            let child = alloc::format!("{}/{}", dir.trim_end_matches('/'), entry.name);
+            if entry.file_type == EXT4_FT_DIR {
+                if dirs.len() < MAX_SCAN_DIRS {
+                    dirs.push(child);
+                }
+            } else if oscomp_sdcard_is_test_script(&child) && test_scripts.len() < MAX_TEST_SCRIPTS {
+                test_scripts.push(child);
+            }
         }
     }
 
-    test_scripts.sort();
-    test_scripts.dedup();
-
-    crate::println!("sdcard:");
-    crate::println!("  mount         : /dev/vda (ext4)");
-    crate::println!("  mounted tree  : /mnt/sdcard");
-    crate::println!("  root entries  : {}", root_entries.len());
-    crate::println!("  test scripts  : {}", test_scripts.len());
-    for script in test_scripts.iter().take(16) {
-        crate::println!("  test script   : {}", script);
-    }
-    if test_scripts.len() > 16 {
-        crate::println!("  test script   : ... {} more", test_scripts.len() - 16);
+    let mut installed_scripts: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    for ext4_path in &test_scripts {
+        let vfs_path = alloc::format!("/mnt/sdcard{}", ext4_path);
+        oscomp_sdcard_install_ext4_path(ext4_path, &vfs_path);
+        if fs::stat(&vfs_path).is_ok() {
+            installed_scripts.push(vfs_path.trim_start_matches('/').into());
+        }
     }
 
-    SCANNED_TEST_SCRIPTS.lock().clone_from(&test_scripts);
+    println!("sdcard:");
+    println!("  mount         : /dev/vda (ext4)");
+    println!("  mounted tree  : /mnt/sdcard (lazy file install)");
+    println!("  root entries  : {}", root_entries.len());
+    println!("  scanned dirs   : {}", dirs.len().min(MAX_SCAN_DIRS));
+    println!("  test scripts  : {}", installed_scripts.len());
+    for script in installed_scripts.iter().take(8) {
+        println!("  test script   : /{}", script);
+    }
+    if installed_scripts.len() > 8 {
+        println!("  test script   : ... {} more", installed_scripts.len() - 8);
+    }
+    SCANNED_TEST_SCRIPTS.lock().clone_from(&installed_scripts);
+}
+
+fn oscomp_sdcard_is_test_script(path: &str) -> bool {
+    let lower = path;
+    lower.ends_with("_testcode.sh")
+        || lower.ends_with("testcode.sh")
+        || lower.ends_with("/run_test.sh")
+        || lower.ends_with("/runtest.sh")
+        || lower.ends_with("/test.sh")
+        || (lower.ends_with(".sh") && lower.contains("test"))
+}
+
+fn oscomp_sdcard_install_ext4_path(ext4_path: &str, vfs_path: &str) {
+    oscomp_sdcard_ensure_parent_dirs(vfs_path);
+    let _ = fs::install_ext4_path("/dev/vda", vfs_path, ext4_path);
+}
+
+fn oscomp_sdcard_ensure_parent_dirs(path: &str) {
+    let mut components: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    for component in path.split('/') {
+        if !component.is_empty() {
+            components.push(component);
+        }
+    }
+    if components.len() <= 1 {
+        return;
+    }
+    let mut current = alloc::string::String::new();
+    for component in components.iter().take(components.len() - 1) {
+        current.push('/');
+        current.push_str(component);
+        let _ = fs::mkdir(&current, 0o755);
+    }
 }
 
 fn collect_sdcard_test_scripts(
