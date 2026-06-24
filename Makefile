@@ -159,3 +159,27 @@ oscomp-sdcard-bounded-discovery-exec-audit:
 .PHONY: oscomp-newtest-p0-abi-audit
 oscomp-newtest-p0-abi-audit:
 	python3 scripts/oscomp-newtest-p0-abi-audit.py
+
+.PHONY: oscomp-newtest-p2-vfs-audit
+oscomp-newtest-p2-vfs-audit:
+	python3 scripts/oscomp-newtest-p2-vfs-audit.py
+
+.PHONY: oscomp-newtest-p3-sched-audit
+oscomp-newtest-p3-sched-audit:
+	python3 scripts/oscomp-newtest-p3-sched-audit.py
+
+.PHONY: oscomp-newtest-p4-dynamic-elf-audit
+oscomp-newtest-p4-dynamic-elf-audit:
+	python3 scripts/oscomp-newtest-p4-dynamic-elf-audit.py
+
+.PHONY: oscomp-newtest-p5-clone-futex-audit
+oscomp-newtest-p5-clone-futex-audit:
+	python3 scripts/oscomp-newtest-p5-clone-futex-audit.py
+
+.PHONY: oscomp-newtest-p6-network-audit
+oscomp-newtest-p6-network-audit:
+	python3 scripts/oscomp-newtest-p6-network-audit.py
+
+.PHONY: oscomp-newtest-full-audit
+oscomp-newtest-full-audit: oscomp-newtest-p0-abi-audit oscomp-newtest-p2-vfs-audit oscomp-newtest-p3-sched-audit oscomp-newtest-p4-dynamic-elf-audit oscomp-newtest-p5-clone-futex-audit oscomp-newtest-p6-network-audit
+	@echo "newtest full audit: all milestones passed"

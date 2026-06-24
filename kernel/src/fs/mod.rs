@@ -529,6 +529,33 @@ fn initialize_mount_table() -> Result<(), Errno> {
     Ok(())
 }
 
+/// Return the statfs `f_type` magic for the mount point that covers `path`.
+/// Linux-compatible magic values so `df`, `stat`, and BusyBox can classify
+/// filesystems correctly.
+pub fn resolve_fs_magic(path: &str) -> u64 {
+    let mounts = MOUNTS.lock();
+    let mut best: Option<(&MountEntry, usize)> = None;
+    for entry in mounts.iter() {
+        if path == entry.target || path.starts_with(&entry.target) {
+            let depth = entry.target.len();
+            if best.map_or(true, |(_, prev)| depth > prev) {
+                best = Some((entry, depth));
+            }
+        }
+    }
+    match best {
+        Some((entry, _)) => match entry.fs_type {
+            MountFsType::Tmpfs => 0x01021994,
+            MountFsType::Devtmpfs => 0x01021994,
+            MountFsType::Proc => 0x9fa0,
+            MountFsType::Sysfs => 0x62656572,
+            MountFsType::Ext4 => 0xEF53,
+            MountFsType::Vfat => 0x4d44,
+        },
+        None => 0x01021994, // default to tmpfs
+    }
+}
+
 pub fn format_mounts() -> Result<alloc::vec::Vec<u8>, Errno> {
     let mounts = MOUNTS.lock();
     let mut output = alloc::string::String::new();
@@ -1561,8 +1588,9 @@ impl FileOperations for DeviceFile {
     fn ioctl(&self, _file: &File, cmd: usize, arg: usize) -> Result<usize, Errno> {
         match self.kind {
             DeviceKind::Console => crate::tty::ioctl(cmd, arg),
+            DeviceKind::Rtc => crate::rtc::ioctl(cmd, arg),
             DeviceKind::Null | DeviceKind::Zero => Err(Errno::Enotty),
-            // Ptmx, Random, Urandom, Rtc — no ioctl support
+            // Ptmx, Random, Urandom — no ioctl support
             _ => Err(Errno::Enotty),
         }
     }

@@ -441,6 +441,33 @@ impl Process {
         process
     }
 
+    /// Create a Process that shares an existing `Arc<UserMm>` (CLONE_VM).
+    /// The mm is shared, not cloned — both the parent and child threads
+    /// use the same address space.
+    fn create_from_shared_mm(self: &Arc<Self>, mm: Arc<UserMm>) -> Result<Arc<Self>, ProcessError> {
+        let id = ProcessId(allocate_process_id());
+        let process = Arc::new(Self {
+            id,
+            // Store the shared Arc without wrapping in another Arc.
+            mm: IrqSpinLock::new_with_class(mm, PROCESS_MM_LOCK),
+            files: FileTable::new(),
+            signals: SignalState::new(),
+            credentials: self.credentials.clone(),
+            fs: FsContext::bootstrap(),
+            relations: IrqSpinLock::new_with_class(ProcessRelations::new(), PROCESS_RELATION_LOCK),
+            child_wait: WaitQueue::new(),
+            process_group: AtomicIsize::new(self.process_group()),
+            session: AtomicIsize::new(self.session()),
+            thread_group: IrqSpinLock::new_with_class(
+                ThreadGroup::new(),
+                PROCESS_THREAD_GROUP_LOCK,
+            ),
+        });
+        register_process(&process);
+        LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
+        Ok(process)
+    }
+
     pub fn fork_child(self: &Arc<Self>, mm: Box<UserMm>) -> Result<Arc<Self>, ProcessError> {
         let child = Self::create(mm);
         {
@@ -454,6 +481,34 @@ impl Process {
             .process_group
             .store(self.process_group(), Ordering::Release);
         child.session.store(self.session(), Ordering::Release);
+        child.set_parent(self.id())?;
+        self.add_child(Arc::clone(&child))?;
+        Ok(child)
+    }
+
+    /// Create a child thread that shares the parent's address space (mm),
+    /// file table, and signal handlers. Used for CLONE_VM | CLONE_THREAD.
+    pub fn fork_child_thread(self: &Arc<Self>) -> Result<Arc<Self>, ProcessError> {
+        // Share the parent's mm (CLONE_VM).
+        let shared_mm = self.mm_arc();
+        // Create a new Process wrapper that shares the same UserMm.
+        let child = Self::create_from_shared_mm(shared_mm)?;
+        // Share file descriptor table (CLONE_FILES).
+        {
+            let mut child_files = child.files.table.lock();
+            *child_files = self.files.table.lock().fork_clone();
+        }
+        // Share fs context.
+        child.fs.copy_from(&self.fs)?;
+        // Share signal handlers and blocked mask (CLONE_SIGHAND).
+        child.signals.set_blocked(self.signals.blocked());
+        child.signals.copy_actions_from(&self.signals);
+        // Share process group and session.
+        child
+            .process_group
+            .store(self.process_group(), Ordering::Release);
+        child.session.store(self.session(), Ordering::Release);
+        // Register in the parent's thread group.
         child.set_parent(self.id())?;
         self.add_child(Arc::clone(&child))?;
         Ok(child)
@@ -646,6 +701,7 @@ impl Process {
             user_sp: AtomicUsize::new(user_stack.end().get()),
             trap_frame: IrqSpinLock::new_with_class(None, THREAD_TRAP_FRAME_LOCK),
             tls: AtomicUsize::new(0),
+            clear_child_tid: AtomicUsize::new(0),
             blocked_signals: AtomicU64::new(0),
             scheduler_task: AtomicUsize::new(UNBOUND_SCHEDULER_TASK),
             visited_cpus: AtomicUsize::new(0),
@@ -726,6 +782,9 @@ pub struct Thread {
     user_sp: AtomicUsize,
     trap_frame: IrqSpinLock<Option<crate::arch::trap::TrapFrame>>,
     tls: AtomicUsize,
+    /// CLONE_CHILD_CLEARTID: user-space address where 0 is written
+    /// and a futex wake is performed when this thread exits.
+    clear_child_tid: AtomicUsize,
     blocked_signals: AtomicU64,
     scheduler_task: AtomicUsize,
     visited_cpus: AtomicUsize,
@@ -887,6 +946,23 @@ impl Thread {
     #[allow(dead_code)]
     pub fn set_tls(&self, value: usize) {
         self.tls.store(value, Ordering::Release);
+    }
+
+    /// CLONE_SETTLS: set the thread's TLS register value (used as `tp`).
+    /// This is an alias for `set_tls` with a CLONE-aware name.
+    pub fn set_tls_pointer(&self, value: usize) {
+        self.tls.store(value, Ordering::Release);
+    }
+
+    /// CLONE_CHILD_CLEARTID: save the user-space address where 0 will be
+    /// written and futex-woken when this thread exits.
+    pub fn set_clear_child_tid(&self, address: usize) {
+        self.clear_child_tid.store(address, Ordering::Release);
+    }
+
+    /// Return the clear_child_tid address, or 0 if none was set.
+    pub fn clear_child_tid_address(&self) -> usize {
+        self.clear_child_tid.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]

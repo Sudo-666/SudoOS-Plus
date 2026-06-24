@@ -88,7 +88,18 @@ pub struct ElfImage {
     pub segments: Vec<LoadSegment>,
 }
 
+/// Parse an ELF file using a custom load bias instead of the default
+/// ET_DYN_LOAD_BIAS. This is used by the dynamic-linker loader so the
+/// interpreter and the main PIE can occupy non-overlapping address ranges.
+pub fn parse_with_bias(image: &[u8], load_bias: usize) -> Result<ElfImage, ElfError> {
+    parse_impl(image, Some(load_bias))
+}
+
 pub fn parse(image: &[u8]) -> Result<ElfImage, ElfError> {
+    parse_impl(image, None)
+}
+
+fn parse_impl(image: &[u8], bias_override: Option<usize>) -> Result<ElfImage, ElfError> {
     let header = image.get(..ELF_HEADER_LEN).ok_or(ElfError::InvalidHeader)?;
     if header.get(..4) != Some(b"\x7fELF")
         || header[EI_CLASS] != ELFCLASS64
@@ -101,7 +112,10 @@ pub fn parse(image: &[u8]) -> Result<ElfImage, ElfError> {
     let file_type = read_u16(header, 16)?;
     let (kind, load_bias) = match file_type {
         ET_EXEC => (ElfKind::Executable, 0),
-        ET_DYN => (ElfKind::PositionIndependent, ET_DYN_LOAD_BIAS),
+        ET_DYN => {
+            let bias = bias_override.unwrap_or(ET_DYN_LOAD_BIAS);
+            (ElfKind::PositionIndependent, bias)
+        }
         _ => return Err(ElfError::Unsupported),
     };
 

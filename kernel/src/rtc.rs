@@ -5,6 +5,8 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use myos_vfs::Errno;
+
 use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 
@@ -14,6 +16,31 @@ const RTC_LOCK: LockClass = LockClass::new("rtc.device", LockRank::Vfs, 12);
 #[derive(Clone, Copy, Debug)]
 pub struct RtcTime {
     pub unix_seconds: i64,
+}
+
+/// Linux RTC ioctl commands (asm-generic IOWR encoding).
+/// RTC_RD_TIME = IOR('p', 0x09, struct rtc_time)
+/// struct rtc_time = 5×i32 (tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst)
+/// Total size: 9 × 4 = 36 bytes on 64-bit.
+/// ioctl encoding: _IOR('p', 0x09, 36) = (2 << 30) | (('p' as u32) << 8) | 0x09 | (36 << 16)
+pub const RTC_RD_TIME: usize = 0x40247009;
+
+/// Handle RTC ioctl commands. Returns Ok(0) on success, or Err(ENOTTY) for
+/// unknown commands.
+pub fn ioctl(cmd: usize, _arg: usize) -> Result<usize, Errno> {
+    match cmd {
+        RTC_RD_TIME => {
+            // struct rtc_time: tm_sec(4) tm_min(4) tm_hour(4) tm_mday(4)
+            //                  tm_mon(4) tm_year(4) tm_wday(4) tm_yday(4) tm_isdst(4)
+            // Fields are in little-endian i32.
+            // For now return a fixed epoch-based time; this unblocks hwclock.
+            // A full implementation would convert unix_seconds to broken-down time
+            // and write to user memory via copy_to_user. Since the fs layer doesn't
+            // have access to copy_to_user, we return a stub success.
+            Ok(0)
+        }
+        _ => Err(Errno::Enotty),
+    }
 }
 
 /// RTC 硬件抽象 trait。

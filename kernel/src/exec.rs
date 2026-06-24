@@ -1,6 +1,7 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: richer auxv for libc startup probes.
 // SUDOOS_M16A_ELF_AUXV_PATCH_V1
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+// SUDOOS_M16B_DYNAMIC_ELF: PT_INTERP interpreter loading and dynamic-linker handoff.
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use myos_mm::{PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 
 use crate::process::{Process, Thread};
@@ -89,9 +90,20 @@ pub struct ExecImage {
 
 pub struct PreparedExec {
     pub mm: Box<UserMm>,
+    /// User-space entry point: for static ELF this is the main binary entry;
+    /// for dynamic ELF this is the interpreter (ld-linux) entry.
     pub entry: VirtAddr,
     pub stack: VirtRange,
     pub stack_pointer: VirtAddr,
+    /// For dynamically-linked executables: the base address where the
+    /// interpreter was loaded. Used for AT_BASE in auxv.
+    pub interp_base: Option<VirtAddr>,
+    /// For dynamically-linked executables: the main program's entry point.
+    /// Used for AT_ENTRY in auxv so ld-linux can transfer control.
+    pub main_entry: Option<VirtAddr>,
+    /// For dynamically-linked executables: the main program's PHDR info.
+    /// Used so ld-linux can find the main binary's program headers via auxv.
+    pub main_phdr: Option<(VirtAddr, usize, usize)>,
 }
 
 pub fn kernel_execve_from_initramfs(
@@ -125,65 +137,15 @@ pub fn exec_elf(image: &[u8], config: ExecConfig<'_>) -> Result<ExecImage, ExecE
     Ok(ExecImage { process, thread })
 }
 
+/// Fixed load bias for the ELF interpreter (ld-linux). Must not overlap
+/// the main-PIE bias (0x4000_0000), the stack, or the user page at 0x400000.
+const INTERP_LOAD_BIAS: usize = 0x2000_0000;
+const MAX_EXEC_IMAGE: usize = 16 * 1024 * 1024;
+
 pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec, ExecError> {
     let elf = crate::elf::parse(image)?;
 
-    // SUDOOS_M16A_CLIPPY_HOTFIX_V1: centralize M16-A dynamic handoff policy and consume the
-    // parsed metadata in the real exec path instead of suppressing warnings.
-    reject_dynamic_handoff_if_needed(&elf)?;
-
-    let mut areas = Vec::new();
-    areas
-        .try_reserve(
-            elf.areas
-                .len()
-                .checked_add(config.extra_areas.len())
-                .and_then(|count| count.checked_add(1))
-                .ok_or(ExecError::AddressOverflow)?,
-        )
-        .map_err(|_| ExecError::MetadataOutOfMemory)?;
-    areas.extend_from_slice(&elf.areas);
-    areas.extend_from_slice(config.extra_areas);
-    areas.push(VmArea::new(
-        config.stack,
-        VmAreaFlags::user_rw().union(VmAreaFlags::GROW_DOWN),
-        VmAreaKind::Stack,
-    ));
-
-    let mm = build_mm(&areas, config.heap_start, config.heap_limit)?;
-    let stack_pointer = match (|| {
-        for segment in &elf.segments {
-            load_segment(&mm, image, *segment)?;
-        }
-        apply_static_pie_relocations(&mm, image, &elf)?;
-        build_initial_stack(&mm, config.stack, config.argv, config.envp, &elf)
-    })() {
-        Ok(stack_pointer) => stack_pointer,
-        Err(error) => {
-            destroy_mm(mm)?;
-            return Err(error);
-        }
-    };
-    Ok(PreparedExec {
-        mm,
-        entry: elf.entry,
-        stack: config.stack,
-        stack_pointer,
-    })
-}
-
-// SUDOOS_M16A_CLIPPY_HOTFIX_V1: M16-A records ET_DYN/PT_INTERP/PT_DYNAMIC metadata before the
-// full interpreter/relocation/TLS path exists. Linux enters the interpreter for
-// dynamic executables; this kernel must therefore fail closed until M16-B can
-// load PT_INTERP, apply relocations, set up TLS, and seal RELRO.
-fn reject_dynamic_handoff_if_needed(elf: &crate::elf::ElfImage) -> Result<(), ExecError> {
-    // Reject dynamically-linked binaries: the kernel does not yet load the
-    // ELF interpreter (ld.so), so any binary with PT_INTERP would crash
-    // with a segfault at address 0x0 (uninitialized GOT).
-    if elf.interpreter.is_some() {
-        return Err(ExecError::DynamicInterpreterUnsupported);
-    }
-
+    // Validate ELF kind and load_bias invariants.
     match elf.kind {
         crate::elf::ElfKind::Executable => {
             if elf.load_bias != 0 {
@@ -197,17 +159,135 @@ fn reject_dynamic_handoff_if_needed(elf: &crate::elf::ElfImage) -> Result<(), Ex
         }
     }
 
-    if let Some(dynamic) = elf.dynamic {
-        let dynamic_start = dynamic.virtual_address.get();
-        let _dynamic_end = dynamic_start
-            .checked_add(dynamic.memory_size)
-            .ok_or(ExecError::AddressOverflow)?;
-        let _dynamic_file_metadata_end = dynamic
-            .file_offset
-            .checked_add(dynamic.memory_size)
-            .ok_or(ExecError::AddressOverflow)?;
+    // Load the ELF interpreter if this binary has PT_INTERP.
+    let interp_image: Option<Vec<u8>>;
+    let interp_elf: Option<crate::elf::ElfImage>;
+    let interp_entry: Option<VirtAddr>;
+    let main_entry: Option<VirtAddr>;
+    let interp_base: Option<VirtAddr>;
+    let main_phdr: Option<(VirtAddr, usize, usize)>;
+
+    if let Some(ref interpreter_path) = elf.interpreter {
+        // Read the interpreter binary from the VFS.
+        let interp_bytes = load_exec_image_from_vfs(interpreter_path)?;
+        // Parse interpreter ELF with its own load bias.
+        let mut parsed = crate::elf::parse_with_bias(&interp_bytes, INTERP_LOAD_BIAS)?;
+        // Validate: interpreter must be ET_DYN (PIE) or ET_EXEC.
+        match parsed.kind {
+            crate::elf::ElfKind::Executable | crate::elf::ElfKind::PositionIndependent => {}
+        }
+        interp_entry = Some(parsed.entry);
+        main_entry = Some(elf.entry);
+        interp_base = Some(VirtAddr::new(INTERP_LOAD_BIAS));
+        main_phdr = elf.program_headers.map(|info| {
+            (
+                info.virtual_address,
+                info.entry_size,
+                info.count,
+            )
+        });
+        interp_image = Some(interp_bytes);
+        interp_elf = Some(parsed);
+    } else {
+        interp_entry = None;
+        main_entry = None;
+        interp_base = None;
+        main_phdr = None;
+        interp_image = None;
+        interp_elf = None;
     }
-    Ok(())
+
+    // Combine areas: main ELF + interpreter ELF (if any) + extra + stack.
+    let mut areas = Vec::new();
+    let area_count = elf.areas.len()
+        .checked_add(if interp_elf.is_some() { interp_elf.as_ref().unwrap().areas.len() } else { 0 })
+        .and_then(|count| count.checked_add(config.extra_areas.len()))
+        .and_then(|count| count.checked_add(1)) // stack
+        .ok_or(ExecError::AddressOverflow)?;
+    areas
+        .try_reserve(area_count)
+        .map_err(|_| ExecError::MetadataOutOfMemory)?;
+    areas.extend_from_slice(&elf.areas);
+    if let Some(ref interp) = interp_elf {
+        areas.extend_from_slice(&interp.areas);
+    }
+    areas.extend_from_slice(config.extra_areas);
+    areas.push(VmArea::new(
+        config.stack,
+        VmAreaFlags::user_rw().union(VmAreaFlags::GROW_DOWN),
+        VmAreaKind::Stack,
+    ));
+
+    let mm = build_mm(&areas, config.heap_start, config.heap_limit)?;
+
+    // Load segments and build stack.
+    let stack_pointer = match (|| {
+        // Load main ELF segments.
+        for segment in &elf.segments {
+            load_segment(&mm, image, *segment)?;
+        }
+        // Apply static PIE relocations on main ELF.
+        apply_static_pie_relocations(&mm, image, &elf)?;
+        // Load interpreter segments if present.
+        if let (Some(ref interp_data), Some(ref interp)) = (&interp_image, &interp_elf) {
+            for segment in &interp.segments {
+                load_segment(&mm, interp_data, *segment)?;
+            }
+            // Apply static PIE relocations on interpreter.
+            apply_static_pie_relocations(&mm, interp_data, interp)?;
+        }
+        build_initial_stack(
+            &mm,
+            config.stack,
+            config.argv,
+            config.envp,
+            &elf,
+            interp_base,
+            main_entry,
+            main_phdr,
+        )
+    })() {
+        Ok(stack_pointer) => stack_pointer,
+        Err(error) => {
+            destroy_mm(mm)?;
+            return Err(error);
+        }
+    };
+
+    // Entry: interpreter entry if dynamic, else main ELF entry.
+    let final_entry = interp_entry.unwrap_or(elf.entry);
+
+    Ok(PreparedExec {
+        mm,
+        entry: final_entry,
+        stack: config.stack,
+        stack_pointer,
+        interp_base,
+        main_entry,
+        main_phdr,
+    })
+}
+
+/// Read an ELF image from the VFS by path. Used for loading the dynamic linker.
+fn load_exec_image_from_vfs(path: &str) -> Result<Vec<u8>, ExecError> {
+    match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
+        Ok(file) => {
+            let stat = file.fstat().map_err(ExecError::from)?;
+            let size = usize::try_from(stat.size)
+                .map_err(|_| ExecError::AddressOverflow)?;
+            if size > MAX_EXEC_IMAGE {
+                return Err(ExecError::AddressOverflow);
+            }
+            let mut image = Vec::new();
+            image.try_reserve(size).map_err(|_| ExecError::MetadataOutOfMemory)?;
+            image.resize(size, 0);
+            let mut output = myos_vfs::MutableIoBuffer::new(&mut image);
+            let read = file.read(&mut output).map_err(ExecError::from)?;
+            image.truncate(read);
+            Ok(image)
+        }
+        Err(errno) => Err(ExecError::Vfs(errno)),
+    }
 }
 
 fn build_mm(
@@ -383,6 +463,9 @@ fn build_initial_stack(
     argv: &[&str],
     envp: &[&str],
     elf: &crate::elf::ElfImage,
+    interp_base: Option<VirtAddr>,
+    main_entry: Option<VirtAddr>,
+    main_phdr: Option<(VirtAddr, usize, usize)>,
 ) -> Result<VirtAddr, ExecError> {
     if argv.is_empty() {
         return Err(ExecError::InvalidStack);
@@ -423,20 +506,35 @@ fn build_initial_stack(
 
     cursor = align_down(cursor, 16);
 
-    let phdr = elf
-        .program_headers
-        .map(|info| info.virtual_address.get())
-        .unwrap_or(0);
-    let phent = elf.program_headers.map(|info| info.entry_size).unwrap_or(0);
-    let phnum = elf.program_headers.map(|info| info.count).unwrap_or(0);
+    // AT_PHDR/AT_PHENT/AT_PHNUM: for dynamically-linked executables the auxv
+    // must describe the *main program's* PHDRs, not the interpreter's.
+    // ld-linux reads these to find the main binary's DYNAMIC segment.
+    let (phdr, phent, phnum) = if let Some((addr, size, count)) = main_phdr {
+        (addr.get(), size, count)
+    } else {
+        let info = elf.program_headers;
+        (
+            info.map(|i| i.virtual_address.get()).unwrap_or(0),
+            info.map(|i| i.entry_size).unwrap_or(0),
+            info.map(|i| i.count).unwrap_or(0),
+        )
+    };
+
+    // AT_BASE: for dynamic ELF this is the interpreter's load base so ld-linux
+    // can find its own ELF headers and apply relocations to itself.
+    let at_base = interp_base.map(|b| b.get()).unwrap_or(0);
+
+    // AT_ENTRY: for dynamic ELF this is the *main program's* entry point;
+    // ld-linux reads this so it can transfer control after relocation.
+    let at_entry = main_entry.map(|e| e.get()).unwrap_or(elf.entry.get());
 
     let auxv = [
         (AT_PHDR, phdr),
         (AT_PHENT, phent),
         (AT_PHNUM, phnum),
-        (AT_BASE, 0),
+        (AT_BASE, at_base),
         (AT_FLAGS, 0),
-        (AT_ENTRY, elf.entry.get()),
+        (AT_ENTRY, at_entry),
         (AT_PAGESZ, PAGE_SIZE),
         (AT_UID, 0), (AT_EUID, 0), (AT_GID, 0), (AT_EGID, 0), (AT_CLKTCK, 100), (AT_PLATFORM, platform_ptr), (AT_HWCAP, 0), (AT_HWCAP2, 0), (AT_SECURE, 0),
         (AT_RANDOM, random_ptr),

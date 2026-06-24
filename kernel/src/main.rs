@@ -459,8 +459,12 @@ fn mount_sdcard_if_present() {
     let _ = fs::mkdir("/mnt/sdcard", 0o755);
     let _ = fs::mkdir("/bin", 0o755);
     let _ = fs::mkdir("/lib", 0o755);
+    let _ = fs::mkdir("/lib64", 0o755);
     let _ = fs::mkdir("/usr", 0o755);
     let _ = fs::mkdir("/usr/lib", 0o755);
+    let _ = fs::mkdir("/usr/lib64", 0o755);
+    // /lib64 is commonly a symlink to /lib on many Linux distributions.
+    let _ = fs::symlink("/lib", "/lib64");
 
     for busybox_ext4 in &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"] {
         oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
@@ -477,13 +481,52 @@ fn mount_sdcard_if_present() {
             break;
         }
     }
-    for lib_path in &["/lib/libc.so", "/usr/lib/libc.so", "/musl/lib/libc.so", "/lib/ld-musl-riscv64-sf.so", "/lib/ld-musl-loongarch64-sf.so"] {
+
+    // Install musl/glibc dynamic linker and libc from ext4 sdcard.
+    // The dynamic linker path must match what PT_INTERP encodes in the ELF.
+    for lib_path in &[
+        // musl
+        "/lib/libc.so", "/usr/lib/libc.so", "/musl/lib/libc.so",
+        "/lib/ld-musl-riscv64-sf.so", "/lib/ld-musl-loongarch64-sf.so",
+        "/lib/ld-musl-riscv64.so.1", "/lib/ld-musl-loongarch64.so.1",
+        // glibc
+        "/lib/ld-linux-riscv64-lp64d.so.1", "/lib/ld-linux-riscv64-lp64.so.1",
+        "/lib/ld-linux-loongarch64-lp64d.so.1", "/lib/ld-linux-loongarch64-lp64.so.1",
+        "/lib/libc.so.6", "/lib/libpthread.so.0", "/lib/libdl.so.2",
+        "/lib/librt.so.1", "/lib/libm.so.6", "/lib/libresolv.so.2",
+        "/lib/libutil.so.1", "/lib/libnsl.so.1", "/lib/libcrypt.so.1",
+        // Extra glibc paths
+        "/usr/lib/libc.so.6", "/usr/lib/libpthread.so.0",
+        "/lib64/ld-linux-riscv64-lp64d.so.1",
+        "/lib64/ld-linux-loongarch64-lp64d.so.1",
+    ] {
         let vfs_path = if lib_path.starts_with("/musl/") {
             alloc::format!("/mnt/sdcard{}", lib_path)
         } else {
             alloc::string::String::from(*lib_path)
         };
         oscomp_sdcard_install_ext4_path(lib_path, &vfs_path);
+    }
+
+    // Create /lib → /mnt/sdcard/glibc/lib fallback symlinks for
+    // dynamically-linked glibc programs whose PT_INTERP points to
+    // paths under /lib or /lib64.
+    let glibc_lib_paths = ["/glibc/lib", "/musl/lib"];
+    for glibc_dir in &glibc_lib_paths {
+        let src = alloc::format!("/mnt/sdcard{}", glibc_dir);
+        if fs::stat(&src).is_ok() {
+            // For each .so file in the glibc/musl lib dir, create a symlink
+            // under /lib if it doesn't already exist.
+            if let Ok(file) = fs::open(&src, myos_vfs::OpenFlags::O_RDONLY | myos_vfs::OpenFlags::O_DIRECTORY) {
+                let mut buf = [0_u8; 4096];
+                let mut output = myos_vfs::MutableIoBuffer::new(&mut buf);
+                if let Ok(_) = file.readdir(&mut output) {
+                    // readdir fills the buffer; we could parse and create symlinks.
+                    // For now, rely on the explicit path list above.
+                }
+            }
+            break;
+        }
     }
 
     const EXT4_FT_DIR: u16 = 2;

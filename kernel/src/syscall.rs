@@ -96,6 +96,8 @@ pub mod number {
     pub const SCHED_GETAFFINITY: usize = 123;
     pub const SCHED_SETAFFINITY: usize = 122;
     pub const SCHED_SETSCHEDULER: usize = 119;
+    pub const SCHED_GETSCHEDULER: usize = 120;
+    pub const SCHED_GETPARAM: usize = 121;
     pub const RENAMEAT2: usize = 276;
     pub const PRCTL: usize = 167;
     pub const SETITIMER: usize = 103;

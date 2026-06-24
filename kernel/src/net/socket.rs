@@ -210,6 +210,19 @@ impl FileOperations for SocketFile {
         stat.nlink = 1;
         Ok(stat)
     }
+
+    fn ioctl(&self, _file: &File, cmd: usize, _arg: usize) -> Result<usize, Errno> {
+        // FIONBIO: set/clear non-blocking mode on the socket.
+        // FIONBIO = 0x5421 (asm-generic ioctl)
+        const FIONBIO: usize = 0x5421;
+        match cmd {
+            FIONBIO => {
+                // Non-blocking is the default for all sockets; accept the request.
+                Ok(0)
+            }
+            _ => Err(Errno::Enotty),
+        }
+    }
 }
 
 impl Drop for SocketFile {
