@@ -132,13 +132,17 @@ pub fn input_byte(byte: u8) {
 }
 
 pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
+    // Pre-check scheduler state WITHOUT holding the Console lock to avoid
+    // lock order violation: Console (rank 80) -> Scheduler (rank 20) is invalid.
+    let can_block = crate::task::scheduler_is_initialized()
+        && crate::task::current_user_thread().is_some();
+
     loop {
         let mut tty = CONSOLE_TTY.lock();
         if tty.len != 0 {
             return Ok(tty.pop_into(buf));
         }
-        if !crate::task::scheduler_is_initialized() || crate::task::current_user_thread().is_none()
-        {
+        if !can_block {
             return Err(Errno::Eagain);
         }
         drop(tty);

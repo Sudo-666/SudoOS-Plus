@@ -906,6 +906,7 @@ fn sdcard_vfs_to_ext4_dir(vfs_path: &str) -> alloc::string::String {
 /// sibling binaries (./busybox, ./dhry2reg, etc.) at runtime.
 fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
     const EXT4_FT_REG_FILE: u16 = 1;
+    const EXT4_FT_DIR: u16 = 2;
     let device = match crate::block::open_device("vda") {
         Some(d) => d,
         None => return,
@@ -933,6 +934,21 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
                 if crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
                     installed += 1;
                 }
+            }
+        } else if entry.file_type == EXT4_FT_DIR
+            && entry.name != "."
+            && entry.name != ".."
+        {
+            let sub_ext4 = if ext4_dir == "/" {
+                alloc::format!("/{}", entry.name)
+            } else {
+                alloc::format!("{}/{}", ext4_dir, entry.name)
+            };
+            let sub_vfs = alloc::format!("{}/{}", vfs_dir, entry.name);
+            if crate::fs::stat(&sub_vfs).is_err() {
+                let _ = crate::fs::mkdir(&sub_vfs, 0o755);
+                // Recursively install files from the subdirectory
+                sdcard_install_ext4_dir_files(&sub_ext4);
             }
         }
     }
@@ -3015,10 +3031,10 @@ fn sys_mknodat(_dirfd: usize, _path: usize, _mode: usize, _dev: usize) -> isize 
 
 fn sys_uname(address: usize) -> isize {
     let mut raw = [0_u8; 65 * 6];
-    write_uts_field(&mut raw, 0, b"SudoOS");
+    write_uts_field(&mut raw, 0, b"Linux");
     write_uts_field(&mut raw, 1, b"sudoos");
-    write_uts_field(&mut raw, 2, b"0.12");
-    write_uts_field(&mut raw, 3, b"M12-M13");
+    write_uts_field(&mut raw, 2, b"5.4.0");
+    write_uts_field(&mut raw, 3, b"#1 SMP");
     write_uts_field(&mut raw, 4, crate::arch::ARCH_NAME.as_bytes());
     write_uts_field(&mut raw, 5, b"unknown");
     if copy_to_user(address, &raw).is_err() {
