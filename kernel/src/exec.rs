@@ -452,8 +452,12 @@ fn apply_static_pie_relocations(
         let addend = read_i64(entry, 16)?;
         let relocation_type = (info & 0xffff_ffff) as u32;
         let symbol = info >> 32;
+        // Skip non-R_RELATIVE relocations instead of aborting the
+        // entire loop.  ld-linux may have R_*_NONE, R_*_IRELATIVE,
+        // R_*_GLOB_DAT, etc. entries interspersed with R_RELATIVE;
+        // we must apply all R_RELATIVE entries to initialize the GOT.
         if relocation_type != R_RELATIVE || symbol != 0 {
-            return Ok(());
+            continue;
         }
         let destination = usize::try_from(raw_offset)
             .map_err(|_| ExecError::AddressOverflow)?

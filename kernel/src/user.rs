@@ -1782,11 +1782,22 @@ pub fn handle_fault(
                 "M8-B4 fault planner classified a user trap as a kernel bug",
             );
             if !verifier {
+                #[cfg(target_arch = "loongarch64")]
+                let fault_pc = frame.era;
+                #[cfg(target_arch = "riscv64")]
+                let fault_pc = frame.sepc;
+                #[cfg(target_arch = "loongarch64")]
+                let tp_val = frame.gpr[2];
+                #[cfg(target_arch = "riscv64")]
+                let tp_val = frame.gpr[4];
                 crate::println!(
-                    "user fatal fault: address={:#018x} access={:?} sp={:#018x} failure={:?}",
+                    "user fatal fault: pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} failure={:?}",
+                    fault_pc,
                     address.get(),
                     access,
                     frame.stack_pointer(),
+                    frame.return_address(),
+                    tp_val,
                     failure,
                 );
             }
@@ -2870,17 +2881,18 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     {
         return -EINVAL;
     }
-    // If this is a dynamically-linked program, set a non-zero initial TLS
-    // pointer so ld-linux doesn't fault on tp-relative GOT/TLS access
-    // before its own TLS_INIT_TP runs.  Use USER_DEMAND which has a
-    // page already mapped via extra_areas.
-    // Must update BOTH the thread's TLS field AND the trap frame's r2/tp
-    // because the trap exit restores r2 from the frame.
-    if prepared.interp_base.is_some() {
-        let init_tls = USER_DEMAND;
-        thread.set_tls_pointer(init_tls);
-        set_frame_tls(frame, init_tls);
-    }
+    // Always reset TLS for the new process.  The previous process may
+    // have set tp via musl/glibc __init_tp; the exec'd process must
+    // start with a clean tp.  For dynamic programs, set a non-zero
+    // initial TLS so ld-linux can access tp-relative GOT before its
+    // own TLS_INIT_TP runs.  For static programs, tp=0 is fine.
+    let init_tls = if prepared.interp_base.is_some() {
+        USER_DEMAND
+    } else {
+        0_usize
+    };
+    thread.set_tls_pointer(init_tls);
+    set_frame_tls(frame, init_tls);
     match Arc::try_unwrap(old_mm) {
         Ok(mut old_mm) => {
             if old_mm.destroy().is_err() {
