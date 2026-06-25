@@ -1969,10 +1969,11 @@ fn sys_file_private_mmap(
         let _ = zero_user_mapping(start.checked_add(readable).unwrap_or(start), rounded - readable);
     }
     if let Err(e) = current_user_mm().protect_range(range, vm_flags.access_only()) {
-        if mprotect_trace_allow() {
+        if mmap_file_fail_trace() {
+            let path = file.path().unwrap_or("?");
             crate::println!(
-                "mmap-file: FAIL protect fd={} off={:#x} len={:#x} range=[{:#x},{:#x}) err={:?}",
-                fd, offset, length, range.start().get(), range.end().get(), e,
+                "mmap-file: FAIL fd={} path={} off={:#x} len={:#x} range=[{:#x},{:#x}) err={:?}",
+                fd, path, offset, length, range.start().get(), range.end().get(), e,
             );
         }
         let _ = current_user_mm().unmap_range(range);
@@ -1981,10 +1982,11 @@ fn sys_file_private_mmap(
     if ACTIVE.load(Ordering::Acquire) {
         MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
     }
-    if mprotect_trace_allow() {
+    if mmap_file_ok_trace() {
+        let path = file.path().unwrap_or("?");
         crate::println!(
-            "mmap-file: ok fd={} off={:#x} len={:#x} -> {:#x} prot={:?}",
-            fd, offset, length, start.get(), vm_flags,
+            "mmap-file: ok fd={} path={} off={:#x} len={:#x} -> {:#x} prot={:?}",
+            fd, path, offset, length, start.get(), vm_flags,
         );
     }
     start.get() as isize
@@ -2044,30 +2046,35 @@ fn sys_munmap(address: usize, length: usize) -> isize {
     }
 }
 
-// Rate-limited mprotect tracing for diagnosing RELRO failures.
-static MPROTECT_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
-const MPROTECT_TRACE_LIMIT: usize = 128;
-const MPROTECT_TRACE_OK_LIMIT: usize = 32;
+// Separated trace counters: failures print unconditionally up to 64.
+// Successes are rate-limited independently so they don't crowd out failures.
+static MPROTECT_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MPROTECT_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FILE_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MMAP_FILE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
+const TRACE_OK_LIMIT: usize = 256;
+const TRACE_FAIL_LIMIT: usize = 64;
 
-fn mprotect_trace_allow() -> bool {
-    let prev = MPROTECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-    prev < MPROTECT_TRACE_LIMIT
+fn mprotect_ok_trace() -> bool {
+    MPROTECT_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
 }
-fn mprotect_trace_ok_allow() -> bool {
-    let prev = MPROTECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-    prev < MPROTECT_TRACE_OK_LIMIT
+fn mprotect_fail_trace() -> bool {
+    MPROTECT_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_FAIL_LIMIT
+}
+fn mmap_file_ok_trace() -> bool {
+    MMAP_FILE_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
+}
+fn mmap_file_fail_trace() -> bool {
+    MMAP_FILE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_FAIL_LIMIT
 }
 
 fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
-    // len == 0 is a no-op per POSIX.
     if length == 0 {
         return 0;
     }
-    // addr must be page-aligned.
     if address & (PAGE_SIZE - 1) != 0 {
         return -EINVAL;
     }
-    // Round length up to page size.
     let end = match address.checked_add(length) {
         Some(end) => end,
         None => return -ENOMEM,
@@ -2080,18 +2087,10 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
         Some(range) => range,
         None => return -ENOMEM,
     };
-
     let flags = match protection_flags(protection) {
         Some(flags) => flags.access_only(),
         None => return -EINVAL,
     };
-
-    if mprotect_trace_allow() {
-        crate::println!(
-            "mprotect: ENTER addr={:#x} len={:#x} prot={:#x} range=[{:#x},{:#x})",
-            address, length, protection, range.start().get(), range.end().get(),
-        );
-    }
 
     let ret = match current_user_mm().protect_range(range, flags) {
         Ok(()) => {
@@ -2101,22 +2100,31 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
             0
         }
         Err(ref e) => {
-            // Map internal errors to Linux-compatible errno.
-            // Never return 0 for errors — glibc must see the real failure.
-            match e {
+            let errno = match e {
                 UserMmRuntimeError::NotMapped => -ENOMEM,
                 UserMmRuntimeError::MetadataOutOfMemory => -ENOMEM,
                 UserMmRuntimeError::InvalidRange => -EINVAL,
                 UserMmRuntimeError::PermissionDenied => -ENOMEM,
                 _ => -ENOMEM,
+            };
+            // FAILURES PRINT UNCONDITIONALLY (up to limit) — never suppressed.
+            if mprotect_fail_trace() {
+                crate::println!(
+                    "mprotect: FAIL ret={} addr={:#x} len={:#x} prot={:#x} range=[{:#x},{:#x}) err={:?}",
+                    errno, address, length, protection,
+                    range.start().get(), range.end().get(), e,
+                );
             }
+            errno
         }
     };
 
-    if mprotect_trace_allow() {
-        crate::println!("mprotect: RETURN ret={}", ret);
+    if ret == 0 && mprotect_ok_trace() {
+        crate::println!(
+            "mprotect: ok addr={:#x} len={:#x} prot={:#x}",
+            address, length, protection,
+        );
     }
-
     ret
 }
 
