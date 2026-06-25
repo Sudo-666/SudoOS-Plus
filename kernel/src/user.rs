@@ -901,6 +901,10 @@ fn verify_sdcard_all_scripts_thread() {
 
     crate::task::spawn_kernel_thread(contest_watchdog_main);
 
+    // ── LoongArch: non-scoring exit-status diagnostics ──
+    #[cfg(target_arch = "loongarch64")]
+    oscomp_la_diag(shell_path);
+
     // ── local counters (mirror atomics for summary) ──
     let mut passed: usize = 0;
     let mut failed: usize = 0;
@@ -911,6 +915,17 @@ fn verify_sdcard_all_scripts_thread() {
     let mut expanded_dirs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 
     for (idx, script) in scripts.iter().enumerate() {
+        // ── P9-H2A: stop promptly if watchdog already finalized ──
+        if OSCOMP_FINALIZED.load(Ordering::Acquire) {
+            crate::println!(
+                "oscomp: finalized before script loop arch={} completed={} total={}",
+                crate::arch::ARCH_NAME,
+                OSCOMP_COMPLETED.load(Ordering::Acquire),
+                OSCOMP_TOTAL.load(Ordering::Acquire),
+            );
+            break;
+        }
+
         // Check global budget before starting a new group.
         let now = crate::time::now().cycles();
         if now + budget_ms_to_cycles(3_000) >= budget_deadline {
@@ -1137,6 +1152,85 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/libctest_testcode.sh")
         || path.ends_with("/musl/busybox_testcode.sh")
         || path.ends_with("/musl/basic_testcode.sh")
+}
+
+// ── P9-H2B: LoongArch exit-status diagnostics ──
+
+/// Run a handful of trivial commands on LoongArch to determine whether
+/// the platform-wide signal 14 failures come from a broken shell, a
+/// broken wait-status decode, or a timer/alarm misconfiguration.
+/// These do **not** affect scoring atomics.
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_diag(shell_path: &str) {
+    crate::println!("oscomp-la-diag: begin");
+
+    // 1. Direct /bin/busybox true
+    match run_rootfs_program_with_cwd(
+        "/bin/busybox", &["true"], &["PATH=/", "HOME=/"], Some("/"),
+    ) {
+        Ok(raw) => crate::println!(
+            "oscomp-la-diag: busybox true -> raw={} class={}",
+            raw,
+            if raw == 0 { alloc::string::String::from("PASS") }
+            else if raw < 0 { alloc::format!("signal={}", -raw) }
+            else { alloc::format!("exit={}", raw) },
+        ),
+        Err(_) => crate::println!("oscomp-la-diag: busybox true -> ERROR"),
+    }
+
+    // 2. Shell -c true
+    match run_rootfs_program_with_cwd(
+        shell_path, &["busybox", "sh", "-c", "true"],
+        &["PATH=/", "HOME=/"], Some("/"),
+    ) {
+        Ok(raw) => crate::println!(
+            "oscomp-la-diag: sh -c true -> raw={} class={}",
+            raw,
+            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
+        ),
+        Err(_) => crate::println!("oscomp-la-diag: sh -c true -> ERROR"),
+    }
+
+    // 3. Shell -c 'exit 0'
+    match run_rootfs_program_with_cwd(
+        shell_path, &["busybox", "sh", "-c", "exit 0"],
+        &["PATH=/", "HOME=/"], Some("/"),
+    ) {
+        Ok(raw) => crate::println!(
+            "oscomp-la-diag: sh -c 'exit 0' -> raw={} class={}",
+            raw,
+            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
+        ),
+        Err(_) => crate::println!("oscomp-la-diag: sh -c 'exit 0' -> ERROR"),
+    }
+
+    // 4. Shell -c 'exit 14' (should be exit=14, not signal=14)
+    match run_rootfs_program_with_cwd(
+        shell_path, &["busybox", "sh", "-c", "exit 14"],
+        &["PATH=/", "HOME=/"], Some("/"),
+    ) {
+        Ok(raw) => crate::println!(
+            "oscomp-la-diag: sh -c 'exit 14' -> raw={} class={}",
+            raw,
+            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
+        ),
+        Err(_) => crate::println!("oscomp-la-diag: sh -c 'exit 14' -> ERROR"),
+    }
+
+    // 5. Shell -c 'echo diag_ok'
+    match run_rootfs_program_with_cwd(
+        shell_path, &["busybox", "sh", "-c", "echo diag_ok"],
+        &["PATH=/", "HOME=/"], Some("/"),
+    ) {
+        Ok(raw) => crate::println!(
+            "oscomp-la-diag: sh -c 'echo diag_ok' -> raw={} class={}",
+            raw,
+            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
+        ),
+        Err(_) => crate::println!("oscomp-la-diag: sh -c 'echo diag_ok' -> ERROR"),
+    }
+
+    crate::println!("oscomp-la-diag: end");
 }
 
 /// External watchdog kernel thread.  If the contest runner blocks
