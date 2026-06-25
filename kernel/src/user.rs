@@ -1303,11 +1303,12 @@ fn choose_la_contest_shell() -> Option<&'static str> {
 /// LoongArch whitelist: only run these four groups after the shell
 /// baseline passes.  Everything else is SKIP (la-defer).
 #[cfg(target_arch = "loongarch64")]
+/// LoongArch whitelist: only the single verified passing group.
+/// glibc basic/busybox disabled — exit 142 / SIGALRM.
+/// musl busybox disabled — SIGSEGV (signal 11).
+#[cfg(target_arch = "loongarch64")]
 fn oscomp_la_whitelist(path: &str) -> bool {
-    path.ends_with("/glibc/busybox_testcode.sh")
-        || path.ends_with("/glibc/basic_testcode.sh")
-        || path.ends_with("/musl/busybox_testcode.sh")
-        || path.ends_with("/musl/basic_testcode.sh")
+    path.ends_with("/musl/basic_testcode.sh")
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
@@ -1368,6 +1369,34 @@ fn oscomp_la_diag(_shell_path: &str) {
                 else { alloc::format!("exit={}", raw) },
             ),
             Err(_) => crate::println!("oscomp-la-diag: {} busybox sh -c true -> ERROR", cand),
+        }
+    }
+
+    // ── alarm diagnosis (non-scoring) ──
+    // glibc groups exit 142 (= 128 + 14, SIGALRM).  Probe whether
+    // simple shell commands under the selected busybox also hit alarm.
+    let diag_shell = "/mnt/sdcard/musl/busybox";
+    let diag_cwd = "/mnt/sdcard/musl";
+    let diag_env = &["PATH=.:/mnt/sdcard/musl:/bin", "HOME=/"];
+
+    let probes: &[(&str, &[&str])] = &[
+        ("sh -c true", &["busybox", "sh", "-c", "true"] as &[&str]),
+        ("sh -c sleep 0", &["busybox", "sh", "-c", "sleep 0"]),
+        ("sh -c sleep 1", &["busybox", "sh", "-c", "sleep 1"]),
+        ("sh -c trap-ignore-alrm true", &["busybox", "sh", "-c", "trap '' ALRM; true"]),
+        ("sh -c echo alarm_diag_ok", &["busybox", "sh", "-c", "echo alarm_diag_ok"]),
+    ];
+
+    for (label, argv) in probes {
+        match run_rootfs_program_with_cwd(diag_shell, argv, diag_env, Some(diag_cwd)) {
+            Ok(raw) => crate::println!(
+                "oscomp-la-alarm-diag: {} -> raw={} class={}",
+                label, raw,
+                if raw == 0 { alloc::string::String::from("PASS") }
+                else if raw < 0 { alloc::format!("signal={}", -raw) }
+                else { alloc::format!("exit={}", raw) },
+            ),
+            Err(_) => crate::println!("oscomp-la-alarm-diag: {} -> ERROR", label),
         }
     }
 
