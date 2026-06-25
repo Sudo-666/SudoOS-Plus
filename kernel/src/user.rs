@@ -2760,7 +2760,15 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     let exec_path = path;
     let mut image = match load_exec_image(&exec_path) {
         Ok(image) => image,
-        Err(errno) => return errno,
+        Err(errno) => {
+            if exec_trace_allow() {
+                crate::println!(
+                    "execve-fail: phase=target-open path={} errno={}",
+                    exec_path, errno,
+                );
+            }
+            return errno;
+        }
     };
     if let Some((interpreter, optional_arg)) = match parse_shebang(&image) {
         Ok(shebang) => shebang,
@@ -2790,7 +2798,15 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         }
         image = match load_exec_image(&interpreter_path) {
             Ok(image) => image,
-            Err(errno) => return errno,
+            Err(errno) => {
+                if exec_trace_allow() {
+                    crate::println!(
+                        "execve-fail: phase=shebang-interp path={} interp={} errno={}",
+                        exec_path, interpreter_path, errno,
+                    );
+                }
+                return errno;
+            }
         };
         exec_argv = rewritten_argv;
     }
@@ -2819,7 +2835,15 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         exec_argv = fallback_argv;
         image = match load_exec_image("/bin/sh") {
             Ok(image) => image,
-            Err(errno) => return errno,
+            Err(errno) => {
+                if exec_trace_allow() {
+                    crate::println!(
+                        "execve-fail: phase=sh-fallback path={} interp=/bin/sh errno={}",
+                        exec_path, errno,
+                    );
+                }
+                return errno;
+            }
         };
         if exec_trace_allow() {
             crate::println!("execve: path={} falling back to /bin/sh", exec_path);
