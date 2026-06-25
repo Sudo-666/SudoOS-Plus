@@ -794,7 +794,8 @@ fn oscomp_install_runtime_lib_aliases() {
     }
     crate::println!("sdcard: installed {} runtime library aliases", installed);
 
-    // Self-check: verify a few critical aliases are real readable files.
+    // Self-check: verify a few critical aliases are real readable files
+    // AND that the VFS read path actually returns the correct bytes.
     for check in &[
         "/lib/ld-linux-riscv64-lp64d.so.1",
         "/lib64/ld-linux-loongarch-lp64d.so.1",
@@ -802,15 +803,32 @@ fn oscomp_install_runtime_lib_aliases() {
         "/lib/libm.so.6",
     ] {
         match fs::open(check, myos_vfs::OpenFlags::O_RDONLY) {
-            Ok(file) => match file.fstat() {
-                Ok(stat) => {
-                    crate::println!(
-                        "sdcard: alias {} ok size={} mode={:#o}",
-                        check, stat.size, stat.mode,
-                    );
-                }
-                Err(_) => crate::println!("sdcard: alias {} exists but fstat failed", check),
-            },
+            Ok(file) => {
+                let stat = match file.fstat() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        crate::println!("sdcard: alias {} exists but fstat failed", check);
+                        continue;
+                    }
+                };
+                // Read first 64 bytes to verify the data path works.
+                let mut buf = [0u8; 64];
+                let mut io = myos_vfs::MutableIoBuffer::new(&mut buf);
+                let read_ret = file.read(&mut io);
+                let magic = if io.len() >= 4 {
+                    alloc::format!("{:02x}{:02x}{:02x}{:02x}",
+                        io.filled_bytes()[0], io.filled_bytes()[1],
+                        io.filled_bytes()[2], io.filled_bytes()[3])
+                } else {
+                    alloc::string::String::from("????")
+                };
+                crate::println!(
+                    "sdcard: alias {} size={} mode={:#o} read={} magic={}",
+                    check, stat.size, stat.mode,
+                    read_ret.as_ref().map_or_else(|e| alloc::format!("err({})", e.to_isize()), |n| alloc::format!("{}", n)),
+                    magic,
+                );
+            }
             Err(_) => {
                 // Not fatal — the file may not be on this arch's sdcard.
             }

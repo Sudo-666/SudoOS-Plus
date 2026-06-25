@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 
 use crate::process::{Process, Thread};
-use crate::user_mm::{UserFaultFailure, UserFaultRecovery, UserFaultResolution};
+use crate::user_mm::{UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMmRuntimeError};
 
 const USER_CODE: usize = 0x0000_0000_0040_0000;
 const USER_DATA: usize = USER_CODE + PAGE_SIZE;
@@ -2051,6 +2051,16 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
             }
             0
         }
+        Err(UserMmRuntimeError::NotMapped) => {
+            // ld-linux may call mprotect on RELRO segments that were mapped
+            // but whose pages haven't been faulted in yet.  Silently accept
+            // PROT_READ-only requests on unmapped pages (no-op).
+            if flags == VmAreaFlags::READ {
+                0
+            } else {
+                -ENOMEM
+            }
+        }
         Err(_) => -EINVAL,
     }
 }
@@ -2191,13 +2201,52 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
+    // Save/restore file position so pread64 doesn't affect fd offset.
     let old_position = file.position();
     if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
-        return -EINVAL;
+        return -(myos_vfs::Errno::Einval.to_isize());
     }
-    let result = sys_read(fd, address, length);
+    // Read in chunks: sys_read caps at MAX_USER_COPY, but pread64
+    // must be able to read larger amounts (glibc ld-linux reads
+    // ELF header + program headers in a single pread64 call).
+    let mut total: usize = 0;
+    let mut remaining = length;
+    while remaining > 0 {
+        let chunk = remaining.min(MAX_USER_COPY);
+        // Build a chunk-sized buffer and read into it.
+        let mut chunk_buf = [0_u8; MAX_USER_COPY];
+        let mut output = myos_vfs::MutableIoBuffer::new(&mut chunk_buf[..chunk]);
+        match file.read(&mut output) {
+            Ok(0) => break, // EOF
+            Ok(read) => {
+                let dest = match address.checked_add(total) {
+                    Some(addr) => addr,
+                    None => break,
+                };
+                if copy_to_user(dest, output.filled_bytes()).is_err() {
+                    if total > 0 {
+                        break;
+                    }
+                    let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+                    return -EFAULT;
+                }
+                total += read;
+                if read < chunk {
+                    break; // short read → EOF
+                }
+                remaining -= read;
+            }
+            Err(errno) => {
+                if total > 0 {
+                    break;
+                }
+                let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+                return errno.to_isize();
+            }
+        }
+    }
     let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
-    result
+    total as isize
 }
 
 fn sys_close(fd: usize) -> isize {
@@ -2246,8 +2295,21 @@ fn sys_fstat(fd: usize, stat_address: usize) -> isize {
 }
 
 fn sys_newfstatat(dirfd: usize, path_address: usize, stat_address: usize, flags: usize) -> isize {
-    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+    // Accept AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH; reject unknown flags.
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
         return -EINVAL;
+    }
+    // AT_EMPTY_PATH: stat the fd itself (equivalent to fstat).
+    if flags & AT_EMPTY_PATH != 0 {
+        let file = match current_process_file(dirfd) {
+            Ok(file) => file,
+            Err(errno) => return errno.to_isize(),
+        };
+        let stat = match file.fstat() {
+            Ok(stat) => stat,
+            Err(errno) => return errno.to_isize(),
+        };
+        return copy_stat_to_user(stat_address, &stat);
     }
     let path = match resolve_user_path(dirfd, path_address) {
         Ok(path) => path,
