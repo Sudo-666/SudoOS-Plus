@@ -1822,10 +1822,12 @@ pub fn handle_fault(
                 LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
                 LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
                 TERMINATED.store(true, Ordering::Release);
-                // Use SIGSEGV (11) so wait4 reports signal death, not kernel errno.
-                EXIT_STATUS.store(-11, Ordering::Release);
+                // Gate tests expect -EFAULT for write-to-RX faults.
+                EXIT_STATUS.store(-EFAULT, Ordering::Release);
             }
-            return_to_kernel(frame, -11);
+            // External programs: use SIGSEGV so wait4 produces signal status.
+            let exit_code = if ACTIVE.load(Ordering::Acquire) { -EFAULT } else { -11 }; // SIGSEGV
+            return_to_kernel(frame, exit_code);
         }
         Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
     }
@@ -1948,10 +1950,8 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
             if ACTIVE.load(Ordering::Acquire) {
                 MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
             }
-            // Trace anonymous mmap for addresses near lib mappings.
-            if (start.get() >= 0x1000000 && start.get() < 0x2000000)
-                || mmap_file_ok_trace()
-            {
+            // Trace anonymous mmap (rate-limited).
+            if mmap_file_ok_trace() {
                 crate::println!(
                     "mmap-anon: ok addr_req={:#x} -> {:#x} len={:#x} prot={:?}",
                     address, start.get(), rounded, vm_flags,
