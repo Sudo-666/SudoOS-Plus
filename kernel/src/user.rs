@@ -1887,7 +1887,7 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
     }
 
     // Anonymous mapping (MAP_PRIVATE | MAP_ANONYMOUS or similar).
-    if offset != 0 {
+    if file != usize::MAX || offset != 0 {
         return -EINVAL;
     }
 
@@ -2104,8 +2104,8 @@ static MPROTECT_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MPROTECT_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FILE_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FILE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
-const TRACE_OK_LIMIT: usize = 256;
-const TRACE_FAIL_LIMIT: usize = 64;
+const TRACE_OK_LIMIT: usize = 32;
+const TRACE_FAIL_LIMIT: usize = 128;
 
 fn mprotect_ok_trace() -> bool {
     MPROTECT_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
@@ -3290,10 +3290,10 @@ fn sys_wait4(pid: usize, status_address: usize) -> isize {
     let process = current_process();
     loop {
         match process.wait_zombie_child(requested) {
-            Ok(Some((child, status))) => {
+            Ok(Some((child, raw_status))) => {
                 let child_pid = child.id().get();
                 if status_address != 0 {
-                    let status = status as i32;
+                    let status = raw_status as i32;
                     if copy_to_user(status_address, &status.to_ne_bytes()).is_err() {
                         return -EFAULT;
                     }
