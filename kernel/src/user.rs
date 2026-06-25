@@ -54,6 +54,7 @@ const SYS_SET_TID_ADDRESS: usize = crate::syscall::number::SET_TID_ADDRESS;
 const SYS_SET_ROBUST_LIST: usize = crate::syscall::number::SET_ROBUST_LIST;
 const SYS_NANOSLEEP: usize = crate::syscall::number::NANOSLEEP;
 const SYS_CLOCK_GETTIME: usize = crate::syscall::number::CLOCK_GETTIME;
+const SYS_CLOCK_NANOSLEEP: usize = crate::syscall::number::CLOCK_NANOSLEEP;
 const SYS_SCHED_YIELD: usize = crate::syscall::number::SCHED_YIELD;
 const SYS_KILL: usize = crate::syscall::number::KILL;
 const SYS_TKILL: usize = crate::syscall::number::TKILL;
@@ -1427,7 +1428,10 @@ fn oscomp_la_diag(_shell_path: &str) {
 
     // Quick functional probes with applet aliases in place
     let applet_probes: &[(&str, &[&str])] = &[
-        ("sh -c true", &["busybox", "sh", "-c", "true"] as &[&str]),
+        ("busybox sleep 0", &["busybox", "sleep", "0"] as &[&str]),
+        ("busybox sleep 1", &["busybox", "sleep", "1"]),
+        ("busybox true", &["busybox", "true"]),
+        ("sh -c true", &["busybox", "sh", "-c", "true"]),
         ("sh -c sleep 0", &["busybox", "sh", "-c", "sleep 0"]),
         ("sh -c sleep 1", &["busybox", "sh", "-c", "sleep 1"]),
         ("sh -c echo diag_ok", &["busybox", "sh", "-c", "echo diag_ok"]),
@@ -2029,6 +2033,11 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_NANOSLEEP => set_syscall_result(frame, sys_nanosleep(arguments[0], arguments[1])),
         SYS_CLOCK_GETTIME => {
             set_syscall_result(frame, sys_clock_gettime(arguments[0], arguments[1]))
+        }
+        SYS_CLOCK_NANOSLEEP => {
+            set_syscall_result(frame, sys_clock_nanosleep(
+                arguments[0], arguments[1], arguments[2], arguments[3],
+            ))
         }
         SYS_GETTIMEOFDAY => set_syscall_result(frame, sys_gettimeofday(arguments[0])),
         SYS_TIMES => set_syscall_result(frame, sys_times(arguments[0])),
@@ -4132,6 +4141,56 @@ fn sys_clock_gettime(clock_id: usize, timespec_address: usize) -> isize {
         nsec: (ns % 1_000_000_000) as isize,
     };
     copy_plain_to_user(timespec_address, &ts)
+}
+
+const TIMER_ABSTIME: usize = 1;
+
+fn sys_clock_nanosleep(
+    clock_id: usize,
+    flags: usize,
+    request_address: usize,
+    remain_address: usize,
+) -> isize {
+    if clock_id > 1 {
+        return -EINVAL;
+    }
+    if flags & !TIMER_ABSTIME != 0 {
+        return -EINVAL;
+    }
+
+    let request = match copy_plain_from_user::<KernelTimespec>(request_address) {
+        Ok(request) => request,
+        Err(errno) => return errno,
+    };
+
+    if request.sec < 0 || request.nsec < 0 || request.nsec >= 1_000_000_000 {
+        return -EINVAL;
+    }
+
+    let duration = core::time::Duration::new(request.sec as u64, request.nsec as u32);
+
+    if remain_address != 0 {
+        let zero = KernelTimespec { sec: 0, nsec: 0 };
+        let result = copy_plain_to_user(remain_address, &zero);
+        if result != 0 {
+            return result;
+        }
+    }
+
+    if flags & TIMER_ABSTIME != 0 {
+        let target_ns = (duration.as_secs() as u128) * 1_000_000_000_u128
+            + u128::from(duration.subsec_nanos());
+        let now_ns = current_time_ns();
+        if target_ns > now_ns {
+            let delta_ns = target_ns - now_ns;
+            let sleep_ns = core::cmp::min(delta_ns, u128::from(u64::MAX));
+            crate::timer::sleep(core::time::Duration::from_nanos(sleep_ns as u64));
+        }
+    } else if !duration.is_zero() {
+        crate::timer::sleep(duration);
+    }
+
+    0
 }
 
 fn sys_gettimeofday(timeval_address: usize) -> isize {

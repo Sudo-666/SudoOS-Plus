@@ -40,6 +40,7 @@ pub mod number {
     pub const SET_ROBUST_LIST: usize = 99;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
+    pub const CLOCK_NANOSLEEP: usize = 115;
     pub const SCHED_YIELD: usize = 124;
     pub const KILL: usize = 129;
     pub const TKILL: usize = 130;
@@ -221,6 +222,7 @@ pub fn verify_contract() {
     assert_eq!(number::SET_ROBUST_LIST, 99);
     assert_eq!(number::NANOSLEEP, 101);
     assert_eq!(number::CLOCK_GETTIME, 113);
+    assert_eq!(number::CLOCK_NANOSLEEP, 115);
     assert_eq!(number::SCHED_YIELD, 124);
     assert_eq!(number::KILL, 129);
     assert_eq!(number::RT_SIGACTION, 134);
