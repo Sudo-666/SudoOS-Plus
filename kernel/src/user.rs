@@ -196,6 +196,10 @@ static OSCOMP_LA_SLEEP_TRACE: AtomicBool = AtomicBool::new(false);
 static OSCOMP_LA_SLEEP_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
 static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 
+// ── P9-H14: LoongArch FPD fixup counter ──
+#[cfg(target_arch = "loongarch64")]
+static OSCOMP_LA_FPD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
+
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
     OSCOMP_LA_SLEEP_TRACE.load(Ordering::Relaxed)
@@ -2523,6 +2527,29 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         frame.previous_mode_was_user(),
         "M8-B3 user exception handler received a kernel exception",
     );
+
+    // ── P9-H14: handle LoongArch user FPD by enabling the FPU ──
+    #[cfg(target_arch = "loongarch64")]
+    if _code == 15 {
+        if frame.previous_mode_was_user() {
+            crate::println!(
+                "oscomp-la-fpd: enable-fpu era={:#x} sp={:#x}",
+                frame.era,
+                frame.stack_pointer(),
+            );
+            let n = OSCOMP_LA_FPD_FIXUPS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 16 {
+                crate::println!(
+                    "oscomp-la-fpd: fixup count={} era={:#x}",
+                    n, frame.era,
+                );
+            }
+            crate::arch::cpu::enable_fpu();
+            // Return without advancing PC — the instruction will retry.
+            return;
+        }
+        // Kernel-mode FPD is a bug — fall through to the assertion below.
+    }
 
     // ── P9-H13: trace LA user exception ──
     #[cfg(target_arch = "loongarch64")]

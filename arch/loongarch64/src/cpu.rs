@@ -25,3 +25,34 @@ pub unsafe fn enable_and_wait_for_interrupt() {
         asm!("idle 0", options(nomem, nostack),);
     }
 }
+
+/// Enable the LoongArch FPU by setting EUEN.FPE.
+///
+/// This is an eager-enable contest fixup.  Full per-thread FPU
+/// save/restore is future work.
+pub fn enable_fpu() {
+    const CSR_EUEN: usize = 0x2;
+    const EUEN_FPE: usize = 1 << 0;
+
+    let value: usize;
+    // SAFETY: CSR read is side-effect-free, does not access memory or stack.
+    unsafe {
+        core::arch::asm!(
+            "csrrd {}, {}",
+            out(reg) value,
+            const CSR_EUEN,
+            options(nomem, nostack),
+        );
+    }
+
+    let new_value = value | EUEN_FPE;
+    // SAFETY: CSR write enables the FPU.
+    unsafe {
+        core::arch::asm!(
+            "csrwr {}, {}",
+            in(reg) new_value,
+            const CSR_EUEN,
+            options(nomem, nostack),
+        );
+    }
+}
