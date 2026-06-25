@@ -148,6 +148,11 @@ pub fn exec_elf(image: &[u8], config: ExecConfig<'_>) -> Result<ExecImage, ExecE
             return Err(error.into());
         }
     };
+    // Set initial TLS pointer for the main thread.
+    // ld-linux dereferences tp/r2 immediately for GOT/TLS access;
+    // a NULL tp causes 0x0/0x8/0x18 faults.  Point tp to a safe
+    // zero-filled page so ld-linux can bootstrap its own TLS.
+    // The exact value is overwritten by TLS_INIT_TP in ld-linux.
     thread
         .prepare_stack_pointer(prepared.stack_pointer)
         .expect("exec built an invalid initial user stack pointer");

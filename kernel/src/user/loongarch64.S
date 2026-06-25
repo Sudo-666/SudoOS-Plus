@@ -33,7 +33,11 @@ __m7_enter_user:
     ori $r3, $r5, 0
 
     or $r1, $r0, $r0
-    or $r2, $r0, $r0
+    /*
+     * Keep r2 (tp) as-is: the Thread::tls field is set before entering
+     * user mode.  Zeroing tp breaks ld-linux which dereferences tp
+     * immediately for GOT/TLS setup.
+     */
     or $r4, $r0, $r0
     or $r5, $r0, $r0
     or $r6, $r0, $r0

@@ -2870,6 +2870,17 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     {
         return -EINVAL;
     }
+    // If this is a dynamically-linked program, set a non-zero initial TLS
+    // pointer so ld-linux doesn't fault on tp-relative GOT/TLS access
+    // before its own TLS_INIT_TP runs.  Use USER_DEMAND which has a
+    // page already mapped via extra_areas.
+    // Must update BOTH the thread's TLS field AND the trap frame's r2/tp
+    // because the trap exit restores r2 from the frame.
+    if prepared.interp_base.is_some() {
+        let init_tls = USER_DEMAND;
+        thread.set_tls_pointer(init_tls);
+        set_frame_tls(frame, init_tls);
+    }
     match Arc::try_unwrap(old_mm) {
         Ok(mut old_mm) => {
             if old_mm.destroy().is_err() {
@@ -2966,6 +2977,11 @@ fn set_frame_stack_pointer(frame: &mut crate::arch::trap::TrapFrame, stack_point
 }
 
 #[cfg(target_arch = "riscv64")]
+fn set_frame_tls(frame: &mut crate::arch::trap::TrapFrame, tls: usize) {
+    frame.gpr[4] = tls; // tp is x4 on RISC-V
+}
+
+#[cfg(target_arch = "riscv64")]
 fn set_frame_entry(frame: &mut crate::arch::trap::TrapFrame, entry: usize) {
     frame.sepc = entry;
 }
@@ -2987,6 +3003,11 @@ fn set_signal_handler_frame(
 #[cfg(target_arch = "loongarch64")]
 fn set_frame_stack_pointer(frame: &mut crate::arch::trap::TrapFrame, stack_pointer: usize) {
     frame.gpr[3] = stack_pointer;
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn set_frame_tls(frame: &mut crate::arch::trap::TrapFrame, tls: usize) {
+    frame.gpr[2] = tls; // tp is r2 on LoongArch
 }
 
 #[cfg(target_arch = "loongarch64")]
