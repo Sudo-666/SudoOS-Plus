@@ -533,24 +533,20 @@ fn mount_sdcard_if_present() {
     // in degraded mode.  Without /bin/sh, all no-shebang scripts fail ENOENT
     // immediately.  A known-bad static busybox may still run simple commands
     // before crashing; that's better than 100% ENOENT.
-    if fs::stat("/bin/busybox").is_err() {
-        let fallback_src = busybox_sources[0];
-        let _ = fs::unlink("/bin/busybox", false);
-        oscomp_sdcard_install_ext4_path(fallback_src, "/bin/busybox");
+    // If no good shell was found (all rejected) but a busybox VFS node
+    // exists, install /bin/sh in degraded mode.  Check /bin/sh existence,
+    // not /bin/busybox — the last rejected install leaves a VFS node.
+    if fs::stat("/bin/sh").is_err() {
         if fs::stat("/bin/busybox").is_ok() {
-            crate::println!(
-                "sdcard: WARNING shell {} installed in degraded mode (known-bad static LA busybox)",
-                fallback_src,
-            );
+            crate::println!("sdcard: WARNING shell degraded mode — using known-bad static LA busybox");
             let _ = fs::symlink("/bin/busybox", "/bin/sh");
             let _ = fs::mkdir("/usr/bin", 0o755);
             let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
-            // Install minimal applets.
             for applet in &["sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep"] {
                 let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
             }
         } else {
-            crate::println!("sdcard: WARNING no usable shell found — shell-script tests will fail");
+            crate::println!("sdcard: WARNING no shell found — shell-script tests will fail");
         }
     }
 
