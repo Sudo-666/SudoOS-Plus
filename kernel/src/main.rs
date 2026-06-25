@@ -468,23 +468,66 @@ fn mount_sdcard_if_present() {
     // files installed from ext4 sdcard; a symlink would break that when /lib
     // entries are materialized independently.
 
-    for busybox_ext4 in &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"] {
+    // Try all ext4 busybox sources.  On LoongArch some static busybox
+    // binaries have unresolved linker relaxation placeholders (andi rX,r0,imm)
+    // that cause 0x0 crashes.  Prefer dynamic (PT_INTERP) busybox candidates.
+    let busybox_sources: &[&str] = if cfg!(target_arch = "loongarch64") {
+        &["/musl/busybox", "/glibc/busybox", "/busybox", "/busybox-static",
+          "/bin/busybox", "/usr/bin/busybox"]
+    } else {
+        &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"]
+    };
+    for busybox_ext4 in busybox_sources {
+        let _ = fs::unlink("/bin/busybox", false);
         oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
-        if fs::stat("/bin/busybox").is_ok() {
-            let _ = fs::symlink("/bin/busybox", "/bin/sh");
-            let _ = fs::mkdir("/usr/bin", 0o755);
-            let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
-            for applet in &[
-                "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
-                "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
-                "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
-                "basename", "dirname", "readlink", "stat", "getopt", "env",
-                "sh", "id", "uname", "df",
-            ] {
-                let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
-            }
-            break;
+        if fs::stat("/bin/busybox").is_err() {
+            continue;
         }
+        // Verify the installed binary is usable.
+        // On LA: reject the known-bad static busybox (phnum=4, entry=0x1201b640c)
+        // which has unresolved linker relaxation placeholders.
+        let mut ok = false;
+        if let Ok(file) = fs::open("/bin/busybox", myos_vfs::OpenFlags::O_RDONLY) {
+            let mut hdr = [0u8; 64];
+            let mut io = myos_vfs::MutableIoBuffer::new(&mut hdr);
+            if file.read(&mut io).is_ok() && io.len() >= 20 && &hdr[..4] == b"\x7fELF" {
+                ok = true;
+                #[cfg(target_arch = "loongarch64")]
+                {
+                    let entry = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+                    let phnum = u16::from_le_bytes(hdr[56..58].try_into().unwrap()) as usize;
+                    // Reject the known-bad static busybox (ext4 offset 0x8600000).
+                    if entry == 0x1201b640c && phnum <= 4 {
+                        crate::println!(
+                            "sdcard: busybox from {} rejected (bad static, entry={:#x} phnum={})",
+                            busybox_ext4, entry, phnum,
+                        );
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        crate::println!(
+            "sdcard: busybox from {} ok ({})",
+            busybox_ext4,
+            if cfg!(target_arch = "loongarch64") { "LA" } else { "RV" },
+        );
+        let _ = fs::symlink("/bin/busybox", "/bin/sh");
+        let _ = fs::mkdir("/usr/bin", 0o755);
+        let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
+        for applet in &[
+            "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
+            "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
+            "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
+            "basename", "dirname", "readlink", "stat", "getopt", "env",
+            "sh", "id", "uname", "df",
+        ] {
+            let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
+        }
+        break;
     }
 
     // P1-A: install ld-linux / ld-musl interpreters from their real ext4
