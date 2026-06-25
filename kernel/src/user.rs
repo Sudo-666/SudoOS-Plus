@@ -831,18 +831,18 @@ fn verify_sdcard_all_scripts_thread() {
         return;
     }
 
-    let busybox_path = if crate::fs::stat("/bin/busybox").is_ok() {
+    let shell_path = if crate::fs::stat("/bin/sh").is_ok() {
+        "/bin/sh"
+    } else if crate::fs::stat("/bin/busybox").is_ok() {
         "/bin/busybox"
     } else if crate::fs::stat("/busybox").is_ok() {
         "/busybox"
-    } else if crate::fs::stat("/bin/sh").is_ok() {
-        "/bin/sh"
     } else {
-        crate::println!("sdcard scripts: no shell found — skipping (checked /bin/busybox /busybox /bin/sh)");
+        crate::println!("sdcard scripts: no shell found — skipping");
         return;
     };
     crate::println!("sdcard scripts: discovered {}", scripts.len());
-    crate::println!("sdcard scripts: using shell {}", busybox_path);
+    crate::println!("sdcard scripts: using shell {}", shell_path);
 
     const GROUP_TIMEOUT_MS: u64 = 30_000;
     let mut total: usize = 0;
@@ -916,7 +916,7 @@ fn verify_sdcard_all_scripts_thread() {
         }
 
         let result = run_rootfs_program_with_cwd(
-            busybox_path,
+            shell_path,
             &["busybox", "sh", &vfs_path],
             &[
                 &path_env,
