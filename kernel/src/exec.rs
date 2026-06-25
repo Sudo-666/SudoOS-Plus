@@ -29,6 +29,10 @@ const DT_JMPREL: u64 = 23;
 
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 const R_RELATIVE: u32 = 3;
+/// R_LARCH_64 (2): absolute 64-bit relocation.  For symbol=0 this is
+/// equivalent to R_LARCH_RELATIVE and writes the addend as the value.
+#[cfg(target_arch = "loongarch64")]
+const R_ABS64: u32 = 2;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -455,15 +459,29 @@ fn apply_static_pie_relocations(
         let addend = read_i64(entry, 16)?;
         let relocation_type = (info & 0xffff_ffff) as u32;
         let symbol = info >> 32;
-        if relocation_type == R_RELATIVE && symbol == 0 {
+        // R_LARCH_64 (type 2, symbol=0): absolute 64-bit relocation.
+        // Writes the addend as an absolute address.  Used by static
+        // PIE binaries for GOT entries pointing to global data.
+        #[cfg(target_arch = "loongarch64")]
+        let is_abs64 = relocation_type == R_ABS64 && symbol == 0;
+        #[cfg(not(target_arch = "loongarch64"))]
+        let is_abs64 = false;
+
+        if (relocation_type == R_RELATIVE || is_abs64) && symbol == 0 {
             let destination = usize::try_from(raw_offset)
                 .map_err(|_| ExecError::AddressOverflow)?
                 .checked_add(elf.load_bias)
                 .ok_or(ExecError::AddressOverflow)?;
-            let value = (elf.load_bias as i128)
-                .checked_add(addend as i128)
-                .and_then(|value| u64::try_from(value).ok())
-                .ok_or(ExecError::AddressOverflow)?;
+            let value = if is_abs64 {
+                // R_LARCH_64 with symbol=0: value = addend (absolute address).
+                addend as u64
+            } else {
+                // R_RELATIVE: value = load_bias + addend.
+                u64::try_from((elf.load_bias as i128)
+                    .checked_add(addend as i128)
+                    .ok_or(ExecError::AddressOverflow)?)
+                    .map_err(|_| ExecError::AddressOverflow)?
+            };
             loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
             applied += 1;
         } else {
