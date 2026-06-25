@@ -919,7 +919,16 @@ fn verify_sdcard_all_scripts_thread() {
         );
         match result {
             Ok(0) => crate::println!("{} : PASS", vfs_path),
-            Ok(rc) => crate::println!("{} : FAIL (exit={})", vfs_path, rc),
+            Ok(rc) => {
+                // Normalize raw kernel exit codes to shell-compatible format.
+                // signal death → signal=N; normal exit → exit=code
+                let label = if rc < 0 {
+                    alloc::format!("FAIL (signal={})", -rc)
+                } else {
+                    alloc::format!("FAIL (exit={})", rc)
+                };
+                crate::println!("{} : {}", vfs_path, label);
+            }
             Err(error) => crate::println!("{} : ERROR ({:?})", vfs_path, error),
         }
         crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
