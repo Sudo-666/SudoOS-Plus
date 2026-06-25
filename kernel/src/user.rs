@@ -858,6 +858,20 @@ fn verify_sdcard_all_scripts_thread() {
     // contest-mode shutdown from smoke-mode idle loop.
     SDCARD_CONTEST_RAN.store(true, Ordering::Release);
 
+    // ── LoongArch: probe shell candidates, prefer musl busybox ──
+    #[cfg(target_arch = "loongarch64")]
+    let (shell_path, la_shell_ok) = match choose_la_contest_shell() {
+        Some(p) => {
+            crate::println!("sdcard scripts: LA shell probe selected {}", p);
+            (p, true)
+        }
+        None => {
+            crate::println!("sdcard scripts: no working LA shell — skipping");
+            return;
+        }
+    };
+
+    #[cfg(not(target_arch = "loongarch64"))]
     let shell_path = if crate::fs::stat("/bin/sh").is_ok() {
         "/bin/sh"
     } else if crate::fs::stat("/bin/busybox").is_ok() {
@@ -868,6 +882,7 @@ fn verify_sdcard_all_scripts_thread() {
         crate::println!("sdcard scripts: no shell found — skipping");
         return;
     };
+
     crate::println!("sdcard scripts: discovered {}", scripts.len());
     crate::println!("sdcard scripts: using shell {}", shell_path);
 
@@ -906,6 +921,8 @@ fn verify_sdcard_all_scripts_thread() {
     oscomp_la_diag(shell_path);
 
     // ── local counters (mirror atomics for summary) ──
+    #[cfg(not(target_arch = "loongarch64"))]
+    let la_shell_ok: bool = true;
     let mut passed: usize = 0;
     let mut failed: usize = 0;
     let mut sig11: usize = 0;
@@ -962,6 +979,27 @@ fn verify_sdcard_all_scripts_thread() {
         if !oscomp_rv_whitelist(&vfs_path) {
             crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
             crate::println!("{} : SKIP (defer)", vfs_path);
+            OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
+            OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+            continue;
+        }
+
+        // ── LoongArch defer ──
+        #[cfg(target_arch = "loongarch64")]
+        if !la_shell_ok {
+            crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
+            crate::println!("{} : SKIP (la-shell-broken)", vfs_path);
+            OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
+            OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+            continue;
+        }
+
+        #[cfg(target_arch = "loongarch64")]
+        if !oscomp_la_whitelist(&vfs_path) {
+            crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
+            crate::println!("{} : SKIP (la-defer)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
@@ -1201,6 +1239,77 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/basic_testcode.sh")
 }
 
+// ── P9-H7: LoongArch shell probe and contest whitelist ──
+
+/// Probe LoongArch shell candidates, preferring the sdcard musl busybox
+/// binary that the M15 gate already verified.  Returns the path of the
+/// first candidate where `busybox true` exits 0.
+#[cfg(target_arch = "loongarch64")]
+fn choose_la_contest_shell() -> Option<&'static str> {
+    // Ensure the musl directory is materialised so the candidate exists.
+    sdcard_install_ext4_dir_files("/musl");
+
+    let candidates: &[&str] = &[
+        "/mnt/sdcard/musl/busybox",
+        "/bin/busybox",
+        "/bin/sh",
+    ];
+
+    let cwd = "/mnt/sdcard/musl";
+    let env = &["PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin", "HOME=/"];
+
+    for cand in candidates {
+        if crate::fs::stat(cand).is_err() {
+            crate::println!("oscomp-la-shell: candidate {} missing", cand);
+            continue;
+        }
+
+        // Probe: busybox true (applet form — argv[0]=busybox, argv[1]=true)
+        let rc = run_rootfs_program_with_cwd(cand, &["busybox", "true"], env, Some(cwd));
+        match rc {
+            Ok(0) => {
+                crate::println!("oscomp-la-shell: probe {} true -> raw=0 PASS", cand);
+                // Second probe: busybox sh -c true
+                let rc2 =
+                    run_rootfs_program_with_cwd(cand, &["busybox", "sh", "-c", "true"], env, Some(cwd));
+                match rc2 {
+                    Ok(0) => {
+                        crate::println!("oscomp-la-shell: probe {} sh -c true -> raw=0 PASS", cand);
+                        crate::println!("oscomp-la-shell: selected {}", cand);
+                        return Some(cand);
+                    }
+                    Ok(raw) => crate::println!(
+                        "oscomp-la-shell: probe {} sh -c true -> raw={} (not 0, skip)",
+                        cand, raw,
+                    ),
+                    Err(_) => crate::println!(
+                        "oscomp-la-shell: probe {} sh -c true -> ERROR",
+                        cand,
+                    ),
+                }
+            }
+            Ok(raw) => crate::println!(
+                "oscomp-la-shell: probe {} true -> raw={} (not 0, skip)",
+                cand, raw,
+            ),
+            Err(_) => crate::println!("oscomp-la-shell: probe {} true -> ERROR", cand),
+        }
+    }
+
+    crate::println!("oscomp-la-shell: no working candidate");
+    None
+}
+
+/// LoongArch whitelist: only run these four groups after the shell
+/// baseline passes.  Everything else is SKIP (la-defer).
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_whitelist(path: &str) -> bool {
+    path.ends_with("/glibc/busybox_testcode.sh")
+        || path.ends_with("/glibc/basic_testcode.sh")
+        || path.ends_with("/musl/busybox_testcode.sh")
+        || path.ends_with("/musl/basic_testcode.sh")
+}
+
 // ── P9-H2B: LoongArch exit-status diagnostics ──
 
 /// Run a handful of trivial commands on LoongArch to determine whether
@@ -1208,73 +1317,58 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
 /// broken wait-status decode, or a timer/alarm misconfiguration.
 /// These do **not** affect scoring atomics.
 #[cfg(target_arch = "loongarch64")]
-fn oscomp_la_diag(shell_path: &str) {
+fn oscomp_la_diag(_shell_path: &str) {
     crate::println!("oscomp-la-diag: begin");
 
-    // 1. Direct /bin/busybox true
-    match run_rootfs_program_with_cwd(
-        "/bin/busybox", &["true"], &["PATH=/", "HOME=/"], Some("/"),
-    ) {
-        Ok(raw) => crate::println!(
-            "oscomp-la-diag: busybox true -> raw={} class={}",
-            raw,
-            if raw == 0 { alloc::string::String::from("PASS") }
-            else if raw < 0 { alloc::format!("signal={}", -raw) }
-            else { alloc::format!("exit={}", raw) },
-        ),
-        Err(_) => crate::println!("oscomp-la-diag: busybox true -> ERROR"),
-    }
+    let shells: &[&str] = &[
+        "/mnt/sdcard/musl/busybox",
+        "/bin/busybox",
+        "/bin/sh",
+    ];
 
-    // 2. Shell -c true
-    match run_rootfs_program_with_cwd(
-        shell_path, &["busybox", "sh", "-c", "true"],
-        &["PATH=/", "HOME=/"], Some("/"),
-    ) {
-        Ok(raw) => crate::println!(
-            "oscomp-la-diag: sh -c true -> raw={} class={}",
-            raw,
-            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
-        ),
-        Err(_) => crate::println!("oscomp-la-diag: sh -c true -> ERROR"),
-    }
+    for cand in shells {
+        let present = crate::fs::stat(cand).is_ok();
+        crate::println!(
+            "oscomp-la-diag: candidate {} present={}",
+            cand, present,
+        );
+        if !present {
+            continue;
+        }
 
-    // 3. Shell -c 'exit 0'
-    match run_rootfs_program_with_cwd(
-        shell_path, &["busybox", "sh", "-c", "exit 0"],
-        &["PATH=/", "HOME=/"], Some("/"),
-    ) {
-        Ok(raw) => crate::println!(
-            "oscomp-la-diag: sh -c 'exit 0' -> raw={} class={}",
-            raw,
-            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
-        ),
-        Err(_) => crate::println!("oscomp-la-diag: sh -c 'exit 0' -> ERROR"),
-    }
+        // Probe: busybox-applet true (argv[0]=busybox, argv[1]=true)
+        let rc1 = run_rootfs_program_with_cwd(
+            cand, &["busybox", "true"],
+            &["PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin", "HOME=/"],
+            Some("/mnt/sdcard/musl"),
+        );
+        match rc1 {
+            Ok(raw) => crate::println!(
+                "oscomp-la-diag: {} busybox true -> raw={} class={}",
+                cand, raw,
+                if raw == 0 { alloc::string::String::from("PASS") }
+                else if raw < 0 { alloc::format!("signal={}", -raw) }
+                else { alloc::format!("exit={}", raw) },
+            ),
+            Err(_) => crate::println!("oscomp-la-diag: {} busybox true -> ERROR", cand),
+        }
 
-    // 4. Shell -c 'exit 14' (should be exit=14, not signal=14)
-    match run_rootfs_program_with_cwd(
-        shell_path, &["busybox", "sh", "-c", "exit 14"],
-        &["PATH=/", "HOME=/"], Some("/"),
-    ) {
-        Ok(raw) => crate::println!(
-            "oscomp-la-diag: sh -c 'exit 14' -> raw={} class={}",
-            raw,
-            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
-        ),
-        Err(_) => crate::println!("oscomp-la-diag: sh -c 'exit 14' -> ERROR"),
-    }
-
-    // 5. Shell -c 'echo diag_ok'
-    match run_rootfs_program_with_cwd(
-        shell_path, &["busybox", "sh", "-c", "echo diag_ok"],
-        &["PATH=/", "HOME=/"], Some("/"),
-    ) {
-        Ok(raw) => crate::println!(
-            "oscomp-la-diag: sh -c 'echo diag_ok' -> raw={} class={}",
-            raw,
-            if raw == 0 { alloc::string::String::from("PASS") } else if raw < 0 { alloc::format!("signal={}", -raw) } else { alloc::format!("exit={}", raw) },
-        ),
-        Err(_) => crate::println!("oscomp-la-diag: sh -c 'echo diag_ok' -> ERROR"),
+        // Probe: shell -c true (argv[0]=busybox, argv[1]=sh if busybox binary)
+        let rc2 = run_rootfs_program_with_cwd(
+            cand, &["busybox", "sh", "-c", "true"],
+            &["PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin", "HOME=/"],
+            Some("/mnt/sdcard/musl"),
+        );
+        match rc2 {
+            Ok(raw) => crate::println!(
+                "oscomp-la-diag: {} busybox sh -c true -> raw={} class={}",
+                cand, raw,
+                if raw == 0 { alloc::string::String::from("PASS") }
+                else if raw < 0 { alloc::format!("signal={}", -raw) }
+                else { alloc::format!("exit={}", raw) },
+            ),
+            Err(_) => crate::println!("oscomp-la-diag: {} busybox sh -c true -> ERROR", cand),
+        }
     }
 
     crate::println!("oscomp-la-diag: end");
