@@ -2126,7 +2126,7 @@ static MPROTECT_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MPROTECT_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FILE_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FILE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
-const TRACE_OK_LIMIT: usize = 32;
+const TRACE_OK_LIMIT: usize = 8;
 const TRACE_FAIL_LIMIT: usize = 128;
 
 fn mprotect_ok_trace() -> bool {
