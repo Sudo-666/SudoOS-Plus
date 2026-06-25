@@ -844,10 +844,27 @@ fn verify_sdcard_all_scripts_thread() {
     crate::println!("sdcard scripts: discovered {}", scripts.len());
     crate::println!("sdcard scripts: using shell {}", shell_path);
 
+    // Arch-specific total budget so RV can get deeper results.
+    #[cfg(target_arch = "riscv64")]
+    const TOTAL_BUDGET_MS: u64 = 120_000;
+    #[cfg(target_arch = "loongarch64")]
+    const TOTAL_BUDGET_MS: u64 = 60_000;
     const GROUP_TIMEOUT_MS: u64 = 30_000;
+
+    let freq_hz = crate::time::clock_frequency_hz();
+    let budget_ms_to_cycles = |ms: u64| ms * freq_hz / 1000;
+    let budget_start = crate::time::now().cycles();
+    let budget_deadline = budget_start + budget_ms_to_cycles(TOTAL_BUDGET_MS);
+
+    crate::println!(
+        "oscomp: arch={} total_budget_ms={}",
+        crate::arch::ARCH_NAME, TOTAL_BUDGET_MS,
+    );
+
     let mut total: usize = 0;
     let mut passed: usize = 0;
     let mut failed: usize = 0;
+    let mut skipped: usize = 0;
     let mut timed_out: usize = 0;
     let mut sig11: usize = 0;
     let mut sig14: usize = 0;
@@ -855,7 +872,21 @@ fn verify_sdcard_all_scripts_thread() {
     // Track which ext4 directories have been expanded with all sibling files
     let mut expanded_dirs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 
-    for script in &scripts {
+    for (idx, script) in scripts.iter().enumerate() {
+        // Check global budget before starting a new group.
+        let now = crate::time::now().cycles();
+        if now + budget_ms_to_cycles(3_000) >= budget_deadline {
+            crate::println!(
+                "oscomp: global budget exhausted arch={} completed={} total={}",
+                crate::arch::ARCH_NAME, idx, scripts.len(),
+            );
+            skipped += scripts.len() - idx;
+            break;
+        }
+        crate::println!(
+            "oscomp-progress: arch={} idx={}/{} script={}",
+            crate::arch::ARCH_NAME, idx + 1, scripts.len(), script,
+        );
         let vfs_path = if script.starts_with('/') {
             script.clone()
         } else {
@@ -952,13 +983,17 @@ fn verify_sdcard_all_scripts_thread() {
     }
 
     crate::println!("#### OS COMP SUMMARY ####");
-    crate::println!("total={}", total);
+    crate::println!("arch={}", crate::arch::ARCH_NAME);
+    crate::println!("total={}", scripts.len());
+    crate::println!("completed={}", total);
     crate::println!("pass={}", passed);
     crate::println!("fail={}", failed);
+    crate::println!("skipped={}", skipped);
     crate::println!("timeout={}", timed_out);
     crate::println!("signal11={}", sig11);
     crate::println!("signal14={}", sig14);
     crate::println!("score={}", passed);
+    crate::println!("score: {}", passed);
     crate::println!("#### OS COMP SUMMARY END ####");
     crate::println!("oscomp: shutdown");
     platform_shutdown();
@@ -967,15 +1002,18 @@ fn verify_sdcard_all_scripts_thread() {
 fn platform_shutdown() -> ! {
     #[cfg(target_arch = "riscv64")]
     {
+        crate::println!("oscomp: riscv sbi shutdown");
+        // SBI system reset: extension=0x53525354, func=0, type=shutdown
         unsafe {
             core::arch::asm!(
                 "ecall",
-                in("a7") 0x8,
-                in("a6") 0x0,
-                in("a0") 0x0,
-                in("a1") 0x0,
+                in("a7") 0x53525354_u64,
+                in("a6") 0x0_u64,
+                in("a0") 0x0_u64,
+                in("a1") 0x0_u64,
             );
         }
+        crate::println!("oscomp: riscv sbi shutdown returned, halt");
     }
     #[cfg(target_arch = "loongarch64")]
     {
