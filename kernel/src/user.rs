@@ -2035,33 +2035,86 @@ fn sys_munmap(address: usize, length: usize) -> isize {
     }
 }
 
+// Rate-limited mprotect tracing for diagnosing RELRO failures.
+static MPROTECT_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+const MPROTECT_TRACE_LIMIT: usize = 128;
+const MPROTECT_TRACE_OK_LIMIT: usize = 32;
+
+fn mprotect_trace_allow() -> bool {
+    let prev = MPROTECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    prev < MPROTECT_TRACE_LIMIT
+}
+fn mprotect_trace_ok_allow() -> bool {
+    let prev = MPROTECT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    prev < MPROTECT_TRACE_OK_LIMIT
+}
+
 fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
-    let range = match syscall_range(address, length) {
-        Some(range) => range,
-        None => return -EINVAL,
+    // len == 0 is a no-op per POSIX.
+    if length == 0 {
+        return 0;
+    }
+    // addr must be page-aligned.
+    if address & (PAGE_SIZE - 1) != 0 {
+        return -EINVAL;
+    }
+    // Round length up to page size.
+    let end = match address.checked_add(length) {
+        Some(end) => end,
+        None => return -ENOMEM,
     };
+    let rounded_end = match end.checked_add(PAGE_SIZE - 1) {
+        Some(end) => end & !(PAGE_SIZE - 1),
+        None => return -ENOMEM,
+    };
+    let range = match VirtRange::new(VirtAddr::new(address), VirtAddr::new(rounded_end)) {
+        Some(range) => range,
+        None => return -ENOMEM,
+    };
+
     let flags = match protection_flags(protection) {
         Some(flags) => flags.access_only(),
         None => return -EINVAL,
     };
+
     match current_user_mm().protect_range(range, flags) {
         Ok(()) => {
             if ACTIVE.load(Ordering::Acquire) {
                 MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
             }
+            if mprotect_trace_ok_allow() {
+                crate::println!(
+                    "mprotect: ok addr={:#x} len={:#x} prot={:#x} -> {:?}",
+                    address, length, protection, flags,
+                );
+            }
             0
         }
         Err(UserMmRuntimeError::NotMapped) => {
-            // ld-linux may call mprotect on RELRO segments that were mapped
-            // but whose pages haven't been faulted in yet.  Silently accept
-            // PROT_READ-only requests on unmapped pages (no-op).
+            // PROT_READ on unmapped pages is acceptable (RELRO on
+            // unfaulted pages).  Other errors on unmapped regions
+            // are reported as ENOMEM like Linux does.
             if flags == VmAreaFlags::READ {
                 0
             } else {
                 -ENOMEM
             }
         }
-        Err(_) => -EINVAL,
+        Err(ref e) => {
+            if mprotect_trace_allow() {
+                crate::println!(
+                    "mprotect: FAIL addr={:#x} len={:#x} range=[{:#x},{:#x}) prot={:#x} err={:?}",
+                    address, length, range.start().get(), range.end().get(), protection, e,
+                );
+            }
+            // Map internal errors to Linux-compatible errno.
+            match e {
+                UserMmRuntimeError::NotMapped => -ENOMEM,
+                UserMmRuntimeError::MetadataOutOfMemory => -ENOMEM,
+                UserMmRuntimeError::InvalidRange => -EINVAL,
+                _ => -EINVAL,
+            }
+        }
     }
 }
 
