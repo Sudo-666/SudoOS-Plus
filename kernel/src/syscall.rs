@@ -93,6 +93,7 @@ pub mod number {
     pub const STATFS: usize = 43;
     pub const FSTATFS: usize = 44;
     pub const SYSLOG: usize = 116;
+    pub const PKEY_MPROTECT: usize = 288;  // RISC-V asm-generic pkey_mprotect
     pub const SCHED_GETAFFINITY: usize = 123;
     pub const SCHED_SETAFFINITY: usize = 122;
     pub const SCHED_SETSCHEDULER: usize = 119;

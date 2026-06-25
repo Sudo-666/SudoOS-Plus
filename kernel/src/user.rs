@@ -83,6 +83,7 @@ const SYS_CLONE: usize = crate::syscall::number::CLONE;
 const SYS_EXECVE: usize = crate::syscall::number::EXECVE;
 const SYS_MMAP: usize = crate::syscall::number::MMAP;
 const SYS_MPROTECT: usize = crate::syscall::number::MPROTECT;
+const SYS_PKEY_MPROTECT: usize = crate::syscall::number::PKEY_MPROTECT;
 const SYS_WAIT4: usize = crate::syscall::number::WAIT4;
 const SYS_PRLIMIT64: usize = crate::syscall::number::PRLIMIT64;
 const SYS_GETRANDOM: usize = crate::syscall::number::GETRANDOM;
@@ -1560,6 +1561,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_mprotect(arguments[0], arguments[1], arguments[2]),
         ),
+        SYS_PKEY_MPROTECT => set_syscall_result(
+            frame,
+            sys_pkey_mprotect(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_PRLIMIT64 => set_syscall_result(
             frame,
             sys_prlimit64(arguments[0], arguments[1], arguments[2], arguments[3]),
@@ -1839,9 +1844,18 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
     if length >> 32 == u32::MAX as usize {
         length &= u32::MAX as usize;
     }
-    if address != 0 || length == 0 {
+    if length == 0 {
         return -EINVAL;
     }
+
+    // MAP_FIXED requires a non-zero address; MAP_FIXED without an
+    // address is an error.  Non-FIXED address hints are accepted but
+    // ignored (map_anonymous chooses the address).
+    let is_fixed = flags & MAP_FIXED != 0;
+    if is_fixed && address == 0 {
+        return -EINVAL;
+    }
+
     let vm_flags = match protection_flags(protection) {
         Some(flags) => flags,
         None => return -EINVAL,
@@ -1982,8 +1996,10 @@ fn sys_file_private_mmap(
     if ACTIVE.load(Ordering::Acquire) {
         MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
     }
-    if mmap_file_ok_trace() {
-        let path = file.path().unwrap_or("?");
+    let path = file.path().unwrap_or("?");
+    let is_lib = path.contains("/lib/") || path.contains("/lib64/") || path.contains("ld-linux") || path.contains("ld-musl");
+    // Always print mmap for lib paths; rate-limit everything else.
+    if is_lib || mmap_file_ok_trace() {
         crate::println!(
             "mmap-file: ok fd={} path={} off={:#x} len={:#x} -> {:#x} prot={:?}",
             fd, path, offset, length, start.get(), vm_flags,
@@ -2068,11 +2084,31 @@ fn mmap_file_fail_trace() -> bool {
     MMAP_FILE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_FAIL_LIMIT
 }
 
+fn sys_pkey_mprotect(address: usize, length: usize, protection: usize, pkey: usize) -> isize {
+    // pkey == -1 (usize::MAX) or pkey == 0 → forward to mprotect.
+    // Other pkey values are not supported.
+    if pkey == usize::MAX || pkey == 0 {
+        return sys_mprotect(address, length, protection);
+    }
+    if mmap_file_fail_trace() {
+        crate::println!(
+            "pkey_mprotect: FAIL pkey={} addr={:#x} len={:#x} prot={:#x}",
+            pkey, address, length, protection,
+        );
+    }
+    -EINVAL
+}
+
 fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
     if length == 0 {
         return 0;
     }
     if address & (PAGE_SIZE - 1) != 0 {
+        return -EINVAL;
+    }
+    // PROT_NONE: prot=0 is valid, maps to empty access (no R/W/X).
+    const PROT_ALLOWED: usize = 0x7; // PROT_READ|PROT_WRITE|PROT_EXEC
+    if protection & !PROT_ALLOWED != 0 {
         return -EINVAL;
     }
     let end = match address.checked_add(length) {
@@ -2087,9 +2123,16 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
         Some(range) => range,
         None => return -ENOMEM,
     };
-    let flags = match protection_flags(protection) {
-        Some(flags) => flags.access_only(),
-        None => return -EINVAL,
+    // PROT_NONE (prot=0): access-only flags will be empty (no R/W/X bits).
+    let flags = if protection == 0 {
+        // PROT_NONE: effectively no access. Use USER flag only so VMA
+        // is recognized as a user mapping; access bits are all cleared.
+        VmAreaFlags::USER
+    } else {
+        match protection_flags(protection) {
+            Some(flags) => flags.access_only(),
+            None => return -EINVAL,
+        }
     };
 
     let ret = match current_user_mm().protect_range(range, flags) {
@@ -2119,7 +2162,14 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
         }
     };
 
-    if ret == 0 && mprotect_ok_trace() {
+    // Print EVERY failure unconditionally (no rate limit for failures).
+    if ret < 0 {
+        crate::println!(
+            "mprotect: FAIL ret={} addr={:#x} len={:#x} prot={:#x} range=[{:#x},{:#x})",
+            ret, address, length, protection,
+            range.start().get(), range.end().get(),
+        );
+    } else if mprotect_ok_trace() {
         crate::println!(
             "mprotect: ok addr={:#x} len={:#x} prot={:#x}",
             address, length, protection,
