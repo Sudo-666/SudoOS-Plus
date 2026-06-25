@@ -468,15 +468,48 @@ fn mount_sdcard_if_present() {
     // files installed from ext4 sdcard; a symlink would break that when /lib
     // entries are materialized independently.
 
+    // P9-G2: try vendor LoongArch busybox first (if present).
+    #[cfg(all(target_arch = "loongarch64", vendor_la_busybox))]
+    {
+        let vendor_data: &[u8] = include_bytes!(env!("MYOS_VENDOR_LA_BUSYBOX"));
+        if vendor_data.len() > 64 && &vendor_data[..4] == b"\x7fELF" {
+            let entry = u64::from_le_bytes(vendor_data[24..32].try_into().unwrap());
+            let phnum = u16::from_le_bytes(vendor_data[56..58].try_into().unwrap()) as usize;
+            let is_bad = entry == 0x1201b640c && phnum <= 4;
+            if is_bad {
+                crate::println!("sdcard: vendor LA busybox rejected (known-bad static)");
+            } else {
+                crate::println!(
+                    "sdcard: vendor LA busybox accepted size={} entry={:#x} phnum={}",
+                    vendor_data.len(), entry, phnum,
+                );
+                // Install as VFS regular file using the raw byte content.
+                let _ = fs::unlink("/bin/busybox", false);
+                oscomp_sdcard_install_bytes("/bin/busybox", vendor_data);
+                let _ = fs::symlink("/bin/busybox", "/bin/sh");
+                let _ = fs::mkdir("/usr/bin", 0o755);
+                let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
+                for applet in &[
+                    "sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep",
+                    "kill", "head", "tail", "grep", "dd", "mount", "ps", "id", "uname", "df",
+                ] {
+                    let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "loongarch64", vendor_la_busybox)))]
+    if cfg!(target_arch = "loongarch64") {
+        crate::println!("sdcard: vendor LA busybox absent");
+    }
+
     // Try all ext4 busybox sources.  On LoongArch some static busybox
     // binaries have unresolved linker relaxation placeholders (andi rX,r0,imm)
     // that cause 0x0 crashes.  Prefer dynamic (PT_INTERP) busybox candidates.
-    // Additional paths try to find a good dynamic busybox on the sdcard.
     let busybox_sources: &[&str] = if cfg!(target_arch = "loongarch64") {
         &["/musl/busybox", "/glibc/busybox", "/busybox", "/busybox-static",
           "/bin/busybox", "/usr/bin/busybox",
-          "/glibc/bin/busybox", "/musl/bin/busybox",
-          "/glibc/lib/ld-linux-loongarch-lp64d.so.1"]
+          "/glibc/bin/busybox", "/musl/bin/busybox"]
     } else {
         &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"]
     };
@@ -651,6 +684,12 @@ fn oscomp_sdcard_is_test_script(path: &str) -> bool {
 fn oscomp_sdcard_install_ext4_path(ext4_path: &str, vfs_path: &str) {
     oscomp_sdcard_ensure_parent_dirs(vfs_path);
     let _ = fs::install_ext4_path("/dev/vda", vfs_path, ext4_path);
+}
+
+/// Install raw bytes as a VFS regular file (for vendor/userland binaries).
+fn oscomp_sdcard_install_bytes(vfs_path: &str, data: &[u8]) {
+    oscomp_sdcard_ensure_parent_dirs(vfs_path);
+    let _ = fs::install_bytes(vfs_path, data);
 }
 
 /// P1-B: materialize an ext4 directory flat into VFS (files only; subdirs

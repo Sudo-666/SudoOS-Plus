@@ -33,6 +33,17 @@ fn main() {
     );
 
     println!("cargo:rustc-link-arg-bin=myos-kernel=--gc-sections");
+
+    // Optional LoongArch vendor busybox for shell fallback.
+    let vendor_la_busybox = project_root.join("vendor/userland/loongarch64/busybox");
+    if target_arch == "loongarch64" && vendor_la_busybox.is_file() {
+        println!("cargo:rustc-cfg=vendor_la_busybox");
+        println!(
+            "cargo:rustc-env=MYOS_VENDOR_LA_BUSYBOX={}",
+            vendor_la_busybox.display()
+        );
+    }
+    println!("cargo:rerun-if-changed={}", vendor_la_busybox.display());
 }
 
 fn require_file(path: &Path) {

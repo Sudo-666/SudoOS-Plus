@@ -452,6 +452,28 @@ pub fn install_ext4_path(source: &str, target_path: &str, source_path: &str) -> 
     insert_child(&parent, name, node)
 }
 
+/// Install raw bytes as a VFS regular file node.
+pub fn install_bytes(target_path: &str, data: &[u8]) -> Result<(), Errno> {
+    let _tree = TREE.lock();
+    let node = Arc::new(Node {
+        ino: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
+        parent_ino: AtomicU64::new(0),
+        nlink: AtomicU64::new(1),
+        mode: FileMode::from_bits(FileMode::S_IFREG | 0o755),
+        read_only: AtomicBool::new(false),
+        state: IrqSpinLock::new_with_class(
+            NodeState::Regular(alloc::vec::Vec::from(data)),
+            NODE_LOCK,
+        ),
+    });
+    let (parent_path, name) = split_parent(target_path)?;
+    let parent = lookup(parent_path)?;
+    if is_node_read_only(&parent) {
+        return Err(Errno::Erofs);
+    }
+    insert_child(&parent, name, node)
+}
+
 pub fn umount(target: &str, _flags: usize) -> Result<(), Errno> {
     if target == "/" {
         return Err(Errno::Ebusy);
