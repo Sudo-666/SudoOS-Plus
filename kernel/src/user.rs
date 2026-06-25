@@ -1797,7 +1797,7 @@ pub fn handle_fault(
                     })
                     .unwrap_or(alloc::string::String::from("?"));
                 crate::println!(
-                    "user fatal fault: exe={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} failure={:?}",
+                    "user fatal fault: exe={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} a0={:#018x} a1={:#018x} a2={:#018x} a3={:#018x} failure={:?}",
                     exec_path,
                     fault_pc,
                     address.get(),
@@ -1805,6 +1805,7 @@ pub fn handle_fault(
                     frame.stack_pointer(),
                     frame.return_address(),
                     tp_val,
+                    frame.gpr[4], frame.gpr[5], frame.gpr[6], frame.gpr[7],
                     failure,
                 );
             }
