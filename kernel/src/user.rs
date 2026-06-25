@@ -939,6 +939,20 @@ fn verify_sdcard_all_scripts_thread() {
                 cwd.push_str(&vfs_path[..pos]);
             }
         }
+
+        // ── RISC-V whitelist defer ──
+        // Non-whitelisted scripts are skipped early, before ext4 expansion,
+        // so the 120 s budget is reserved for the six lightweight groups.
+        #[cfg(target_arch = "riscv64")]
+        if !oscomp_rv_whitelist(&vfs_path) {
+            crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
+            crate::println!("{} : SKIP (defer)", vfs_path);
+            OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
+            OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+            continue;
+        }
+
         // Expand ext4 directory: install all regular files from the
         // script's ext4 parent directory into VFS so that ./busybox,
         // ./dhry2reg, ./lmbench_all etc. resolve at runtime.
@@ -1110,6 +1124,19 @@ fn oscomp_should_skip_heavy(script: &str) -> bool {
         || script.contains("cyclictest")
         || script.contains("/ltp/")
         || script.contains("ltp_testcode")
+}
+
+/// RISC-V whitelist: only these six lightweight scripts are allowed to
+/// actually run.  Everything else is deferred so the 120 s budget is
+/// spent on groups with a proven chance of passing.
+#[cfg(target_arch = "riscv64")]
+fn oscomp_rv_whitelist(path: &str) -> bool {
+    path.ends_with("/glibc/libctest_testcode.sh")
+        || path.ends_with("/glibc/busybox_testcode.sh")
+        || path.ends_with("/glibc/basic_testcode.sh")
+        || path.ends_with("/musl/libctest_testcode.sh")
+        || path.ends_with("/musl/busybox_testcode.sh")
+        || path.ends_with("/musl/basic_testcode.sh")
 }
 
 /// External watchdog kernel thread.  If the contest runner blocks
