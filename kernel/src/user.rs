@@ -1790,8 +1790,15 @@ pub fn handle_fault(
                 let tp_val = frame.gpr[2];
                 #[cfg(target_arch = "riscv64")]
                 let tp_val = frame.gpr[4];
+                let exec_path = crate::task::current_user_thread()
+                    .and_then(|t| {
+                        let p = t.process();
+                        Some(alloc::string::String::from(p.fs().cwd_path()))
+                    })
+                    .unwrap_or(alloc::string::String::from("?"));
                 crate::println!(
-                    "user fatal fault: pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} failure={:?}",
+                    "user fatal fault: exe={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} failure={:?}",
+                    exec_path,
                     fault_pc,
                     address.get(),
                     access,

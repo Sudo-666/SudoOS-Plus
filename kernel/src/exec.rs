@@ -266,8 +266,19 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         for segment in &elf.segments {
             load_segment(&mm, image, *segment)?;
         }
-        // Apply static PIE relocations on main ELF.
-        apply_static_pie_relocations(&mm, image, &elf)?;
+        // Apply static PIE relocations on the MAIN binary ONLY if it has
+        // no PT_INTERP (true static PIE).  Dynamically-linked binaries
+        // get their GOT/PLT fixed up by ld-linux at runtime; the kernel
+        // must not touch them here.
+        let has_interp = elf.interpreter.is_some();
+        if has_interp {
+            crate::println!(
+                "exec-reloc: skip main (has PT_INTERP) rela={}",
+                elf.dynamic.map_or(0, |d| d.memory_size),
+            );
+        } else {
+            apply_static_pie_relocations(&mm, image, &elf)?;
+        }
         // Load interpreter segments if present.
         if let (Some(interp_data), Some(interp)) = (interp_image.as_ref(), interp_elf.as_ref()) {
             for segment in &interp.segments {
