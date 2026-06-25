@@ -1968,15 +1968,24 @@ fn sys_file_private_mmap(
     if rounded > readable {
         let _ = zero_user_mapping(start.checked_add(readable).unwrap_or(start), rounded - readable);
     }
-    if current_user_mm()
-        .protect_range(range, vm_flags.access_only())
-        .is_err()
-    {
+    if let Err(e) = current_user_mm().protect_range(range, vm_flags.access_only()) {
+        if mprotect_trace_allow() {
+            crate::println!(
+                "mmap-file: FAIL protect fd={} off={:#x} len={:#x} range=[{:#x},{:#x}) err={:?}",
+                fd, offset, length, range.start().get(), range.end().get(), e,
+            );
+        }
         let _ = current_user_mm().unmap_range(range);
-        return -EINVAL;
+        return -ENOMEM;
     }
     if ACTIVE.load(Ordering::Acquire) {
         MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
+    if mprotect_trace_allow() {
+        crate::println!(
+            "mmap-file: ok fd={} off={:#x} len={:#x} -> {:#x} prot={:?}",
+            fd, offset, length, start.get(), vm_flags,
+        );
     }
     start.get() as isize
 }
@@ -2077,45 +2086,38 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
         None => return -EINVAL,
     };
 
-    match current_user_mm().protect_range(range, flags) {
+    if mprotect_trace_allow() {
+        crate::println!(
+            "mprotect: ENTER addr={:#x} len={:#x} prot={:#x} range=[{:#x},{:#x})",
+            address, length, protection, range.start().get(), range.end().get(),
+        );
+    }
+
+    let ret = match current_user_mm().protect_range(range, flags) {
         Ok(()) => {
             if ACTIVE.load(Ordering::Acquire) {
                 MPROTECT_COUNT.fetch_add(1, Ordering::AcqRel);
             }
-            if mprotect_trace_ok_allow() {
-                crate::println!(
-                    "mprotect: ok addr={:#x} len={:#x} prot={:#x} -> {:?}",
-                    address, length, protection, flags,
-                );
-            }
             0
         }
-        Err(UserMmRuntimeError::NotMapped) => {
-            // PROT_READ on unmapped pages is acceptable (RELRO on
-            // unfaulted pages).  Other errors on unmapped regions
-            // are reported as ENOMEM like Linux does.
-            if flags == VmAreaFlags::READ {
-                0
-            } else {
-                -ENOMEM
-            }
-        }
         Err(ref e) => {
-            if mprotect_trace_allow() {
-                crate::println!(
-                    "mprotect: FAIL addr={:#x} len={:#x} range=[{:#x},{:#x}) prot={:#x} err={:?}",
-                    address, length, range.start().get(), range.end().get(), protection, e,
-                );
-            }
             // Map internal errors to Linux-compatible errno.
+            // Never return 0 for errors — glibc must see the real failure.
             match e {
                 UserMmRuntimeError::NotMapped => -ENOMEM,
                 UserMmRuntimeError::MetadataOutOfMemory => -ENOMEM,
                 UserMmRuntimeError::InvalidRange => -EINVAL,
-                _ => -EINVAL,
+                UserMmRuntimeError::PermissionDenied => -ENOMEM,
+                _ => -ENOMEM,
             }
         }
+    };
+
+    if mprotect_trace_allow() {
+        crate::println!("mprotect: RETURN ret={}", ret);
     }
+
+    ret
 }
 
 fn syscall_range(address: usize, mut length: usize) -> Option<VirtRange> {

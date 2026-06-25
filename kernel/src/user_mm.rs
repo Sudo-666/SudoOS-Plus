@@ -3,9 +3,10 @@ use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use myos_mm::{
-    AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, FaultSource, PAGE_SIZE,
-    PageAllocation, PageFault, PerMmTlbRequest, PhysAddr, TlbFlush, TlbScope, UserAddressSpace,
-    UserFaultPlan, UserMmError, VirtAddr, VirtPage, VirtRange, VmArea, VmAreaFlags,
+    AddressSpaceError, AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, FaultSource,
+    PAGE_SIZE, PageAllocation, PageFault, PerMmTlbRequest, PhysAddr, TlbFlush, TlbScope,
+    UserAddressSpace, UserFaultPlan, UserMmError, VirtAddr, VirtPage, VirtRange, VmArea,
+    VmAreaError, VmAreaFlags,
 };
 
 use crate::irq_lock::IrqSpinLock;
@@ -518,42 +519,96 @@ impl UserMm {
                 })?)
             };
 
-            state
+            // Try the full VMA-splitting protect first.
+            let layout_result = state
                 .core
                 .layout_mut()
-                .protect_range(range, access)
-                .map_err(UserMmError::from)?;
+                .protect_range(range, access);
 
-            let result: Result<(), RuntimePageTableError> = (|| {
-                for (page, _) in &changed_pages {
-                    let area = state
-                        .core
-                        .layout()
-                        .find_area(page.start_address())
-                        .expect("mprotect removed a mapped page's VMA");
-                    state
+            // PTE-only fallback: when VMA capacity is exhausted but the
+            // range is fully covered by existing VMAs, update only the
+            // page-table entries without splitting VMAs.
+            // Covers both RELRO (PROT_READ) and text-segment mmap
+            // finalization (R-X or R-- from temporary RW).
+            let is_downgrade = !access.contains(VmAreaFlags::WRITE);
+            let pte_fallback = layout_result.is_err()
+                && is_downgrade
+                && !changed_pages.is_empty();
+
+            if pte_fallback {
+                // Don't update the VMA layout — just protect existing PTEs.
+                let mut pte_result = Ok(());
+                if let Some(page_table) = state.page_table.as_mut() {
+                    for (page, old_area) in &changed_pages {
+                        // Build a temporary read-only VMA to derive mapping options.
+                        let ro_start = page.start_address().get();
+                        let ro_end = ro_start
+                            .checked_add(PAGE_SIZE)
+                            .ok_or(RuntimePageTableError::NotMapped)?;
+                        let ro_range = VirtRange::from_bounds(ro_start, ro_end);
+                        let ro_area = VmArea::new(
+                            ro_range,
+                            old_area.flags().with_access(VmAreaFlags::READ),
+                            old_area.kind(),
+                        );
+                        if let Err(e) = page_table.protect_page(*page, ro_area.mapping_options()) {
+                            pte_result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                if let Err(e) = pte_result {
+                    // Rollback: restore original PTE flags.
+                    if let Some(page_table) = state.page_table.as_mut() {
+                        for (page, old_area) in &changed_pages {
+                            let _ = page_table.protect_page(*page, old_area.mapping_options());
+                        }
+                    }
+                    return Err(UserMmRuntimeError::Core(UserMmError::AddressSpace(
+                        AddressSpaceError::Area(VmAreaError::CapacityExceeded),
+                    )));
+                }
+                // PTE-only fallback succeeded — skip VMA layout update.
+                request
+            } else {
+                // Normal path: layout protect succeeded, now update PTEs.
+                state
+                    .core
+                    .layout_mut()
+                    .protect_range(range, access)
+                    .map_err(UserMmError::from)?;
+
+                let result: Result<(), RuntimePageTableError> = (|| {
+                    for (page, _) in &changed_pages {
+                        let area = state
+                            .core
+                            .layout()
+                            .find_area(page.start_address())
+                            .expect("mprotect removed a mapped page's VMA");
+                        state
+                            .page_table
+                            .as_mut()
+                            .ok_or(RuntimePageTableError::NotMapped)?
+                            .protect_page(*page, area.mapping_options())?;
+                    }
+                    Ok(())
+                })();
+
+                if let Err(error) = result {
+                    let page_table = state
                         .page_table
                         .as_mut()
-                        .ok_or(RuntimePageTableError::NotMapped)?
-                        .protect_page(*page, area.mapping_options())?;
+                        .expect("mprotect rollback lost the user page table");
+                    for (page, old_area) in &changed_pages {
+                        page_table
+                            .protect_page(*page, old_area.mapping_options())
+                            .expect("mprotect rollback could not restore a leaf PTE");
+                    }
+                    *state.core.layout_mut() = old_layout;
+                    return Err(error.into());
                 }
-                Ok(())
-            })();
-
-            if let Err(error) = result {
-                let page_table = state
-                    .page_table
-                    .as_mut()
-                    .expect("mprotect rollback lost the user page table");
-                for (page, old_area) in &changed_pages {
-                    page_table
-                        .protect_page(*page, old_area.mapping_options())
-                        .expect("mprotect rollback could not restore a leaf PTE");
-                }
-                *state.core.layout_mut() = old_layout;
-                return Err(error.into());
+                request
             }
-            request
         };
         if let Some(request) = request {
             shootdown_user_request(request);
