@@ -188,6 +188,13 @@ static OSCOMP_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_SIGNAL11: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_SIGNAL14: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_DEADLINE_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+// ── P9-H11: LoongArch sleep syscall trace (diagnostic only) ──
+#[cfg(target_arch = "loongarch64")]
+static OSCOMP_LA_SLEEP_TRACE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_arch = "loongarch64")]
+static OSCOMP_LA_SLEEP_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1342,6 +1349,40 @@ fn oscomp_la_install_busybox_applets() {
     }
 }
 
+/// Run a single probe with syscall tracing enabled on LoongArch.
+/// Only used for `busybox sleep` diagnostics; does not affect scoring.
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_run_sleep_trace_probe(
+    label: &str,
+    path: &str,
+    argv: &[&str],
+    env: &[&str],
+    cwd: Option<&str>,
+) -> isize {
+    crate::println!("oscomp-la-sleep-trace: begin {}", label);
+    OSCOMP_LA_SLEEP_TRACE_BUDGET.store(80, Ordering::Relaxed);
+    OSCOMP_LA_SLEEP_TRACE.store(true, Ordering::Relaxed);
+
+    let raw = match run_rootfs_program_with_cwd(path, argv, env, cwd) {
+        Ok(r) => r,
+        Err(_) => -127_isize,
+    };
+
+    OSCOMP_LA_SLEEP_TRACE.store(false, Ordering::Relaxed);
+    let class = if raw == 0 {
+        alloc::string::String::from("PASS")
+    } else if raw < 0 {
+        alloc::format!("signal={}", -raw)
+    } else {
+        alloc::format!("exit={}", raw)
+    };
+    crate::println!(
+        "oscomp-la-sleep-trace: end {} raw={} class={}",
+        label, raw, class,
+    );
+    raw
+}
+
 /// LoongArch whitelist: basic groups only.
 /// Busybox groups are disabled — musl/busybox hits known-bad-busybox SIGSEGV.
 /// Everything else is SKIP (la-defer).
@@ -1427,10 +1468,19 @@ fn oscomp_la_diag(_shell_path: &str) {
     }
 
     // Quick functional probes with applet aliases in place
+    // Trace-enabled probes for busybox sleep (syscall-level diag).
+    oscomp_la_run_sleep_trace_probe(
+        "busybox sleep 0",
+        diag_busybox, &["busybox", "sleep", "0"], diag_env, Some(diag_cwd),
+    );
+    oscomp_la_run_sleep_trace_probe(
+        "busybox sleep 1",
+        diag_busybox, &["busybox", "sleep", "1"], diag_env, Some(diag_cwd),
+    );
+
+    // Non-trace probes (keep the existing diag format).
     let applet_probes: &[(&str, &[&str])] = &[
-        ("busybox sleep 0", &["busybox", "sleep", "0"] as &[&str]),
-        ("busybox sleep 1", &["busybox", "sleep", "1"]),
-        ("busybox true", &["busybox", "true"]),
+        ("busybox true", &["busybox", "true"] as &[&str]),
         ("sh -c true", &["busybox", "sh", "-c", "true"]),
         ("sh -c sleep 0", &["busybox", "sh", "-c", "sleep 0"]),
         ("sh -c sleep 1", &["busybox", "sh", "-c", "sleep 1"]),
@@ -1964,6 +2014,22 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     let number = syscall_number(frame);
     let arguments = syscall_arguments(frame);
     advance_syscall_pc(frame);
+
+    // ── P9-H11: LA sleep syscall trace (enter) ──
+    #[cfg(target_arch = "loongarch64")]
+    if OSCOMP_LA_SLEEP_TRACE.load(Ordering::Relaxed) {
+        let budget = OSCOMP_LA_SLEEP_TRACE_BUDGET.load(Ordering::Relaxed);
+        if budget > 0 {
+            OSCOMP_LA_SLEEP_TRACE_BUDGET.store(budget - 1, Ordering::Relaxed);
+            LAST_TRACED_SYSCALL_NR.store(number, Ordering::Relaxed);
+            crate::println!(
+                "oscomp-la-sleep-syscall: enter nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                number, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
+            );
+        } else {
+            OSCOMP_LA_SLEEP_TRACE.store(false, Ordering::Relaxed);
+        }
+    }
 
     let _interrupt_guard = SyscallInterruptGuard::enable_until_trap_return();
 
@@ -5461,6 +5527,14 @@ fn advance_syscall_pc(frame: &mut crate::arch::trap::TrapFrame) {
 }
 
 fn set_syscall_result(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
+    // ── P9-H11: LA sleep syscall trace (exit) ──
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let nr = LAST_TRACED_SYSCALL_NR.swap(0, Ordering::Relaxed);
+        if nr != 0 {
+            crate::println!("oscomp-la-sleep-syscall: exit nr={} ret={}", nr, result);
+        }
+    }
     crate::syscall::abi::set_result(frame, result);
 }
 
