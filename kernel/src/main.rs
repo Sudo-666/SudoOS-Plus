@@ -529,10 +529,29 @@ fn mount_sdcard_if_present() {
         }
         break;
     }
-    // If no usable shell was found on LA, the sdcard test scripts cannot run.
-    // Print a clear diagnostic so cloud logs show the root cause immediately.
+    // If no usable shell was found, install the first busybox source anyway
+    // in degraded mode.  Without /bin/sh, all no-shebang scripts fail ENOENT
+    // immediately.  A known-bad static busybox may still run simple commands
+    // before crashing; that's better than 100% ENOENT.
     if fs::stat("/bin/busybox").is_err() {
-        crate::println!("sdcard: WARNING no usable shell found — shell-script tests will fail");
+        let fallback_src = busybox_sources[0];
+        let _ = fs::unlink("/bin/busybox", false);
+        oscomp_sdcard_install_ext4_path(fallback_src, "/bin/busybox");
+        if fs::stat("/bin/busybox").is_ok() {
+            crate::println!(
+                "sdcard: WARNING shell {} installed in degraded mode (known-bad static LA busybox)",
+                fallback_src,
+            );
+            let _ = fs::symlink("/bin/busybox", "/bin/sh");
+            let _ = fs::mkdir("/usr/bin", 0o755);
+            let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
+            // Install minimal applets.
+            for applet in &["sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep"] {
+                let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
+            }
+        } else {
+            crate::println!("sdcard: WARNING no usable shell found — shell-script tests will fail");
+        }
     }
 
     // P1-A: install ld-linux / ld-musl interpreters from their real ext4
