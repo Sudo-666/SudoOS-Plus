@@ -200,6 +200,16 @@ static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
     OSCOMP_LA_SLEEP_TRACE.load(Ordering::Relaxed)
 }
+
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_status_trace(source: &str, value: isize) {
+    if oscomp_la_sleep_trace_active() {
+        crate::println!(
+            "oscomp-la-status-trace: source={} value={}",
+            source, value,
+        );
+    }
+}
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1746,8 +1756,16 @@ fn run_program_image_with_cwd(
     if let Some(cwd) = cwd {
         exec.process.fs().set_cwd(cwd)?;
     }
+    let child_pid = exec.process.id();
     let task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
     let result = exec.thread.wait_for_exit();
+    #[cfg(target_arch = "loongarch64")]
+    if oscomp_la_sleep_trace_active() {
+        crate::println!(
+            "oscomp-la-status-trace: child-exit pid={} raw={}",
+            child_pid.get(), result,
+        );
+    }
     task.wait_for_detach();
     drop(exec.thread);
     let process = Arc::try_unwrap(exec.process)
@@ -2283,6 +2301,8 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
                 EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
                 TERMINATED.store(true, Ordering::Release);
             }
+            #[cfg(target_arch = "loongarch64")]
+            oscomp_la_status_trace("sys_exit", arguments[0] as isize);
             return_to_kernel(frame, arguments[0] as isize);
         }
         SYS_SOCKET => {
@@ -2468,6 +2488,8 @@ pub fn handle_fault(
             }
             // External programs: use SIGSEGV so wait4 produces signal status.
             let exit_code = if ACTIVE.load(Ordering::Acquire) { -EFAULT } else { -11 }; // SIGSEGV
+            #[cfg(target_arch = "loongarch64")]
+            oscomp_la_status_trace("fault-sigsegv", exit_code);
             return_to_kernel(frame, exit_code);
         }
         Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
@@ -2502,6 +2524,17 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         "M8-B3 user exception handler received a kernel exception",
     );
 
+    // ── P9-H13: trace LA user exception ──
+    #[cfg(target_arch = "loongarch64")]
+    if oscomp_la_sleep_trace_active() {
+        let era = frame.era;
+        let sp = frame.stack_pointer();
+        crate::println!(
+            "oscomp-la-exception-trace: code={} era={:#x} sp={:#x}",
+            _code, era, sp,
+        );
+    }
+
     if ACTIVE.load(Ordering::Acquire) {
         LAST_FAULT_ADDRESS.store(0, Ordering::Release);
         LAST_FAULT_KIND.store(FAULT_EXCEPTION, Ordering::Release);
@@ -2509,6 +2542,8 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         TERMINATED.store(true, Ordering::Release);
         EXIT_STATUS.store(-EFAULT, Ordering::Release);
     }
+    #[cfg(target_arch = "loongarch64")]
+    oscomp_la_status_trace("exception", -EFAULT);
     return_to_kernel(frame, -EFAULT);
 }
 
@@ -4039,6 +4074,8 @@ fn deliver_pending_signal(frame: &mut crate::arch::trap::TrapFrame) {
         SIG_DFL => {
             TERMINATED.store(true, Ordering::Release);
             EXIT_STATUS.store(-(signal as isize), Ordering::Release);
+            #[cfg(target_arch = "loongarch64")]
+            oscomp_la_status_trace("signal-default", -(signal as isize));
             return_to_kernel(frame, -(signal as isize));
         }
         SIG_IGN => {}
