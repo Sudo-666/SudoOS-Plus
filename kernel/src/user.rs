@@ -1151,20 +1151,40 @@ fn arch_contest_poweroff_rv() {
 
 #[cfg(target_arch = "loongarch64")]
 fn arch_contest_poweroff_la() {
-    // QEMU virt board power-management MMIO.
-    // PM_CTRL = PM_BASE (0x1008_0000) + 0x10, accessed via uncached DMW alias.
+    // QEMU virt board power-off: try legacy PM device first, then
+    // ACPI FADT sleep control.  Both are accessed via the uncached
+    // DMW alias so no page-table setup is needed.
     const LA_DMW_UNCACHED: usize = 0x8000_0000_0000_0000;
-    const QEMU_LA_PM_CTRL: usize = LA_DMW_UNCACHED + 0x1008_0010;
 
-    crate::println!("oscomp: loongarch qemu pm shutdown");
+    // Older QEMU placeholder PM device (removed in newer QEMU,
+    // but harmless to try first).
+    const QEMU_LA_LEGACY_PM_CTRL: usize = LA_DMW_UNCACHED + 0x1008_0010;
+
+    // Newer QEMU ACPI FADT sleep control register.
+    // QEMU tests use byte write 0x34 to physical 0x100e_001c.
+    const QEMU_LA_ACPI_SLEEP_CTL: usize = LA_DMW_UNCACHED + 0x100e_001c;
+
+    crate::println!("oscomp: loongarch qemu shutdown");
+
+    // 1. Legacy PM write (0xff → 0x1008_0010).
     crate::println!(
-        "oscomp: loongarch pm write addr={:#x} value=0xff",
-        QEMU_LA_PM_CTRL,
+        "oscomp: loongarch legacy pm write addr={:#x} value=0xff",
+        QEMU_LA_LEGACY_PM_CTRL,
     );
     unsafe {
-        core::ptr::write_volatile(QEMU_LA_PM_CTRL as *mut u8, 0xff);
+        core::ptr::write_volatile(QEMU_LA_LEGACY_PM_CTRL as *mut u8, 0xff);
     }
-    crate::println!("oscomp: loongarch pm write returned, halt");
+
+    // 2. ACPI sleep control write (0x34 → 0x100e_001c).
+    crate::println!(
+        "oscomp: loongarch acpi sleep write addr={:#x} value=0x34",
+        QEMU_LA_ACPI_SLEEP_CTL,
+    );
+    unsafe {
+        core::ptr::write_volatile(QEMU_LA_ACPI_SLEEP_CTL as *mut u8, 0x34);
+    }
+
+    crate::println!("oscomp: loongarch shutdown returned, idle fallback");
 }
 
 // ── P9-G7d: external contest watchdog ──
