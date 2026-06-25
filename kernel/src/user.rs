@@ -2622,13 +2622,15 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 
     let flags = arguments[0];
     let wants_thread = flags & CLONE_THREAD != 0;
     let wants_vm_share = flags & CLONE_VM != 0;
     let wants_tls = flags & CLONE_SETTLS != 0;
     let wants_child_cleartid = flags & CLONE_CHILD_CLEARTID != 0;
-    let _wants_child_settid = flags & CLONE_CHILD_SETTID != 0;
+    let wants_child_settid = flags & CLONE_CHILD_SETTID != 0;
+    let wants_parent_settid = flags & CLONE_PARENT_SETTID != 0;
 
     // Thread creation requires CLONE_VM (shared address space).
     if wants_thread && !wants_vm_share {
@@ -2676,6 +2678,18 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     // CLONE_CHILD_CLEARTID: write the child tid pointer for futex wake on exit.
     if wants_child_cleartid && arguments[5] != 0 {
         child_thread.set_clear_child_tid(arguments[5]);
+    }
+
+    // CLONE_PARENT_SETTID: write child TID to parent's user-space pointer.
+    if wants_parent_settid && arguments[2] != 0 {
+        let tid = child_thread.id().get() as u32;
+        let _ = copy_to_user(arguments[2], &tid.to_ne_bytes());
+    }
+
+    // CLONE_CHILD_SETTID: write child TID to child's user-space pointer.
+    if wants_child_settid && arguments[4] != 0 {
+        let tid = child_thread.id().get() as u32;
+        let _ = copy_to_user(arguments[4], &tid.to_ne_bytes());
     }
 
     // Prepare the child's trap frame (copy of parent's, with return value 0).
@@ -3595,7 +3609,7 @@ fn sys_futex(
     let op = futex_op & !FUTEX_PRIVATE_FLAG;
 
     match op {
-        FUTEX_WAIT => {
+        FUTEX_WAIT | 9 /* FUTEX_WAIT_BITSET */ => {
             let current_val = match copy_plain_from_user::<u32>(uaddr) {
                 Ok(v) => v as usize,
                 Err(e) => return e,
@@ -3616,7 +3630,7 @@ fn sys_futex(
             );
             0
         }
-        FUTEX_WAKE => {
+        FUTEX_WAKE | 10 /* FUTEX_WAKE_BITSET */ => {
             let queue = get_futex_queue(uaddr);
             let woken = if val >= 1 { queue.wake_all() } else { 0 };
             woken as isize
