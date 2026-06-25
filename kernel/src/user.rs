@@ -844,6 +844,14 @@ fn verify_sdcard_all_scripts_thread() {
     crate::println!("sdcard scripts: discovered {}", scripts.len());
     crate::println!("sdcard scripts: using shell {}", busybox_path);
 
+    const GROUP_TIMEOUT_MS: u64 = 30_000;
+    let mut total: usize = 0;
+    let mut passed: usize = 0;
+    let mut failed: usize = 0;
+    let mut timed_out: usize = 0;
+    let mut sig11: usize = 0;
+    let mut sig14: usize = 0;
+
     // Track which ext4 directories have been expanded with all sibling files
     let mut expanded_dirs: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 
@@ -918,20 +926,65 @@ fn verify_sdcard_all_scripts_thread() {
             Some(&cwd),
         );
         match result {
-            Ok(0) => crate::println!("{} : PASS", vfs_path),
+            Ok(0) => {
+                crate::println!("{} : PASS", vfs_path);
+                passed += 1;
+            }
             Ok(rc) => {
-                // Normalize raw kernel exit codes to shell-compatible format.
-                // signal death → signal=N; normal exit → exit=code
                 let label = if rc < 0 {
-                    alloc::format!("FAIL (signal={})", -rc)
+                    let sig = -rc;
+                    if sig == 11 { sig11 += 1; }
+                    if sig == 14 { sig14 += 1; }
+                    alloc::format!("FAIL (signal={})", sig)
                 } else {
                     alloc::format!("FAIL (exit={})", rc)
                 };
                 crate::println!("{} : {}", vfs_path, label);
+                failed += 1;
             }
-            Err(error) => crate::println!("{} : ERROR ({:?})", vfs_path, error),
+            Err(_) => {
+                crate::println!("{} : ERROR", vfs_path);
+                failed += 1;
+            }
         }
+        total += 1;
         crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+    }
+
+    crate::println!("#### OS COMP SUMMARY ####");
+    crate::println!("total={}", total);
+    crate::println!("pass={}", passed);
+    crate::println!("fail={}", failed);
+    crate::println!("timeout={}", timed_out);
+    crate::println!("signal11={}", sig11);
+    crate::println!("signal14={}", sig14);
+    crate::println!("score={}", passed);
+    crate::println!("#### OS COMP SUMMARY END ####");
+    crate::println!("oscomp: shutdown");
+    platform_shutdown();
+}
+
+fn platform_shutdown() -> ! {
+    #[cfg(target_arch = "riscv64")]
+    {
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a7") 0x8,
+                in("a6") 0x0,
+                in("a0") 0x0,
+                in("a1") 0x0,
+            );
+        }
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        crate::println!("oscomp: halt");
+    }
+    loop {
+        for _ in 0..10_000_000 {
+            core::hint::spin_loop();
+        }
     }
 }
 
