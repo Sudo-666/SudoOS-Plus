@@ -1786,39 +1786,46 @@ pub fn handle_fault(
                 let fault_pc = frame.era;
                 #[cfg(target_arch = "riscv64")]
                 let fault_pc = frame.sepc;
-                #[cfg(target_arch = "loongarch64")]
-                let tp_val = frame.gpr[2];
-                #[cfg(target_arch = "riscv64")]
-                let tp_val = frame.gpr[4];
-                let exec_path = crate::task::current_user_thread()
-                    .and_then(|t| {
-                        let p = t.process();
-                        Some(alloc::string::String::from(p.fs().cwd_path()))
-                    })
-                    .unwrap_or(alloc::string::String::from("?"));
-                crate::println!(
-                    "user fatal fault: exe={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} r3={:#018x} a0-a7=[{:#018x},{:#018x},{:#018x},{:#018x},{:#018x},{:#018x},{:#018x},{:#018x}] r12={:#018x} failure={:?}",
-                    exec_path,
-                    fault_pc,
-                    address.get(),
-                    access,
-                    frame.stack_pointer(),
-                    frame.return_address(),
-                    tp_val,
-                    frame.gpr[3],
-                    frame.gpr[4], frame.gpr[5], frame.gpr[6], frame.gpr[7],
-                    frame.gpr[8], frame.gpr[9], frame.gpr[10], frame.gpr[11],
-                    frame.gpr[12],
-                    failure,
-                );
+
+                // Rate-limit the verbose fault trace.  Known-bad LA busybox
+                // crashes at the same PC every time; print at most 4.
+                static FAULT_PRINT_COUNT: AtomicUsize = AtomicUsize::new(0);
+                let print_idx = FAULT_PRINT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if print_idx < 4 {
+                    #[cfg(target_arch = "loongarch64")]
+                    let tp_val = frame.gpr[2];
+                    #[cfg(target_arch = "riscv64")]
+                    let tp_val = frame.gpr[4];
+                    let exec_path = crate::task::current_user_thread()
+                        .and_then(|t| {
+                            let p = t.process();
+                            Some(alloc::string::String::from(p.fs().cwd_path()))
+                        })
+                        .unwrap_or(alloc::string::String::from("?"));
+                    crate::println!(
+                        "user fatal fault: exe={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} r12={:#018x} failure={:?}",
+                        exec_path,
+                        fault_pc,
+                        address.get(),
+                        access,
+                        frame.stack_pointer(),
+                        frame.return_address(),
+                        tp_val,
+                        frame.gpr[12],
+                        failure,
+                    );
+                } else if print_idx == 4 {
+                    crate::println!("user fatal fault: ... further faults suppressed");
+                }
             }
             if verifier {
                 LAST_FAULT_ADDRESS.store(address.get(), Ordering::Release);
                 LAST_FAULT_KIND.store(FAULT_PAGE, Ordering::Release);
                 TERMINATED.store(true, Ordering::Release);
-                EXIT_STATUS.store(-EFAULT, Ordering::Release);
+                // Use SIGSEGV (11) so wait4 reports signal death, not kernel errno.
+                EXIT_STATUS.store(-11, Ordering::Release);
             }
-            return_to_kernel(frame, -EFAULT);
+            return_to_kernel(frame, -11);
         }
         Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
     }
