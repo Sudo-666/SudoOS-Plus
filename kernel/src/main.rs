@@ -471,9 +471,12 @@ fn mount_sdcard_if_present() {
     // Try all ext4 busybox sources.  On LoongArch some static busybox
     // binaries have unresolved linker relaxation placeholders (andi rX,r0,imm)
     // that cause 0x0 crashes.  Prefer dynamic (PT_INTERP) busybox candidates.
+    // Additional paths try to find a good dynamic busybox on the sdcard.
     let busybox_sources: &[&str] = if cfg!(target_arch = "loongarch64") {
         &["/musl/busybox", "/glibc/busybox", "/busybox", "/busybox-static",
-          "/bin/busybox", "/usr/bin/busybox"]
+          "/bin/busybox", "/usr/bin/busybox",
+          "/glibc/bin/busybox", "/musl/bin/busybox",
+          "/glibc/lib/ld-linux-loongarch-lp64d.so.1"]
     } else {
         &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"]
     };
