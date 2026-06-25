@@ -774,16 +774,24 @@ pub fn lookup_process(pid: ProcessId) -> Option<Arc<Process>> {
         .and_then(alloc::sync::Weak::upgrade)
 }
 
-/// Call `f` once for every live process.  Processes whose weak reference
-/// has expired are skipped.
+/// Call `f` once for every live process.  Collects a snapshot of
+/// `Arc<Process>` references first, then invokes `f` without holding
+/// the process registry lock.  This is essential because `f` may
+/// perform arbitrary work (signal delivery, lock acquisition, etc.).
 pub fn for_each_process(mut f: impl FnMut(&Arc<Process>)) {
-    let registry = PROCESS_REGISTRY.lock();
-    if let Some(map) = registry.as_ref() {
-        for weak in map.values() {
-            if let Some(process) = weak.upgrade() {
-                f(&process);
-            }
+    let snapshot: alloc::vec::Vec<Arc<Process>> = {
+        let registry = PROCESS_REGISTRY.lock();
+        match registry.as_ref() {
+            Some(map) => map
+                .values()
+                .filter_map(alloc::sync::Weak::upgrade)
+                .collect(),
+            None => alloc::vec::Vec::new(),
         }
+    };
+
+    for process in snapshot.iter() {
+        f(process);
     }
 }
 

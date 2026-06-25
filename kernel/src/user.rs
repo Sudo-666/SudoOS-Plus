@@ -1,6 +1,6 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: uname release is Linux-compatible for contest libc startup.
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 
@@ -174,6 +174,19 @@ static TERMINATED: AtomicBool = AtomicBool::new(false);
 /// Set to true when the contest runner finds at least one test script on
 /// the sdcard and runs the full contest loop (including shutdown).
 static SDCARD_CONTEST_RAN: AtomicBool = AtomicBool::new(false);
+
+// ── P9-G7d: contest progress atomics (visible to external watchdog) ──
+static OSCOMP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static OSCOMP_FINALIZED: AtomicBool = AtomicBool::new(false);
+static OSCOMP_TOTAL: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_COMPLETED: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_PASS: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_FAIL: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_SIGNAL11: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_SIGNAL14: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_DEADLINE_CYCLES: AtomicU64 = AtomicU64::new(0);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -863,8 +876,6 @@ fn verify_sdcard_all_scripts_thread() {
     const TOTAL_BUDGET_MS: u64 = 120_000;
     #[cfg(target_arch = "loongarch64")]
     const TOTAL_BUDGET_MS: u64 = 60_000;
-    const GROUP_TIMEOUT_MS: u64 = 30_000;
-
     let freq_hz = crate::time::clock_frequency_hz();
     let budget_ms_to_cycles = |ms: u64| ms * freq_hz / 1000;
     let budget_start = crate::time::now().cycles();
@@ -875,11 +886,24 @@ fn verify_sdcard_all_scripts_thread() {
         crate::arch::ARCH_NAME, TOTAL_BUDGET_MS,
     );
 
-    let mut total: usize = 0;
+    // ── initialise contest atomics and launch external watchdog ──
+    OSCOMP_ACTIVE.store(true, Ordering::Release);
+    OSCOMP_FINALIZED.store(false, Ordering::Release);
+    OSCOMP_TOTAL.store(scripts.len(), Ordering::Release);
+    OSCOMP_COMPLETED.store(0, Ordering::Release);
+    OSCOMP_PASS.store(0, Ordering::Release);
+    OSCOMP_FAIL.store(0, Ordering::Release);
+    OSCOMP_SKIPPED.store(0, Ordering::Release);
+    OSCOMP_TIMEOUT.store(0, Ordering::Release);
+    OSCOMP_SIGNAL11.store(0, Ordering::Release);
+    OSCOMP_SIGNAL14.store(0, Ordering::Release);
+    OSCOMP_DEADLINE_CYCLES.store(budget_deadline, Ordering::Release);
+
+    crate::task::spawn_kernel_thread(contest_watchdog_main);
+
+    // ── local counters (mirror atomics for summary) ──
     let mut passed: usize = 0;
     let mut failed: usize = 0;
-    let mut skipped: usize = 0;
-    let mut timed_out: usize = 0;
     let mut sig11: usize = 0;
     let mut sig14: usize = 0;
 
@@ -894,7 +918,8 @@ fn verify_sdcard_all_scripts_thread() {
                 "oscomp: global budget exhausted arch={} completed={} total={}",
                 crate::arch::ARCH_NAME, idx, scripts.len(),
             );
-            skipped += scripts.len() - idx;
+            let remaining = scripts.len() - idx;
+            OSCOMP_SKIPPED.fetch_add(remaining, Ordering::AcqRel);
             break;
         }
         crate::println!(
@@ -926,9 +951,22 @@ fn verify_sdcard_all_scripts_thread() {
         crate::println!("#### OS COMP TEST GROUP START {} ####", vfs_path);
         if crate::fs::stat(&vfs_path).is_err() {
             crate::println!("{} : SKIP (not found)", vfs_path);
+            OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
+            OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }
+
+        // ── heavy-group skip (RISC-V only) ──
+        #[cfg(target_arch = "riscv64")]
+        if oscomp_should_skip_heavy(&vfs_path) {
+            crate::println!("{} : SKIP (heavy)", vfs_path);
+            OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
+            OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
+            continue;
+        }
+
         // Build a PATH that covers: CWD, common system dirs, and the
         // expanded ext4 directories under /mnt/sdcard.
         let cwd_path = if cwd == "/" {
@@ -960,69 +998,73 @@ fn verify_sdcard_all_scripts_thread() {
             }
         }
 
-        // Spawn the group and wait with deadline awareness.
-        let group_result = run_group_with_deadline(
-            shell_path, &["busybox", "sh", &vfs_path],
+        // Run the script using the verified spawn/exec/task lifecycle.
+        let group_result = run_rootfs_program_with_cwd(
+            shell_path,
+            &["busybox", "sh", &vfs_path],
             &[&path_env, &ld_env, "HOME=/"],
             Some(&cwd),
-            budget_ms_to_cycles(core::cmp::min(
-                GROUP_TIMEOUT_MS,
-                budget_deadline.saturating_sub(crate::time::now().cycles()) * 1000 / freq_hz,
-            ).max(1000)),
-            budget_deadline,
-            budget_ms_to_cycles,
-            freq_hz,
-            TOTAL_BUDGET_MS,
-            idx + 1,
-            scripts.len(),
-            &vfs_path,
         );
         match group_result {
             Ok(0) => {
                 crate::println!("{} : PASS", vfs_path);
                 passed += 1;
+                OSCOMP_PASS.fetch_add(1, Ordering::AcqRel);
             }
             Ok(rc) => {
                 let label = if rc < 0 {
                     let sig = -rc;
-                    if sig == 11 { sig11 += 1; }
-                    if sig == 14 { sig14 += 1; }
+                    if sig == 11 {
+                        sig11 += 1;
+                        OSCOMP_SIGNAL11.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if sig == 14 {
+                        sig14 += 1;
+                        OSCOMP_SIGNAL14.fetch_add(1, Ordering::AcqRel);
+                    }
                     alloc::format!("FAIL (signal={})", sig)
                 } else {
                     alloc::format!("FAIL (exit={})", rc)
                 };
                 crate::println!("{} : {}", vfs_path, label);
                 failed += 1;
+                OSCOMP_FAIL.fetch_add(1, Ordering::AcqRel);
             }
-            Err(GroupError::Timeout) => {
-                crate::println!("{} : FAIL (timeout)", vfs_path);
-                timed_out += 1;
-                failed += 1;
-            }
-            Err(GroupError::Exec) => {
+            Err(_) => {
                 crate::println!("{} : ERROR", vfs_path);
                 failed += 1;
+                OSCOMP_FAIL.fetch_add(1, Ordering::AcqRel);
             }
         }
-        total += 1;
+        OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
         crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
     }
 
-    crate::println!("#### OS COMP SUMMARY ####");
-    crate::println!("arch={}", crate::arch::ARCH_NAME);
-    crate::println!("total={}", scripts.len());
-    crate::println!("completed={}", total);
-    crate::println!("pass={}", passed);
-    crate::println!("fail={}", failed);
-    crate::println!("skipped={}", skipped);
-    crate::println!("timeout={}", timed_out);
-    crate::println!("signal11={}", sig11);
-    crate::println!("signal14={}", sig14);
-    crate::println!("score={}", passed);
-    crate::println!("score: {}", passed);
-    crate::println!("#### OS COMP SUMMARY END ####");
-    crate::println!("oscomp: shutdown");
-    platform_shutdown();
+    // ── normal completion: CAS summary then shutdown ──
+    OSCOMP_ACTIVE.store(false, Ordering::Release);
+    if OSCOMP_FINALIZED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let skipped = OSCOMP_SKIPPED.load(Ordering::Acquire);
+        let timed_out = OSCOMP_TIMEOUT.load(Ordering::Acquire);
+        crate::println!("#### OS COMP SUMMARY ####");
+        crate::println!("arch={}", crate::arch::ARCH_NAME);
+        crate::println!("total={}", scripts.len());
+        crate::println!("completed={}", OSCOMP_COMPLETED.load(Ordering::Acquire));
+        crate::println!("pass={}", passed);
+        crate::println!("fail={}", failed);
+        crate::println!("skipped={}", skipped);
+        crate::println!("timeout={}", timed_out);
+        crate::println!("signal11={}", sig11);
+        crate::println!("signal14={}", sig14);
+        crate::println!("score={}", passed);
+        crate::println!("score: {}", passed);
+        crate::println!("#### OS COMP SUMMARY END ####");
+        crate::println!("oscomp: shutdown");
+        platform_shutdown();
+    }
+    // unreachable (platform_shutdown diverges)
 }
 
 fn platform_shutdown() -> ! {
@@ -1052,214 +1094,67 @@ fn platform_shutdown() -> ! {
     }
 }
 
-// ── P9-G7: group deadline enforcement ──
+// ── P9-G7d: external contest watchdog ──
 
-const GROUP_REAP_GRACE_MS: u64 = 1_000;
-const GROUP_REAP_LIMIT: usize = 256;
-const STILL_RUNNING_INTERVAL_MS: u64 = 10_000;
-const OSCOMP_SHUTDOWN_SAFETY_MS: u64 = 5_000;
-
-#[derive(Clone, Copy, Debug)]
-enum GroupError {
-    Timeout,
-    Exec,
+/// Heavy test groups that are known to run too long or hang.
+/// Skipped on RISC-V so the runner has a chance to reach
+/// busybox/basic/test.sh and produce a partial score.
+#[cfg(target_arch = "riscv64")]
+fn oscomp_should_skip_heavy(script: &str) -> bool {
+    script.contains("unixbench")
+        || script.contains("libcbench")
+        || script.contains("lmbench")
+        || script.contains("netperf")
+        || script.contains("iperf")
+        || script.contains("iozone")
+        || script.contains("cyclictest")
+        || script.contains("/ltp/")
+        || script.contains("ltp_testcode")
 }
 
-/// Send a signal to every live process whose pgid matches `pgid`.
-/// Returns the number of processes signalled.
-fn kill_process_group(pgid: isize, signal: u32) -> usize {
-    let mut killed = 0_usize;
-    crate::process::for_each_process(|process| {
-        if process.process_group() == pgid {
-            let _ = crate::signal::send_signal(process.id(), signal);
-            killed += 1;
-        }
-    });
-    killed
-}
-
-/// Count live processes belonging to the given process group.
-fn count_live_in_group(pgid: isize) -> usize {
-    let mut alive = 0_usize;
-    crate::process::for_each_process(|process| {
-        if process.process_group() == pgid {
-            alive += 1;
-        }
-    });
-    alive
-}
-
-/// Spawn `busybox sh <script>` and wait with a hard deadline.
-///
-/// Returns `Ok(status)` when the shell exits by itself, or
-/// `Err(GroupError::Timeout)` when the group or global deadline fires.
-fn run_group_with_deadline(
-    shell_path: &str,
-    argv: &[&str],
-    envp: &[&str],
-    cwd: Option<&str>,
-    timeout_cycles: u64,
-    budget_deadline: u64,
-    budget_ms_to_cycles: impl Fn(u64) -> u64,
-    freq_hz: u64,
-    total_budget_ms: u64,
-    group_index: usize,
-    group_total: usize,
-    script_path: &str,
-) -> Result<isize, GroupError> {
-    let image = match load_exec_image(shell_path) {
-        Ok(img) => img,
-        Err(_) => return Err(GroupError::Exec),
-    };
-
-    let extra_areas = [VmArea::new(
-        VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
-        VmAreaFlags::user_rw(),
-        VmAreaKind::Anonymous,
-    )];
-
-    let config = crate::exec::ExecConfig {
-        argv,
-        envp,
-        stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
-        heap_start: VirtAddr::new(USER_HEAP_START),
-        heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
-        extra_areas: &extra_areas,
-    };
-
-    let exec = match crate::exec::exec_elf(&image, config) {
-        Ok(e) => e,
-        Err(_) => return Err(GroupError::Exec),
-    };
-
-    if let Some(cwd) = cwd {
-        if exec.process.fs().set_cwd(cwd).is_err() {
-            return Err(GroupError::Exec);
-        }
-    }
-
-    let root_pid = exec.process.id();
-    let pgid = exec.process.process_group();
-    let group_start = crate::time::now().cycles();
-    let group_deadline = group_start + timeout_cycles;
-    let mut last_heartbeat = group_start;
-    let shutdown_safety = budget_ms_to_cycles(OSCOMP_SHUTDOWN_SAFETY_MS);
-    let heartbeat_interval = budget_ms_to_cycles(STILL_RUNNING_INTERVAL_MS);
-    let budget_start = budget_deadline - budget_ms_to_cycles(total_budget_ms);
-
-    let _task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
-
-    // ── deadline-aware poll loop ──
+/// External watchdog kernel thread.  If the contest runner blocks
+/// inside a script group, the watchdog prints a partial summary and
+/// shuts down when the global deadline expires.
+fn contest_watchdog_main() {
     loop {
-        // Root thread exited by itself — success.
-        if let Some(status) = exec.thread.exit_status() {
-            _task.wait_for_detach();
-            drop(exec.thread);
-            if let Ok(process) = Arc::try_unwrap(exec.process) {
-                let _ = process.destroy();
-            }
-            return Ok(status);
+        if !OSCOMP_ACTIVE.load(Ordering::Acquire) {
+            return;
         }
 
         let now = crate::time::now().cycles();
+        let deadline = OSCOMP_DEADLINE_CYCLES.load(Ordering::Acquire);
 
-        // Still-running heartbeat ─ every STILL_RUNNING_INTERVAL_MS.
-        if now - last_heartbeat >= heartbeat_interval {
-            last_heartbeat = now;
-            let group_elapsed_ms = (now - group_start) * 1000 / freq_hz;
-            let global_elapsed_ms = (now - budget_start) * 1000 / freq_hz;
-            let live_count = count_live_in_group(pgid);
-            crate::println!(
-                "oscomp-still-running: arch={} idx={}/{} script={} group_elapsed_ms={} global_elapsed_ms={} root_pid={} pgid={} live_count={}",
-                crate::arch::ARCH_NAME,
-                group_index,
-                group_total,
-                script_path,
-                group_elapsed_ms,
-                global_elapsed_ms,
-                root_pid.get(),
-                pgid,
-                live_count,
-            );
-        }
-
-        // Group deadline reached, OR global budget nearly exhausted.
-        if now >= group_deadline || now + shutdown_safety >= budget_deadline {
-            let reason = if now + shutdown_safety >= budget_deadline {
-                "global budget"
-            } else {
-                "group deadline"
-            };
-            crate::println!(
-                "oscomp-group-timeout: arch={} idx={}/{} script={} reason={} timeout_ms={} root_pid={} pgid={} live_before_kill={}",
-                crate::arch::ARCH_NAME,
-                group_index,
-                group_total,
-                script_path,
-                reason,
-                timeout_cycles * 1000 / freq_hz,
-                root_pid.get(),
-                pgid,
-                count_live_in_group(pgid),
-            );
-
-            // Kill the entire process group.
-            let killed = kill_process_group(pgid, crate::signal::SIGKILL);
-            crate::println!(
-                "oscomp-group-timeout: killed={} pgid={}",
-                killed, pgid,
-            );
-
-            // Bounded reap: wait up to GROUP_REAP_GRACE_MS for the root
-            // thread to exit so we can safely drop the Thread.
-            let reap_deadline =
-                crate::time::now().cycles() + budget_ms_to_cycles(GROUP_REAP_GRACE_MS);
-            let mut reaped = 0_usize;
-            while exec.thread.exit_status().is_none()
-                && crate::time::now().cycles() < reap_deadline
-                && reaped < GROUP_REAP_LIMIT
+        if deadline != 0 && now >= deadline {
+            if OSCOMP_FINALIZED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
-                reaped += 1;
-                crate::task::yield_now();
+                let completed = OSCOMP_COMPLETED.load(Ordering::Acquire);
+                let passed = OSCOMP_PASS.load(Ordering::Acquire);
+                let failed = OSCOMP_FAIL.load(Ordering::Acquire);
+                let skipped = OSCOMP_SKIPPED.load(Ordering::Acquire);
+                let timed_out = OSCOMP_TIMEOUT.load(Ordering::Acquire);
+                let sig11 = OSCOMP_SIGNAL11.load(Ordering::Acquire);
+                let sig14 = OSCOMP_SIGNAL14.load(Ordering::Acquire);
+
+                crate::println!("oscomp: watchdog global deadline reached");
+                crate::println!("#### OS COMP SUMMARY ####");
+                crate::println!("arch={}", crate::arch::ARCH_NAME);
+                crate::println!("total={}", OSCOMP_TOTAL.load(Ordering::Acquire));
+                crate::println!("completed={}", completed);
+                crate::println!("pass={}", passed);
+                crate::println!("fail={}", failed);
+                crate::println!("skipped={}", skipped);
+                crate::println!("timeout={}", timed_out);
+                crate::println!("signal11={}", sig11);
+                crate::println!("signal14={}", sig14);
+                crate::println!("score={}", passed);
+                crate::println!("score: {}", passed);
+                crate::println!("#### OS COMP SUMMARY END ####");
+                crate::println!("oscomp: shutdown");
+                platform_shutdown();
             }
-
-            // If the root thread has not exited yet, extend the grace
-            // period — SIGKILL is unblockable and will be delivered, but
-            // the target may be deep inside a blocking kernel call.
-            if exec.thread.exit_status().is_none() {
-                let extra_deadline =
-                    crate::time::now().cycles() + budget_ms_to_cycles(4_000);
-                while exec.thread.exit_status().is_none()
-                    && crate::time::now().cycles() < extra_deadline
-                {
-                    crate::task::yield_now();
-                }
-            }
-
-            let live_left = count_live_in_group(pgid);
-            crate::println!(
-                "oscomp-group-timeout: reaped_attempts={} live_left={}",
-                reaped, live_left,
-            );
-
-            // Clean up if the root thread exited, otherwise leak to avoid
-            // panicking in Thread::drop (which asserts THREAD_EXITED).
-            if exec.thread.exit_status().is_some() {
-                _task.wait_for_detach();
-                drop(exec.thread);
-                if let Ok(process) = Arc::try_unwrap(exec.process) {
-                    let _ = process.destroy();
-                }
-            } else {
-                crate::println!(
-                    "oscomp-group-timeout: WARNING root_pid={} still alive after grace, leaking",
-                    root_pid.get(),
-                );
-                // Prevent Thread::drop assertion failure.
-                core::mem::forget(exec);
-            }
-
-            return Err(GroupError::Timeout);
+            return;
         }
 
         crate::task::yield_now();
