@@ -2503,15 +2503,22 @@ fn sys_newfstatat(dirfd: usize, path_address: usize, stat_address: usize, flags:
         Ok(path) => path,
         Err(errno) => return errno,
     };
-    let stat = match if flags & AT_SYMLINK_NOFOLLOW != 0 {
+    let mut stat_result = if flags & AT_SYMLINK_NOFOLLOW != 0 {
         crate::fs::lstat(&path)
     } else {
         crate::fs::stat(&path)
-    } {
-        Ok(stat) => stat,
-        Err(errno) => return errno.to_isize(),
     };
-    copy_stat_to_user(stat_address, &stat)
+    if stat_result.is_err() && crate::ensure_sdcard_dir_materialized(&path) {
+        stat_result = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            crate::fs::lstat(&path)
+        } else {
+            crate::fs::stat(&path)
+        };
+    }
+    match stat_result {
+        Ok(stat) => copy_stat_to_user(stat_address, &stat),
+        Err(errno) => errno.to_isize(),
+    }
 }
 
 fn sys_statx(
@@ -2548,11 +2555,19 @@ fn sys_statx(
             Ok(path) => path,
             Err(errno) => return errno,
         };
-        match if flags & AT_SYMLINK_NOFOLLOW != 0 {
+        let mut stat = if flags & AT_SYMLINK_NOFOLLOW != 0 {
             crate::fs::lstat(&path)
         } else {
             crate::fs::stat(&path)
-        } {
+        };
+        if stat.is_err() && crate::ensure_sdcard_dir_materialized(&path) {
+            stat = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+                crate::fs::lstat(&path)
+            } else {
+                crate::fs::stat(&path)
+            };
+        }
+        match stat {
             Ok(stat) => stat,
             Err(errno) => return errno.to_isize(),
         }
@@ -4108,7 +4123,11 @@ fn sys_faccessat(dirfd: usize, path_address: usize, mode: usize) -> isize {
         Ok(path) => path,
         Err(errno) => return errno,
     };
-    match crate::fs::stat(&path) {
+    let mut result = crate::fs::stat(&path);
+    if result.is_err() && crate::ensure_sdcard_dir_materialized(&path) {
+        result = crate::fs::stat(&path);
+    }
+    match result {
         Ok(_) => 0,
         Err(errno) => errno.to_isize(),
     }
