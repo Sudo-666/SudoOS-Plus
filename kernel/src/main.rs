@@ -511,7 +511,7 @@ fn mount_sdcard_if_present() {
             continue;
         }
         crate::println!(
-            "sdcard: busybox from {} ok ({})",
+            "sdcard: shell {} selected ({})",
             busybox_ext4,
             if cfg!(target_arch = "loongarch64") { "LA" } else { "RV" },
         );
@@ -528,6 +528,11 @@ fn mount_sdcard_if_present() {
             let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
         }
         break;
+    }
+    // If no usable shell was found on LA, the sdcard test scripts cannot run.
+    // Print a clear diagnostic so cloud logs show the root cause immediately.
+    if fs::stat("/bin/busybox").is_err() {
+        crate::println!("sdcard: WARNING no usable shell found — shell-script tests will fail");
     }
 
     // P1-A: install ld-linux / ld-musl interpreters from their real ext4
