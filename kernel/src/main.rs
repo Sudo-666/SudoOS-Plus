@@ -503,6 +503,9 @@ fn mount_sdcard_if_present() {
         crate::println!("sdcard: vendor LA busybox absent");
     }
 
+    // If vendor busybox is already installed, skip sdcard sources entirely.
+    let vendor_installed = fs::stat("/bin/busybox").is_ok() && fs::stat("/bin/sh").is_ok();
+    if !vendor_installed {
     // Try all ext4 busybox sources.  On LoongArch some static busybox
     // binaries have unresolved linker relaxation placeholders (andi rX,r0,imm)
     // that cause 0x0 crashes.  Prefer dynamic (PT_INTERP) busybox candidates.
@@ -585,6 +588,7 @@ fn mount_sdcard_if_present() {
             crate::println!("sdcard: WARNING no shell found — shell-script tests will fail");
         }
     }
+    } // if !vendor_installed
 
     // P1-A: install ld-linux / ld-musl interpreters from their real ext4
     // source paths (/glibc/lib/... or /musl/lib/...) into the canonical
