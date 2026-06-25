@@ -1887,8 +1887,27 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
     }
 
     // Anonymous mapping (MAP_PRIVATE | MAP_ANONYMOUS or similar).
-    if file != usize::MAX || offset != 0 {
+    if offset != 0 {
         return -EINVAL;
+    }
+
+    // MAP_FIXED: unmap the target range first, then let the allocator
+    // place the mapping.  (For true MAP_FIXED we should map at the exact
+    // address; this is a best-effort approximation.)
+    if is_fixed && address != 0 {
+        let fixed_start = VirtAddr::new(address);
+        if let Some(fixed_range) = fixed_start
+            .checked_add(rounded)
+            .and_then(|end| VirtRange::new(fixed_start, end))
+        {
+            let _ = current_user_mm().unmap_range(fixed_range);
+        }
+        if mmap_file_ok_trace() {
+            crate::println!(
+                "mmap-anon: FIXED addr={:#x} len={:#x} prot={:?}",
+                address, rounded, vm_flags,
+            );
+        }
     }
 
     match current_user_mm().map_anonymous(
@@ -1900,9 +1919,26 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
             if ACTIVE.load(Ordering::Acquire) {
                 MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
             }
+            // Trace anonymous mmap for addresses near lib mappings.
+            if (start.get() >= 0x1000000 && start.get() < 0x2000000)
+                || mmap_file_ok_trace()
+            {
+                crate::println!(
+                    "mmap-anon: ok addr_req={:#x} -> {:#x} len={:#x} prot={:?}",
+                    address, start.get(), rounded, vm_flags,
+                );
+            }
             start.get() as isize
         }
-        Err(_) => -ENOMEM,
+        Err(_) => {
+            if is_fixed {
+                crate::println!(
+                    "mmap-anon: FAIL FIXED addr={:#x} len={:#x} prot={:?}",
+                    address, rounded, vm_flags,
+                );
+            }
+            -ENOMEM
+        }
     }
 }
 
