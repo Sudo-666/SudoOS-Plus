@@ -866,8 +866,8 @@ fn verify_sdcard_all_scripts_thread() {
             (p, true)
         }
         None => {
-            crate::println!("sdcard scripts: no working LA shell — skipping");
-            return;
+            crate::println!("sdcard scripts: no working LA shell — all scripts will be skipped");
+            ("/bin/sh", false)
         }
     };
 
