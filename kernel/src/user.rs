@@ -195,6 +195,11 @@ static OSCOMP_LA_SLEEP_TRACE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_SLEEP_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
 static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_arch = "loongarch64")]
+pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
+    OSCOMP_LA_SLEEP_TRACE.load(Ordering::Relaxed)
+}
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -4017,6 +4022,18 @@ fn deliver_pending_signal(frame: &mut crate::arch::trap::TrapFrame) {
     let Some(signal) = process.signals().take_unblocked(thread.blocked_signals()) else {
         return;
     };
+
+    // ── P9-H12: trace SIGALRM delivery ──
+    #[cfg(target_arch = "loongarch64")]
+    if signal == 14 && oscomp_la_sleep_trace_active() {
+        let action = process.signals().action(signal).unwrap_or_default();
+        crate::println!(
+            "oscomp-la-signal-trace: deliver sig=14 handler={:#x} blocked={:#x}",
+            action.handler,
+            thread.blocked_signals(),
+        );
+    }
+
     let action = process.signals().action(signal).unwrap_or_default();
     match action.handler {
         SIG_DFL => {

@@ -35,6 +35,14 @@ impl KernelSigAction {
 
 pub fn send_signal(pid: ProcessId, signal: u32) -> Result<(), myos_vfs::Errno> {
     validate_signal(signal)?;
+    // ── P9-H12: trace SIGALRM enqueue ──
+    #[cfg(target_arch = "loongarch64")]
+    if signal == 14 && crate::user::oscomp_la_sleep_trace_active() {
+        crate::println!(
+            "oscomp-la-signal-trace: enqueue from send_signal pid={} sig=14",
+            pid.get(),
+        );
+    }
     let process = crate::process::lookup_process(pid).ok_or(myos_vfs::Errno::Esrch)?;
     process.signals().add_pending(signal)
 }
