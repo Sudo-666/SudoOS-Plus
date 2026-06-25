@@ -215,6 +215,10 @@ pub fn lstat(path: &str) -> Result<Stat, Errno> {
 }
 
 pub fn mkdir(path: &str, mode: u32) -> Result<(), Errno> {
+    // mkdir "/" or "/." etc. → already exists
+    if path == "/" || path == "/." || path == "//" {
+        return Err(Errno::Eexist);
+    }
     let _tree = TREE.lock();
     let (parent_path, name) = split_parent(path)?;
     let parent = lookup(parent_path)?;
