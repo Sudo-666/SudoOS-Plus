@@ -263,7 +263,9 @@ fn parse_impl(image: &[u8], bias_override: Option<usize>) -> Result<ElfImage, El
                 if interpreter.is_some() || memory_size < file_size {
                     return Err(ElfError::InvalidProgramHeader);
                 }
-                interpreter = Some(read_interpreter(image, file_offset, file_size)?);
+                let path = read_interpreter(image, file_offset, file_size)?;
+                crate::println!("elf-parse: PT_INTERP={} kind={:?}", path, kind);
+                interpreter = Some(path);
             }
             PT_PHDR => {
                 if program_headers.is_some() || memory_size < phdr_length {

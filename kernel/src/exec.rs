@@ -617,6 +617,15 @@ fn build_initial_stack(
         (AT_EXECFN, execfn_ptr),
     ];
 
+    crate::println!(
+        "la-auxv: exe={} kind={:?} interp={:?} phdr={:#x} phent={} phnum={} base={:#x} entry={:#x} sp={:#x}",
+        argv[0],
+        elf.kind,
+        elf.interpreter,
+        phdr, phent, phnum, at_base, at_entry,
+        cursor.checked_sub(0).unwrap_or(0),
+    );
+
     let mut words = Vec::new();
     words
         .try_reserve(1 + argv_ptrs.len() + 1 + envp_ptrs.len() + 1 + auxv.len() * 2 + 2)
