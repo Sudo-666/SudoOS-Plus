@@ -2482,8 +2482,9 @@ fn sys_fstat(fd: usize, stat_address: usize) -> isize {
 }
 
 fn sys_newfstatat(dirfd: usize, path_address: usize, stat_address: usize, flags: usize) -> isize {
-    // Accept AT_SYMLINK_NOFOLLOW and AT_EMPTY_PATH; reject unknown flags.
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+    // Accept common Linux flags; ignore harmless ones like AT_NO_AUTOMOUNT.
+    const AT_OK: usize = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | 0x800 | 0x1000;
+    if flags & !AT_OK != 0 {
         return -EINVAL;
     }
     // AT_EMPTY_PATH: stat the fd itself (equivalent to fstat).
@@ -2520,7 +2521,9 @@ fn sys_statx(
     _mask: usize,
     statx_address: usize,
 ) -> isize {
-    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+    // Accept AT_STATX_SYNC_TYPE (0x6000) and other common flags.
+    const AT_STATX_OK: usize = AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | 0x6000 | 0x800;
+    if flags & !AT_STATX_OK != 0 {
         return -EINVAL;
     }
 
