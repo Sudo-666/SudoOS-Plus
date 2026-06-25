@@ -1796,35 +1796,24 @@ pub fn handle_fault(
                 #[cfg(target_arch = "riscv64")]
                 let fault_pc = frame.sepc;
 
-                // Rate-limit the verbose fault trace.  Known-bad LA busybox
-                // crashes at the same PC every time; print at most 4.
+                // Classify the fault for summary.
+                #[cfg(target_arch = "loongarch64")]
+                let bpc = frame.era;
+                #[cfg(target_arch = "riscv64")]
+                let bpc = frame.sepc;
+                let baddr = address.get();
+                let bsp = frame.stack_pointer();
+                let class = classify_segv(bpc, baddr, bsp, frame);
+                // Rate-limited trace (at most 4 per class).
                 static FAULT_PRINT_COUNT: AtomicUsize = AtomicUsize::new(0);
                 let print_idx = FAULT_PRINT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if print_idx < 4 {
-                    #[cfg(target_arch = "loongarch64")]
-                    let tp_val = frame.gpr[2];
-                    #[cfg(target_arch = "riscv64")]
-                    let tp_val = frame.gpr[4];
-                    let exec_path = crate::task::current_user_thread()
-                        .and_then(|t| {
-                            let p = t.process();
-                            Some(alloc::string::String::from(p.fs().cwd_path()))
-                        })
-                        .unwrap_or(alloc::string::String::from("?"));
+                if print_idx < 8 {
                     crate::println!(
-                        "user fatal fault: exe={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x} ra={:#018x} tp={:#018x} r12={:#018x} failure={:?}",
-                        exec_path,
-                        fault_pc,
-                        address.get(),
-                        access,
-                        frame.stack_pointer(),
-                        frame.return_address(),
-                        tp_val,
-                        frame.gpr[12],
-                        failure,
+                        "sigsegv: class={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x}",
+                        class, bpc, baddr, access, bsp,
                     );
-                } else if print_idx == 4 {
-                    crate::println!("user fatal fault: ... further faults suppressed");
+                } else if print_idx == 8 {
+                    crate::println!("sigsegv: ... further faults suppressed");
                 }
             }
             if verifier {
@@ -1840,6 +1829,28 @@ pub fn handle_fault(
         }
         Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
     }
+}
+
+fn classify_segv(pc: usize, badaddr: usize, sp: usize, _frame: &crate::arch::trap::TrapFrame) -> &'static str {
+    // Known-bad LA static busybox: andi rX,r0,imm placeholder.
+    if pc == 0x12018ae50 || pc == 0x12018bd2c || pc == 0x12018b840
+        || pc == 0x12018b4c8 || pc == 0x1201acc9c
+    {
+        return "known-bad-busybox";
+    }
+    // Near-stack access: within 64KB of stack pointer.
+    if badaddr >= sp.saturating_sub(0x10000) && badaddr <= sp.saturating_add(0x10000) {
+        return "near-stack";
+    }
+    // Null/near-null dereference.
+    if badaddr < 0x1000 {
+        return "null-deref";
+    }
+    // Low address access.
+    if badaddr < 0x100000 {
+        return "low-addr";
+    }
+    "other"
 }
 
 pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) {
