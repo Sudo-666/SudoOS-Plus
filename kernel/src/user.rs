@@ -3011,6 +3011,30 @@ fn load_exec_image(path: &str) -> Result<Vec<u8>, isize> {
             return Ok(image);
         }
         Err(myos_vfs::Errno::Enoent) if path == "/init" || path == EXEC_PROBE_PATH => {}
+        Err(myos_vfs::Errno::Enoent) => {
+            // Try lazy materialize from sdcard, then retry.
+            if crate::ensure_sdcard_dir_materialized(path) {
+                match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
+                    Ok(file) => {
+                        let stat = file.fstat().map_err(|e| e.to_isize())?;
+                        let size = usize::try_from(stat.size)
+                            .map_err(|_| myos_vfs::Errno::Eoverflow.to_isize())?;
+                        if size > MAX_EXEC_IMAGE {
+                            return Err(myos_vfs::Errno::Eoverflow.to_isize());
+                        }
+                        let mut image = Vec::new();
+                        image.try_reserve(size).map_err(|_| -ENOMEM)?;
+                        image.resize(size, 0);
+                        let mut output = myos_vfs::MutableIoBuffer::new(&mut image);
+                        let read = file.read(&mut output).map_err(|e| e.to_isize())?;
+                        image.truncate(read);
+                        return Ok(image);
+                    }
+                    Err(e) => return Err(e.to_isize()),
+                }
+            }
+            return Err(myos_vfs::Errno::Enoent.to_isize());
+        }
         Err(error) => return Err(error.to_isize()),
     }
 

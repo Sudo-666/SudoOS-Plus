@@ -701,6 +701,31 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
     newly_installed + already_available
 }
 
+/// Lazy on-demand materialize: when execve/open/stat encounters ENOENT
+/// on a path under /mnt/sdcard, try installing the parent directory's
+/// children from ext4 before giving up.
+pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
+    // Only handle paths under the sdcard mount point.
+    let rel = match vfs_path.strip_prefix("/mnt/sdcard/") {
+        Some(r) if !r.is_empty() => r,
+        _ => return false,
+    };
+    // Get the parent directory in ext4 space.
+    let ext4_parent = match rel.rfind('/') {
+        Some(pos) => &rel[..pos],
+        None => rel,
+    };
+    let vfs_parent = alloc::format!("/mnt/sdcard/{}", ext4_parent);
+
+    // Try materializing if the parent directory exists in VFS.
+    if crate::fs::stat(&vfs_parent).is_err() {
+        return false;
+    }
+    let ext4_dir = alloc::format!("/{}", ext4_parent);
+    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_parent, 256);
+    count > 0
+}
+
 /// P1-A: install ELF dynamic linker (ld-linux / ld-musl) from their real
 /// ext4 source paths into the canonical /lib and /lib64 VFS paths that
 /// PT_INTERP encodes.
