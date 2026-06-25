@@ -360,29 +360,36 @@ fn kernel_main(boot: BootInfo) -> ! {
         user::verify_busybox_rootfs();
     }
     user::verify_sdcard_sample();
-    user::verify_sdcard_all_scripts();
+    let contest_ran = user::verify_sdcard_all_scripts();
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");
 
-    // Competition: shut down so QEMU exits and the evaluator can score.
-    #[cfg(target_arch = "riscv64")]
-    {
-        let ret: usize;
-        unsafe {
-            core::arch::asm!(
-                "ecall",
-                inlateout("a0") 0usize => ret,
-                in("a1") 0usize,
-                in("a6") 0usize,
-                in("a7") 0x53525354usize,
-            );
+    if contest_ran {
+        // Competition: contest ran to completion with score/summary already
+        // printed.  Shut down so QEMU exits and the evaluator can score.
+        #[cfg(target_arch = "riscv64")]
+        {
+            let ret: usize;
+            unsafe {
+                core::arch::asm!(
+                    "ecall",
+                    inlateout("a0") 0usize => ret,
+                    in("a1") 0usize,
+                    in("a6") 0usize,
+                    in("a7") 0x53525354usize,
+                );
+            }
+            println!("contest: SBI shutdown returned {}", ret);
         }
-        println!("contest: SBI shutdown returned {}", ret);
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        println!("contest: loongarch shutdown — halting");
+        #[cfg(target_arch = "loongarch64")]
+        {
+            println!("contest: loongarch shutdown — halting");
+        }
+    } else {
+        // No sdcard: smoke / non-contest boot — stay alive so the smoke
+        // runner can capture all markers.
+        println!("oscomp: no contest — idle halt");
     }
     loop {
         #[cfg(target_arch = "riscv64")]

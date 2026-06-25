@@ -171,6 +171,9 @@ const FAULT_RECOVERED: usize = 3;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static TERMINATED: AtomicBool = AtomicBool::new(false);
+/// Set to true when the contest runner finds at least one test script on
+/// the sdcard and runs the full contest loop (including shutdown).
+static SDCARD_CONTEST_RAN: AtomicBool = AtomicBool::new(false);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -790,12 +793,19 @@ fn verify_sdcard_basic_script_thread() {
     crate::println!("  /mnt/sdcard/musl/basic_testcode.sh : verified");
 }
 
-pub fn verify_sdcard_all_scripts() {
+/// Returns `true` if the contest runner discovered scripts and ran to
+/// completion (including shutdown).  Returns `false` when there is no
+/// sdcard block device, so the caller can keep the machine alive for
+/// smoke / non-contest boot paths.
+pub fn verify_sdcard_all_scripts() -> bool {
     if crate::block::open_device("vda").is_none() {
-        return;
+        crate::println!("oscomp: no sdcard, skip contest runner");
+        return false;
     }
 
+    SDCARD_CONTEST_RAN.store(false, Ordering::Release);
     crate::task::run_kernel_thread_sync(verify_sdcard_all_scripts_thread);
+    SDCARD_CONTEST_RAN.load(Ordering::Acquire)
 }
 
 fn verify_sdcard_all_scripts_thread() {
@@ -830,6 +840,10 @@ fn verify_sdcard_all_scripts_thread() {
         crate::println!("sdcard scripts: no test scripts found on disk");
         return;
     }
+
+    // Contest will run: set the flag so the caller can distinguish
+    // contest-mode shutdown from smoke-mode idle loop.
+    SDCARD_CONTEST_RAN.store(true, Ordering::Release);
 
     let shell_path = if crate::fs::stat("/bin/sh").is_ok() {
         "/bin/sh"
@@ -946,17 +960,24 @@ fn verify_sdcard_all_scripts_thread() {
             }
         }
 
-        let result = run_rootfs_program_with_cwd(
-            shell_path,
-            &["busybox", "sh", &vfs_path],
-            &[
-                &path_env,
-                &ld_env,
-                "HOME=/",
-            ],
+        // Spawn the group and wait with deadline awareness.
+        let group_result = run_group_with_deadline(
+            shell_path, &["busybox", "sh", &vfs_path],
+            &[&path_env, &ld_env, "HOME=/"],
             Some(&cwd),
+            budget_ms_to_cycles(core::cmp::min(
+                GROUP_TIMEOUT_MS,
+                budget_deadline.saturating_sub(crate::time::now().cycles()) * 1000 / freq_hz,
+            ).max(1000)),
+            budget_deadline,
+            budget_ms_to_cycles,
+            freq_hz,
+            TOTAL_BUDGET_MS,
+            idx + 1,
+            scripts.len(),
+            &vfs_path,
         );
-        match result {
+        match group_result {
             Ok(0) => {
                 crate::println!("{} : PASS", vfs_path);
                 passed += 1;
@@ -973,7 +994,12 @@ fn verify_sdcard_all_scripts_thread() {
                 crate::println!("{} : {}", vfs_path, label);
                 failed += 1;
             }
-            Err(_) => {
+            Err(GroupError::Timeout) => {
+                crate::println!("{} : FAIL (timeout)", vfs_path);
+                timed_out += 1;
+                failed += 1;
+            }
+            Err(GroupError::Exec) => {
                 crate::println!("{} : ERROR", vfs_path);
                 failed += 1;
             }
@@ -1023,6 +1049,220 @@ fn platform_shutdown() -> ! {
         for _ in 0..10_000_000 {
             core::hint::spin_loop();
         }
+    }
+}
+
+// ── P9-G7: group deadline enforcement ──
+
+const GROUP_REAP_GRACE_MS: u64 = 1_000;
+const GROUP_REAP_LIMIT: usize = 256;
+const STILL_RUNNING_INTERVAL_MS: u64 = 10_000;
+const OSCOMP_SHUTDOWN_SAFETY_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug)]
+enum GroupError {
+    Timeout,
+    Exec,
+}
+
+/// Send a signal to every live process whose pgid matches `pgid`.
+/// Returns the number of processes signalled.
+fn kill_process_group(pgid: isize, signal: u32) -> usize {
+    let mut killed = 0_usize;
+    crate::process::for_each_process(|process| {
+        if process.process_group() == pgid {
+            let _ = crate::signal::send_signal(process.id(), signal);
+            killed += 1;
+        }
+    });
+    killed
+}
+
+/// Count live processes belonging to the given process group.
+fn count_live_in_group(pgid: isize) -> usize {
+    let mut alive = 0_usize;
+    crate::process::for_each_process(|process| {
+        if process.process_group() == pgid {
+            alive += 1;
+        }
+    });
+    alive
+}
+
+/// Spawn `busybox sh <script>` and wait with a hard deadline.
+///
+/// Returns `Ok(status)` when the shell exits by itself, or
+/// `Err(GroupError::Timeout)` when the group or global deadline fires.
+fn run_group_with_deadline(
+    shell_path: &str,
+    argv: &[&str],
+    envp: &[&str],
+    cwd: Option<&str>,
+    timeout_cycles: u64,
+    budget_deadline: u64,
+    budget_ms_to_cycles: impl Fn(u64) -> u64,
+    freq_hz: u64,
+    total_budget_ms: u64,
+    group_index: usize,
+    group_total: usize,
+    script_path: &str,
+) -> Result<isize, GroupError> {
+    let image = match load_exec_image(shell_path) {
+        Ok(img) => img,
+        Err(_) => return Err(GroupError::Exec),
+    };
+
+    let extra_areas = [VmArea::new(
+        VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
+        VmAreaFlags::user_rw(),
+        VmAreaKind::Anonymous,
+    )];
+
+    let config = crate::exec::ExecConfig {
+        argv,
+        envp,
+        stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
+        heap_start: VirtAddr::new(USER_HEAP_START),
+        heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+        extra_areas: &extra_areas,
+    };
+
+    let exec = match crate::exec::exec_elf(&image, config) {
+        Ok(e) => e,
+        Err(_) => return Err(GroupError::Exec),
+    };
+
+    if let Some(cwd) = cwd {
+        if exec.process.fs().set_cwd(cwd).is_err() {
+            return Err(GroupError::Exec);
+        }
+    }
+
+    let root_pid = exec.process.id();
+    let pgid = exec.process.process_group();
+    let group_start = crate::time::now().cycles();
+    let group_deadline = group_start + timeout_cycles;
+    let mut last_heartbeat = group_start;
+    let shutdown_safety = budget_ms_to_cycles(OSCOMP_SHUTDOWN_SAFETY_MS);
+    let heartbeat_interval = budget_ms_to_cycles(STILL_RUNNING_INTERVAL_MS);
+    let budget_start = budget_deadline - budget_ms_to_cycles(total_budget_ms);
+
+    let _task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
+
+    // ── deadline-aware poll loop ──
+    loop {
+        // Root thread exited by itself — success.
+        if let Some(status) = exec.thread.exit_status() {
+            _task.wait_for_detach();
+            drop(exec.thread);
+            if let Ok(process) = Arc::try_unwrap(exec.process) {
+                let _ = process.destroy();
+            }
+            return Ok(status);
+        }
+
+        let now = crate::time::now().cycles();
+
+        // Still-running heartbeat ─ every STILL_RUNNING_INTERVAL_MS.
+        if now - last_heartbeat >= heartbeat_interval {
+            last_heartbeat = now;
+            let group_elapsed_ms = (now - group_start) * 1000 / freq_hz;
+            let global_elapsed_ms = (now - budget_start) * 1000 / freq_hz;
+            let live_count = count_live_in_group(pgid);
+            crate::println!(
+                "oscomp-still-running: arch={} idx={}/{} script={} group_elapsed_ms={} global_elapsed_ms={} root_pid={} pgid={} live_count={}",
+                crate::arch::ARCH_NAME,
+                group_index,
+                group_total,
+                script_path,
+                group_elapsed_ms,
+                global_elapsed_ms,
+                root_pid.get(),
+                pgid,
+                live_count,
+            );
+        }
+
+        // Group deadline reached, OR global budget nearly exhausted.
+        if now >= group_deadline || now + shutdown_safety >= budget_deadline {
+            let reason = if now + shutdown_safety >= budget_deadline {
+                "global budget"
+            } else {
+                "group deadline"
+            };
+            crate::println!(
+                "oscomp-group-timeout: arch={} idx={}/{} script={} reason={} timeout_ms={} root_pid={} pgid={} live_before_kill={}",
+                crate::arch::ARCH_NAME,
+                group_index,
+                group_total,
+                script_path,
+                reason,
+                timeout_cycles * 1000 / freq_hz,
+                root_pid.get(),
+                pgid,
+                count_live_in_group(pgid),
+            );
+
+            // Kill the entire process group.
+            let killed = kill_process_group(pgid, crate::signal::SIGKILL);
+            crate::println!(
+                "oscomp-group-timeout: killed={} pgid={}",
+                killed, pgid,
+            );
+
+            // Bounded reap: wait up to GROUP_REAP_GRACE_MS for the root
+            // thread to exit so we can safely drop the Thread.
+            let reap_deadline =
+                crate::time::now().cycles() + budget_ms_to_cycles(GROUP_REAP_GRACE_MS);
+            let mut reaped = 0_usize;
+            while exec.thread.exit_status().is_none()
+                && crate::time::now().cycles() < reap_deadline
+                && reaped < GROUP_REAP_LIMIT
+            {
+                reaped += 1;
+                crate::task::yield_now();
+            }
+
+            // If the root thread has not exited yet, extend the grace
+            // period — SIGKILL is unblockable and will be delivered, but
+            // the target may be deep inside a blocking kernel call.
+            if exec.thread.exit_status().is_none() {
+                let extra_deadline =
+                    crate::time::now().cycles() + budget_ms_to_cycles(4_000);
+                while exec.thread.exit_status().is_none()
+                    && crate::time::now().cycles() < extra_deadline
+                {
+                    crate::task::yield_now();
+                }
+            }
+
+            let live_left = count_live_in_group(pgid);
+            crate::println!(
+                "oscomp-group-timeout: reaped_attempts={} live_left={}",
+                reaped, live_left,
+            );
+
+            // Clean up if the root thread exited, otherwise leak to avoid
+            // panicking in Thread::drop (which asserts THREAD_EXITED).
+            if exec.thread.exit_status().is_some() {
+                _task.wait_for_detach();
+                drop(exec.thread);
+                if let Ok(process) = Arc::try_unwrap(exec.process) {
+                    let _ = process.destroy();
+                }
+            } else {
+                crate::println!(
+                    "oscomp-group-timeout: WARNING root_pid={} still alive after grace, leaking",
+                    root_pid.get(),
+                );
+                // Prevent Thread::drop assertion failure.
+                core::mem::forget(exec);
+            }
+
+            return Err(GroupError::Timeout);
+        }
+
+        crate::task::yield_now();
     }
 }
 

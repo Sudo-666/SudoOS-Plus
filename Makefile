@@ -187,3 +187,35 @@ oscomp-newtest-full-audit: oscomp-newtest-p0-abi-audit oscomp-newtest-p2-vfs-aud
 .PHONY: oscomp-final-p1-runtime-audit
 oscomp-final-p1-runtime-audit:
 	python3 scripts/oscomp-final-p1-runtime-audit.py
+
+# ── P9-G7: local contest QEMU targets (require sdcard-rv.img / sdcard-la.img) ──
+
+.PHONY: contest-rv
+contest-rv: kernel-rv
+	qemu-system-riscv64 \
+		-machine virt \
+		-kernel kernel-rv \
+		-m 1G \
+		-nographic \
+		-smp 1 \
+		-bios default \
+		-drive file=sdcard-rv.img,if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot \
+		-device virtio-net-device,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc
+
+.PHONY: contest-la
+contest-la: kernel-la
+	qemu-system-loongarch64 \
+		-kernel kernel-la \
+		-m 1G \
+		-nographic \
+		-smp 1 \
+		-drive file=sdcard-la.img,if=none,format=raw,id=x0 \
+		-device virtio-blk-pci,drive=x0 \
+		-no-reboot \
+		-device virtio-net-pci,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc

@@ -774,6 +774,19 @@ pub fn lookup_process(pid: ProcessId) -> Option<Arc<Process>> {
         .and_then(alloc::sync::Weak::upgrade)
 }
 
+/// Call `f` once for every live process.  Processes whose weak reference
+/// has expired are skipped.
+pub fn for_each_process(mut f: impl FnMut(&Arc<Process>)) {
+    let registry = PROCESS_REGISTRY.lock();
+    if let Some(map) = registry.as_ref() {
+        for weak in map.values() {
+            if let Some(process) = weak.upgrade() {
+                f(&process);
+            }
+        }
+    }
+}
+
 pub struct Thread {
     id: ThreadId,
     process: Arc<Process>,
