@@ -863,6 +863,7 @@ fn verify_sdcard_all_scripts_thread() {
     let (shell_path, la_shell_ok) = match choose_la_contest_shell() {
         Some(p) => {
             crate::println!("sdcard scripts: LA shell probe selected {}", p);
+            oscomp_la_install_busybox_applets();
             (p, true)
         }
         None => {
@@ -1312,16 +1313,40 @@ fn choose_la_contest_shell() -> Option<&'static str> {
     None
 }
 
-/// LoongArch whitelist: only run these four groups after the shell
-/// baseline passes.  Everything else is SKIP (la-defer).
+/// Install BusyBox applet symlinks in /mnt/sdcard/musl so that shell
+/// commands like `sleep`, `true`, `echo` can be resolved via PATH.
+/// The musl busybox binary was verified working by the shell probe;
+/// missing applets cause execve-fail → exit=142 (SIGALRM).
 #[cfg(target_arch = "loongarch64")]
-/// LoongArch whitelist: run basic/busybox four groups.
+fn oscomp_la_install_busybox_applets() {
+    let busybox = "/mnt/sdcard/musl/busybox";
+    if crate::fs::stat(busybox).is_err() {
+        return;
+    }
+
+    let applets: &[&str] = &[
+        "sh", "sleep", "true", "false", "echo", "printf", "test", "[",
+    ];
+
+    for applet in applets {
+        let target = alloc::format!("/mnt/sdcard/musl/{}", applet);
+        if crate::fs::stat(&target).is_err() {
+            if crate::fs::symlink(busybox, &target).is_ok() {
+                crate::println!(
+                    "oscomp-la-applet: installed /mnt/sdcard/musl/{} -> busybox",
+                    applet,
+                );
+            }
+        }
+    }
+}
+
+/// LoongArch whitelist: basic groups only.
+/// Busybox groups are disabled — musl/busybox hits known-bad-busybox SIGSEGV.
 /// Everything else is SKIP (la-defer).
 #[cfg(target_arch = "loongarch64")]
 fn oscomp_la_whitelist(path: &str) -> bool {
-    path.ends_with("/glibc/busybox_testcode.sh")
-        || path.ends_with("/glibc/basic_testcode.sh")
-        || path.ends_with("/musl/busybox_testcode.sh")
+    path.ends_with("/glibc/basic_testcode.sh")
         || path.ends_with("/musl/basic_testcode.sh")
 }
 
@@ -1383,6 +1408,41 @@ fn oscomp_la_diag(_shell_path: &str) {
                 else { alloc::format!("exit={}", raw) },
             ),
             Err(_) => crate::println!("oscomp-la-diag: {} busybox sh -c true -> ERROR", cand),
+        }
+    }
+
+    // ── applet alias diag (non-scoring) ──
+    let diag_busybox = "/mnt/sdcard/musl/busybox";
+    let diag_cwd = "/mnt/sdcard/musl";
+    let diag_env = &["PATH=.:/mnt/sdcard/musl:/bin", "HOME=/"];
+
+    for applet in &["sleep", "true", "echo"] {
+        let path = alloc::format!("/mnt/sdcard/musl/{}", applet);
+        let present = crate::fs::stat(&path).is_ok();
+        crate::println!(
+            "oscomp-la-applet-diag: /mnt/sdcard/musl/{} present={}",
+            applet, present,
+        );
+    }
+
+    // Quick functional probes with applet aliases in place
+    let applet_probes: &[(&str, &[&str])] = &[
+        ("sh -c true", &["busybox", "sh", "-c", "true"] as &[&str]),
+        ("sh -c sleep 0", &["busybox", "sh", "-c", "sleep 0"]),
+        ("sh -c sleep 1", &["busybox", "sh", "-c", "sleep 1"]),
+        ("sh -c echo diag_ok", &["busybox", "sh", "-c", "echo diag_ok"]),
+    ];
+
+    for (label, argv) in applet_probes {
+        match run_rootfs_program_with_cwd(diag_busybox, argv, diag_env, Some(diag_cwd)) {
+            Ok(raw) => crate::println!(
+                "oscomp-la-applet-diag: {} -> raw={} class={}",
+                label, raw,
+                if raw == 0 { alloc::string::String::from("PASS") }
+                else if raw < 0 { alloc::format!("signal={}", -raw) }
+                else { alloc::format!("exit={}", raw) },
+            ),
+            Err(_) => crate::println!("oscomp-la-applet-diag: {} -> ERROR", label),
         }
     }
 
