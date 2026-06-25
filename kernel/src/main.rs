@@ -588,11 +588,15 @@ fn oscomp_sdcard_install_ext4_path(ext4_path: &str, vfs_path: &str) {
 }
 
 /// P1-B: materialize an ext4 directory flat into VFS (files only; subdirs
-/// created as empty directories).  Returns the number of regular files installed.
+/// created as empty directories).  Returns the number of files installed.
+///
+/// P1-D fix: do NOT mkdir(vfs_dir) before checking ext4 type — if ext4 path
+/// is a regular file (e.g. /glibc/lua), creating a directory first pollutes
+/// the VFS namespace and causes "Is a directory" errors later.
+///
+/// P1-E fix: also count files that already exist as "available", and log both
+/// counts separately so "0 newly installed" doesn't look like a regression.
 fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: usize) -> usize {
-    oscomp_sdcard_ensure_parent_dirs(vfs_dir);
-    let _ = fs::mkdir(vfs_dir, 0o755);
-
     let Some(device) = crate::block::open_device("vda") else {
         crate::println!("sdcard: expand {} — no device", ext4_dir);
         return 0;
@@ -600,13 +604,25 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
 
     const EXT4_FT_DIR: u16 = 2;
     let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir) else {
+        // ext4_dir may be a regular file (e.g. /glibc/lua), not a directory.
+        // Install it as a regular file instead of creating a false directory.
+        oscomp_sdcard_install_ext4_path(ext4_dir, vfs_dir);
+        if fs::stat(vfs_dir).is_ok() {
+            crate::println!("sdcard: installed {} -> {} (regular file)", ext4_dir, vfs_dir);
+            return 1;
+        }
         crate::println!("sdcard: expand failed {} -> {}", ext4_dir, vfs_dir);
         return 0;
     };
 
-    let mut installed: usize = 0;
+    // Only create the VFS directory after confirming ext4_dir is a directory.
+    oscomp_sdcard_ensure_parent_dirs(vfs_dir);
+    let _ = fs::mkdir(vfs_dir, 0o755);
+
+    let mut newly_installed: usize = 0;
+    let mut already_available: usize = 0;
     for entry in entries {
-        if installed >= max_files {
+        if newly_installed + already_available >= max_files {
             break;
         }
         let ext4_child = alloc::format!("{}/{}", ext4_dir.trim_end_matches('/'), entry.name);
@@ -615,20 +631,26 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
         if entry.file_type == EXT4_FT_DIR {
             oscomp_sdcard_ensure_parent_dirs(&vfs_child);
             let _ = fs::mkdir(&vfs_child, 0o755);
+            already_available += 1;
+            continue;
+        }
+
+        if fs::stat(&vfs_child).is_ok() {
+            already_available += 1;
             continue;
         }
 
         oscomp_sdcard_install_ext4_path(&ext4_child, &vfs_child);
         if fs::stat(&vfs_child).is_ok() {
-            installed += 1;
+            newly_installed += 1;
         }
     }
 
     crate::println!(
-        "sdcard: expanded {} -> {} : {} files installed",
-        ext4_dir, vfs_dir, installed,
+        "sdcard: expanded {} -> {} : {} newly installed, {} already available",
+        ext4_dir, vfs_dir, newly_installed, already_available,
     );
-    installed
+    newly_installed + already_available
 }
 
 /// P1-A: install ELF dynamic linker (ld-linux / ld-musl) from their real
@@ -694,6 +716,33 @@ fn oscomp_install_runtime_loader_aliases() {
                 "/lib64/ld-musl-loongarch64-sf.so.1",
             ],
         ),
+        // B1-B2: musl LoongArch LP64D variants — the exact name that
+        // PT_INTERP encodes on many LA musl binaries.
+        (
+            "/musl/lib/ld-musl-loongarch-lp64d.so.1",
+            &[
+                "/lib/ld-musl-loongarch-lp64d.so.1",
+                "/lib64/ld-musl-loongarch-lp64d.so.1",
+            ],
+        ),
+        // musl LA: ld-musl-loongarch64-lp64d name variant.
+        (
+            "/musl/lib/ld-musl-loongarch64-lp64d.so.1",
+            &[
+                "/lib/ld-musl-loongarch64-lp64d.so.1",
+                "/lib64/ld-musl-loongarch64-lp64d.so.1",
+            ],
+        ),
+        // Fallback: if there's no separate ld-musl, the musl libc.so
+        // itself can act as the dynamic linker.
+        (
+            "/musl/lib/libc.so",
+            &[
+                "/lib/ld-musl-loongarch-lp64d.so.1",
+                "/lib64/ld-musl-loongarch-lp64d.so.1",
+                "/lib/ld-musl-loongarch64-lp64d.so.1",
+            ],
+        ),
     ];
 
     for (src, dsts) in ALIASES {
@@ -744,6 +793,29 @@ fn oscomp_install_runtime_lib_aliases() {
         }
     }
     crate::println!("sdcard: installed {} runtime library aliases", installed);
+
+    // Self-check: verify a few critical aliases are real readable files.
+    for check in &[
+        "/lib/ld-linux-riscv64-lp64d.so.1",
+        "/lib64/ld-linux-loongarch-lp64d.so.1",
+        "/lib/libc.so.6",
+        "/lib/libm.so.6",
+    ] {
+        match fs::open(check, myos_vfs::OpenFlags::O_RDONLY) {
+            Ok(file) => match file.fstat() {
+                Ok(stat) => {
+                    crate::println!(
+                        "sdcard: alias {} ok size={} mode={:#o}",
+                        check, stat.size, stat.mode,
+                    );
+                }
+                Err(_) => crate::println!("sdcard: alias {} exists but fstat failed", check),
+            },
+            Err(_) => {
+                // Not fatal — the file may not be on this arch's sdcard.
+            }
+        }
+    }
 }
 
 fn oscomp_sdcard_ensure_parent_dirs(path: &str) {

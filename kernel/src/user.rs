@@ -122,6 +122,7 @@ const PROT_EXEC: usize = 4;
 const MAP_SHARED: usize = 0x01;
 const MAP_PRIVATE: usize = 0x02;
 const MAP_TYPE: usize = 0x0f;
+const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const VFS_PROBE_DATA: &[u8] = b"/m11-user\0......................uvfs";
 const M12_PROBE_DATA: &[u8] = b"pipe";
@@ -1850,14 +1851,29 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
         None => return -ENOMEM,
     };
 
+    // ld-linux and glibc often set historical flags that Linux silently
+    // ignores.  Accept MAP_DENYWRITE(0x800) and MAP_EXECUTABLE(0x1000)
+    // as no-ops so file-backed mmap doesn't fail with EINVAL.
+    const MAP_ACCEPTED: usize = MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS
+        | MAP_FIXED | 0x800 | 0x1000;  // MAP_DENYWRITE | MAP_EXECUTABLE
+
     let map_type = flags & MAP_TYPE;
-    if file != usize::MAX && (map_type == MAP_PRIVATE || map_type == MAP_SHARED) {
-        if flags & MAP_ANONYMOUS != 0 || flags & !MAP_TYPE != 0 {
-            return -EINVAL;
-        }
-        return sys_file_private_mmap(file, offset, length, rounded, vm_flags);
+    let is_file_backed = file != usize::MAX && (map_type == MAP_PRIVATE || map_type == MAP_SHARED);
+
+    if flags & !MAP_ACCEPTED != 0 {
+        return -EINVAL;
     }
-    if flags != (MAP_PRIVATE | MAP_ANONYMOUS) || file != usize::MAX || offset != 0 {
+
+    if is_file_backed && flags & MAP_ANONYMOUS == 0 {
+        // MAP_FIXED: ld-linux uses this to place PT_LOAD segments at
+        // specific addresses.  We map the file content into a temporary
+        // anonymous area first, then the caller may re-map with MAP_FIXED.
+        let is_fixed = flags & MAP_FIXED != 0;
+        return sys_file_private_mmap(file, offset, length, rounded, vm_flags, address, is_fixed);
+    }
+
+    // Anonymous mapping (MAP_PRIVATE | MAP_ANONYMOUS or similar).
+    if file != usize::MAX || offset != 0 {
         return -EINVAL;
     }
 
@@ -1882,6 +1898,8 @@ fn sys_file_private_mmap(
     length: usize,
     rounded: usize,
     vm_flags: VmAreaFlags,
+    _address: usize,
+    is_fixed: bool,
 ) -> isize {
     const MAX_FILE_MMAP: usize = 16 * 1024 * 1024;
     if offset & (PAGE_SIZE - 1) != 0 || rounded > MAX_FILE_MMAP {
@@ -1895,17 +1913,30 @@ fn sys_file_private_mmap(
         Ok(stat) => stat,
         Err(errno) => return errno.to_isize(),
     };
-    if stat.mode & myos_vfs::FileMode::S_IFMT != myos_vfs::FileMode::S_IFREG {
-        return -EINVAL;
+    // Accept regular files AND block-device-backed ext4 files.
+    let mode = stat.mode & myos_vfs::FileMode::S_IFMT;
+    if mode != myos_vfs::FileMode::S_IFREG && mode != myos_vfs::FileMode::S_IFBLK {
+        return -(myos_vfs::Errno::Eacces.to_isize());
     }
-    let file_size = if stat.size <= 0 {
-        0
-    } else {
-        stat.size as usize
-    };
+    let file_size = if stat.size <= 0 { 0 } else { stat.size as usize };
     let readable = file_size.saturating_sub(offset).min(length);
 
     let temporary_flags = VmAreaFlags::user_rw();
+
+    // MAP_FIXED: unmap the target range first, then let the allocator
+    // place the new mapping.  (A full implementation would map at the
+    // exact address; for now this avoids EINVAL when ld-linux uses
+    // MAP_FIXED to place PT_LOAD segments.)
+    if is_fixed {
+        let fixed_start = VirtAddr::new(_address);
+        if let Some(fixed_range) = fixed_start
+            .checked_add(rounded)
+            .and_then(|end| VirtRange::new(fixed_start, end))
+        {
+            let _ = current_user_mm().unmap_range(fixed_range);
+        }
+    }
+
     let start = match current_user_mm().map_anonymous(
         VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
         rounded,
@@ -1933,6 +1964,10 @@ fn sys_file_private_mmap(
         let _ = current_user_mm().unmap_range(range);
         return -EFAULT;
     }
+    // Zero-fill tail padding (BSS / partial page beyond file size).
+    if rounded > readable {
+        let _ = zero_user_mapping(start.checked_add(readable).unwrap_or(start), rounded - readable);
+    }
     if current_user_mm()
         .protect_range(range, vm_flags.access_only())
         .is_err()
@@ -1944,6 +1979,20 @@ fn sys_file_private_mmap(
         MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
     }
     start.get() as isize
+}
+
+fn zero_user_mapping(mut addr: VirtAddr, mut remaining: usize) -> Result<(), ()> {
+    let mm = current_user_mm();
+    while remaining > 0 {
+        let chunk = core::cmp::min(PAGE_SIZE, remaining);
+        let phys = mm.populate_page(addr).map_err(|_| ())?;
+        let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(phys)
+            .map_err(|_| ())?;
+        unsafe { core::ptr::write_bytes(ptr, 0, chunk); }
+        addr = addr.checked_add(chunk).ok_or(())?;
+        remaining -= chunk;
+    }
+    Ok(())
 }
 
 fn copy_file_into_private_mapping(
@@ -2464,6 +2513,38 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         };
         exec_argv = rewritten_argv;
     }
+
+    // C1-C3: if the file is not an ELF and no shebang was found,
+    // fallback to /bin/sh so scripts without #! still execute.
+    // Linux leaves this to the shell, but contest shells may not
+    // implement the ENOEXEC→/bin/sh fallback reliably.
+    if !image.starts_with(b"\x7fELF") && exec_path != "/bin/sh" && exec_path != "/bin/busybox" {
+        if exec_argv.len() + 1 > MAX_EXEC_ARGS {
+            return -EINVAL;
+        }
+        // Construct: /bin/sh <original_path> <original_argv[1..]>
+        let mut fallback_argv = Vec::new();
+        if fallback_argv
+            .try_reserve(exec_argv.len() + 1)
+            .is_err()
+        {
+            return -ENOMEM;
+        }
+        fallback_argv.push(alloc::string::String::from("/bin/sh"));
+        fallback_argv.push(exec_path.clone());
+        for argument in exec_argv.iter().skip(1) {
+            fallback_argv.push(argument.clone());
+        }
+        exec_argv = fallback_argv;
+        image = match load_exec_image("/bin/sh") {
+            Ok(image) => image,
+            Err(errno) => return errno,
+        };
+        if exec_trace_allow() {
+            crate::println!("execve: path={} falling back to /bin/sh", exec_path);
+        }
+    }
+
     let argv_refs = exec_argv.iter().map(String::as_str).collect::<Vec<_>>();
     let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
     let extra_areas = [VmArea::new(
