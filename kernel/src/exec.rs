@@ -428,9 +428,10 @@ fn apply_static_pie_relocations(
         }
     }
 
-    if rel_size != 0 || jmprel != 0 || pltrel_size != 0 {
-        return Ok(());
-    }
+    // DT_JMPREL/DT_PLTRELSZ/DT_REL must NOT prevent processing of
+    // DT_RELA R_RELATIVE entries.  They indicate the presence of PLT
+    // or REL-type relocations which the kernel does not handle; the
+    // dynamic linker (ld-linux) resolves those at runtime.
     if rela_size == 0 {
         return Ok(());
     }
@@ -446,28 +447,34 @@ fn apply_static_pie_relocations(
         .get(rela_offset..rela_offset + rela_size)
         .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
 
+    let mut applied: usize = 0;
+    let mut skipped: usize = 0;
     for entry in rela_bytes.chunks_exact(rela_ent) {
         let raw_offset = read_u64(entry, 0)?;
         let info = read_u64(entry, 8)?;
         let addend = read_i64(entry, 16)?;
         let relocation_type = (info & 0xffff_ffff) as u32;
         let symbol = info >> 32;
-        // Skip non-R_RELATIVE relocations instead of aborting the
-        // entire loop.  ld-linux may have R_*_NONE, R_*_IRELATIVE,
-        // R_*_GLOB_DAT, etc. entries interspersed with R_RELATIVE;
-        // we must apply all R_RELATIVE entries to initialize the GOT.
-        if relocation_type != R_RELATIVE || symbol != 0 {
-            continue;
+        if relocation_type == R_RELATIVE && symbol == 0 {
+            let destination = usize::try_from(raw_offset)
+                .map_err(|_| ExecError::AddressOverflow)?
+                .checked_add(elf.load_bias)
+                .ok_or(ExecError::AddressOverflow)?;
+            let value = (elf.load_bias as i128)
+                .checked_add(addend as i128)
+                .and_then(|value| u64::try_from(value).ok())
+                .ok_or(ExecError::AddressOverflow)?;
+            loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
+            applied += 1;
+        } else {
+            skipped += 1;
         }
-        let destination = usize::try_from(raw_offset)
-            .map_err(|_| ExecError::AddressOverflow)?
-            .checked_add(elf.load_bias)
-            .ok_or(ExecError::AddressOverflow)?;
-        let value = (elf.load_bias as i128)
-            .checked_add(addend as i128)
-            .and_then(|value| u64::try_from(value).ok())
-            .ok_or(ExecError::AddressOverflow)?;
-        loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
+    }
+    if applied > 0 || skipped > 0 {
+        crate::println!(
+            "exec-reloc: applied={} skipped={} jmprel={} pltrel={}",
+            applied, skipped, jmprel, pltrel_size,
+        );
     }
 
     Ok(())
