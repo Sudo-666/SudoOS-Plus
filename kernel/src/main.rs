@@ -366,26 +366,11 @@ fn kernel_main(boot: BootInfo) -> ! {
     println!("SMOKE_TEST: PASS");
 
     if contest_ran {
-        // Competition: contest ran to completion with score/summary already
-        // printed.  Shut down so QEMU exits and the evaluator can score.
-        #[cfg(target_arch = "riscv64")]
-        {
-            let ret: usize;
-            unsafe {
-                core::arch::asm!(
-                    "ecall",
-                    inlateout("a0") 0usize => ret,
-                    in("a1") 0usize,
-                    in("a6") 0usize,
-                    in("a7") 0x53525354usize,
-                );
-            }
-            println!("contest: SBI shutdown returned {}", ret);
-        }
-        #[cfg(target_arch = "loongarch64")]
-        {
-            println!("contest: loongarch shutdown — halting");
-        }
+        // Competition: contest completed, summary/score already printed.
+        // Use the same unified power-off path as the contest runner and
+        // watchdog so RISC-V and LoongArch behaviour stay consistent.
+        println!("contest: runner returned after summary; forcing platform shutdown");
+        user::contest_platform_shutdown();
     } else {
         // No sdcard: smoke / non-contest boot — stay alive so the smoke
         // runner can capture all markers.

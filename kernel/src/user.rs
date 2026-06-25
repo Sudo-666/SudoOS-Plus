@@ -1091,36 +1091,80 @@ fn verify_sdcard_all_scripts_thread() {
         crate::println!("score: {}", passed);
         crate::println!("#### OS COMP SUMMARY END ####");
         crate::println!("oscomp: shutdown");
-        platform_shutdown();
+        contest_platform_shutdown();
     }
-    // unreachable (platform_shutdown diverges)
+    // unreachable (contest_platform_shutdown diverges)
 }
 
-fn platform_shutdown() -> ! {
+/// Unified contest power-off: called by the runner, the watchdog, and
+/// `main.rs` after a completed contest run.
+///
+/// RISC-V   – SBI SRST, then legacy SBI shutdown, then `wfi` fallback.
+/// LoongArch – QEMU virt PM MMIO write via uncached DMW, then spin fallback.
+pub(crate) fn contest_platform_shutdown() -> ! {
+    crate::println!("oscomp: platform shutdown");
+
     #[cfg(target_arch = "riscv64")]
-    {
-        crate::println!("oscomp: riscv sbi shutdown");
-        // SBI system reset: extension=0x53525354, func=0, type=shutdown
+    arch_contest_poweroff_rv();
+
+    #[cfg(target_arch = "loongarch64")]
+    arch_contest_poweroff_la();
+
+    // Fallback if every power-off mechanism returned.
+    #[cfg(target_arch = "riscv64")]
+    loop {
         unsafe {
-            core::arch::asm!(
-                "ecall",
-                in("a7") 0x53525354_u64,
-                in("a6") 0x0_u64,
-                in("a0") 0x0_u64,
-                in("a1") 0x0_u64,
-            );
+            core::arch::asm!("wfi", options(nomem, nostack));
         }
-        crate::println!("oscomp: riscv sbi shutdown returned, halt");
     }
     #[cfg(target_arch = "loongarch64")]
-    {
-        crate::println!("oscomp: halt");
-    }
     loop {
-        for _ in 0..10_000_000 {
-            core::hint::spin_loop();
-        }
+        core::hint::spin_loop();
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn arch_contest_poweroff_rv() {
+    // SBI System Reset: extension=0x53525354 (SRST), func=0, type=shutdown
+    crate::println!("oscomp: riscv sbi srst shutdown");
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") 0x53525354_usize,
+            in("a6") 0_usize,
+            in("a0") 0_usize,
+            in("a1") 0_usize,
+        );
+    }
+
+    // SRST returned — try legacy SBI shutdown (a7 = 0x8)
+    crate::println!("oscomp: riscv sbi srst returned, trying legacy shutdown");
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") 0x8_usize,
+        );
+    }
+
+    crate::println!("oscomp: riscv shutdown returned, halt");
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn arch_contest_poweroff_la() {
+    // QEMU virt board power-management MMIO.
+    // PM_CTRL = PM_BASE (0x1008_0000) + 0x10, accessed via uncached DMW alias.
+    const LA_DMW_UNCACHED: usize = 0x8000_0000_0000_0000;
+    const QEMU_LA_PM_CTRL: usize = LA_DMW_UNCACHED + 0x1008_0010;
+
+    crate::println!("oscomp: loongarch qemu pm shutdown");
+    crate::println!(
+        "oscomp: loongarch pm write addr={:#x} value=0xff",
+        QEMU_LA_PM_CTRL,
+    );
+    unsafe {
+        core::ptr::write_volatile(QEMU_LA_PM_CTRL as *mut u8, 0xff);
+    }
+    crate::println!("oscomp: loongarch pm write returned, halt");
 }
 
 // ── P9-G7d: external contest watchdog ──
@@ -1273,7 +1317,7 @@ fn contest_watchdog_main() {
                 crate::println!("score: {}", passed);
                 crate::println!("#### OS COMP SUMMARY END ####");
                 crate::println!("oscomp: shutdown");
-                platform_shutdown();
+                contest_platform_shutdown();
             }
             return;
         }
