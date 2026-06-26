@@ -392,13 +392,13 @@ pub fn emit_dirent64(buf: &mut MutableIoBuffer<'_>, entry: DirEntry<'_>) -> Resu
     header[8..16].copy_from_slice(&entry.offset.to_ne_bytes());
     header[16..18].copy_from_slice(&record_len_u16.to_ne_bytes());
     header[18] = entry.file_type.dirent_type();
-    debug_assert_eq!(buf.push(&header), header.len());
-    debug_assert_eq!(buf.push(entry.name.as_bytes()), entry.name.len());
-    debug_assert_eq!(buf.push(&[0]), 1);
+    let _ = buf.push(&header);
+    let _ = buf.push(entry.name.as_bytes());
+    let _ = buf.push(&[0]);
 
     const ZEROES: [u8; 8] = [0; 8];
     let padding = record_len - raw_len;
-    debug_assert_eq!(buf.push(&ZEROES[..padding]), padding);
+    let _ = buf.push(&ZEROES[..padding]);
     Ok(true)
 }
 
