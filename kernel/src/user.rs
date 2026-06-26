@@ -1337,10 +1337,176 @@ fn oscomp_log_probe_catalog_once(spec: &OscompGroupSpec<'_>) {
     );
 }
 
-/// TODO P10-F4: real mini-probe execution.
-/// Currently always returns NotRun.
-fn oscomp_run_mini_probe(_probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
-    OscompProbeRunStatus::NotRun
+/// Read-only path existence check for probe targets.
+fn oscomp_probe_path_exists(path: &str) -> bool {
+    crate::fs::stat(path).is_ok()
+}
+
+/// Choose a shell binary for a mini probe based on its cwd.
+fn oscomp_probe_shell_for(probe: &OscompMiniProbe<'_>) -> &'static str {
+    if probe.cwd.contains("/mnt/sdcard/glibc") {
+        "/mnt/sdcard/glibc/busybox"
+    } else if probe.cwd.contains("/mnt/sdcard/musl") {
+        #[cfg(target_arch = "loongarch64")]
+        { "/mnt/sdcard/glibc/busybox" }
+        #[cfg(not(target_arch = "loongarch64"))]
+        { "/mnt/sdcard/musl/busybox" }
+    } else {
+        "/bin/sh"
+    }
+}
+
+/// Log budget for mini-probe execution (avoid flooding serial).
+static OSCOMP_MINI_PROBE_LOG_BUDGET: AtomicUsize = AtomicUsize::new(64);
+
+/// Execute a single mini probe.  ShellTrue / ShellEcho / ScriptSmoke /
+/// DirectBinary are executed via run_rootfs_program_with_cwd.
+/// FsMini / Net* / LtpScan currently return NotRun.
+fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
+    if !oscomp_probe_path_exists(probe.path) {
+        return OscompProbeRunStatus::Missing;
+    }
+
+    match probe.kind {
+        OscompProbeKind::ShellTrue => {
+            let shell = oscomp_probe_shell_for(probe);
+            match run_rootfs_program_with_cwd(
+                shell,
+                &["busybox", "true"],
+                &["PATH=/", "HOME=/"],
+                Some(probe.cwd),
+            ) {
+                Ok(0) => OscompProbeRunStatus::Pass,
+                Ok(raw) => {
+                    let budget = OSCOMP_MINI_PROBE_LOG_BUDGET.load(Ordering::Relaxed);
+                    if budget > 0 {
+                        OSCOMP_MINI_PROBE_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+                        let class = if raw < 0 {
+                            alloc::format!("signal={}", -raw)
+                        } else {
+                            alloc::format!("exit={}", raw)
+                        };
+                        crate::println!(
+                            "oscomp-mini-probe: name={} kind=ShellTrue path={} cwd={} status=Fail raw={} class={}",
+                            probe.name, probe.path, probe.cwd, raw, class,
+                        );
+                    }
+                    OscompProbeRunStatus::Fail
+                }
+                Err(_) => OscompProbeRunStatus::Fail,
+            }
+        }
+        OscompProbeKind::ShellEcho => {
+            let shell = oscomp_probe_shell_for(probe);
+            match run_rootfs_program_with_cwd(
+                shell,
+                &["busybox", "sh", "-c", "echo probe_ok"],
+                &["PATH=/", "HOME=/"],
+                Some(probe.cwd),
+            ) {
+                Ok(0) => OscompProbeRunStatus::Pass,
+                Ok(raw) => {
+                    let budget = OSCOMP_MINI_PROBE_LOG_BUDGET.load(Ordering::Relaxed);
+                    if budget > 0 {
+                        OSCOMP_MINI_PROBE_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+                        let class = if raw < 0 {
+                            alloc::format!("signal={}", -raw)
+                        } else {
+                            alloc::format!("exit={}", raw)
+                        };
+                        crate::println!(
+                            "oscomp-mini-probe: name={} kind=ShellEcho path={} cwd={} status=Fail raw={} class={}",
+                            probe.name, probe.path, probe.cwd, raw, class,
+                        );
+                    }
+                    OscompProbeRunStatus::Fail
+                }
+                Err(_) => OscompProbeRunStatus::Fail,
+            }
+        }
+        OscompProbeKind::ScriptSmoke => {
+            let shell = oscomp_probe_shell_for(probe);
+            match run_rootfs_program_with_cwd(
+                shell,
+                &["busybox", "sh", probe.path],
+                &["PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin", "HOME=/"],
+                Some(probe.cwd),
+            ) {
+                Ok(0) => OscompProbeRunStatus::Pass,
+                Ok(raw) => {
+                    let budget = OSCOMP_MINI_PROBE_LOG_BUDGET.load(Ordering::Relaxed);
+                    if budget > 0 {
+                        OSCOMP_MINI_PROBE_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+                        let class = if raw < 0 {
+                            alloc::format!("signal={}", -raw)
+                        } else {
+                            alloc::format!("exit={}", raw)
+                        };
+                        crate::println!(
+                            "oscomp-mini-probe: name={} kind=ScriptSmoke path={} cwd={} status=Fail raw={} class={}",
+                            probe.name, probe.path, probe.cwd, raw, class,
+                        );
+                    }
+                    OscompProbeRunStatus::Fail
+                }
+                Err(_) => OscompProbeRunStatus::Fail,
+            }
+        }
+        OscompProbeKind::DirectBinary => {
+            match run_rootfs_program_with_cwd(
+                probe.path,
+                &[probe.argv0],
+                &["PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin", "HOME=/"],
+                Some(probe.cwd),
+            ) {
+                Ok(0) => OscompProbeRunStatus::Pass,
+                Ok(raw) => {
+                    let budget = OSCOMP_MINI_PROBE_LOG_BUDGET.load(Ordering::Relaxed);
+                    if budget > 0 {
+                        OSCOMP_MINI_PROBE_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+                        let class = if raw < 0 {
+                            alloc::format!("signal={}", -raw)
+                        } else {
+                            alloc::format!("exit={}", raw)
+                        };
+                        crate::println!(
+                            "oscomp-mini-probe: name={} kind=DirectBinary path={} cwd={} status=Fail raw={} class={}",
+                            probe.name, probe.path, probe.cwd, raw, class,
+                        );
+                    }
+                    OscompProbeRunStatus::Fail
+                }
+                Err(_) => OscompProbeRunStatus::Fail,
+            }
+        }
+        OscompProbeKind::FsMini
+        | OscompProbeKind::NetTcpMini
+        | OscompProbeKind::NetUdpMini
+        | OscompProbeKind::LtpScan => {
+            OscompProbeRunStatus::NotRun
+        }
+    }
+}
+
+/// Run all mini probes for a group spec and return the pass count.
+/// Future P10-F5 will call this under ProbeOnly mode.
+fn oscomp_run_probe_catalog_for_spec(spec: &OscompGroupSpec<'_>) -> usize {
+    let mut passes: usize = 0;
+    for probe in oscomp_mini_probes_for(spec) {
+        let status = oscomp_run_mini_probe(probe);
+        let budget = OSCOMP_MINI_PROBE_LOG_BUDGET.load(Ordering::Relaxed);
+        if budget > 0 {
+            OSCOMP_MINI_PROBE_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+            crate::println!(
+                "oscomp-mini-probe: name={} kind={:?} path={} cwd={} status={:?}",
+                probe.name, probe.kind, probe.path, probe.cwd, status,
+            );
+        }
+        if status == OscompProbeRunStatus::Pass {
+            passes += 1;
+        }
+    }
+    passes
 }
 
 /// Return static env strings for a given env policy.

@@ -258,3 +258,35 @@ paths (RV direct override, LA direct basic, whitelist/defer).
 - **No skip is removed**. All heavy groups remain skipped.
 - **pthread_cond_smasher is banned** from the catalog.
 - P10-F4 will implement real mini-probe execution.
+
+## P10-F4 Mini Probe Runner
+
+*Real execution for low-risk probe types. Not called from contest runner.*
+
+### Implementation status
+
+| ProbeKind | Status | Method |
+|-----------|--------|--------|
+| ShellTrue | **executed** | `run_rootfs_program_with_cwd(shell, ["busybox","true"], ...)` |
+| ShellEcho | **executed** | `run_rootfs_program_with_cwd(shell, ["busybox","sh","-c","echo probe_ok"], ...)` |
+| ScriptSmoke | **executed** | `run_rootfs_program_with_cwd(shell, ["busybox","sh",script], ...)` |
+| DirectBinary | **executed** | `run_rootfs_program_with_cwd(path, [argv0], ...)` |
+| FsMini | NotRun | P10-F5+ |
+| NetTcpMini | NotRun | P10-F5+ |
+| NetUdpMini | NotRun | P10-F5+ |
+| LtpScan | NotRun | P10-F5+ |
+
+### New helpers
+
+| Function | Purpose |
+|----------|---------|
+| `oscomp_probe_path_exists(path)` | Stat check before executing probe |
+| `oscomp_probe_shell_for(probe)` | Choose shell per cwd/arch |
+| `oscomp_run_probe_catalog_for_spec(spec)` | Run all probes for a group → pass count |
+
+### Safety
+
+- **Not called from contest runner**
+- Budget limits log output to 64 lines
+- Missing paths return `Missing`, not Fail
+- No fake `testcase success` output

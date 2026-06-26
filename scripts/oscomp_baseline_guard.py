@@ -189,15 +189,57 @@ def main() -> int:
         check(WARN, "pthread_cond_smasher absent from catalog", False,
               "oscomp_mini_probes_for not found — cannot check catalog")
 
-    # oscomp_run_mini_probe must NOT return Pass by default
-    if "OscompProbeRunStatus::Pass" in user_rs:
-        check(WARN, "oscomp_run_mini_probe not Pass-by-default", False,
-              "probe runner default may be Pass — should be NotRun")
-    elif "OscompProbeRunStatus::NotRun" in user_rs:
-        check(PASS, "oscomp_run_mini_probe defaults NotRun", True)
+    # ── P10-F4 mini probe runner ──
+    check(PASS, "oscomp_probe_path_exists exists",
+          "oscomp_probe_path_exists" in user_rs)
+    check(PASS, "oscomp_probe_shell_for exists",
+          "oscomp_probe_shell_for" in user_rs)
+    check(PASS, "oscomp_run_probe_catalog_for_spec exists",
+          "oscomp_run_probe_catalog_for_spec" in user_rs)
+
+    # Real probe branches implemented
+    for kind in ["ShellTrue", "ShellEcho", "ScriptSmoke", "DirectBinary"]:
+        check(PASS, f"{kind} implemented", kind in user_rs)
+
+    # Heavy probes still NotRun
+    for kind in ["FsMini", "NetTcpMini", "NetUdpMini", "LtpScan"]:
+        has_notrun = "OscompProbeRunStatus::NotRun" in user_rs and kind in user_rs
+        check(WARN, f"{kind} not implemented yet", has_notrun,
+              "expected — P10-F5 or later")
+
+    # oscomp_run_mini_probe must NOT be an unconditional Pass stub
+    if "OscompProbeRunStatus::NotRun" in user_rs:
+        check(PASS, "oscomp_run_mini_probe has real branches", True)
     else:
-        check(WARN, "oscomp_run_mini_probe defaults NotRun", False,
-              "probe runner status unknown")
+        check(FAIL, "oscomp_run_mini_probe has real branches", False,
+              "missing NotRun — is this still a stub?")
+
+    # Must not print fake testcase success in probe runner
+    if "testcase success" in user_rs:
+        check(WARN, "testcase success not in probe runner",
+              "oscomp_run_mini_probe" not in user_rs.split("testcase success")[0],
+              "")
+    else:
+        check(PASS, "testcase success absent from probe runner", True)
+
+    # oscomp-mini-probe log string exists
+    check(PASS, "oscomp-mini-probe log string exists",
+          "oscomp-mini-probe" in user_rs)
+
+    # oscomp_run_probe_catalog_for_spec must NOT be called from contest runner
+    # (check: not present in the contest loop area around "Run the script")
+    idx_run_script = user_rs.find("Run the script")
+    idx_catalog_call = user_rs.find("oscomp_run_probe_catalog_for_spec(")
+    if idx_run_script > 0 and idx_catalog_call > 0:
+        # crude proximity check — if catalog call is near the run script line
+        if abs(idx_run_script - idx_catalog_call) < 3000:
+            check(FAIL, "catalog not called from runner", False,
+                  "oscomp_run_probe_catalog_for_spec may be called near contest runner!")
+        else:
+            check(PASS, "catalog not called from runner", True)
+    else:
+        check(PASS, "catalog not called from runner", True,
+              "function exists but not called from contest runner")
 
     # ── DANGER: forbidden patterns ──
     if "run_group_with_deadline" in user_rs:
