@@ -304,6 +304,23 @@ def main() -> int:
           "mask == 0" in user_rs.split("sys_sched_getaffinity")[1][:200]
           if "sys_sched_getaffinity" in user_rs else False)
 
+    # ── P10-R2 fs/iozone compat ──
+    check(PASS, "FDATASYNC exists", "SYS_FDATASYNC" in user_rs or "FDATASYNC" in user_rs)
+    check(PASS, "sys_fdatasync exists", "sys_fdatasync" in user_rs)
+    check(PASS, "PWRITE64 exists", "SYS_PWRITE64" in user_rs or "PWRITE64" in user_rs)
+    check(PASS, "sys_pwrite64 exists", "sys_pwrite64" in user_rs)
+    check(PASS, "RENAME_NOREPLACE appears", "RENAME_NOREPLACE" in user_rs)
+    check(PASS, "renameat2 validates flags", "flags == 0" in user_rs.split("sys_renameat2")[1][:400]
+          if "sys_renameat2" in user_rs else False)
+    check(PASS, "UTIME_NOW appears", "UTIME_NOW" in user_rs)
+    check(PASS, "UTIME_OMIT appears", "UTIME_OMIT" in user_rs)
+    check(PASS, "/proc/self/exe in readlinkat",
+          "/proc/self/exe" in user_rs.split("sys_readlinkat")[1][:600]
+          if "sys_readlinkat" in user_rs else False)
+    check(PASS, "/proc/self/fd in readlinkat",
+          "/proc/self/fd" in user_rs.split("sys_readlinkat")[1][:600]
+          if "sys_readlinkat" in user_rs else False)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)

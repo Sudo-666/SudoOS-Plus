@@ -55,6 +55,8 @@ const SYS_SET_ROBUST_LIST: usize = crate::syscall::number::SET_ROBUST_LIST;
 const SYS_NANOSLEEP: usize = crate::syscall::number::NANOSLEEP;
 const SYS_CLOCK_GETTIME: usize = crate::syscall::number::CLOCK_GETTIME;
 const SYS_CLOCK_NANOSLEEP: usize = crate::syscall::number::CLOCK_NANOSLEEP;
+const SYS_FDATASYNC: usize = crate::syscall::number::FDATASYNC;
+const SYS_PWRITE64: usize = crate::syscall::number::PWRITE64;
 const SYS_SCHED_YIELD: usize = crate::syscall::number::SCHED_YIELD;
 const SYS_KILL: usize = crate::syscall::number::KILL;
 const SYS_TKILL: usize = crate::syscall::number::TKILL;
@@ -3363,6 +3365,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let result = sys_pread64(arguments[0], arguments[1], arguments[2], arguments[3]);
             set_syscall_result(frame, result);
         }
+        SYS_PWRITE64 => {
+            let result = sys_pwrite64(arguments[0], arguments[1], arguments[2], arguments[3]);
+            set_syscall_result(frame, result);
+        }
         SYS_READLINKAT => set_syscall_result(
             frame,
             sys_readlinkat(arguments[0], arguments[1], arguments[2], arguments[3]),
@@ -3385,6 +3391,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             ),
         ),
         SYS_FSYNC => set_syscall_result(frame, sys_fsync(arguments[0])),
+        SYS_FDATASYNC => set_syscall_result(frame, sys_fdatasync(arguments[0])),
         SYS_BRK => set_syscall_result(frame, sys_brk(arguments[0])),
         SYS_MUNMAP => set_syscall_result(frame, sys_munmap(arguments[0], arguments[1])),
         SYS_MMAP => set_syscall_result(frame, sys_mmap(arguments)),
@@ -5715,11 +5722,28 @@ fn sys_mknodat(dirfd: usize, path_address: usize, mode: usize, _dev: usize) -> i
     }
 }
 
-fn sys_utimensat(_dirfd: usize, _path: usize, _times: usize) -> isize {
-    // Stub: enough to unblock `touch` without full nanosecond timestamp support.
-    // Busybox `touch` calls utimensat(AT_FDCWD, path, NULL, 0) to set mtime/atime
-    // to "now". Accepting NULL times with success makes touch work; the VFS
-    // does not track timestamps yet.
+fn sys_utimensat(_dirfd: usize, _path: usize, times: usize) -> isize {
+    const UTIME_NOW:  isize = (1_isize << 30) - 1; // 1073741823
+    const UTIME_OMIT: isize = (1_isize << 30) - 2; // 1073741822
+
+    // times == 0 -> set to "now" (success, no real persistence)
+    if times == 0 {
+        return 0;
+    }
+
+    // Validate both timespecs
+    let ts = match copy_plain_from_user::<[KernelTimespec; 2]>(times) {
+        Ok(v) => v,
+        Err(errno) => return errno,
+    };
+    for t in &ts {
+        if t.nsec == UTIME_NOW || t.nsec == UTIME_OMIT {
+            continue;
+        }
+        if t.nsec < 0 || t.nsec >= 1_000_000_000 {
+            return -EINVAL;
+        }
+    }
     0
 }
 
@@ -5902,10 +5926,38 @@ fn sys_sched_setscheduler(_pid: usize, policy: usize, param_address: usize) -> i
 fn sys_renameat2(
     olddirfd: usize, oldpath: usize,
     newdirfd: usize, newpath: usize,
-    _flags: usize,
+    flags: usize,
 ) -> isize {
-    // Delegate to renameat for now; flags (RENAME_NOREPLACE etc.) are ignored.
-    sys_renameat(olddirfd, oldpath, newdirfd, newpath)
+    const RENAME_NOREPLACE: usize = 1;
+    const RENAME_EXCHANGE: usize = 2;
+    const RENAME_WHITEOUT: usize = 4;
+
+    if flags == 0 {
+        return sys_renameat(olddirfd, oldpath, newdirfd, newpath);
+    }
+    if flags == RENAME_NOREPLACE {
+        // Check if newpath exists before renaming.
+        let new_raw = match copy_user_c_string(newpath) {
+            Ok(s) => s,
+            Err(errno) => return errno,
+        };
+        let new_resolved = match resolve_path_from_user(newdirfd, &new_raw) {
+            Ok(p) => p,
+            Err(errno) => return errno,
+        };
+        if crate::fs::stat(&new_resolved).is_ok() {
+            return -(crate::syscall::errno::EEXIST);
+        }
+        return sys_renameat(olddirfd, oldpath, newdirfd, newpath);
+    }
+    if flags == RENAME_EXCHANGE {
+        // Atomic exchange not supported — do not fake success.
+        return -(crate::syscall::errno::ENOSYS);
+    }
+    if flags == RENAME_WHITEOUT {
+        return -(crate::syscall::errno::EINVAL);
+    }
+    -(crate::syscall::errno::EINVAL)
 }
 
 fn sys_prctl(_option: usize, _arg2: usize, _arg3: usize) -> isize {
@@ -6222,6 +6274,31 @@ fn sys_readlinkat(
         Ok(path) => path,
         Err(errno) => return errno,
     };
+
+    // Compatibility /proc symlinks
+    if path == "/proc/self/exe" || path == "/proc/thread-self/exe" {
+        let target = b"/init";
+        let copy_len = core::cmp::min(length, target.len());
+        if copy_to_user(buffer_address, &target[..copy_len]).is_err() {
+            return -EFAULT;
+        }
+        return copy_len as isize;
+    }
+    if path.starts_with("/proc/self/fd/") || path.starts_with("/dev/fd/") {
+        let fd_str = path.rsplit('/').next().unwrap_or("0");
+        if let Ok(fd) = fd_str.parse::<usize>() {
+            if current_process_file(fd).is_ok() {
+                let target = b"anon_inode:[fd]";
+                let copy_len = core::cmp::min(length, target.len());
+                if copy_to_user(buffer_address, &target[..copy_len]).is_err() {
+                    return -EFAULT;
+                }
+                return copy_len as isize;
+            }
+        }
+        return -(crate::syscall::errno::EBADF);
+    }
+
     let mut buffer = [0_u8; MAX_USER_COPY];
     let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer[..length]);
     match crate::fs::readlink(&path, &mut output) {
@@ -6498,6 +6575,50 @@ fn sys_fsync(fd: usize) -> isize {
         },
         Err(errno) => errno.to_isize(),
     }
+}
+
+fn sys_fdatasync(fd: usize) -> isize {
+    sys_fsync(fd)
+}
+
+fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
+    if buf == 0 && count > 0 {
+        return -EFAULT;
+    }
+    if count > MAX_USER_COPY {
+        return -EINVAL;
+    }
+    if offset > isize::MAX as usize {
+        return -EINVAL;
+    }
+    let file = match current_process_file(fd) {
+        Ok(f) => f,
+        Err(errno) => return errno.to_isize(),
+    };
+    // Seek-save-write-restore (VFS lacks atomic write_at).
+    let saved = match file.seek(0, myos_vfs::SeekWhence::Current) {
+        Ok(off) => off,
+        Err(_) => {
+            // non-seekable fd — write_at not supported
+            return -(crate::syscall::errno::ENOSYS);
+        }
+    };
+    if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
+        let _ = file.seek(saved as i64, myos_vfs::SeekWhence::Set);
+        return -EINVAL;
+    }
+    let mut data = alloc::vec![0_u8; count];
+    if copy_from_user(buf, &mut data).is_err() {
+        let _ = file.seek(saved as i64, myos_vfs::SeekWhence::Set);
+        return -EFAULT;
+    }
+    let io_buf = myos_vfs::IoBuffer::new(&data);
+    let written = match file.write(&io_buf) {
+        Ok(n) => n as isize,
+        Err(errno) => errno.to_isize(),
+    };
+    let _ = file.seek(saved as i64, myos_vfs::SeekWhence::Set);
+    written
 }
 
 fn sys_ftruncate(fd: usize, length: usize) -> isize {

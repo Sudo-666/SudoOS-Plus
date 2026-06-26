@@ -28,12 +28,14 @@ pub mod number {
     pub const READV: usize = 65;
     pub const WRITEV: usize = 66;
     pub const PREAD64: usize = 67;
+    pub const PWRITE64: usize = 68;
     pub const PSELECT6: usize = 72;
     pub const PPOLL: usize = 73;
     pub const READLINKAT: usize = 78;
     pub const NEWFSTATAT: usize = 79;
     pub const FSTAT: usize = 80;
     pub const FSYNC: usize = 82;
+    pub const FDATASYNC: usize = 83;
     pub const EXIT: usize = 93;
     pub const EXIT_GROUP: usize = 94;
     pub const SET_TID_ADDRESS: usize = 96;
@@ -117,6 +119,7 @@ pub mod errno {
     pub const EAGAIN: isize = 11;
     pub const ENOMEM: isize = 12;
     pub const EFAULT: isize = 14;
+    pub const EEXIST: isize = 17;
     pub const EINVAL: isize = 22;
     pub const EPIPE: isize = 32;
     pub const ENOSYS: isize = 38;
