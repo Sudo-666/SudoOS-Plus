@@ -1106,6 +1106,35 @@ fn verify_sdcard_all_scripts_thread() {
         }
 
         // Run the script using the verified spawn/exec/task lifecycle.
+        // ── RISC-V glibc/busybox: use group-specific shell ──
+        #[cfg(target_arch = "riscv64")]
+        let group_result = if vfs_path.ends_with("/glibc/busybox_testcode.sh")
+            && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
+        {
+            let rv_shell = "/mnt/sdcard/glibc/busybox";
+            let rv_cwd = "/mnt/sdcard/glibc";
+            let rv_path_env = "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
+            let rv_ld_env = "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib";
+            crate::println!(
+                "oscomp-rv-busybox-direct: shell={} cwd={} script={}",
+                rv_shell, rv_cwd, vfs_path,
+            );
+            run_rootfs_program_with_cwd(
+                rv_shell,
+                &["busybox", "sh", &vfs_path],
+                &[rv_path_env, rv_ld_env, "HOME=/"],
+                Some(rv_cwd),
+            )
+        } else {
+            run_rootfs_program_with_cwd(
+                shell_path,
+                &["busybox", "sh", &vfs_path],
+                &[&path_env, &ld_env, "HOME=/"],
+                Some(&cwd),
+            )
+        };
+
+        #[cfg(not(target_arch = "riscv64"))]
         let group_result = run_rootfs_program_with_cwd(
             shell_path,
             &["busybox", "sh", &vfs_path],
