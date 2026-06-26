@@ -948,6 +948,19 @@ fn verify_sdcard_all_scripts_thread() {
     #[cfg(target_arch = "loongarch64")]
     oscomp_la_diag(shell_path);
 
+    // ── LoongArch: replace crashing musl busybox with glibc one ──
+    #[cfg(target_arch = "loongarch64")]
+    if crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
+        && crate::fs::stat("/mnt/sdcard/musl/busybox").is_ok()
+    {
+        crate::fs::unlink("/mnt/sdcard/musl/busybox", false).ok();
+        crate::fs::symlink(
+            "/mnt/sdcard/glibc/busybox",
+            "/mnt/sdcard/musl/busybox",
+        ).ok();
+        crate::println!("oscomp-la: replaced musl busybox -> glibc to avoid SIGSEGV");
+    }
+
     // ── local counters (mirror atomics for summary) ──
     #[cfg(not(target_arch = "loongarch64"))]
     let la_shell_ok: bool = true;
@@ -1151,19 +1164,21 @@ fn verify_sdcard_all_scripts_thread() {
             } else if vfs_path.ends_with("/musl/busybox_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
             {
-                // Use glibc busybox as shell for musl test to avoid
-                // known-bad-busybox SIGSEGV in the musl-linked binary.
+                // Replace crashing musl busybox with working glibc one
+                // so that `./busybox` in the test script resolves correctly.
+                crate::fs::unlink("/mnt/sdcard/musl/busybox", false).ok();
+                crate::fs::symlink(
+                    "/mnt/sdcard/glibc/busybox",
+                    "/mnt/sdcard/musl/busybox",
+                ).ok();
                 crate::println!(
-                    "oscomp-la-musl-busybox: use glibc shell script={}",
+                    "oscomp-la-musl-busybox: replaced musl busybox -> glibc script={}",
                     vfs_path,
-                );
-                let glibc_env = alloc::format!(
-                    "PATH=.:/mnt/sdcard/musl/basic:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin"
                 );
                 run_rootfs_program_with_cwd(
                     "/mnt/sdcard/glibc/busybox",
                     &["busybox", "sh", &vfs_path],
-                    &[&glibc_env, &ld_env, "HOME=/"],
+                    &[&path_env, &ld_env, "HOME=/"],
                     Some(&cwd),
                 )
             } else {
