@@ -948,6 +948,10 @@ fn verify_sdcard_all_scripts_thread() {
     #[cfg(target_arch = "loongarch64")]
     oscomp_la_diag(shell_path);
 
+    // ── P9-H17: LA basic direct binary probe ──
+    #[cfg(target_arch = "loongarch64")]
+    oscomp_la_basic_probe();
+
     // ── local counters (mirror atomics for summary) ──
     #[cfg(not(target_arch = "loongarch64"))]
     let la_shell_ok: bool = true;
@@ -1578,6 +1582,65 @@ fn oscomp_la_diag(_shell_path: &str) {
     }
 
     crate::println!("oscomp-la-diag: end");
+}
+
+/// Run direct binary probes for LA basic groups to determine whether
+/// individual test binaries can execute and produce output.
+/// Non-scoring — does not modify OSCOMP_* atomics.
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_basic_probe() {
+    crate::println!("oscomp-la-basic-probe: begin");
+
+    let glibc_env = &[
+        "PATH=.:/mnt/sdcard/glibc/basic:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin",
+        "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
+        "HOME=/",
+    ];
+    let musl_env = &[
+        "PATH=.:/mnt/sdcard/musl/basic:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin",
+        "LD_LIBRARY_PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
+        "HOME=/",
+    ];
+
+    let probes: &[(&str, &str, &[&str])] = &[
+        ("glibc/brk",    "/mnt/sdcard/glibc/basic/brk",    glibc_env),
+        ("glibc/getpid", "/mnt/sdcard/glibc/basic/getpid", glibc_env),
+        ("glibc/write",  "/mnt/sdcard/glibc/basic/write",  glibc_env),
+        ("glibc/exit",   "/mnt/sdcard/glibc/basic/exit",   glibc_env),
+        ("musl/brk",     "/mnt/sdcard/musl/basic/brk",     musl_env),
+        ("musl/getpid",  "/mnt/sdcard/musl/basic/getpid",  musl_env),
+        ("musl/write",   "/mnt/sdcard/musl/basic/write",   musl_env),
+        ("musl/exit",    "/mnt/sdcard/musl/basic/exit",    musl_env),
+    ];
+
+    for (label, path, env) in probes {
+        let cwd = if label.starts_with("glibc") {
+            "/mnt/sdcard/glibc/basic"
+        } else {
+            "/mnt/sdcard/musl/basic"
+        };
+
+        crate::println!(
+            "oscomp-la-basic-probe: run path={} cwd={}",
+            path, cwd,
+        );
+
+        match run_rootfs_program_with_cwd(path, &[label.split('/').nth(1).unwrap_or("?")], env, Some(cwd)) {
+            Ok(raw) => crate::println!(
+                "oscomp-la-basic-probe: done path={} raw={} class={}",
+                path, raw,
+                if raw == 0 { alloc::string::String::from("PASS") }
+                else if raw < 0 { alloc::format!("signal={}", -raw) }
+                else { alloc::format!("exit={}", raw) },
+            ),
+            Err(_) => crate::println!(
+                "oscomp-la-basic-probe: done path={} ERROR",
+                path,
+            ),
+        }
+    }
+
+    crate::println!("oscomp-la-basic-probe: end");
 }
 
 /// External watchdog kernel thread.  If the contest runner blocks
