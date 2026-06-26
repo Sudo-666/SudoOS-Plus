@@ -1946,6 +1946,12 @@ fn run_program_image_with_cwd(
             extra_areas: &extra_areas,
         },
     )?;
+    // Set parent so getppid returns a valid PID.
+    // During contest we may run in a kernel thread; fallback to PID 1 (init).
+    let ppid = crate::task::current_user_thread()
+        .map(|t| t.process().id())
+        .unwrap_or(crate::process::ProcessId::from_raw_for_kernel(1));
+    let _ = exec.process.set_parent(ppid);
     if let Some(cwd) = cwd {
         exec.process.fs().set_cwd(cwd)?;
     }
