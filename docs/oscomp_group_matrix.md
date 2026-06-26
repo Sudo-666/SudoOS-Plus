@@ -217,3 +217,44 @@ paths (RV direct override, LA direct basic, whitelist/defer).
 - Preflight does **not** unskip any group. All heavy groups remain skipped.
 - `Ready` ≠ test will pass — it only means the entry conditions (file/cwd/shell) exist.
 - P10-F3 will connect preflight to mini-probe execution.
+
+## P10-F3 Mini Probe Catalog
+
+*Added in `6.27` — scaffold only, no probes executed.*
+
+### New types
+
+| Type | Purpose |
+|------|---------|
+| `OscompProbeKind` | ShellTrue / ShellEcho / DirectBinary / ScriptSmoke / FsMini / NetTcpMini / NetUdpMini / LtpScan |
+| `OscompMiniProbe` | name + kind + path + argv0 + cwd + risk |
+| `OscompProbeRunStatus` | NotRun / Pass / Fail / Missing / Timeout |
+
+### New functions
+
+| Function | Status | Purpose |
+|----------|--------|---------|
+| `oscomp_mini_probes_for(spec)` | ready | Returns probe list per group/libc |
+| `oscomp_log_probe_catalog_once(spec)` | ready | Budgeted (16) summary log |
+| `oscomp_run_mini_probe(probe)` | stub → NotRun | TODO P10-F4 |
+| `oscomp_env_for_policy(policy)` | ready | Env strings per policy |
+
+### Probe catalog by group
+
+| Group | Probes | Risk |
+|-------|--------|------|
+| Lua | shell-true, shell-echo, lua-smoke | Medium |
+| Libcbench | shell-true, shell-echo, libcbench-smoke | Medium |
+| Lmbench | lat_syscall_null, lat_syscall_read, lat_pipe, lat_proc_fork | High |
+| Cyclictest | clock_gettime, nanosleep, clock_nanosleep, sched_yield | High |
+| Iozone | fs_create_4k, fs_write_4k, fs_readback_4k, fs_ftruncate, fs_fsync, fs_statfs, fs_unlink | High |
+| Iperf/Netperf | tcp_socket, tcp_bind_listen, tcp_connect_accept, tcp_send_recv, udp_sendto_recvfrom, poll_select | Extreme |
+| Libctest | nonpthread_smoke, malloc_stdio_smoke, signal_basic_smoke, futex_basic (**NO** pthread_cond_smasher) | Extreme |
+| LTP | metadata_scan, syscall_basic_allowlist, fs_small_allowlist, time_small_allowlist | Extreme |
+
+### Important
+
+- **No probes are executed** in P10-F3. `oscomp_run_mini_probe` always returns `NotRun`.
+- **No skip is removed**. All heavy groups remain skipped.
+- **pthread_cond_smasher is banned** from the catalog.
+- P10-F4 will implement real mini-probe execution.

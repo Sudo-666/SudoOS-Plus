@@ -152,6 +152,53 @@ def main() -> int:
     check(PASS, "oscomp_log_preflight_once exists",
           "oscomp_log_preflight_once" in user_rs)
 
+    # ── P10-F3 mini probe scaffold ──
+    check(PASS, "OscompProbeKind exists",
+          "OscompProbeKind" in user_rs)
+    check(PASS, "OscompMiniProbe exists",
+          "OscompMiniProbe" in user_rs)
+    check(PASS, "OscompProbeRunStatus exists",
+          "OscompProbeRunStatus" in user_rs)
+    check(PASS, "oscomp_mini_probes_for exists",
+          "oscomp_mini_probes_for" in user_rs)
+    check(PASS, "oscomp_log_probe_catalog_once exists",
+          "oscomp_log_probe_catalog_once" in user_rs)
+    check(PASS, "oscomp_run_mini_probe exists",
+          "oscomp_run_mini_probe" in user_rs)
+    check(PASS, "oscomp_env_for_policy exists",
+          "oscomp_env_for_policy" in user_rs)
+
+    # Each heavy group must appear in the probe catalog
+    for g in ["lua", "libcbench", "lmbench", "cyclictest", "iozone",
+              "iperf", "libctest", "ltp"]:
+        found = g.lower() in user_rs.lower() and "oscomp_mini_probes_for" in user_rs
+        check(PASS if found else WARN, f"probe catalog covers {g}", found)
+
+    # Forbidden in probe catalog (only check near probe array definitions)
+    # pthread_cond_smasher in old comments about libctest disabled is OK.
+    if "oscomp_mini_probes_for" in user_rs:
+        # Extract just the probe catalog area (600 chars after the function)
+        idx = user_rs.index("oscomp_mini_probes_for")
+        probe_area = user_rs[idx:idx+6000]
+        if "pthread_cond_smasher" in probe_area.lower():
+            check(FAIL, "pthread_cond_smasher absent from catalog", False,
+                  "pthread_cond_smasher FOUND in probe catalog area!")
+        else:
+            check(PASS, "pthread_cond_smasher absent from catalog", True)
+    else:
+        check(WARN, "pthread_cond_smasher absent from catalog", False,
+              "oscomp_mini_probes_for not found — cannot check catalog")
+
+    # oscomp_run_mini_probe must NOT return Pass by default
+    if "OscompProbeRunStatus::Pass" in user_rs:
+        check(WARN, "oscomp_run_mini_probe not Pass-by-default", False,
+              "probe runner default may be Pass — should be NotRun")
+    elif "OscompProbeRunStatus::NotRun" in user_rs:
+        check(PASS, "oscomp_run_mini_probe defaults NotRun", True)
+    else:
+        check(WARN, "oscomp_run_mini_probe defaults NotRun", False,
+              "probe runner status unknown")
+
     # ── DANGER: forbidden patterns ──
     if "run_group_with_deadline" in user_rs:
         check(FAIL, "run_group_with_deadline absent", False, "FOUND — dangerous!")

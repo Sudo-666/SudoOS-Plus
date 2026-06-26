@@ -1208,6 +1208,176 @@ fn oscomp_log_preflight_once(spec: &OscompGroupSpec<'_>, result: &OscompPrefligh
     );
 }
 
+// ── P10-F3: mini probe catalog scaffold (read-only, runner-unchanged) ──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompProbeKind {
+    ShellTrue,
+    ShellEcho,
+    DirectBinary,
+    ScriptSmoke,
+    FsMini,
+    NetTcpMini,
+    NetUdpMini,
+    LtpScan,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OscompMiniProbe<'a> {
+    name: &'a str,
+    kind: OscompProbeKind,
+    path: &'a str,
+    argv0: &'a str,
+    cwd: &'a str,
+    risk: OscompRisk,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompProbeRunStatus {
+    NotRun,
+    Pass,
+    Fail,
+    Missing,
+    Timeout,
+}
+
+/// Return static mini-probe descriptions for a group.
+/// Pure function — no FS access, no program execution.
+fn oscomp_mini_probes_for(spec: &OscompGroupSpec<'_>) -> &'static [OscompMiniProbe<'static>] {
+    match spec.group {
+        OscompGroup::Lua => {
+            if spec.libc == OscompLibc::Glibc {
+                &[
+                    OscompMiniProbe { name: "shell-true",  kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "shell-echo", kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "lua-smoke",  kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/glibc/lua_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Medium },
+                ]
+            } else {
+                &[
+                    OscompMiniProbe { name: "shell-true",  kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "shell-echo", kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "lua-smoke",  kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/musl/lua_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Medium },
+                ]
+            }
+        }
+        OscompGroup::Libcbench => {
+            if spec.libc == OscompLibc::Glibc {
+                &[
+                    OscompMiniProbe { name: "shell-true",     kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "shell-echo",    kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "libcbench-smoke", kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/glibc/libcbench_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Medium },
+                ]
+            } else {
+                &[
+                    OscompMiniProbe { name: "shell-true",     kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "shell-echo",    kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
+                    OscompMiniProbe { name: "libcbench-smoke", kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/musl/libcbench_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Medium },
+                ]
+            }
+        }
+        OscompGroup::Lmbench => &[
+            OscompMiniProbe { name: "lat_syscall_null",  kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_syscall", argv0: "lat_syscall", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
+            OscompMiniProbe { name: "lat_syscall_read",  kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_syscall", argv0: "lat_syscall", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
+            OscompMiniProbe { name: "lat_pipe",          kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_pipe", argv0: "lat_pipe", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
+            OscompMiniProbe { name: "lat_proc_fork",     kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_proc", argv0: "lat_proc", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
+        ],
+        OscompGroup::Cyclictest => &[
+            OscompMiniProbe { name: "clock_gettime",       kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
+            OscompMiniProbe { name: "nanosleep",           kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
+            OscompMiniProbe { name: "clock_nanosleep",     kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
+            OscompMiniProbe { name: "sched_yield",         kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
+        ],
+        OscompGroup::Iozone => &[
+            OscompMiniProbe { name: "fs_create_4k",   kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe { name: "fs_write_4k",    kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe { name: "fs_readback_4k", kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe { name: "fs_ftruncate",   kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe { name: "fs_fsync",       kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe { name: "fs_statfs",      kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe { name: "fs_unlink",      kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+        ],
+        OscompGroup::Iperf | OscompGroup::Netperf => &[
+            OscompMiniProbe { name: "tcp_socket",           kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "tcp_bind_listen",      kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "tcp_connect_accept",   kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "tcp_send_recv",        kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "udp_sendto_recvfrom",  kind: OscompProbeKind::NetUdpMini, path: "/tmp/net-probe", argv0: "udp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "poll_select_probe",    kind: OscompProbeKind::NetUdpMini, path: "/tmp/net-probe", argv0: "poll_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+        ],
+        OscompGroup::Libctest => &[
+            OscompMiniProbe { name: "nonpthread_smoke",     kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "nonpthread_smoke", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "malloc_stdio_smoke",   kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "malloc_stdio_smoke", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "signal_basic_smoke",   kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "signal_basic_smoke", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "futex_basic_probe",    kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "futex_basic_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+        ],
+        OscompGroup::Ltp => &[
+            OscompMiniProbe { name: "metadata_scan",         kind: OscompProbeKind::LtpScan,      path: "/mnt/sdcard/glibc/ltp", argv0: "metadata_scan", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "syscall_basic_allowlist", kind: OscompProbeKind::LtpScan,    path: "/mnt/sdcard/glibc/ltp", argv0: "syscall_allowlist", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "fs_small_allowlist",    kind: OscompProbeKind::LtpScan,      path: "/mnt/sdcard/glibc/ltp", argv0: "fs_allowlist", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
+            OscompMiniProbe { name: "time_small_allowlist",  kind: OscompProbeKind::LtpScan,      path: "/mnt/sdcard/glibc/ltp", argv0: "time_allowlist", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
+        ],
+        _ => &[],
+    }
+}
+
+/// Budgeted one-shot summary of the probe catalog for a group.
+fn oscomp_log_probe_catalog_once(spec: &OscompGroupSpec<'_>) {
+    static PROBE_CAT_LOG_BUDGET: AtomicUsize = AtomicUsize::new(16);
+    let budget = PROBE_CAT_LOG_BUDGET.load(Ordering::Relaxed);
+    if budget == 0 {
+        return;
+    }
+    PROBE_CAT_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+
+    let probes = oscomp_mini_probes_for(spec);
+    let first = probes.first().map(|p| p.name).unwrap_or("none");
+    crate::println!(
+        "oscomp-probe-catalog: group={:?} libc={:?} probes={} first={} risk={:?}",
+        spec.group, spec.libc, probes.len(), first, spec.risk,
+    );
+}
+
+/// TODO P10-F4: real mini-probe execution.
+/// Currently always returns NotRun.
+fn oscomp_run_mini_probe(_probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
+    OscompProbeRunStatus::NotRun
+}
+
+/// Return static env strings for a given env policy.
+/// Does not execute code — just returns string slices.
+fn oscomp_env_for_policy(policy: OscompEnvPolicy) -> &'static [&'static str] {
+    match policy {
+        OscompEnvPolicy::Glibc => &[
+            "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/basic:/bin:/sbin:/usr/bin:/usr/sbin",
+            "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib64:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
+            "HOME=/",
+        ],
+        OscompEnvPolicy::Musl => &[
+            "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/basic:/bin:/sbin:/usr/bin:/usr/sbin",
+            "LD_LIBRARY_PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/lib64:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
+            "HOME=/",
+        ],
+        OscompEnvPolicy::MixedMuslWithGlibcShell => &[
+            "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin",
+            "LD_LIBRARY_PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib64:/lib:/usr/lib",
+            "HOME=/",
+        ],
+        OscompEnvPolicy::Network => &[
+            "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin",
+            "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/lib64:/lib:/usr/lib",
+            "HOME=/",
+        ],
+        OscompEnvPolicy::FilesystemStress => &[
+            "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/basic:/bin:/sbin:/usr/bin:/usr/sbin",
+            "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib64:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
+            "HOME=/",
+        ],
+        OscompEnvPolicy::Default => &[
+            "HOME=/",
+        ],
+    }
+}
+
 /// Returns `true` if the contest runner discovered scripts and ran to
 /// completion (including shutdown).  Returns `false` when there is no
 /// sdcard block device, so the caller can keep the machine alive for
