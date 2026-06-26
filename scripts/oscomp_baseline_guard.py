@@ -264,6 +264,28 @@ def main() -> int:
     check(PASS, "oscomp-probe-only log string exists",
           "oscomp-probe-only" in user_rs)
 
+    # ── P10-F8 no-sdcard selftest ──
+    for flag in ["OSCOMP_PROBE_SELFTEST_NO_SDCARD",
+                 "OSCOMP_PROBE_SELFTEST_LUA",
+                 "OSCOMP_PROBE_SELFTEST_LIBCBENCH"]:
+        check(PASS, f"{flag} exists", flag in user_rs)
+        if f"{flag}: bool = true" in user_rs or f"{flag}: bool=true" in user_rs:
+            check(FAIL, f"{flag} is false", False, f"{flag} must be false!")
+        else:
+            check(PASS, f"{flag} is false", True)
+
+    check(PASS, "oscomp_probe_only_no_sdcard_selftest exists",
+          "oscomp_probe_only_no_sdcard_selftest" in user_rs)
+    check(PASS, "no-vda branch calls selftest",
+          "oscomp_probe_only_no_sdcard_selftest()" in user_rs)
+    check(PASS, "prepare_path has no-vda guard",
+          'open_device("vda")' in user_rs.split("oscomp_probe_only_prepare_path")[1][:300]
+          if "oscomp_probe_only_prepare_path" in user_rs else False)
+    check(PASS, "oscomp-probe-selftest log exists",
+          "oscomp-probe-selftest" in user_rs)
+    check(PASS, "prepare skipped no-vda log exists",
+          "prepare skipped no-vda" in user_rs)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)

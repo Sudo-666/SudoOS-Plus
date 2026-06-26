@@ -379,3 +379,38 @@ directory via `sdcard_install_ext4_dir_files`. Called only inside
 - Cloud with SD card would trigger probe hooks in skip/defer branches
 - If preflight shows Ready → Lua probes can be enabled for real
 - If NotReady → check which preflight item failed
+
+## P10-F8 No-SDCard Probe Selftest
+
+*Local smoke validation of the full probe pipeline without SD card.*
+
+### Dryrun output (RV smoke, selftest enabled)
+
+```
+oscomp: no sdcard, skip contest runner
+oscomp-probe-selftest: no-sdcard begin
+oscomp-probe-only: prepare skipped no-vda path=/mnt/sdcard/glibc/lua_testcode.sh
+oscomp-probe-only: begin path=/mnt/sdcard/glibc/lua_testcode.sh group=Lua libc=Glibc
+oscomp-preflight: ... status=NotReady script=0 cwd=0 shell=0 loader=0 env=1
+oscomp-probe-only: not-ready path=... status=NotReady
+oscomp-probe-selftest: no-sdcard end
+```
+
+### Verified
+
+- classify → correct (Lua/Glibc, Lua/Musl)
+- allowed gate → passed with flags enabled
+- prepare_path → skipped no-vda (safe, no block device access)
+- preflight → NotReady (expected — no SD card in smoke)
+- log → all three types present
+- no panic, no fake testcase success
+- flags restored to false
+
+### Enabling locally
+
+```
+OSCOMP_PROBE_ONLY_ENABLED = true
+OSCOMP_PROBE_LUA = true
+OSCOMP_PROBE_SELFTEST_NO_SDCARD = true
+OSCOMP_PROBE_SELFTEST_LUA = true
+```

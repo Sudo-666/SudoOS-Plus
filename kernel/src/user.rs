@@ -1560,6 +1560,11 @@ const OSCOMP_PROBE_LIBCTEST: bool = false;
 const OSCOMP_PROBE_LTP: bool = false;
 const OSCOMP_PROBE_UNIXBENCH: bool = false;
 
+// ── P10-F8: no-sdcard selftest flags (all false) ──
+const OSCOMP_PROBE_SELFTEST_NO_SDCARD: bool = false;
+const OSCOMP_PROBE_SELFTEST_LUA: bool = false;
+const OSCOMP_PROBE_SELFTEST_LIBCBENCH: bool = false;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OscompProbeOnlyOutcome {
     Disabled,
@@ -1596,6 +1601,19 @@ static OSCOMP_PROBE_ONLY_LOG_BUDGET: AtomicUsize = AtomicUsize::new(64);
 /// when OSCOMP_PROBE_ONLY_ENABLED is false this function is never reached.
 fn oscomp_probe_only_prepare_path(path: &str) {
     if !path.starts_with("/mnt/sdcard/") {
+        return;
+    }
+    // No local sdcard: skip ext4 materialisation so preflight can safely
+    // report NotReady without touching a block device.
+    if crate::block::open_device("vda").is_none() {
+        let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
+        if budget > 0 {
+            OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+            crate::println!(
+                "oscomp-probe-only: prepare skipped no-vda path={}",
+                path,
+            );
+        }
         return;
     }
     let ext4_dir = sdcard_vfs_to_ext4_dir(path);
@@ -1691,9 +1709,41 @@ fn oscomp_probe_only_skip_hook(vfs_path: &str) {
 /// completion (including shutdown).  Returns `false` when there is no
 /// sdcard block device, so the caller can keep the machine alive for
 /// smoke / non-contest boot paths.
+/// No-sdcard ProbeOnly selftest — validates the classify→allowed→prepare→
+/// preflight→log pipeline when no vda block device is present.
+/// Default OSCOMP_PROBE_SELFTEST_NO_SDCARD=false → no-op.
+fn oscomp_probe_only_no_sdcard_selftest() {
+    if !OSCOMP_PROBE_SELFTEST_NO_SDCARD {
+        return;
+    }
+
+    crate::println!("oscomp-probe-selftest: no-sdcard begin");
+
+    if OSCOMP_PROBE_SELFTEST_LUA {
+        for path in &[
+            "/mnt/sdcard/glibc/lua_testcode.sh",
+            "/mnt/sdcard/musl/lua_testcode.sh",
+        ] {
+            let _ = oscomp_maybe_run_probe_only(path);
+        }
+    }
+
+    if OSCOMP_PROBE_SELFTEST_LIBCBENCH {
+        for path in &[
+            "/mnt/sdcard/glibc/libcbench_testcode.sh",
+            "/mnt/sdcard/musl/libcbench_testcode.sh",
+        ] {
+            let _ = oscomp_maybe_run_probe_only(path);
+        }
+    }
+
+    crate::println!("oscomp-probe-selftest: no-sdcard end");
+}
+
 pub fn verify_sdcard_all_scripts() -> bool {
     if crate::block::open_device("vda").is_none() {
         crate::println!("oscomp: no sdcard, skip contest runner");
+        oscomp_probe_only_no_sdcard_selftest();
         return false;
     }
 
