@@ -407,11 +407,7 @@ pub fn mount(
         MountFsType::Proc => {
             ensure_mount_target_free(target)?;
             if !directory_is_empty(&target_node)? {
-                crate::println!(
-                    "mount: clearing non-empty target {} before proc mount",
-                    target,
-                );
-                *target_node.state.lock() = NodeState::Directory(Vec::new());
+                return Err(Errno::Ebusy);
             }
             populate_proc_root(&target_node)?;
             insert_mount(source.unwrap_or("proc"), target, fs_type, flags)
@@ -487,7 +483,18 @@ pub fn install_bytes(target_path: &str, data: &[u8]) -> Result<(), Errno> {
     insert_child(&parent, name, node)
 }
 
-pub fn umount(target: &str, _flags: usize) -> Result<(), Errno> {
+// Linux umount2 flags (asm-generic).
+const MNT_FORCE: usize = 0x1;
+const MNT_DETACH: usize = 0x2;
+const MNT_EXPIRE: usize = 0x4;
+const UMOUNT_NOFOLLOW: usize = 0x8;
+
+pub fn umount(target: &str, flags: usize) -> Result<(), Errno> {
+    // Validate flags: only MNT_FORCE, MNT_DETACH, MNT_EXPIRE, UMOUNT_NOFOLLOW are valid.
+    let known = MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW;
+    if flags & !known != 0 {
+        return Err(Errno::Einval);
+    }
     if target == "/" {
         return Err(Errno::Ebusy);
     }
@@ -503,6 +510,12 @@ pub fn umount(target: &str, _flags: usize) -> Result<(), Errno> {
     if removed.fs_type == MountFsType::Ext4 {
         clear_ext4_snapshot(&target_node)?;
     }
+    // MNT_DETACH: lazy unmount — mark as detached but don't fail if busy.
+    // MNT_FORCE: force unmount even if busy (best-effort).
+    // MNT_EXPIRE: mark for expiration if not accessed recently.
+    // For now all flags are accepted and behave identically; the mount is
+    // already removed from the table above.
+    let _ = flags;
     Ok(())
 }
 
@@ -512,9 +525,6 @@ fn populate_proc_root(parent: &Arc<Node>) -> Result<(), Errno> {
         let node = proc_file_node(generator);
         insert_child(parent, name, node)?;
     }
-    // /proc/self — 符号链接到当前 PID
-    let self_node = symlink_node("1");
-    insert_child(parent, "self", self_node)?;
     Ok(())
 }
 
