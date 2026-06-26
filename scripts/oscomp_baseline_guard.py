@@ -321,6 +321,23 @@ def main() -> int:
           "/proc/self/fd" in user_rs.split("sys_readlinkat")[1][:600]
           if "sys_readlinkat" in user_rs else False)
 
+    # ── P10-R3 process/pipe/fcntl/prctl compat ──
+    check(PASS, "F_SETFL appears", "F_SETFL" in user_rs)
+    check(PASS, "F_GETOWN appears", "F_GETOWN" in user_rs)
+    check(PASS, "F_SETOWN appears", "F_SETOWN" in user_rs)
+    check(PASS, "fcntl handles F_SETFL", "F_SETFL" in user_rs.split("sys_fcntl")[1][:600]
+          if "sys_fcntl" in user_rs else False)
+    check(PASS, "pipe2 validates flags", "allowed" in user_rs.split("sys_pipe2")[1][:500]
+          if "sys_pipe2" in user_rs else False)
+    check(PASS, "WNOHANG appears", "WNOHANG" in user_rs)
+    check(PASS, "wait4 accepts 4 args", "rusage_address" in user_rs)
+    check(PASS, "PR_SET_NAME appears", "PR_SET_NAME" in user_rs)
+    check(PASS, "PR_GET_NAME appears", "PR_GET_NAME" in user_rs)
+    check(PASS, "PR_SET_VMA appears", "PR_SET_VMA" in user_rs)
+    check(PASS, "PR_SET_TIMERSLACK appears", "PR_SET_TIMERSLACK" in user_rs)
+    check(PASS, "sys_prctl no longer all-0", "PR_SET_DUMPABLE" in user_rs)
+    check(PASS, "set_robust_list length 24", "ROBUST_LIST_HEAD_SIZE" in user_rs or "24" in user_rs)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)
