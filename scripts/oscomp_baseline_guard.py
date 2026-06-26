@@ -354,6 +354,19 @@ def main() -> int:
     check(PASS, "sigreturn clears unblockable", "unblockable" in user_rs.split("sys_rt_sigreturn")[1][:400]
           if "sys_rt_sigreturn" in user_rs else True)
 
+    # ── P10-R5 net/socket/poll compat ──
+    check(PASS, "SOCK_NONBLOCK appears", "SOCK_NONBLOCK" in user_rs or "SOCK_NONBLOCK" in (open("kernel/src/net/socket.rs").read() if True else ""))
+    check(PASS, "SOCK_CLOEXEC appears", "SOCK_CLOEXEC" in user_rs or "SOCK_CLOEXEC" in (open("kernel/src/net/socket.rs").read() if True else ""))
+    check(PASS, "MSG_DONTWAIT appears", "MSG_DONTWAIT" in user_rs or "MSG_DONTWAIT" in (open("kernel/src/net/socket.rs").read() if True else ""))
+    check(PASS, "MSG_NOSIGNAL appears", "MSG_NOSIGNAL" in user_rs or "MSG_NOSIGNAL" in (open("kernel/src/net/socket.rs").read() if True else ""))
+    check(PASS, "ENOTSOCK exists", "ENOTSOCK" in user_rs or "pub const ENOTSOCK" in (open("kernel/src/syscall.rs").read() if True else ""))
+    check(PASS, "ENOPROTOOPT exists", "ENOPROTOOPT" in user_rs or "pub const ENOPROTOOPT" in (open("kernel/src/syscall.rs").read() if True else ""))
+    check(PASS, "EOPNOTSUPP exists", "EOPNOTSUPP" in user_rs or "pub const EOPNOTSUPP" in (open("kernel/src/syscall.rs").read() if True else ""))
+    check(PASS, "getsockopt reads optlen ptr", "optlen_addr" in user_rs.split("sys_getsockopt")[1][:300]
+          if "sys_getsockopt" in user_rs else False)
+    check(PASS, "setsockopt no longer all-0", "SOL_SOCKET" in user_rs.split("sys_setsockopt")[1][:300]
+          if "sys_setsockopt" in user_rs else False)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)

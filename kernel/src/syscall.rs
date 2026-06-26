@@ -123,6 +123,13 @@ pub mod errno {
     pub const EEXIST: isize = 17;
     pub const EINVAL: isize = 22;
     pub const EPIPE: isize = 32;
+    pub const ENOTSOCK: isize = 88;
+    pub const ENOPROTOOPT: isize = 92;
+    pub const EOPNOTSUPP: isize = 95;
+    pub const EISCONN: isize = 106;
+    pub const ENOTCONN: isize = 107;
+    pub const EINPROGRESS: isize = 115;
+    pub const EALREADY: isize = 114;
     pub const ENOSYS: isize = 38;
     pub const ETIMEDOUT: isize = 110;
     pub const MAX_ERRNO: isize = 4095;

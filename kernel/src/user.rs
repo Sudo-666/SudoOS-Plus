@@ -5323,39 +5323,102 @@ const TCP_NODELAY: usize = 1;
 const IPPROTO_TCP: usize = 6;
 
 fn sys_setsockopt(
-    _fd: usize, _level: usize, _optname: usize,
-    _optval: usize, _optlen: usize,
+    fd: usize, level: usize, optname: usize,
+    optval: usize, optlen: usize,
 ) -> isize {
-    // Accept common socket options as no-ops so netperf/iperf don't fail.
-    // A full implementation would validate the option and apply it to
-    // the socket's internal state.
-    0
+    const SOL_SOCKET: usize = 1;
+    const IPPROTO_TCP: usize = 6;
+
+    // Validate fd is a socket (best-effort — current syscall path may not
+    // distinguish socket files from regular files; accept any valid fd).
+    if current_process_file(fd).is_err() {
+        return -EBADF;
+    }
+    // Validate pointer / length
+    if optval == 0 && optlen > 0 {
+        return -EFAULT;
+    }
+
+    match level {
+        SOL_SOCKET => match optname {
+            2 /* SO_REUSEADDR */ | 6 /* SO_BROADCAST */ | 7 /* SO_SNDBUF */
+            | 8 /* SO_RCVBUF */ | 9 /* SO_KEEPALIVE */
+            | 20 /* SO_RCVTIMEO */ | 21 /* SO_SNDTIMEO */ => {
+                if optlen >= 4 {
+                    // Validate we can read the option value.
+                    let _ = match copy_plain_from_user::<i32>(optval) {
+                        Ok(v) => v,
+                        Err(errno) => return errno,
+                    };
+                }
+                0
+            }
+            4 /* SO_ERROR — read-only */ => -(crate::syscall::errno::ENOPROTOOPT),
+            _ => -(crate::syscall::errno::ENOPROTOOPT),
+        },
+        IPPROTO_TCP => match optname {
+            1 /* TCP_NODELAY */ => 0,
+            _ => -(crate::syscall::errno::ENOPROTOOPT),
+        },
+        _ => -(crate::syscall::errno::ENOPROTOOPT),
+    }
 }
 
 fn sys_getsockopt(
-    _fd: usize, _level: usize, optname: usize,
-    optval: usize, optlen: usize,
+    fd: usize, level: usize, optname: usize,
+    optval: usize, optlen_addr: usize,
 ) -> isize {
-    // Return sensible defaults for commonly-queried socket options.
-    let mut value_len = [0_u8; 4];
-    let value: i32 = match optname {
-        SO_ERROR => 0,          // no pending error
-        SO_KEEPALIVE => 0,      // keepalive disabled
-        SO_REUSEADDR => 1,      // reuseaddr enabled (common default)
-        SO_SNDBUF => 65536,     // default send buffer
-        SO_RCVBUF => 65536,     // default recv buffer
-        _ => 0,
+    const SOL_SOCKET: usize = 1;
+    const IPPROTO_TCP: usize = 6;
+
+    if current_process_file(fd).is_err() {
+        return -EBADF;
+    }
+    if optval == 0 || optlen_addr == 0 {
+        return -EFAULT;
+    }
+    // Read the user's optlen pointer to get the buffer size.
+    let mut user_optlen: i32 = match copy_plain_from_user::<i32>(optlen_addr) {
+        Ok(v) => v,
+        Err(errno) => return errno,
     };
-    value_len.copy_from_slice(&value.to_ne_bytes());
-    if optlen != 0 {
-        let len = core::cmp::min(4, optlen);
-        if copy_to_user(optval, &value_len[..len]).is_err() {
-            return -EFAULT;
+    if user_optlen < 4 {
+        return -EINVAL;
+    }
+
+    match level {
+        SOL_SOCKET => {
+            let value: i32 = match optname {
+                4 /* SO_ERROR */ => 0,
+                2 /* SO_REUSEADDR */ => 1,
+                9 /* SO_KEEPALIVE */ => 0,
+                6 /* SO_BROADCAST */ => 0,
+                7 /* SO_SNDBUF */ => 65536,
+                8 /* SO_RCVBUF */ => 65536,
+                3 /* SO_TYPE */ => 1, // SOCK_STREAM
+                30 /* SO_ACCEPTCONN */ => 0,
+                _ => return -(crate::syscall::errno::ENOPROTOOPT),
+            };
+            if copy_to_user(optval, &value.to_ne_bytes()[..core::cmp::min(user_optlen as usize, 4)]).is_err() {
+                return -EFAULT;
+            }
+            user_optlen = core::cmp::min(user_optlen, 4);
         }
-        // Write back the actual length if the user provided a pointer.
-        if copy_to_user(optlen, &len.to_ne_bytes()).is_err() {
-            return -EFAULT;
-        }
+        IPPROTO_TCP => match optname {
+            1 /* TCP_NODELAY */ => {
+                let value: i32 = 0;
+                if copy_to_user(optval, &value.to_ne_bytes()[..core::cmp::min(user_optlen as usize, 4)]).is_err() {
+                    return -EFAULT;
+                }
+                user_optlen = core::cmp::min(user_optlen, 4);
+            }
+            _ => return -(crate::syscall::errno::ENOPROTOOPT),
+        },
+        _ => return -(crate::syscall::errno::ENOPROTOOPT),
+    }
+    // Write back updated optlen.
+    if copy_to_user(optlen_addr, &user_optlen.to_ne_bytes()).is_err() {
+        return -EFAULT;
     }
     0
 }

@@ -331,14 +331,20 @@ fn get_socket_id_from_fd(fd: usize) -> Result<usize, isize> {
 
 /// socket(domain, type, protocol) → fd
 pub fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
+    const SOCK_CLOEXEC: usize = 0o2000000;
+    const SOCK_NONBLOCK: usize = 0o0004000;
+
     if domain != AF_INET && domain != AF_INET6 {
         return -(Errno::Eafnosupport as isize);
     }
-    if sock_type != SOCK_STREAM && sock_type != SOCK_DGRAM {
+    let wants_cloexec = sock_type & SOCK_CLOEXEC != 0;
+    let wants_nonblock = sock_type & SOCK_NONBLOCK != 0;
+    let base_type = sock_type & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
         return -(Errno::Einval as isize);
     }
     let protocol = if protocol == 0 {
-        match sock_type {
+        match base_type {
             SOCK_STREAM => IPPROTO_TCP,
             SOCK_DGRAM => IPPROTO_UDP,
             _ => return -(Errno::Einval as isize),
@@ -348,7 +354,7 @@ pub fn sys_socket(domain: usize, sock_type: usize, protocol: usize) -> isize {
     };
 
     let id = allocate_socket_id();
-    let inner = SocketInner::new(domain, sock_type, protocol);
+    let inner = SocketInner::new(domain, base_type, protocol);
 
     {
         let mut table = SOCKET_TABLE.lock();
@@ -530,10 +536,18 @@ pub fn sys_sendto(
     fd: usize,
     buf_ptr: usize,
     buf_len: usize,
-    _flags: usize,
+    flags: usize,
     _dest_addr_ptr: usize,
     _addr_len: usize,
 ) -> isize {
+    // Validate flags: MSG_DONTWAIT(0x40), MSG_NOSIGNAL(0x4000),
+    // MSG_DONTROUTE(0x4) are accepted.
+    const MSG_DONTWAIT: usize = 0x40;
+    const MSG_NOSIGNAL: usize = 0x4000;
+    const MSG_DONTROUTE: usize = 0x4;
+    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL | MSG_DONTROUTE) != 0 {
+        return -(Errno::Einval as isize);
+    }
     let _sid = match get_socket_id_from_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
@@ -552,10 +566,18 @@ pub fn sys_recvfrom(
     fd: usize,
     buf_ptr: usize,
     buf_len: usize,
-    _flags: usize,
+    flags: usize,
     _src_addr_ptr: usize,
     _addr_len_ptr: usize,
 ) -> isize {
+    // Validate flags: MSG_DONTWAIT(0x40), MSG_PEEK(0x2),
+    // MSG_CMSG_CLOEXEC(0x40000000) are accepted.
+    const MSG_DONTWAIT: usize = 0x40;
+    const MSG_PEEK: usize = 0x2;
+    const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
+    if flags & !(MSG_DONTWAIT | MSG_PEEK | MSG_CMSG_CLOEXEC) != 0 {
+        return -(Errno::Einval as isize);
+    }
     let sid = match get_socket_id_from_fd(fd) {
         Ok(id) => id,
         Err(e) => return e,
