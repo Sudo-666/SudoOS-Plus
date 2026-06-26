@@ -1148,13 +1148,13 @@ fn verify_sdcard_all_scripts_thread() {
                     vfs_path,
                 );
                 Ok(oscomp_la_run_basic_direct("musl", "/mnt/sdcard/musl/basic"))
-            } else if vfs_path.ends_with("/musl/busybox_testcode.sh")
+            } else if vfs_path.contains("/musl/")
                 && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
             {
-                // Use glibc busybox as shell and put glibc dir first in PATH
-                // so that sleep/kill applets come from the working binary.
+                // All musl/* scripts use glibc busybox as shell to avoid
+                // known SIGSEGV in the musl-linked busybox binary on LA.
                 crate::println!(
-                    "oscomp-la-musl-busybox: use glibc busybox script={}",
+                    "oscomp-la-musl-shell: use glibc busybox script={}",
                     vfs_path,
                 );
                 let musl_fixed_env = alloc::format!(
@@ -1483,7 +1483,8 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || path.ends_with("/glibc/busybox_testcode.sh")
         || path.ends_with("/musl/busybox_testcode.sh")
         || path.ends_with("/glibc/libcbench_testcode.sh")
-    // musl lua SIGSEGVs (bad LA binary), musl libcbench SIGSEGVs
+        || path.ends_with("/musl/libcbench_testcode.sh")
+        || path.ends_with("/musl/lua_testcode.sh")
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
