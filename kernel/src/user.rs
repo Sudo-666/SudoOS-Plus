@@ -1151,16 +1151,19 @@ fn verify_sdcard_all_scripts_thread() {
             } else if vfs_path.ends_with("/musl/busybox_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
             {
-                // Use glibc busybox directly for the musl test to avoid
-                // known-bad-busybox SIGSEGV in the musl-linked binary.
+                // Use glibc busybox as shell and put glibc dir first in PATH
+                // so that sleep/kill applets come from the working binary.
                 crate::println!(
                     "oscomp-la-musl-busybox: use glibc busybox script={}",
                     vfs_path,
                 );
+                let musl_fixed_env = alloc::format!(
+                    "PATH=.:/mnt/sdcard/glibc/basic:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin"
+                );
                 run_rootfs_program_with_cwd(
                     "/mnt/sdcard/glibc/busybox",
                     &["busybox", "sh", &vfs_path],
-                    &[&path_env, &ld_env, "HOME=/"],
+                    &[&musl_fixed_env, &ld_env, "HOME=/"],
                     Some(&cwd),
                 )
             } else {
@@ -1729,6 +1732,34 @@ fn oscomp_la_run_basic_direct(kind: &str, root: &str) -> isize {
 /// External watchdog kernel thread.  If the contest runner blocks
 /// inside a script group, the watchdog prints a partial summary and
 /// shuts down when the global deadline expires.
+/// Spawn a long-lived sleep process so that busybox "kill 10" has a valid PID.
+pub(crate) fn spawn_dummy_sleep(shell_path: &str) {
+    let image = match load_exec_image(shell_path) {
+        Ok(img) => img,
+        Err(_) => return,
+    };
+    let exec = match crate::exec::exec_elf(
+        &image,
+        crate::exec::ExecConfig {
+            argv: &["sleep", "999"],
+            envp: &["PATH=/", "HOME=/"],
+            stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
+            heap_start: VirtAddr::new(USER_HEAP_START),
+            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+            extra_areas: &[],
+        },
+    ) {
+        Ok(exec) => exec,
+        Err(_) => return,
+    };
+    let pid = exec.process.id();
+    let _task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
+    // Leak the process and thread — they stay alive serving as kill target.
+    core::mem::forget(exec.thread);
+    core::mem::forget(exec.process);
+    crate::println!("oscomp: dummy-sleep pid={}", pid.get());
+}
+
 fn contest_watchdog_main() {
     loop {
         if !OSCOMP_ACTIVE.load(Ordering::Acquire) {
