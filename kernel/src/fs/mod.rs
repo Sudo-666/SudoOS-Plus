@@ -379,8 +379,13 @@ pub fn mount(
             let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
             verify_ext4_superblock(&device)?;
             ensure_mount_target_free(target)?;
+            // Clear previous mount leftovers so repeated mount works.
             if !directory_is_empty(&target_node)? {
-                return Err(Errno::Ebusy);
+                crate::println!(
+                    "mount: clearing non-empty target {} before ext4 mount",
+                    target,
+                );
+                *target_node.state.lock() = NodeState::Directory(Vec::new());
             }
             install_ext4_snapshot(&target_node, device)?;
             insert_mount(source, target, fs_type, flags)
@@ -391,14 +396,22 @@ pub fn mount(
             let _device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
             ensure_mount_target_free(target)?;
             if !directory_is_empty(&target_node)? {
-                return Err(Errno::Ebusy);
+                crate::println!(
+                    "mount: clearing non-empty target {} before vfat mount",
+                    target,
+                );
+                *target_node.state.lock() = NodeState::Directory(Vec::new());
             }
             insert_mount(source, target, fs_type, flags)
         }
         MountFsType::Proc => {
             ensure_mount_target_free(target)?;
             if !directory_is_empty(&target_node)? {
-                return Err(Errno::Ebusy);
+                crate::println!(
+                    "mount: clearing non-empty target {} before proc mount",
+                    target,
+                );
+                *target_node.state.lock() = NodeState::Directory(Vec::new());
             }
             populate_proc_root(&target_node)?;
             insert_mount(source.unwrap_or("proc"), target, fs_type, flags)

@@ -139,7 +139,7 @@ const EINVAL: isize = crate::syscall::errno::EINVAL;
 const ENOSYS: isize = crate::syscall::errno::ENOSYS;
 const ERANGE: isize = 34;
 
-const MAX_USER_COPY: usize = 256;
+const MAX_USER_COPY: usize = 4096;
 const MAX_USER_PATH: usize = 256;
 const MAX_EXEC_ARGS: usize = 32;
 const MAX_EXEC_ENVS: usize = 32;
