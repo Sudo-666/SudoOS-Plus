@@ -1544,6 +1544,126 @@ fn oscomp_env_for_policy(policy: OscompEnvPolicy) -> &'static [&'static str] {
     }
 }
 
+// ── P10-F5: ProbeOnly bridge (all disabled by default) ──
+
+/// Master switch — must be true for any probe-only group to run.
+const OSCOMP_PROBE_ONLY_ENABLED: bool = false;
+
+const OSCOMP_PROBE_LUA: bool = false;
+const OSCOMP_PROBE_LIBCBENCH: bool = false;
+const OSCOMP_PROBE_LMBENCH: bool = false;
+const OSCOMP_PROBE_CYCLICTEST: bool = false;
+const OSCOMP_PROBE_IOZONE: bool = false;
+const OSCOMP_PROBE_IPERF: bool = false;
+const OSCOMP_PROBE_NETPERF: bool = false;
+const OSCOMP_PROBE_LIBCTEST: bool = false;
+const OSCOMP_PROBE_LTP: bool = false;
+const OSCOMP_PROBE_UNIXBENCH: bool = false;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompProbeOnlyOutcome {
+    Disabled,
+    NotApplicable,
+    NotReady,
+    Ran,
+}
+
+/// Check whether probe-only is permitted for a given group.
+fn oscomp_probe_only_allowed(spec: &OscompGroupSpec<'_>) -> bool {
+    if !OSCOMP_PROBE_ONLY_ENABLED {
+        return false;
+    }
+    match spec.group {
+        OscompGroup::Lua => OSCOMP_PROBE_LUA,
+        OscompGroup::Libcbench => OSCOMP_PROBE_LIBCBENCH,
+        OscompGroup::Lmbench => OSCOMP_PROBE_LMBENCH,
+        OscompGroup::Cyclictest => OSCOMP_PROBE_CYCLICTEST,
+        OscompGroup::Iozone => OSCOMP_PROBE_IOZONE,
+        OscompGroup::Iperf => OSCOMP_PROBE_IPERF,
+        OscompGroup::Netperf => OSCOMP_PROBE_NETPERF,
+        OscompGroup::Libctest => OSCOMP_PROBE_LIBCTEST,
+        OscompGroup::Ltp => OSCOMP_PROBE_LTP,
+        OscompGroup::Unixbench => OSCOMP_PROBE_UNIXBENCH,
+        _ => false,
+    }
+}
+
+static OSCOMP_PROBE_ONLY_LOG_BUDGET: AtomicUsize = AtomicUsize::new(64);
+
+/// Run preflight + mini probes for a script path in ProbeOnly mode.
+/// Does **not** affect pass_count, fail_count, score, or group_result.
+fn oscomp_maybe_run_probe_only(path: &str) -> OscompProbeOnlyOutcome {
+    let spec = oscomp_classify_script(path);
+
+    if !oscomp_probe_only_allowed(&spec) {
+        return OscompProbeOnlyOutcome::Disabled;
+    }
+
+    {
+        let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
+        if budget > 0 {
+            OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+            crate::println!(
+                "oscomp-probe-only: begin path={} group={:?} libc={:?}",
+                path, spec.group, spec.libc,
+            );
+        }
+    }
+
+    let result = oscomp_group_preflight(&spec);
+    oscomp_log_preflight_once(&spec, &result);
+
+    if result.status != OscompPreflightStatus::Ready {
+        let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
+        if budget > 0 {
+            OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+            crate::println!(
+                "oscomp-probe-only: not-ready path={} status={:?}",
+                path, result.status,
+            );
+        }
+        return OscompProbeOnlyOutcome::NotReady;
+    }
+
+    let probes = oscomp_mini_probes_for(&spec);
+    if probes.is_empty() {
+        return OscompProbeOnlyOutcome::NotApplicable;
+    }
+
+    let mut pass: usize = 0;
+    let mut fail: usize = 0;
+    let mut missing: usize = 0;
+    let mut notrun: usize = 0;
+
+    for probe in probes {
+        let status = oscomp_run_mini_probe(probe);
+        match status {
+            OscompProbeRunStatus::Pass => pass += 1,
+            OscompProbeRunStatus::Fail | OscompProbeRunStatus::Timeout => fail += 1,
+            OscompProbeRunStatus::Missing => missing += 1,
+            OscompProbeRunStatus::NotRun => notrun += 1,
+        }
+    }
+
+    {
+        let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
+        if budget > 0 {
+            OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+            let total = probes.len();
+            crate::println!(
+                "oscomp-probe-only: end path={} total={} pass={} fail={} missing={} notrun={}",
+                path, total, pass, fail, missing, notrun,
+            );
+        }
+    }
+
+    OscompProbeOnlyOutcome::Ran
+}
+
+fn oscomp_probe_only_skip_hook(vfs_path: &str) {
+    let _ = oscomp_maybe_run_probe_only(vfs_path);
+}
+
 /// Returns `true` if the contest runner discovered scripts and ran to
 /// completion (including shutdown).  Returns `false` when there is no
 /// sdcard block device, so the caller can keep the machine alive for
@@ -1720,6 +1840,8 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("{} : SKIP (defer)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            // ── P10-F5: probe-only hook (no-op when disabled) ──
+            oscomp_probe_only_skip_hook(&vfs_path);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }
@@ -1769,6 +1891,8 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("{} : SKIP (heavy)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            // ── P10-F5: probe-only hook (no-op when disabled) ──
+            oscomp_probe_only_skip_hook(&vfs_path);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }

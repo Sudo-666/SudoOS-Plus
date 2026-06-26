@@ -241,6 +241,37 @@ def main() -> int:
         check(PASS, "catalog not called from runner", True,
               "function exists but not called from contest runner")
 
+    # ── P10-F5 ProbeOnly bridge ──
+    for flag in ["OSCOMP_PROBE_ONLY_ENABLED", "OSCOMP_PROBE_LUA",
+                 "OSCOMP_PROBE_LIBCBENCH", "OSCOMP_PROBE_LMBENCH",
+                 "OSCOMP_PROBE_CYCLICTEST", "OSCOMP_PROBE_IOZONE",
+                 "OSCOMP_PROBE_IPERF", "OSCOMP_PROBE_NETPERF",
+                 "OSCOMP_PROBE_LIBCTEST", "OSCOMP_PROBE_LTP"]:
+        check(PASS, f"{flag} exists", flag in user_rs)
+        if f"{flag}: bool = true" in user_rs or f"{flag}: bool=true" in user_rs:
+            check(FAIL, f"{flag} is false", False, f"{flag} must be false!")
+        else:
+            check(PASS, f"{flag} is false", True)
+
+    check(PASS, "OscompProbeOnlyOutcome exists",
+          "OscompProbeOnlyOutcome" in user_rs)
+    check(PASS, "oscomp_probe_only_allowed exists",
+          "oscomp_probe_only_allowed" in user_rs)
+    check(PASS, "oscomp_maybe_run_probe_only exists",
+          "oscomp_maybe_run_probe_only" in user_rs)
+    check(PASS, "oscomp_probe_only_skip_hook exists",
+          "oscomp_probe_only_skip_hook" in user_rs)
+    check(PASS, "oscomp-probe-only log string exists",
+          "oscomp-probe-only" in user_rs)
+
+    # Probe-only must NOT touch score/pass_count/fail_count
+    probe_fn = user_rs.split("oscomp_maybe_run_probe_only")[1] if "oscomp_maybe_run_probe_only" in user_rs else ""
+    if "pass_count" in probe_fn or "fail_count" in probe_fn or "score" in probe_fn:
+        check(FAIL, "probe-only does not update scoring", False,
+              "probe-only function appears to modify score/pass/fail!")
+    else:
+        check(PASS, "probe-only does not update scoring", True)
+
     # ── DANGER: forbidden patterns ──
     if "run_group_with_deadline" in user_rs:
         check(FAIL, "run_group_with_deadline absent", False, "FOUND — dangerous!")

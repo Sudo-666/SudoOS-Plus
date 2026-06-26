@@ -271,7 +271,56 @@ paths (RV direct override, LA direct basic, whitelist/defer).
 | ShellEcho | **executed** | `run_rootfs_program_with_cwd(shell, ["busybox","sh","-c","echo probe_ok"], ...)` |
 | ScriptSmoke | **executed** | `run_rootfs_program_with_cwd(shell, ["busybox","sh",script], ...)` |
 | DirectBinary | **executed** | `run_rootfs_program_with_cwd(path, [argv0], ...)` |
-| FsMini | NotRun | P10-F5+ |
+| FsMini | NotRun | future |
+| NetTcpMini | NotRun | future |
+| NetUdpMini | NotRun | future |
+| LtpScan | NotRun | future |
+
+## P10-F5 ProbeOnly Bridge
+
+*Probe-only entry point — disabled by default, no scoring impact.*
+
+### Constants
+
+All constants are `false` by default:
+```
+OSCOMP_PROBE_ONLY_ENABLED = false
+OSCOMP_PROBE_LUA = false
+OSCOMP_PROBE_LIBCBENCH = false
+OSCOMP_PROBE_LMBENCH = false
+OSCOMP_PROBE_CYCLICTEST = false
+OSCOMP_PROBE_IOZONE = false
+OSCOMP_PROBE_IPERF = false
+OSCOMP_PROBE_NETPERF = false
+OSCOMP_PROBE_LIBCTEST = false
+OSCOMP_PROBE_LTP = false
+OSCOMP_PROBE_UNIXBENCH = false
+```
+
+### New functions
+
+| Function | Purpose |
+|----------|---------|
+| `oscomp_probe_only_allowed(spec)` | Check master + per-group flags |
+| `oscomp_maybe_run_probe_only(path)` | Preflight → probes → summary |
+| `oscomp_probe_only_skip_hook(path)` | No-op hook in skip branches |
+
+### Behavior
+
+- Hook is called in RV `SKIP (defer)` and `SKIP (heavy)` branches
+- When `OSCOMP_PROBE_ONLY_ENABLED = false`: **no-op** — no logs, no execution
+- When enabled: runs preflight + mini probes, prints summary, then continues to skip
+- **Does not** affect pass_count, fail_count, score, or group_result
+- **Does not** print `testcase success`
+
+### Unlock order (tomorrow)
+
+1. OSCOMP_PROBE_LUA = true
+2. OSCOMP_PROBE_LIBCBENCH = true
+3. OSCOMP_PROBE_LMBENCH = true
+4. OSCOMP_PROBE_CYCLICTEST = true
+5. OSCOMP_PROBE_IOZONE = true
+6. OSCOMP_PROBE_IPERF / OSCOMP_PROBE_NETPERF = true
 | NetTcpMini | NotRun | P10-F5+ |
 | NetUdpMini | NotRun | P10-F5+ |
 | LtpScan | NotRun | P10-F5+ |
