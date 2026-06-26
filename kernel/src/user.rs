@@ -1590,6 +1590,26 @@ fn oscomp_probe_only_allowed(spec: &OscompGroupSpec<'_>) -> bool {
 
 static OSCOMP_PROBE_ONLY_LOG_BUDGET: AtomicUsize = AtomicUsize::new(64);
 
+/// Materialise the sdcard/ext4 parent directory for a probe-only path
+/// so that preflight file/cwd/shell checks can see the relevant files.
+/// Only called inside oscomp_maybe_run_probe_only after the allowed gate;
+/// when OSCOMP_PROBE_ONLY_ENABLED is false this function is never reached.
+fn oscomp_probe_only_prepare_path(path: &str) {
+    if !path.starts_with("/mnt/sdcard/") {
+        return;
+    }
+    let ext4_dir = sdcard_vfs_to_ext4_dir(path);
+    let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
+    if budget > 0 {
+        OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+        crate::println!(
+            "oscomp-probe-only: prepare path={} ext4_dir={}",
+            path, ext4_dir,
+        );
+    }
+    sdcard_install_ext4_dir_files(&ext4_dir);
+}
+
 /// Run preflight + mini probes for a script path in ProbeOnly mode.
 /// Does **not** affect pass_count, fail_count, score, or group_result.
 fn oscomp_maybe_run_probe_only(path: &str) -> OscompProbeOnlyOutcome {
@@ -1598,6 +1618,9 @@ fn oscomp_maybe_run_probe_only(path: &str) -> OscompProbeOnlyOutcome {
     if !oscomp_probe_only_allowed(&spec) {
         return OscompProbeOnlyOutcome::Disabled;
     }
+
+    // Materialise sdcard parent dir so preflight sees script/cwd/shell.
+    oscomp_probe_only_prepare_path(path);
 
     {
         let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
@@ -1840,7 +1863,7 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("{} : SKIP (defer)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
-            // ── P10-F5: probe-only hook (no-op when disabled) ──
+            // P10-F6 probe-only hook: RV defer
             oscomp_probe_only_skip_hook(&vfs_path);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
@@ -1863,6 +1886,8 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("{} : SKIP (la-defer)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            // P10-F6 probe-only hook: LA defer
+            oscomp_probe_only_skip_hook(&vfs_path);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }
@@ -1881,6 +1906,8 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("{} : SKIP (not found)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
+            // P10-F6 probe-only hook: not found
+            oscomp_probe_only_skip_hook(&vfs_path);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;
         }
@@ -1891,7 +1918,7 @@ fn verify_sdcard_all_scripts_thread() {
             crate::println!("{} : SKIP (heavy)", vfs_path);
             OSCOMP_SKIPPED.fetch_add(1, Ordering::AcqRel);
             OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
-            // ── P10-F5: probe-only hook (no-op when disabled) ──
+            // P10-F6 probe-only hook: RV heavy
             oscomp_probe_only_skip_hook(&vfs_path);
             crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
             continue;

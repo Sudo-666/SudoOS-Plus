@@ -339,3 +339,28 @@ OSCOMP_PROBE_UNIXBENCH = false
 - Budget limits log output to 64 lines
 - Missing paths return `Missing`, not Fail
 - No fake `testcase success` output
+
+## P10-F6 Probe Bridge Coverage
+
+### Hook callsites
+
+| Site | Status |
+|------|--------|
+| RV defer (`SKIP (defer)`) | hooked |
+| RV heavy (`SKIP (heavy)`) | hooked |
+| LA defer (`SKIP (la-defer)`) | hooked |
+| not found (`SKIP (not found)`) | hooked |
+| LA shell-broken | intentionally not hooked |
+
+### Path preparation
+
+`oscomp_probe_only_prepare_path(path)` materialises the sdcard/ext4 parent
+directory via `sdcard_install_ext4_dir_files`. Called only inside
+`oscomp_maybe_run_probe_only` after the allowed gate — never runs when
+`OSCOMP_PROBE_ONLY_ENABLED = false`.
+
+### Safety
+
+- All hooks are no-ops when master flag is false
+- Path preparation is gated behind per-group flags
+- No scoring impact, no skip removal

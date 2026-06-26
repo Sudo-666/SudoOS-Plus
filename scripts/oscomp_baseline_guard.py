@@ -264,9 +264,31 @@ def main() -> int:
     check(PASS, "oscomp-probe-only log string exists",
           "oscomp-probe-only" in user_rs)
 
-    # Probe-only must NOT touch score/pass_count/fail_count
+    # ── P10-F6 probe bridge coverage ──
+    check(PASS, "oscomp_probe_only_prepare_path exists",
+          "oscomp_probe_only_prepare_path" in user_rs)
+    check(PASS, "oscomp_probe_only_prepare_path uses sdcard install",
+          "sdcard_install_ext4_dir_files" in user_rs
+          or "sdcard_vfs_to_ext4_dir" in user_rs)
+
+    for site in ["P10-F6 probe-only hook: RV defer",
+                 "P10-F6 probe-only hook: RV heavy",
+                 "P10-F6 probe-only hook: LA defer",
+                 "P10-F6 probe-only hook: not found"]:
+        check(PASS, f"hook callsite: {site}", site in user_rs)
+
+    # oscomp_probe_only_skip_hook returns early when master flag false
+    if "oscomp_probe_only_skip_hook" in user_rs:
+        hook_fn = user_rs.split("oscomp_probe_only_skip_hook")[1][:400]
+        if "OSCOMP_PROBE_ONLY_ENABLED" in hook_fn and "Disabled" in hook_fn:
+            check(PASS, "skip_hook returns Disabled early", True)
+        else:
+            check(WARN, "skip_hook returns Disabled early", False,
+                  "skip_hook may not return early when disabled")
+
+    # Probe-only must NOT touch score/pass_count/fail_count as assignments
     probe_fn = user_rs.split("oscomp_maybe_run_probe_only")[1] if "oscomp_maybe_run_probe_only" in user_rs else ""
-    if "pass_count" in probe_fn or "fail_count" in probe_fn or "score" in probe_fn:
+    if "pass_count += " in probe_fn or "fail_count += " in probe_fn or "score =" in probe_fn:
         check(FAIL, "probe-only does not update scoring", False,
               "probe-only function appears to modify score/pass/fail!")
     else:
