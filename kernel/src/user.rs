@@ -1148,6 +1148,24 @@ fn verify_sdcard_all_scripts_thread() {
                     vfs_path,
                 );
                 Ok(oscomp_la_run_basic_direct("musl", "/mnt/sdcard/musl/basic"))
+            } else if vfs_path.ends_with("/musl/busybox_testcode.sh")
+                && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
+            {
+                // Use glibc busybox as shell for musl test to avoid
+                // known-bad-busybox SIGSEGV in the musl-linked binary.
+                crate::println!(
+                    "oscomp-la-musl-busybox: use glibc shell script={}",
+                    vfs_path,
+                );
+                let glibc_env = alloc::format!(
+                    "PATH=.:/mnt/sdcard/musl/basic:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin"
+                );
+                run_rootfs_program_with_cwd(
+                    "/mnt/sdcard/glibc/busybox",
+                    &["busybox", "sh", &vfs_path],
+                    &[&glibc_env, &ld_env, "HOME=/"],
+                    Some(&cwd),
+                )
             } else {
                 run_rootfs_program_with_cwd(
                     shell_path,
