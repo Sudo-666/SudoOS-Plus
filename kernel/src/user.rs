@@ -833,6 +833,210 @@ fn verify_sdcard_basic_script_thread() {
     crate::println!("  /mnt/sdcard/musl/basic_testcode.sh : verified");
 }
 
+// ── P10-F1: group spec scaffold (read-only, runner-unchanged) ──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompLibc {
+    Glibc,
+    Musl,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompGroup {
+    Basic,
+    Busybox,
+    Lua,
+    Libcbench,
+    Lmbench,
+    Cyclictest,
+    Iozone,
+    Iperf,
+    Netperf,
+    Libctest,
+    Ltp,
+    Unixbench,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompShellPolicy {
+    Default,
+    RvGlibcBusyboxDirect,
+    LaGlibcBusyboxForMusl,
+    LaDirectBasic,
+    ProbeOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompEnvPolicy {
+    Default,
+    Glibc,
+    Musl,
+    MixedMuslWithGlibcShell,
+    Network,
+    FilesystemStress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompRunPolicy {
+    Script,
+    DirectBasic,
+    ProbeOnly,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompRisk {
+    Low,
+    Medium,
+    High,
+    Extreme,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OscompGroupSpec<'a> {
+    path: &'a str,
+    libc: OscompLibc,
+    group: OscompGroup,
+    shell_policy: OscompShellPolicy,
+    env_policy: OscompEnvPolicy,
+    run_policy: OscompRunPolicy,
+    risk: OscompRisk,
+}
+
+/// Classify a test-script path into a group spec.
+/// Pure function — does not access filesystem or mutate global state.
+fn oscomp_classify_script(path: &str) -> OscompGroupSpec<'_> {
+    let libc = if path.contains("/glibc/") {
+        OscompLibc::Glibc
+    } else if path.contains("/musl/") {
+        OscompLibc::Musl
+    } else {
+        OscompLibc::Unknown
+    };
+
+    let group = if path.ends_with("/basic_testcode.sh") {
+        OscompGroup::Basic
+    } else if path.ends_with("/busybox_testcode.sh") {
+        OscompGroup::Busybox
+    } else if path.ends_with("/lua_testcode.sh") {
+        OscompGroup::Lua
+    } else if path.ends_with("/libcbench_testcode.sh") {
+        OscompGroup::Libcbench
+    } else if path.ends_with("/lmbench_testcode.sh") {
+        OscompGroup::Lmbench
+    } else if path.ends_with("/cyclictest_testcode.sh") {
+        OscompGroup::Cyclictest
+    } else if path.ends_with("/iozone_testcode.sh") {
+        OscompGroup::Iozone
+    } else if path.ends_with("/iperf_testcode.sh") {
+        OscompGroup::Iperf
+    } else if path.ends_with("/netperf_testcode.sh") {
+        OscompGroup::Netperf
+    } else if path.ends_with("/libctest_testcode.sh") {
+        OscompGroup::Libctest
+    } else if path.ends_with("/ltp_testcode.sh") {
+        OscompGroup::Ltp
+    } else if path.ends_with("/unixbench_testcode.sh") {
+        OscompGroup::Unixbench
+    } else {
+        OscompGroup::Unknown
+    };
+
+    let (shell_policy, env_policy, run_policy, risk) = match group {
+        OscompGroup::Basic => {
+            if libc == OscompLibc::Glibc || libc == OscompLibc::Musl {
+                // LA uses direct runner; RV uses script.
+                // Per-arch adjustment is done separately.
+                (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+                 OscompRunPolicy::Script, OscompRisk::Low)
+            } else {
+                (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+                 OscompRunPolicy::Script, OscompRisk::Low)
+            }
+        }
+        OscompGroup::Busybox => {
+            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+             OscompRunPolicy::Script, OscompRisk::Medium)
+        }
+        OscompGroup::Lua => {
+            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+             OscompRunPolicy::Script, OscompRisk::Medium)
+        }
+        OscompGroup::Libcbench => {
+            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+             OscompRunPolicy::Script, OscompRisk::Medium)
+        }
+        OscompGroup::Lmbench => {
+            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
+             OscompRunPolicy::ProbeOnly, OscompRisk::High)
+        }
+        OscompGroup::Cyclictest => {
+            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
+             OscompRunPolicy::ProbeOnly, OscompRisk::High)
+        }
+        OscompGroup::Iozone => {
+            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::FilesystemStress,
+             OscompRunPolicy::ProbeOnly, OscompRisk::High)
+        }
+        OscompGroup::Iperf | OscompGroup::Netperf => {
+            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Network,
+             OscompRunPolicy::ProbeOnly, OscompRisk::Extreme)
+        }
+        OscompGroup::Libctest => {
+            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
+             OscompRunPolicy::ProbeOnly, OscompRisk::Extreme)
+        }
+        OscompGroup::Ltp => {
+            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
+             OscompRunPolicy::ProbeOnly, OscompRisk::Extreme)
+        }
+        OscompGroup::Unixbench => {
+            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+             OscompRunPolicy::ProbeOnly, OscompRisk::High)
+        }
+        OscompGroup::Unknown => {
+            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
+             OscompRunPolicy::Script, OscompRisk::Low)
+        }
+    };
+
+    OscompGroupSpec {
+        path,
+        libc,
+        group,
+        shell_policy,
+        env_policy,
+        run_policy,
+        risk,
+    }
+}
+
+/// Budgeted one-shot log of a classified group spec.
+/// Budget cap prevents flooding contest serial output.
+fn oscomp_log_group_spec_once(path: &str) {
+    static SPEC_LOG_BUDGET: AtomicUsize = AtomicUsize::new(16);
+    let budget = SPEC_LOG_BUDGET.load(Ordering::Relaxed);
+    if budget == 0 {
+        return;
+    }
+    SPEC_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+
+    let spec = oscomp_classify_script(path);
+    crate::println!(
+        "oscomp-group-spec: path={} libc={:?} group={:?} shell={:?} env={:?} run={:?} risk={:?}",
+        path, spec.libc, spec.group, spec.shell_policy,
+        spec.env_policy, spec.run_policy, spec.risk,
+    );
+}
+
+/// TODO P10-F2: real preflight checks.
+/// Currently a stub that always returns true.
+fn oscomp_group_preflight(_spec: &OscompGroupSpec<'_>) -> bool {
+    true
+}
+
 /// Returns `true` if the contest runner discovered scripts and ran to
 /// completion (including shutdown).  Returns `false` when there is no
 /// sdcard block device, so the caller can keep the machine alive for
