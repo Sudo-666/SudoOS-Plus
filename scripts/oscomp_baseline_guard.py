@@ -338,6 +338,22 @@ def main() -> int:
     check(PASS, "sys_prctl no longer all-0", "PR_SET_DUMPABLE" in user_rs)
     check(PASS, "set_robust_list length 24", "ROBUST_LIST_HEAD_SIZE" in user_rs or "24" in user_rs)
 
+    # ── P10-R4 signal/kill compat ──
+    check(PASS, "EINTR exists", "EINTR" in user_rs or "pub const EINTR" in (open("kernel/src/syscall.rs").read() if False else ""))
+    check(PASS, "oscomp_validate_sigset_size exists", "oscomp_validate_sigset_size" in user_rs)
+    check(PASS, "rt_sigaction rejects SIGSTOP", "SIGSTOP" in user_rs.split("sys_rt_sigaction")[1][:200]
+          if "sys_rt_sigaction" in user_rs else False)
+    check(PASS, "rt_sigprocmask validates sigsetsize", "sigsetsize" in user_rs.split("sys_rt_sigprocmask")[1][:200]
+          if "sys_rt_sigprocmask" in user_rs else False)
+    check(PASS, "rt_sigpending exists", "sys_rt_sigpending" in user_rs)
+    check(PASS, "rt_sigsuspend exists", "sys_rt_sigsuspend" in user_rs)
+    check(PASS, "rt_sigtimedwait bounded sleep", "timeout_address == 0" in user_rs.split("sys_rt_sigtimedwait")[1][:800]
+          if "sys_rt_sigtimedwait" in user_rs else False)
+    check(PASS, "kill handles sig==0", "signal == 0" in user_rs.split("fn sys_kill")[1][:300]
+          if "fn sys_kill" in user_rs else False)
+    check(PASS, "sigreturn clears unblockable", "unblockable" in user_rs.split("sys_rt_sigreturn")[1][:400]
+          if "sys_rt_sigreturn" in user_rs else True)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)

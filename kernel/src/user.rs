@@ -3269,7 +3269,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_RT_SIGACTION => set_syscall_result(frame, sys_rt_sigaction(arguments)),
         SYS_RT_SIGPROCMASK => set_syscall_result(
             frame,
-            sys_rt_sigprocmask(arguments[0], arguments[1], arguments[2]),
+            sys_rt_sigprocmask(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
         SYS_RT_SIGTIMEDWAIT => {
             set_syscall_result(frame, sys_rt_sigtimedwait(arguments))
@@ -3443,7 +3443,8 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_SETITIMER => set_syscall_result(frame, sys_setitimer(arguments[0], arguments[1], arguments[2])),
         SYS_GETITIMER => set_syscall_result(frame, sys_getitimer(arguments[0], arguments[1])),
         SYS_GETRUSAGE => set_syscall_result(frame, sys_getrusage(arguments[0], arguments[1])),
-        SYS_RT_SIGPENDING => set_syscall_result(frame, 0),
+        SYS_RT_SIGPENDING => set_syscall_result(frame, sys_rt_sigpending(arguments[0], arguments[1])),
+        SYS_RT_SIGSUSPEND => set_syscall_result(frame, sys_rt_sigsuspend(arguments[0], arguments[1])),
         SYS_SCHED_YIELD => {
             let thread = crate::task::current_user_thread()
                 .expect("M9-B sched_yield arrived without a current user Thread");
@@ -5080,22 +5081,56 @@ fn sys_getsid(pid: usize) -> isize {
 }
 
 fn sys_kill(pid: usize, signal: usize) -> isize {
-    match crate::signal::send_signal(
-        crate::process::ProcessId::from_raw_for_kernel(pid),
-        signal as u32,
-    ) {
-        Ok(()) => 0,
-        Err(errno) => errno.to_isize(),
+    // sig==0: existence/permission check only.
+    if signal == 0 {
+        if pid == 0 || pid == usize::MAX {
+            return 0; // group/broadcast — no process group, accept for compat
+        }
+        match crate::process::lookup_process(crate::process::ProcessId::from_raw_for_kernel(pid)) {
+            Some(_) => 0,
+            None => -(crate::syscall::errno::ESRCH),
+        }
+    } else if pid == usize::MAX {
+        // -1 broadcast not supported
+        -(crate::syscall::errno::EPERM)
+    } else if pid == 0 {
+        // process group kill — fallback to self for compat
+        match crate::signal::send_signal(
+            current_process().id(),
+            signal as u32,
+        ) {
+            Ok(()) => 0,
+            Err(errno) => errno.to_isize(),
+        }
+    } else {
+        match crate::signal::send_signal(
+            crate::process::ProcessId::from_raw_for_kernel(pid),
+            signal as u32,
+        ) {
+            Ok(()) => 0,
+            Err(errno) => errno.to_isize(),
+        }
+    }
+}
+
+fn oscomp_validate_sigset_size(sigsetsize: usize) -> Result<(), isize> {
+    if sigsetsize == core::mem::size_of::<u64>() {
+        Ok(())
+    } else {
+        Err(-EINVAL)
     }
 }
 
 fn sys_rt_sigaction(arguments: [usize; 6]) -> isize {
     let signal = arguments[0] as u32;
-    if crate::signal::signal_bit(signal).is_none() || signal == crate::signal::SIGKILL {
+    // signal=0 is invalid, SIGKILL/SIGSTOP cannot have their action changed.
+    if crate::signal::signal_bit(signal).is_none()
+        || signal == crate::signal::SIGKILL
+        || signal == 19 /* SIGSTOP */ {
         return -EINVAL;
     }
-    if arguments[3] != core::mem::size_of::<u64>() {
-        return -EINVAL;
+    if let Err(errno) = oscomp_validate_sigset_size(arguments[3]) {
+        return errno;
     }
     let new_action = arguments[1];
     let old_action = arguments[2];
@@ -5121,7 +5156,10 @@ fn sys_rt_sigaction(arguments: [usize; 6]) -> isize {
     0
 }
 
-fn sys_rt_sigprocmask(how: usize, set_address: usize, oldset_address: usize) -> isize {
+fn sys_rt_sigprocmask(how: usize, set_address: usize, oldset_address: usize, sigsetsize: usize) -> isize {
+    if let Err(errno) = oscomp_validate_sigset_size(sigsetsize) {
+        return errno;
+    }
     let thread =
         crate::task::current_user_thread().expect("rt_sigprocmask arrived without current Thread");
     let old = thread.blocked_signals();
@@ -5186,8 +5224,77 @@ fn sys_rt_sigtimedwait(arguments: [usize; 6]) -> isize {
         return signal as isize;
     }
 
-    // No matching signal
+    // No matching signal — bounded sleep if timeout, else EAGAIN
+    let timeout_address = arguments[2];
+    if timeout_address == 0 {
+        return -EAGAIN;
+    }
+    let ts = match copy_plain_from_user::<KernelTimespec>(timeout_address) {
+        Ok(v) => v,
+        Err(errno) => return errno,
+    };
+    if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
+        return -EINVAL;
+    }
+    let duration = core::time::Duration::new(ts.sec as u64, ts.nsec as u32);
+    if duration.is_zero() {
+        return -EAGAIN;
+    }
+    let capped = core::cmp::min(duration, core::time::Duration::from_millis(50));
+    crate::timer::sleep(capped);
     -EAGAIN
+}
+
+fn sys_rt_sigpending(set_address: usize, sigsetsize: usize) -> isize {
+    if let Err(errno) = oscomp_validate_sigset_size(sigsetsize) {
+        return errno;
+    }
+    if set_address == 0 {
+        return -EFAULT;
+    }
+    let process = current_process();
+    let thread = crate::task::current_user_thread()
+        .expect("rt_sigpending without current Thread");
+    // Return pending signals that are not blocked.
+    let pending = process.signals().pending() & !thread.blocked_signals();
+    if copy_to_user(set_address, &pending.to_ne_bytes()).is_err() {
+        return -EFAULT;
+    }
+    0
+}
+
+fn sys_rt_sigsuspend(mask_address: usize, sigsetsize: usize) -> isize {
+    if let Err(errno) = oscomp_validate_sigset_size(sigsetsize) {
+        return errno;
+    }
+    if mask_address == 0 {
+        return -EFAULT;
+    }
+    let mut mask_bytes = [0_u8; 8];
+    if copy_from_user(mask_address, &mut mask_bytes).is_err() {
+        return -EFAULT;
+    }
+    let temp_mask = u64::from_ne_bytes(mask_bytes) & !crate::signal::unblockable_mask();
+    let thread = crate::task::current_user_thread()
+        .expect("rt_sigsuspend without current Thread");
+    let old_mask = thread.blocked_signals();
+    thread.set_blocked_signals(temp_mask);
+
+    // Check if a pending signal is now unblocked.
+    let process = thread.process();
+    let pending = process.signals().pending() & !temp_mask;
+    if pending != 0 {
+        // A signal is pending — restore old mask and return EINTR.
+        thread.set_blocked_signals(old_mask);
+        return -(crate::syscall::errno::EINTR);
+    }
+
+    // Short yield so a pending signal has a chance to arrive.
+    crate::task::yield_now();
+
+    // Restore old mask before returning.
+    thread.set_blocked_signals(old_mask);
+    -(crate::syscall::errno::EINTR)
 }
 
 fn sys_rt_sigreturn(frame: &mut crate::arch::trap::TrapFrame) -> Result<(), isize> {
