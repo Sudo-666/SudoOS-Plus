@@ -3298,7 +3298,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_TIMES => set_syscall_result(frame, sys_times(arguments[0])),
         SYS_UNAME => set_syscall_result(frame, sys_uname(arguments[0])),
         SYS_SYSINFO => set_syscall_result(frame, sys_sysinfo(arguments[0])),
-        SYS_GETRANDOM => set_syscall_result(frame, sys_getrandom(arguments[0], arguments[1])),
+        SYS_GETRANDOM => set_syscall_result(frame, sys_getrandom(arguments[0], arguments[1], arguments[2])),
         SYS_MKDIRAT => {
             set_syscall_result(frame, sys_mkdirat(arguments[0], arguments[1], arguments[2]))
         }
@@ -3793,7 +3793,9 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
     // ignores.  Accept MAP_DENYWRITE(0x800) and MAP_EXECUTABLE(0x1000)
     // as no-ops so file-backed mmap doesn't fail with EINVAL.
     const MAP_ACCEPTED: usize = MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS
-        | MAP_FIXED | 0x800 | 0x1000;  // MAP_DENYWRITE | MAP_EXECUTABLE
+        | MAP_FIXED | 0x800 | 0x1000  // MAP_DENYWRITE | MAP_EXECUTABLE
+        | 0x4000 | 0x8000 | 0x20000   // MAP_NORESERVE | MAP_POPULATE | MAP_STACK
+        | 0x100000;                   // MAP_FIXED_NOREPLACE
 
     let map_type = flags & MAP_TYPE;
     let is_file_backed = file != usize::MAX && (map_type == MAP_PRIVATE || map_type == MAP_SHARED);
@@ -5743,10 +5745,17 @@ fn current_time_ns() -> u128 {
 
 fn sys_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limit: usize) -> isize {
     if pid != 0 && pid != current_process().id().get() {
-        return -crate::syscall::errno::ESRCH;
+        return -(crate::syscall::errno::ESRCH);
     }
+    // Validate new_limit by copyin if provided.
     if new_limit != 0 {
-        return -crate::syscall::errno::EPERM;
+        let new = match copy_plain_from_user::<KernelRlimit64>(new_limit) {
+            Ok(v) => v,
+            Err(errno) => return errno,
+        };
+        if new.cur > new.max {
+            return -EINVAL;
+        }
     }
     if old_limit == 0 {
         return 0;
@@ -5789,7 +5798,19 @@ fn sys_sysinfo(address: usize) -> isize {
     0
 }
 
-fn sys_getrandom(address: usize, length: usize) -> isize {
+fn sys_getrandom(address: usize, length: usize, flags: usize) -> isize {
+    const GRND_NONBLOCK: usize = 0x0001;
+    const GRND_RANDOM: usize = 0x0002;
+
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM) != 0 {
+        return -EINVAL;
+    }
+    if address == 0 && length > 0 {
+        return -EFAULT;
+    }
+    if length == 0 {
+        return 0;
+    }
     if length > MAX_USER_COPY {
         return -EINVAL;
     }

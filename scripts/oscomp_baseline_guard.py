@@ -367,6 +367,19 @@ def main() -> int:
     check(PASS, "setsockopt no longer all-0", "SOL_SOCKET" in user_rs.split("sys_setsockopt")[1][:300]
           if "sys_setsockopt" in user_rs else False)
 
+    # ── P10-R6 mm/resource/misc compat ──
+    check(PASS, "GRND_NONBLOCK appears", "GRND_NONBLOCK" in user_rs)
+    check(PASS, "getrandom validates flags", "flags" in user_rs.split("sys_getrandom")[1][:200]
+          if "sys_getrandom" in user_rs else False)
+    check(PASS, "prlimit64 validates new_limit", "new.cur > new.max" in user_rs.split("sys_prlimit64")[1][:300]
+          if "sys_prlimit64" in user_rs else False)
+    check(PASS, "MAP_NORESERVE accepted", "0x4000" in user_rs.split("MAP_ACCEPTED")[1][:100]
+          if "MAP_ACCEPTED" in user_rs else False)
+    check(PASS, "MAP_STACK accepted", "0x20000" in user_rs.split("MAP_ACCEPTED")[1][:100]
+          if "MAP_ACCEPTED" in user_rs else False)
+    check(PASS, "MAP_FIXED_NOREPLACE accepted", "0x100000" in user_rs.split("MAP_ACCEPTED")[1][:100]
+          if "MAP_ACCEPTED" in user_rs else False)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)
