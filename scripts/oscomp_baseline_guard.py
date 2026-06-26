@@ -124,10 +124,33 @@ def main() -> int:
           "oscomp_log_group_spec_once" in user_rs)
 
     if "oscomp_group_preflight" in user_rs:
-        check(PASS, "oscomp_group_preflight exists", True)
+        if 'OscompPreflightResult' in user_rs:
+            check(PASS, "oscomp_group_preflight is real", True,
+                  "not stub — OscompPreflightResult present")
+        else:
+            check(WARN, "oscomp_group_preflight is real", False,
+                  "still appears to be stub (no OscompPreflightResult)")
     else:
-        check(WARN, "oscomp_group_preflight exists", False,
-              "TODO P10-F2 preflight stub not yet present")
+        check(FAIL, "oscomp_group_preflight exists", False,
+              "preflight function is missing")
+
+    # ── P10-F2 preflight ──
+    check(PASS, "OscompPreflightStatus exists",
+          "OscompPreflightStatus" in user_rs)
+    check(PASS, "OscompPreflightResult exists",
+          "OscompPreflightResult" in user_rs)
+    check(PASS, "oscomp_vfs_path_exists exists",
+          "oscomp_vfs_path_exists" in user_rs)
+    check(PASS, "oscomp_expected_cwd exists",
+          "oscomp_expected_cwd" in user_rs)
+    check(PASS, "oscomp_expected_shell exists",
+          "oscomp_expected_shell" in user_rs)
+    check(PASS, "oscomp_loader_ready exists",
+          "oscomp_loader_ready" in user_rs)
+    check(PASS, "oscomp_env_ready exists",
+          "oscomp_env_ready" in user_rs)
+    check(PASS, "oscomp_log_preflight_once exists",
+          "oscomp_log_preflight_once" in user_rs)
 
     # ── DANGER: forbidden patterns ──
     if "run_group_with_deadline" in user_rs:

@@ -168,3 +168,52 @@ Do **not** bulk-enable.
 
 All current ScoreEnabled behavior is still controlled by the existing runner
 paths (RV direct override, LA direct basic, whitelist/defer).
+
+## P10-F2 Preflight
+
+*Added in `6.27` — read-only, does not change runner behavior.*
+
+### New types
+
+| Type | Purpose |
+|------|---------|
+| `OscompPreflightStatus` | Ready / NotReady / Skipped |
+| `OscompPreflightResult` | status + script/cwd/shell/loader/env booleans |
+
+### New functions
+
+| Function | Purpose |
+|----------|---------|
+| `oscomp_vfs_path_exists(path)` | Read-only VFS stat check |
+| `oscomp_expected_cwd(spec)` | Returns expected CWD per group/libc |
+| `oscomp_expected_shell(spec)` | Returns expected shell (or None for direct) |
+| `oscomp_loader_ready(spec)` | Checks dynamic-linker alias existence |
+| `oscomp_env_ready(spec)` | Validates env policy is recognised |
+| `oscomp_group_preflight(spec)` | **Real** — combines all 5 checks → status |
+| `oscomp_log_preflight_once(spec, result)` | Budgeted (24) debug log |
+
+### What preflight checks
+
+| Check | How |
+|-------|-----|
+| script_exists | `crate::fs::stat(path).is_ok()` |
+| cwd_exists | `oscomp_expected_cwd` → `stat` |
+| shell_exists | `oscomp_expected_shell` → `stat` (or true if None) |
+| loader_ready | `stat` on arch-specific loader alias |
+| env_ready | env policy enum matched (no network/fs probe) |
+
+### Status
+
+| Condition | Status |
+|-----------|--------|
+| `run_policy == Skip` | Skipped |
+| `group == Unknown \|\| libc == Unknown` | NotReady |
+| script + cwd + shell + env are all ok | Ready |
+| Any missing | NotReady |
+
+### Important
+
+- Preflight is **read-only**: no VFS writes, no sdcard expansion, no process creation.
+- Preflight does **not** unskip any group. All heavy groups remain skipped.
+- `Ready` ≠ test will pass — it only means the entry conditions (file/cwd/shell) exist.
+- P10-F3 will connect preflight to mini-probe execution.

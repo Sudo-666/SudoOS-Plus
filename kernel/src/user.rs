@@ -1031,10 +1031,181 @@ fn oscomp_log_group_spec_once(path: &str) {
     );
 }
 
-/// TODO P10-F2: real preflight checks.
-/// Currently a stub that always returns true.
-fn oscomp_group_preflight(_spec: &OscompGroupSpec<'_>) -> bool {
-    true
+// ── P10-F2: group preflight (read-only file/cwd/shell/loader/env) ──
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscompPreflightStatus {
+    Ready,
+    NotReady,
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OscompPreflightResult {
+    status: OscompPreflightStatus,
+    script_exists: bool,
+    cwd_exists: bool,
+    shell_exists: bool,
+    loader_ready: bool,
+    env_ready: bool,
+}
+
+/// Read-only VFS existence check.  Does not create files, install aliases,
+/// expand sdcard directories, or change cwd.
+fn oscomp_vfs_path_exists(path: &str) -> bool {
+    crate::fs::stat(path).is_ok()
+}
+
+/// Return the expected working directory for a group.
+fn oscomp_expected_cwd(spec: &OscompGroupSpec<'_>) -> &'static str {
+    match spec.libc {
+        OscompLibc::Glibc => {
+            if spec.group == OscompGroup::Basic {
+                "/mnt/sdcard/glibc/basic"
+            } else {
+                "/mnt/sdcard/glibc"
+            }
+        }
+        OscompLibc::Musl => {
+            if spec.group == OscompGroup::Basic {
+                "/mnt/sdcard/musl/basic"
+            } else {
+                "/mnt/sdcard/musl"
+            }
+        }
+        OscompLibc::Unknown => "/",
+    }
+}
+
+/// Return the expected shell binary, or None for direct-basic runners.
+fn oscomp_expected_shell(spec: &OscompGroupSpec<'_>) -> Option<&'static str> {
+    match spec.shell_policy {
+        OscompShellPolicy::LaDirectBasic => None,
+        OscompShellPolicy::RvGlibcBusyboxDirect
+        | OscompShellPolicy::LaGlibcBusyboxForMusl => {
+            Some("/mnt/sdcard/glibc/busybox")
+        }
+        OscompShellPolicy::ProbeOnly => {
+            // Guess the likely shell without executing.
+            match spec.libc {
+                OscompLibc::Glibc => Some("/mnt/sdcard/glibc/busybox"),
+                OscompLibc::Musl => Some("/mnt/sdcard/musl/busybox"),
+                OscompLibc::Unknown => Some("/bin/sh"),
+            }
+        }
+        OscompShellPolicy::Default => {
+            match spec.libc {
+                OscompLibc::Glibc => {
+                    if spec.group == OscompGroup::Busybox {
+                        Some("/mnt/sdcard/glibc/busybox")
+                    } else {
+                        Some("/bin/sh")
+                    }
+                }
+                OscompLibc::Musl => Some("/mnt/sdcard/musl/busybox"),
+                OscompLibc::Unknown => Some("/bin/sh"),
+            }
+        }
+    }
+}
+
+/// Check whether a dynamic-linker alias exists for this group's libc.
+fn oscomp_loader_ready(spec: &OscompGroupSpec<'_>) -> bool {
+    match spec.libc {
+        OscompLibc::Glibc | OscompLibc::Musl => {
+            #[cfg(target_arch = "riscv64")]
+            return crate::fs::stat("/lib/ld-linux-riscv64-lp64d.so.1").is_ok();
+            #[cfg(target_arch = "loongarch64")]
+            return crate::fs::stat("/lib64/ld-linux-loongarch-lp64d.so.1").is_ok();
+            #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+            return false;
+        }
+        OscompLibc::Unknown => false,
+    }
+}
+
+/// Check whether the environment policy is recognised.
+fn oscomp_env_ready(spec: &OscompGroupSpec<'_>) -> bool {
+    match spec.env_policy {
+        OscompEnvPolicy::Default
+        | OscompEnvPolicy::Glibc
+        | OscompEnvPolicy::Musl
+        | OscompEnvPolicy::MixedMuslWithGlibcShell
+        | OscompEnvPolicy::Network
+        | OscompEnvPolicy::FilesystemStress => true,
+    }
+}
+
+/// Real group preflight: check script/cwd/shell/loader/env readiness.
+/// Does not execute code, expand sdcard, or change scoring.
+fn oscomp_group_preflight(spec: &OscompGroupSpec<'_>) -> OscompPreflightResult {
+    if spec.run_policy == OscompRunPolicy::Skip {
+        return OscompPreflightResult {
+            status: OscompPreflightStatus::Skipped,
+            script_exists: oscomp_vfs_path_exists(spec.path),
+            cwd_exists: false,
+            shell_exists: false,
+            loader_ready: false,
+            env_ready: false,
+        };
+    }
+
+    if spec.group == OscompGroup::Unknown || spec.libc == OscompLibc::Unknown {
+        return OscompPreflightResult {
+            status: OscompPreflightStatus::NotReady,
+            script_exists: oscomp_vfs_path_exists(spec.path),
+            cwd_exists: false,
+            shell_exists: false,
+            loader_ready: false,
+            env_ready: false,
+        };
+    }
+
+    let script_exists = oscomp_vfs_path_exists(spec.path);
+    let cwd = oscomp_expected_cwd(spec);
+    let cwd_exists = oscomp_vfs_path_exists(cwd);
+    let shell_exists = oscomp_expected_shell(spec)
+        .map(|s| oscomp_vfs_path_exists(s))
+        .unwrap_or(true);
+    let loader_ready = oscomp_loader_ready(spec);
+    let env_ready = oscomp_env_ready(spec);
+
+    let status = if script_exists && cwd_exists && shell_exists && env_ready {
+        OscompPreflightStatus::Ready
+    } else {
+        OscompPreflightStatus::NotReady
+    };
+
+    OscompPreflightResult {
+        status,
+        script_exists,
+        cwd_exists,
+        shell_exists,
+        loader_ready,
+        env_ready,
+    }
+}
+
+/// Budgeted one-shot log of preflight results.
+fn oscomp_log_preflight_once(spec: &OscompGroupSpec<'_>, result: &OscompPreflightResult) {
+    static PREFLIGHT_LOG_BUDGET: AtomicUsize = AtomicUsize::new(24);
+    let budget = PREFLIGHT_LOG_BUDGET.load(Ordering::Relaxed);
+    if budget == 0 {
+        return;
+    }
+    PREFLIGHT_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
+
+    let cwd = oscomp_expected_cwd(spec);
+    crate::println!(
+        "oscomp-preflight: path={} libc={:?} group={:?} run={:?} risk={:?} status={:?} script={} cwd={} shell={} loader={} env={}",
+        spec.path, spec.libc, spec.group, spec.run_policy, spec.risk,
+        result.status,
+        result.script_exists as u8,
+        result.cwd_exists as u8,
+        result.shell_exists as u8,
+        result.loader_ready as u8,
+        result.env_ready as u8,
+    );
 }
 
 /// Returns `true` if the contest runner discovered scripts and ran to
