@@ -200,18 +200,6 @@ static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_FPD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 
-// ── P9-H15: LoongArch musl/basic SIGSEGV trace ──
-#[cfg(target_arch = "loongarch64")]
-static OSCOMP_LA_MUSL_BASIC_TRACE: AtomicBool = AtomicBool::new(false);
-#[cfg(target_arch = "loongarch64")]
-static OSCOMP_LA_MUSL_BASIC_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
-static LAST_FAULT_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(target_arch = "loongarch64")]
-fn oscomp_la_musl_basic_trace_active() -> bool {
-    OSCOMP_LA_MUSL_BASIC_TRACE.load(Ordering::Relaxed)
-}
-
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
     OSCOMP_LA_SLEEP_TRACE.load(Ordering::Relaxed)
@@ -1117,20 +1105,6 @@ fn verify_sdcard_all_scripts_thread() {
             );
         }
 
-        // ── P9-H15: enable musl/basic SIGSEGV trace ──
-        #[cfg(target_arch = "loongarch64")]
-        let _musl_basic_trace_guard = if vfs_path.contains("musl/basic_testcode") {
-            crate::println!(
-                "oscomp-la-musl-basic-trace: begin script={}",
-                vfs_path,
-            );
-            OSCOMP_LA_MUSL_BASIC_TRACE_BUDGET.store(120, Ordering::Relaxed);
-            OSCOMP_LA_MUSL_BASIC_TRACE.store(true, Ordering::Relaxed);
-            true
-        } else {
-            false
-        };
-
         // Run the script using the verified spawn/exec/task lifecycle.
         let group_result = run_rootfs_program_with_cwd(
             shell_path,
@@ -1169,22 +1143,6 @@ fn verify_sdcard_all_scripts_thread() {
                 OSCOMP_FAIL.fetch_add(1, Ordering::AcqRel);
             }
         }
-        // ── P9-H15: disable musl/basic trace ──
-        #[cfg(target_arch = "loongarch64")]
-        if _musl_basic_trace_guard {
-            OSCOMP_LA_MUSL_BASIC_TRACE.store(false, Ordering::Relaxed);
-            crate::println!(
-                "oscomp-la-musl-basic-trace: end raw={} class={}",
-                group_result.as_ref().map_or(-127_isize, |r| *r),
-                match &group_result {
-                    Ok(0) => alloc::string::String::from("PASS"),
-                    Ok(r) if *r < 0 => alloc::format!("signal={}", -*r),
-                    Ok(r) => alloc::format!("exit={}", *r),
-                    Err(_) => alloc::string::String::from("ERROR"),
-                },
-            );
-        }
-
         OSCOMP_COMPLETED.fetch_add(1, Ordering::AcqRel);
         crate::println!("#### OS COMP TEST GROUP END {} ####", vfs_path);
     }
@@ -1803,17 +1761,6 @@ fn run_program_image_with_cwd(
         exec.process.fs().set_cwd(cwd)?;
     }
     let child_pid = exec.process.id();
-    // ── P9-H15: musl/basic spawn trace ──
-    #[cfg(target_arch = "loongarch64")]
-    if oscomp_la_musl_basic_trace_active() {
-        crate::println!(
-            "oscomp-la-musl-basic-trace: spawn pid={} argv0={} argv1={} argv2={}",
-            child_pid.get(),
-            argv.get(0).copied().unwrap_or("?"),
-            argv.get(1).copied().unwrap_or(""),
-            argv.get(2).copied().unwrap_or(""),
-        );
-    }
     let task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
     let result = exec.thread.wait_for_exit();
     #[cfg(target_arch = "loongarch64")]
@@ -2108,20 +2055,6 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             );
         } else {
             OSCOMP_LA_SLEEP_TRACE.store(false, Ordering::Relaxed);
-        }
-    }
-
-    // ── P9-H15: musl/basic syscall trace ──
-    #[cfg(target_arch = "loongarch64")]
-    if oscomp_la_musl_basic_trace_active() {
-        LAST_FAULT_SYSCALL_NR.store(number, Ordering::Relaxed);
-        let budget = OSCOMP_LA_MUSL_BASIC_TRACE_BUDGET.load(Ordering::Relaxed);
-        if budget > 0 {
-            OSCOMP_LA_MUSL_BASIC_TRACE_BUDGET.store(budget - 1, Ordering::Relaxed);
-            crate::println!(
-                "oscomp-la-musl-basic-syscall: enter nr={} a0={:#x} a1={:#x} a2={:#x}",
-                number, arguments[0], arguments[1], arguments[2],
-            );
         }
     }
 
@@ -2541,19 +2474,6 @@ pub fn handle_fault(
                 // Rate-limited trace (at most 4 per class).
                 static FAULT_PRINT_COUNT: AtomicUsize = AtomicUsize::new(0);
                 let print_idx = FAULT_PRINT_COUNT.fetch_add(1, Ordering::Relaxed);
-                // ── P9-H15: musl/basic enhanced fault trace ──
-                #[cfg(target_arch = "loongarch64")]
-                if oscomp_la_musl_basic_trace_active() {
-                    let last_sys = LAST_FAULT_SYSCALL_NR.load(Ordering::Relaxed);
-                    // pid is not easily available here without plumbing —
-                    // the child-exit trace links pid→raw, and sigsegv
-                    // already has pc/class.  last_syscall is the key
-                    // addition.
-                    crate::println!(
-                        "oscomp-la-musl-basic-fault: pc={:#x} badaddr={:#x} access={:?} sp={:#x} last_syscall={}",
-                        bpc, baddr, access, bsp, last_sys,
-                    );
-                }
                 if print_idx < 8 {
                     crate::println!(
                         "sigsegv: class={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x}",
