@@ -916,7 +916,7 @@ fn verify_sdcard_all_scripts_thread() {
 
     // Arch-specific total budget so RV can get deeper results.
     #[cfg(target_arch = "riscv64")]
-    const TOTAL_BUDGET_MS: u64 = 120_000;
+    const TOTAL_BUDGET_MS: u64 = 150_000;
     #[cfg(target_arch = "loongarch64")]
     const TOTAL_BUDGET_MS: u64 = 60_000;
     let freq_hz = crate::time::clock_frequency_hz();
@@ -1337,17 +1337,17 @@ fn oscomp_should_skip_heavy(script: &str) -> bool {
         || script.contains("ltp_testcode")
 }
 
-/// RISC-V whitelist: only these four safe groups are allowed to run.
+/// RISC-V whitelist: safe groups that can run without hanging.
 /// glibc/musl libctest are disabled — pthread_cond_smasher can trigger
 /// a scheduler recursive-lock panic on cloud QEMU.
-/// Everything else is deferred so the budget is spent on groups with
-/// a proven chance of passing.
 #[cfg(target_arch = "riscv64")]
 fn oscomp_rv_whitelist(path: &str) -> bool {
     path.ends_with("/glibc/busybox_testcode.sh")
         || path.ends_with("/glibc/basic_testcode.sh")
         || path.ends_with("/musl/busybox_testcode.sh")
         || path.ends_with("/musl/basic_testcode.sh")
+        || path.ends_with("/glibc/lua_testcode.sh")
+        || path.ends_with("/musl/lua_testcode.sh")
 }
 
 // ── P9-H7: LoongArch shell probe and contest whitelist ──
