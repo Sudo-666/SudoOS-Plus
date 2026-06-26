@@ -1134,7 +1134,36 @@ fn verify_sdcard_all_scripts_thread() {
             )
         };
 
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "loongarch64")]
+        let group_result = {
+            if vfs_path.ends_with("/musl/basic_testcode.sh")
+                && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
+            {
+                let la_override_shell = "/mnt/sdcard/glibc/busybox";
+                let la_override_cwd = "/mnt/sdcard/musl";
+                let la_path_env = "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin";
+                let la_ld_env = "LD_LIBRARY_PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib:/usr/lib";
+                crate::println!(
+                    "oscomp-la-musl-basic-override: shell={} cwd={} script={}",
+                    la_override_shell, la_override_cwd, vfs_path,
+                );
+                run_rootfs_program_with_cwd(
+                    la_override_shell,
+                    &["busybox", "sh", &vfs_path],
+                    &[la_path_env, la_ld_env, "HOME=/"],
+                    Some(la_override_cwd),
+                )
+            } else {
+                run_rootfs_program_with_cwd(
+                    shell_path,
+                    &["busybox", "sh", &vfs_path],
+                    &[&path_env, &ld_env, "HOME=/"],
+                    Some(&cwd),
+                )
+            }
+        };
+
+        #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
         let group_result = run_rootfs_program_with_cwd(
             shell_path,
             &["busybox", "sh", &vfs_path],
