@@ -916,7 +916,7 @@ fn verify_sdcard_all_scripts_thread() {
 
     // Arch-specific total budget so RV can get deeper results.
     #[cfg(target_arch = "riscv64")]
-    const TOTAL_BUDGET_MS: u64 = 150_000;
+    const TOTAL_BUDGET_MS: u64 = 180_000;
     #[cfg(target_arch = "loongarch64")]
     const TOTAL_BUDGET_MS: u64 = 60_000;
     let freq_hz = crate::time::clock_frequency_hz();
@@ -1327,7 +1327,6 @@ fn arch_contest_poweroff_la() {
 #[cfg(target_arch = "riscv64")]
 fn oscomp_should_skip_heavy(script: &str) -> bool {
     script.contains("unixbench")
-        || script.contains("libcbench")
         || script.contains("lmbench")
         || script.contains("netperf")
         || script.contains("iperf")
@@ -1348,6 +1347,8 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/basic_testcode.sh")
         || path.ends_with("/glibc/lua_testcode.sh")
         || path.ends_with("/musl/lua_testcode.sh")
+        || path.ends_with("/glibc/libcbench_testcode.sh")
+        || path.ends_with("/musl/libcbench_testcode.sh")
 }
 
 // ── P9-H7: LoongArch shell probe and contest whitelist ──
@@ -1481,6 +1482,8 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/basic_testcode.sh")
         || path.ends_with("/glibc/busybox_testcode.sh")
         || path.ends_with("/musl/busybox_testcode.sh")
+        || path.ends_with("/glibc/libcbench_testcode.sh")
+    // musl lua SIGSEGVs (bad LA binary), musl libcbench SIGSEGVs
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
