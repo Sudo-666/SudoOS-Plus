@@ -364,3 +364,18 @@ directory via `sdcard_install_ext4_dir_files`. Called only inside
 - All hooks are no-ops when master flag is false
 - Path preparation is gated behind per-group flags
 - No scoring impact, no skip removal
+
+## P10-F7 Lua ProbeOnly Dryrun
+
+*Dryrun completed — all flags restored to false.*
+
+| Item | Result |
+|------|--------|
+| Lua probe enabled + built | ✅ both archs |
+| Smoke (no SD card) | ⚠️ probe hooks not triggered |
+| Kernel panic | ❌ none |
+| Flags restored to false | ✅ |
+
+- Cloud with SD card would trigger probe hooks in skip/defer branches
+- If preflight shows Ready → Lua probes can be enabled for real
+- If NotReady → check which preflight item failed
