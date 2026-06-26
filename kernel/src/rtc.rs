@@ -18,29 +18,75 @@ pub struct RtcTime {
     pub unix_seconds: i64,
 }
 
-/// Linux RTC ioctl commands (asm-generic IOWR encoding).
-/// RTC_RD_TIME = IOR('p', 0x09, struct rtc_time)
-/// struct rtc_time = 5×i32 (tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst)
-/// Total size: 9 × 4 = 36 bytes on 64-bit.
-/// ioctl encoding: _IOR('p', 0x09, 36) = (2 << 30) | (('p' as u32) << 8) | 0x09 | (36 << 16)
-pub const RTC_RD_TIME: usize = 0x40247009;
+/// Linux RTC ioctl: _IOR('p', 0x09, struct rtc_time)
+/// Match any encoding: check type='p', nr=0x09, accepting any size/direction.
+fn is_rtc_rd_time(cmd: usize) -> bool {
+    let typ = (cmd >> 8) & 0xff;
+    let nr = cmd & 0xff;
+    typ == b'p' as usize && nr == 0x09
+}
 
 /// Handle RTC ioctl commands. Returns Ok(0) on success, or Err(ENOTTY) for
 /// unknown commands.
-pub fn ioctl(cmd: usize, _arg: usize) -> Result<usize, Errno> {
-    match cmd {
-        RTC_RD_TIME => {
-            // struct rtc_time: tm_sec(4) tm_min(4) tm_hour(4) tm_mday(4)
-            //                  tm_mon(4) tm_year(4) tm_wday(4) tm_yday(4) tm_isdst(4)
-            // Fields are in little-endian i32.
-            // For now return a fixed epoch-based time; this unblocks hwclock.
-            // A full implementation would convert unix_seconds to broken-down time
-            // and write to user memory via copy_to_user. Since the fs layer doesn't
-            // have access to copy_to_user, we return a stub success.
-            Ok(0)
+pub fn ioctl(cmd: usize, arg: usize) -> Result<usize, Errno> {
+    if is_rtc_rd_time(cmd) {
+        // struct rtc_time: 9 × i32 (36 bytes) in little-endian
+        let time = read_rtc_time().unwrap_or(RtcTime { unix_seconds: 0 });
+        let secs = time.unix_seconds;
+        let day_secs = secs.rem_euclid(86400);
+        let tm_sec = (day_secs % 60) as i32;
+        let tm_min = ((day_secs / 60) % 60) as i32;
+        let tm_hour = (day_secs / 3600) as i32;
+        let days = (secs / 86400) as i32;
+        let (tm_year, tm_mon, tm_mday) = civil_from_days(days);
+        let tm_wday = ((days + 4) % 7) as i32;
+        let tm_yday = (days - days_from_civil(tm_year, 0, 1)) as i32;
+        let tm_isdst: i32 = 0;
+        let mut buf = [0u8; 36];
+        buf[0..4].copy_from_slice(&tm_sec.to_le_bytes());
+        buf[4..8].copy_from_slice(&tm_min.to_le_bytes());
+        buf[8..12].copy_from_slice(&tm_hour.to_le_bytes());
+        buf[12..16].copy_from_slice(&tm_mday.to_le_bytes());
+        buf[16..20].copy_from_slice(&tm_mon.to_le_bytes());
+        buf[20..24].copy_from_slice(&(tm_year - 1900).to_le_bytes());
+        buf[24..28].copy_from_slice(&tm_wday.to_le_bytes());
+        buf[28..32].copy_from_slice(&tm_yday.to_le_bytes());
+        buf[32..36].copy_from_slice(&tm_isdst.to_le_bytes());
+        if crate::user::copy_to_user(arg, &buf).is_err() {
+            return Err(Errno::Efault);
         }
-        _ => Err(Errno::Enotty),
+        Ok(0)
+    } else {
+        Err(Errno::Enotty)
     }
+}
+
+/// Days from 0000-03-01 to the given (year, month 0-11, day 1-31).
+/// Uses the proleptic Gregorian calendar.
+fn days_from_civil(y: i32, m: i32, d: i32) -> i32 {
+    let y = if m <= 1 { y - 1 } else { y };
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+    let yoe = y - era * 400;
+    let doy = if m <= 1 {
+        m * 31 + d - 1
+    } else {
+        (153 * (m - 2) + 2) / 5 + d - 1
+    };
+    era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy
+}
+
+fn civil_from_days(z: i32) -> (i32, i32, i32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m - 1, d)
 }
 
 /// RTC 硬件抽象 trait。

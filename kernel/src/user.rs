@@ -5698,7 +5698,7 @@ fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
 /// M9-B has no syscall that copies kernel output into userspace yet, but the
 /// helper remains the checked counterpart of `copy_from_user` for the next VFS
 /// stage. Keeping the allowance local prevents unrelated dead code.
-fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
+pub(crate) fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
     let Some(thread) = crate::task::current_user_thread() else {
         return Err(());
     };
