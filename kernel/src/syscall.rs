@@ -120,6 +120,7 @@ pub mod errno {
     pub const EINVAL: isize = 22;
     pub const EPIPE: isize = 32;
     pub const ENOSYS: isize = 38;
+    pub const ETIMEDOUT: isize = 110;
     pub const MAX_ERRNO: isize = 4095;
 
     pub const fn encode(errno: isize) -> isize {
@@ -247,6 +248,7 @@ pub fn verify_contract() {
     assert_eq!(number::PRLIMIT64, 261);
     assert_eq!(number::GETRANDOM, 278);
     assert_eq!(errno::EAGAIN, 11);
+    assert_eq!(errno::ETIMEDOUT, 110);
     assert_eq!(errno::EPIPE, 32);
     assert!(errno::is_error(errno::encode(errno::ENOSYS)));
     assert!(!errno::is_error(0));

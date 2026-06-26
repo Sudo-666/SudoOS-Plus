@@ -286,6 +286,24 @@ def main() -> int:
     check(PASS, "prepare skipped no-vda log exists",
           "prepare skipped no-vda" in user_rs)
 
+    # ── P10-R1 time/poll/sched/futex compat ──
+    check(PASS, "CLOCK_BOOTTIME appears (clock_gettime 0-7)",
+          "clock_id > 7" in user_rs)
+    check(PASS, "ITIMER_REAL appears",
+          "ITIMER_REAL" in user_rs)
+    check(PASS, "KernelItimerval appears",
+          "KernelItimerval" in user_rs)
+    check(PASS, "getrusage validates who",
+          "who > 1" in user_rs)
+    check(PASS, "ETIMEDOUT in futex timeout path",
+          "ETIMEDOUT" in user_rs)
+    check(PASS, "ppoll timeout_address used",
+          "timeout_address" in user_rs.split("sys_ppoll")[1][:200]
+          if "sys_ppoll" in user_rs else False)
+    check(PASS, "sched_getaffinity mask==0 → EFAULT",
+          "mask == 0" in user_rs.split("sys_sched_getaffinity")[1][:200]
+          if "sys_sched_getaffinity" in user_rs else False)
+
     # ── P10-F6 probe bridge coverage ──
     check(PASS, "oscomp_probe_only_prepare_path exists",
           "oscomp_probe_only_prepare_path" in user_rs)

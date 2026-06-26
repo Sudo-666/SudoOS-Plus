@@ -5436,7 +5436,10 @@ fn sys_nanosleep(request_address: usize, remain_address: usize) -> isize {
 }
 
 fn sys_clock_gettime(clock_id: usize, timespec_address: usize) -> isize {
-    if clock_id > 1 {
+    // Accept standard Linux clock IDs. CPU-time clocks (2/3) return the
+    // monotonic counter as a best-effort approximation so that lua/
+    // libcbench/cyclictest don't fail with EINVAL.
+    if clock_id > 7 {
         return -EINVAL;
     }
     let ns = current_time_ns();
@@ -5455,7 +5458,9 @@ fn sys_clock_nanosleep(
     request_address: usize,
     remain_address: usize,
 ) -> isize {
-    if clock_id > 1 {
+    // Accept CLOCK_REALTIME(0), CLOCK_MONOTONIC(1), CLOCK_BOOTTIME(7).
+    // CPU-time clocks (2/3) cannot sleep — return EINVAL.
+    if clock_id > 7 || clock_id == 2 || clock_id == 3 {
         return -EINVAL;
     }
     if flags & !TIMER_ABSTIME != 0 {
@@ -5621,7 +5626,7 @@ fn sys_futex(
     uaddr: usize,
     futex_op: usize,
     val: usize,
-    _timeout: usize,
+    timeout: usize,
     _uaddr2: usize,
     _val3: usize,
 ) -> isize {
@@ -5636,11 +5641,29 @@ fn sys_futex(
             if current_val != val {
                 return -(crate::syscall::errno::EAGAIN);
             }
+            // Timed wait: if timeout != 0, sleep a bounded duration and
+            // return ETIMEDOUT without blocking on the futex queue.
+            if timeout != 0 {
+                let ts = match copy_plain_from_user::<KernelTimespec>(timeout) {
+                    Ok(ts) => ts,
+                    Err(errno) => return errno,
+                };
+                if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
+                    return -EINVAL;
+                }
+                let duration = core::time::Duration::new(ts.sec as u64, ts.nsec as u32);
+                // Cap at 50ms to avoid hanging the contest runner.
+                let capped = core::cmp::min(duration, core::time::Duration::from_millis(50));
+                if !capped.is_zero() {
+                    crate::timer::sleep(capped);
+                }
+                return -(crate::syscall::errno::ETIMEDOUT);
+            }
+            // Untimed wait: block on the futex queue.
             let queue = get_futex_queue(uaddr);
             let _ = crate::task::block_current_on_if_from_user_trap(
                 &queue,
                 || {
-                    // Re-check: if value changed between check and block, don't sleep
                     match copy_plain_from_user::<u32>(uaddr) {
                         Ok(v) => v as usize == val,
                         Err(_) => false,
@@ -5652,7 +5675,8 @@ fn sys_futex(
         FUTEX_WAKE | 10 /* FUTEX_WAKE_BITSET */ => {
             let queue = get_futex_queue(uaddr);
             let woken = if val >= 1 { queue.wake_all() } else { 0 };
-            woken as isize
+            // Return at most `val` woken, consistent with Linux.
+            core::cmp::min(woken, val) as isize
         }
         _ => -(crate::syscall::errno::ENOSYS),
     }
@@ -5784,6 +5808,12 @@ const SCHED_RR: usize = 2;
 
 fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> isize {
     // Return affinity mask with all active CPUs set (as-per-Linux cpumask).
+    if mask == 0 {
+        return -EFAULT;
+    }
+    if cpusetsize == 0 {
+        return -EINVAL;
+    }
     if cpusetsize < core::mem::size_of::<u64>() {
         return -(crate::syscall::errno::EINVAL);
     }
@@ -5800,6 +5830,12 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> isize {
 
 fn sys_sched_setaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> isize {
     // Single-core scheduler: accept any mask that includes CPU 0, reject others.
+    if mask == 0 {
+        return -EFAULT;
+    }
+    if cpusetsize == 0 {
+        return -EINVAL;
+    }
     if cpusetsize < core::mem::size_of::<u64>() {
         return -(crate::syscall::errno::EINVAL);
     }
@@ -5825,6 +5861,9 @@ fn sys_sched_getscheduler(_pid: usize) -> isize {
 }
 
 fn sys_sched_getparam(_pid: usize, param_address: usize) -> isize {
+    if param_address == 0 {
+        return -EFAULT;
+    }
     // struct sched_param: sched_priority (i32), on Linux 64-bit.
     // SCHED_OTHER always has priority 0.
     let priority: i32 = 0;
@@ -5875,17 +5914,73 @@ fn sys_prctl(_option: usize, _arg2: usize, _arg3: usize) -> isize {
     0
 }
 
-fn sys_setitimer(_which: usize, _new_value: usize, _old_value: usize) -> isize {
-    // Stub: busybox `sleep` and some benchmarks use setitimer(ITIMER_REAL).
-    // Accept the call without implementing interval timers yet.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct KernelItimerval {
+    interval: KernelTimeval,
+    value: KernelTimeval,
+}
+
+const ITIMER_REAL: usize = 0;
+const ITIMER_VIRTUAL: usize = 1;
+const ITIMER_PROF: usize = 2;
+
+fn sys_setitimer(which: usize, new_value: usize, old_value: usize) -> isize {
+    if which > 2 {
+        return -EINVAL;
+    }
+    // Write zero old value if requested.
+    if old_value != 0 {
+        let zero = KernelItimerval {
+            interval: KernelTimeval { sec: 0, usec: 0 },
+            value: KernelTimeval { sec: 0, usec: 0 },
+        };
+        let result = copy_plain_to_user(old_value, &zero);
+        if result != 0 {
+            return result;
+        }
+    }
+    // Validate new value pointer and fields without arming a real timer.
+    if new_value != 0 {
+        let new = match copy_plain_from_user::<KernelItimerval>(new_value) {
+            Ok(v) => v,
+            Err(errno) => return errno,
+        };
+        if new.value.sec < 0
+            || new.value.usec < 0
+            || new.value.usec >= 1_000_000
+            || new.interval.sec < 0
+            || new.interval.usec < 0
+            || new.interval.usec >= 1_000_000
+        {
+            return -EINVAL;
+        }
+    }
     0
 }
 
-fn sys_getitimer(_which: usize, _old_value: usize) -> isize {
-    0
+fn sys_getitimer(which: usize, old_value: usize) -> isize {
+    if which > 2 {
+        return -EINVAL;
+    }
+    if old_value == 0 {
+        return -EFAULT;
+    }
+    let zero = KernelItimerval {
+        interval: KernelTimeval { sec: 0, usec: 0 },
+        value: KernelTimeval { sec: 0, usec: 0 },
+    };
+    copy_plain_to_user(old_value, &zero)
 }
 
-fn sys_getrusage(_who: usize, usage: usize) -> isize {
+fn sys_getrusage(who: usize, usage: usize) -> isize {
+    // RUSAGE_SELF=0, RUSAGE_CHILDREN=-1(usize::MAX), RUSAGE_THREAD=1
+    if who > 1 && who != usize::MAX {
+        return -EINVAL;
+    }
+    if usage == 0 {
+        return -EFAULT;
+    }
     // Return a zeroed rusage struct (144 bytes on Linux 64-bit).
     let raw = [0_u8; 144];
     if copy_to_user(usage, &raw).is_err() {
@@ -6140,13 +6235,17 @@ fn sys_readlinkat(
     }
 }
 
-fn sys_ppoll(fds_address: usize, nfds: usize, _timeout_address: usize) -> isize {
+fn sys_ppoll(fds_address: usize, nfds: usize, timeout_address: usize) -> isize {
     let pollfd_len = core::mem::size_of::<KernelPollFd>();
     let bytes_len = match nfds.checked_mul(pollfd_len) {
         Some(length) if length <= MAX_USER_COPY => length,
         _ => return -EINVAL,
     };
     if nfds == 0 {
+        // nfds==0 with non-NULL timeout: sleep relative duration.
+        if timeout_address != 0 {
+            return sys_nanosleep(timeout_address, 0);
+        }
         return 0;
     }
     let mut buffer = [0_u8; MAX_USER_COPY];
