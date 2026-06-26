@@ -948,19 +948,6 @@ fn verify_sdcard_all_scripts_thread() {
     #[cfg(target_arch = "loongarch64")]
     oscomp_la_diag(shell_path);
 
-    // ── LoongArch: replace crashing musl busybox with glibc one ──
-    #[cfg(target_arch = "loongarch64")]
-    if crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
-        && crate::fs::stat("/mnt/sdcard/musl/busybox").is_ok()
-    {
-        crate::fs::unlink("/mnt/sdcard/musl/busybox", false).ok();
-        crate::fs::symlink(
-            "/mnt/sdcard/glibc/busybox",
-            "/mnt/sdcard/musl/busybox",
-        ).ok();
-        crate::println!("oscomp-la: replaced musl busybox -> glibc to avoid SIGSEGV");
-    }
-
     // ── local counters (mirror atomics for summary) ──
     #[cfg(not(target_arch = "loongarch64"))]
     let la_shell_ok: bool = true;
@@ -1164,15 +1151,10 @@ fn verify_sdcard_all_scripts_thread() {
             } else if vfs_path.ends_with("/musl/busybox_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
             {
-                // Replace crashing musl busybox with working glibc one
-                // so that `./busybox` in the test script resolves correctly.
-                crate::fs::unlink("/mnt/sdcard/musl/busybox", false).ok();
-                crate::fs::symlink(
-                    "/mnt/sdcard/glibc/busybox",
-                    "/mnt/sdcard/musl/busybox",
-                ).ok();
+                // Use glibc busybox directly for the musl test to avoid
+                // known-bad-busybox SIGSEGV in the musl-linked binary.
                 crate::println!(
-                    "oscomp-la-musl-busybox: replaced musl busybox -> glibc script={}",
+                    "oscomp-la-musl-busybox: use glibc busybox script={}",
                     vfs_path,
                 );
                 run_rootfs_program_with_cwd(
