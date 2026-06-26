@@ -1455,13 +1455,14 @@ fn oscomp_la_run_sleep_trace_probe(
     raw
 }
 
-/// LoongArch whitelist: basic groups only.
-/// Busybox groups are disabled — musl/busybox hits known-bad-busybox SIGSEGV.
+/// LoongArch whitelist: basic and busybox groups.
 /// Everything else is SKIP (la-defer).
 #[cfg(target_arch = "loongarch64")]
 fn oscomp_la_whitelist(path: &str) -> bool {
     path.ends_with("/glibc/basic_testcode.sh")
         || path.ends_with("/musl/basic_testcode.sh")
+        || path.ends_with("/glibc/busybox_testcode.sh")
+        || path.ends_with("/musl/busybox_testcode.sh")
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
@@ -1643,11 +1644,13 @@ fn oscomp_la_run_basic_direct(kind: &str, root: &str) -> isize {
     let mut all_passed: bool = true;
 
     // Cases known to exist in sdcard basic directories.
-    // P9-H18R: safe subset — only cases H17 proved stable.
-    // Full list (clone/fork/pipe/sleep/mount/wait/yield etc.) is
-    // deferred to avoid hanging the contest runner.
+    // Full list — all cases that RISC-V passes.
     let cases: &[&str] = &[
-        "brk", "getpid", "write", "exit",
+        "brk", "chdir", "clone", "close", "dup2", "dup", "execve", "exit",
+        "fork", "fstat", "getcwd", "getdents", "getpid", "getppid",
+        "gettimeofday", "mkdir_", "mmap", "mount", "munmap", "openat",
+        "open", "pipe", "read", "sleep", "times", "umount", "uname",
+        "unlink", "wait", "waitpid", "write", "yield",
     ];
 
     let path_env: &str;
