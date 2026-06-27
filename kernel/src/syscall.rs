@@ -120,6 +120,7 @@ pub mod errno {
     pub const EAGAIN: isize = 11;
     pub const ENOMEM: isize = 12;
     pub const EFAULT: isize = 14;
+    pub const ERANGE: isize = 34;
     pub const EEXIST: isize = 17;
     pub const EINVAL: isize = 22;
     pub const EPIPE: isize = 32;

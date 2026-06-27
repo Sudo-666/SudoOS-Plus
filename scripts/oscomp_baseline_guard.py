@@ -349,6 +349,14 @@ def main() -> int:
     check(PASS, "LA musl lua log exists",
           'oscomp-la-musl-lua' in user_rs)
 
+    # ── P10-SCORE-FIX2 getcwd conditional ──
+    check(PASS, "getcwd prefers full path first",
+          'full_need <= size' in user_rs)
+    check(PASS, "getcwd strips only as fallback",
+          'visible != full && visible_need' in user_rs)
+    check(PASS, "getcwd returns cwd len not address",
+          'chosen.len() as isize' in user_rs)
+
     check(PASS, "wait4 accepts 4 args", "rusage_address" in user_rs)
     check(PASS, "PR_SET_NAME appears", "PR_SET_NAME" in user_rs)
     check(PASS, "PR_GET_NAME appears", "PR_GET_NAME" in user_rs)

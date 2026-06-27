@@ -6383,29 +6383,44 @@ fn sys_getcwd(address: usize, size: usize) -> isize {
     if size == 0 {
         return -EINVAL;
     }
-    let cwd = current_process().fs().cwd_path();
-    // `/mnt/sdcard` is the kernel runner's internal mount prefix.  The
-    // official userland image treats the sdcard root as `/`, so do not leak
-    // that implementation detail through getcwd.
-    let visible_cwd = match cwd.strip_prefix("/mnt/sdcard") {
-        Some("") => "/",
-        Some(path) => path,
-        None => cwd.as_str(),
-    };
-    let needed = match visible_cwd.len().checked_add(1) {
-        Some(needed) => needed,
-        None => return -ERANGE,
-    };
-    if needed > size || needed > MAX_USER_COPY {
-        return -ERANGE;
-    }
-    let mut bytes = [0_u8; MAX_USER_COPY];
-    bytes[..visible_cwd.len()].copy_from_slice(visible_cwd.as_bytes());
-    bytes[visible_cwd.len()] = 0;
-    if copy_to_user(address, &bytes[..needed]).is_err() {
+    if address == 0 {
         return -EFAULT;
     }
-    address as isize
+    let cwd = current_process().fs().cwd_path();
+    let full = cwd.as_str();
+
+    // Compute the user-visible path (strip internal mount prefix).
+    let visible = match full.strip_prefix("/mnt/sdcard") {
+        Some("") => "/",
+        Some(path) => path,
+        None => full,
+    };
+
+    // Prefer the full internal path so shells that use large buffers
+    // can do `cd ..` correctly.  Only fall back to the stripped path
+    // when the full path won't fit in the user buffer.
+    let full_need = full.len() + 1; // includes NUL
+    let visible_need = visible.len() + 1;
+
+    let chosen = if full_need <= size {
+        full
+    } else if visible != full && visible_need <= size {
+        visible
+    } else {
+        return -(crate::syscall::errno::ERANGE);
+    };
+
+    if chosen.len() + 1 > MAX_USER_COPY {
+        return -(crate::syscall::errno::ERANGE);
+    }
+
+    let mut bytes = [0_u8; MAX_USER_COPY];
+    bytes[..chosen.len()].copy_from_slice(chosen.as_bytes());
+    bytes[chosen.len()] = 0;
+    if copy_to_user(address, &bytes[..chosen.len() + 1]).is_err() {
+        return -EFAULT;
+    }
+    chosen.len() as isize
 }
 
 fn sys_chdir(path_address: usize) -> isize {
