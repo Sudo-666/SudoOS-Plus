@@ -215,7 +215,7 @@ static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 
 // ── P11B: pthread create trace (default false) ──
 const OSCOMP_TRACE_PTHREAD_CREATE: bool = false;
-static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(4000);
+static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(8000);
 
 // ── P9-H14: LoongArch FPD fixup counter ──
 #[cfg(target_arch = "loongarch64")]
@@ -1587,7 +1587,7 @@ const OSCOMP_PROBE_UNIXBENCH: bool = false;
 #[allow(dead_code)]
 const OSCOMP_ENABLE_LIBCBENCH_EXTRA: bool = false;
 #[allow(dead_code)]
-const OSCOMP_ENABLE_CYCLICTEST_MINI: bool = false;
+const OSCOMP_ENABLE_CYCLICTEST_MINI: bool = true; // P12B dryrun
 #[allow(dead_code)]
 const OSCOMP_ENABLE_LMBENCH_MINI: bool = true;
 #[allow(dead_code)]
@@ -3412,7 +3412,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
               98 |                      // futex
               261 |                     // prlimit64
               123 | 122 |               // sched_get/setaffinity
-              228 | 230                 // mlock/mlockall
+              119 | 120 | 121 | 118 |   // sched_setscheduler/getscheduler/getparam/setparam
+              125 | 126 | 127 |         // sched_get_priority_max/min, sched_rr_get_interval
+              228 | 230 | 229           // mlock/mlockall/munlock
             )
         {
             OSCOMP_PTHREAD_TRACE_BUDGET.store(budget - 1, Ordering::Relaxed);

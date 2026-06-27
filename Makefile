@@ -12,6 +12,10 @@ oscomp-all:
 oscomp-audit:
 	@python3 scripts/oscomp-audit.py
 
+.PHONY: oscomp-baseline-check
+oscomp-baseline-check:
+	@python3 scripts/oscomp_baseline_guard.py
+
 oscomp-vendor:
 	@bash scripts/oscomp-vendor.sh
 

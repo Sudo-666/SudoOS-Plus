@@ -13,7 +13,7 @@ use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
-const VMA_CAPACITY: usize = 32;
+const VMA_CAPACITY: usize = 96;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
