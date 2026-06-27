@@ -350,6 +350,12 @@ def main() -> int:
           and "run_rootfs_program_with_cwd(" in
           user_rs.split("fn oscomp_run_lmbench_case", 1)[1][:1_500])
 
+    task_stack_rs = read_text("kernel/src/task/stack.rs") or ""
+    stack_64 = "const KERNEL_STACK_SIZE: usize = 64 * 1024;" in task_stack_rs
+    stack_32 = "const KERNEL_STACK_SIZE: usize = 32 * 1024;" in task_stack_rs
+    check(PASS, "RV kernel stack >= 64 KiB", stack_64 and not stack_32)
+    check(PASS, "LA kernel stack >= 64 KiB", stack_64 and not stack_32)
+
     # ── P10-R2 fs/iozone compat ──
     check(PASS, "FDATASYNC exists", "SYS_FDATASYNC" in user_rs or "FDATASYNC" in user_rs)
     check(PASS, "sys_fdatasync exists", "sys_fdatasync" in user_rs)

@@ -1580,10 +1580,7 @@ pub fn initialize() {
     wait_queue::verify_local();
     crate::println!("kernel scheduler:");
     crate::println!("  policy          : preemptive per-CPU FIFO round-robin");
-    #[cfg(target_arch = "riscv64")]
     crate::println!("  kernel stack    : 64 KiB plus guard pages");
-    #[cfg(not(target_arch = "riscv64"))]
-    crate::println!("  kernel stack    : 32 KiB plus guard pages");
     crate::println!("  bootstrap CPUs  : 1");
     crate::println!("  configured CPUs : {}", discovered);
     crate::println!(
