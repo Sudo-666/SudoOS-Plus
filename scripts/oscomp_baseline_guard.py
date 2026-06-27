@@ -537,6 +537,25 @@ def main() -> int:
           'OSCOMP_TRACE_PTHREAD_CREATE: bool = false' in user_rs
           or 'OSCOMP_TRACE_PTHREAD_CREATE: bool=false' in user_rs)
 
+    # ── P13B lmbench scope ──
+    check(PASS, "lmbench mini present",
+          'oscomp_run_lmbench_mini' in user_rs)
+    # RV glibc lmbench should be enabled via heavy skip gate
+    check(PASS, "lmbench heavy skip gated RV glibc",
+          'OSCOMP_ENABLE_LMBENCH_MINI' in user_rs
+          and '"/glibc/"' in user_rs.split('oscomp_should_skip_heavy')[1][:300]
+          if 'oscomp_should_skip_heavy' in user_rs else False)
+    # LA whitelist must NOT include lmbench
+    la_wl = user_rs.split('fn oscomp_la_whitelist')[1][:600] if 'fn oscomp_la_whitelist' in user_rs else ""
+    check(PASS, "LA whitelist excludes lmbench",
+          'lmbench' not in la_wl)
+
+    # iperf/netperf/LTP must remain disabled
+    for grp in ["iperf", "netperf", "LTP", "ltp_testcode"]:
+        check(PASS, f"{grp} still in heavy skip",
+              grp in user_rs.split('oscomp_should_skip_heavy')[1][:800]
+              if 'oscomp_should_skip_heavy' in user_rs else True)
+
     # ── Remaining-score staged group switches ──
     # Heavy groups must be enabled one at a time only after local validation.
     staged_flags = {
