@@ -495,6 +495,48 @@ def main() -> int:
     else:
         check(PASS, "kill_process_group absent", True)
 
+    # ── P13A safe ABI baseline ──
+    # Dangerous symbols must not exist in kernel source
+    for sym in ["mem::forget", "OSCOMP_LOCAL_ONLY", "local-cyclic-only",
+                "spawn_dummy_sleep"]:
+        found = sym in user_rs
+        check(FAIL if found else PASS, f"dangerous symbol absent: {sym}",
+              not found)
+
+    # VMA capacity
+    umm_rs = read_text("kernel/src/user_mm.rs")
+    if umm_rs and "VMA_CAPACITY" in umm_rs:
+        # crude: check there's a 96 or higher near VMA_CAPACITY
+        cap_line = [l for l in umm_rs.split('\n') if 'VMA_CAPACITY' in l and 'usize' in l]
+        cap_ok = any('96' in l or '128' in l or '192' in l or '256' in l for l in cap_line)
+        check(PASS if cap_ok else FAIL, "VMA_CAPACITY >= 96", cap_ok)
+    else:
+        check(FAIL, "VMA_CAPACITY >= 96", False, "user_mm.rs not found or VMA_CAPACITY missing")
+
+    # Syscall numbers
+    sc_rs = read_text("kernel/src/syscall.rs")
+    if sc_rs:
+        sc_checks = {
+            "SIGALTSTACK = 132": "pub const SIGALTSTACK: usize = 132;",
+            "RT_SIGSUSPEND = 133": "pub const RT_SIGSUSPEND: usize = 133;",
+            "SETPGID = 154": "pub const SETPGID: usize = 154;",
+            "GETPGID = 155": "pub const GETPGID: usize = 155;",
+            "GETSID = 156": "pub const GETSID: usize = 156;",
+            "SETSID = 157": "pub const SETSID: usize = 157;",
+            "RSEQ = 293": "pub const RSEQ: usize = 293;",
+        }
+        for name, needle in sc_checks.items():
+            check(PASS if needle in sc_rs else FAIL, f"syscall number: {name}",
+                  needle in sc_rs)
+
+    # Cyclictest must be disabled
+    check(PASS, "cyclictest flag is false",
+          'OSCOMP_ENABLE_CYCLICTEST_MINI: bool = false' in user_rs
+          or 'OSCOMP_ENABLE_CYCLICTEST_MINI: bool=false' in user_rs)
+    check(PASS, "pthread trace is false",
+          'OSCOMP_TRACE_PTHREAD_CREATE: bool = false' in user_rs
+          or 'OSCOMP_TRACE_PTHREAD_CREATE: bool=false' in user_rs)
+
     # ── Remaining-score staged group switches ──
     # Heavy groups must be enabled one at a time only after local validation.
     staged_flags = {
