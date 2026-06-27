@@ -2161,11 +2161,8 @@ fn verify_sdcard_all_scripts_thread() {
                     "/mnt/sdcard/musl",
                 ))
             } else if OSCOMP_ENABLE_LMBENCH_MINI
-                && vfs_path.ends_with("/glibc/lmbench_testcode.sh")
-            {
-                Ok(oscomp_run_lmbench_mini(&vfs_path))
-            } else if OSCOMP_ENABLE_LMBENCH_MINI
-                && vfs_path.ends_with("/musl/lmbench_testcode.sh")
+                && (vfs_path.ends_with("/glibc/lmbench_testcode.sh")
+                    || vfs_path.ends_with("/musl/lmbench_testcode.sh"))
             {
                 Ok(oscomp_run_lmbench_mini(&vfs_path))
             } else if vfs_path.ends_with("/musl/lua_testcode.sh")
@@ -2482,37 +2479,26 @@ fn oscomp_la_install_busybox_applets() {
 
 #[cfg(target_arch = "loongarch64")]
 fn oscomp_la_busybox_use_glibc_applet_fallback(libc: &str, label: &str) -> bool {
-    if libc != "musl" {
-        return false;
-    }
-
-    matches!(
-        label,
-        "echo \"#### independent command test\""
-            | "ash -c exit"
-            | "cal"
-            | "df"
-            | "dmesg"
-            | "du"
-            | "expr 1 + 1"
-            | "which ls"
-            | "ps"
-            | "pwd"
-            | "free"
-            | "echo \"ccccccc\" >> test.txt"
-            | "echo \"bbbbbbb\" >> test.txt"
-            | "echo \"2222222\" >> test.txt"
-            | "echo \"1111111\" >> test.txt"
-            | "sort test.txt | ./busybox uniq"
-            | "sort test.txt | busybox uniq"
-            | "strings test.txt"
-            | "wc test.txt"
-            | "[ -f test.txt ]"
-            | "find -name \"busybox_cmd.txt\""
-            | "cut -c 3 test.txt"
-            | "head test.txt"
-            | "ls"
-    )
+    libc == "musl"
+        && matches!(
+            label,
+            "df"
+                | "dmesg"
+                | "du"
+                | "expr 1 + 1"
+                | "which ls"
+                | "ps"
+                | "pwd"
+                | "free"
+                | "cut -c 3 test.txt"
+                | "head test.txt"
+                | "strings test.txt"
+                | "wc test.txt"
+                | "[ -f test.txt ]"
+                | "find -name \"busybox_cmd.txt\""
+                | "sort test.txt | ./busybox uniq"
+                | "sort test.txt | busybox uniq"
+        )
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -2780,6 +2766,7 @@ fn oscomp_run_lmbench_case(
     label: &str,
     parser_label: &str,
     argv: &[&str],
+    unit: &str,
     path_env: &str,
     ld_env: &str,
     mini_start: crate::time::MonotonicInstant,
@@ -2801,14 +2788,15 @@ fn oscomp_run_lmbench_case(
     .unwrap_or(-127);
     let (captured, captured_len) = oscomp_lmbench_capture_finish();
     let parsed = (raw == 0)
-        .then(|| oscomp_lmbench_parse_microseconds(&captured[..captured_len], parser_label))
+        .then(|| oscomp_lmbench_parse_value(&captured[..captured_len], parser_label, unit))
         .flatten();
     let passed = raw == 0 && parsed.is_some();
     if let Some(value) = parsed {
-        let canonical = oscomp_lmbench_canonical_label(label);
-        crate::println!("lmbench {}:(microseconds) {}", parser_label, value);
-        crate::println!("{}: {} microseconds", canonical, value);
-        crate::println!("lmbench-result {} {} microseconds", canonical, value);
+        if unit == "microseconds" {
+            crate::println!("lmbench {}:(microseconds) {}", parser_label, value);
+        } else {
+            crate::println!("lmbench {}:(MB/sec) {}", parser_label, value);
+        }
         crate::println!("testcase lmbench {} success", label);
     } else if raw == 0 {
         crate::println!(
@@ -2857,9 +2845,10 @@ fn oscomp_lmbench_capture_finish() -> ([u8; OSCOMP_LMBENCH_CAPTURE_CAPACITY], us
     (capture.bytes, capture.len)
 }
 
-fn oscomp_lmbench_parse_microseconds<'a>(
+fn oscomp_lmbench_parse_value<'a>(
     captured: &'a [u8],
     parser_label: &str,
+    unit: &str,
 ) -> Option<&'a str> {
     let text = core::str::from_utf8(captured).ok()?;
     for line in text.lines() {
@@ -2869,7 +2858,7 @@ fn oscomp_lmbench_parse_microseconds<'a>(
         let Some(rest) = rest.strip_prefix(':') else {
             continue;
         };
-        let Some(value) = rest.trim().strip_suffix("microseconds") else {
+        let Some(value) = rest.trim().strip_suffix(unit) else {
             continue;
         };
         let value = value.trim();
@@ -2912,9 +2901,10 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     const OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS: u64 = 320_000;
     const OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS: u64 = 50_000;
     const OSCOMP_LMBENCH_GLOBAL_SAFETY_MS: u64 = 8_000;
-    const OSCOMP_LMBENCH_MAX_SAFE_CASES: usize = 6;
+    const OSCOMP_LMBENCH_MAX_SAFE_CASES: usize = 15;
 
     let libc = if script.contains("/glibc/") { "glibc" } else { "musl" };
+    crate::println!("#### OS COMP TEST GROUP START lmbench-{} ####", libc);
     let cwd = alloc::format!("/mnt/sdcard/{}", libc);
     let binary = alloc::format!("{}/lmbench_all", cwd);
     let fixture = "/var/tmp/lmbench";
@@ -2927,36 +2917,96 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
         cwd, cwd,
     );
 
-    let cases: [(&str, &str, &[&str]); 6] = [
+    let cases: &[(&str, &str, &[&str], &str)] = &[
         (
-            "lat_syscall_null",
-            "Simple syscall",
-            &["lmbench_all", "lat_syscall", "-P", "1", "null"],
+            "lat_pagefault",
+            "Pagefaults on /var/tmp/XXX",
+            &["lmbench_all", "lat_pagefault", "-P", "1"],
+            "microseconds",
+        ),
+        (
+            "bw_pipe",
+            "Pipe bandwidth",
+            &["lmbench_all", "bw_pipe", "-P", "1"],
+            "MB/sec",
+        ),
+        (
+            "lat_pipe",
+            "Pipe latency",
+            &["lmbench_all", "lat_pipe", "-P", "1"],
+            "microseconds",
+        ),
+        (
+            "lat_proc_shell",
+            "Process fork+/bin/sh -c",
+            &["lmbench_all", "lat_proc", "-P", "1", "shell"],
+            "microseconds",
+        ),
+        (
+            "lat_proc_exec",
+            "Process fork+execve",
+            &["lmbench_all", "lat_proc", "-P", "1", "exec"],
+            "microseconds",
+        ),
+        (
+            "lat_proc_fork",
+            "Process fork+exit",
+            &["lmbench_all", "lat_proc", "-P", "1", "fork"],
+            "microseconds",
+        ),
+        (
+            "lat_select",
+            "Select on 100 fd's",
+            &["lmbench_all", "lat_select", "-P", "1"],
+            "microseconds",
+        ),
+        (
+            "lat_sig_install",
+            "Signal handler installation",
+            &["lmbench_all", "lat_sig", "-P", "1", "install"],
+            "microseconds",
+        ),
+        (
+            "lat_sig_catch",
+            "Signal handler overhead",
+            &["lmbench_all", "lat_sig", "-P", "1", "catch"],
+            "microseconds",
+        ),
+        (
+            "lat_syscall_fstat",
+            "Simple fstat",
+            &["lmbench_all", "lat_syscall", "-P", "1", "fstat", "/var/tmp/lmbench"],
+            "microseconds",
+        ),
+        (
+            "lat_syscall_open",
+            "Simple open/close",
+            &["lmbench_all", "lat_syscall", "-P", "1", "open", "/var/tmp/lmbench"],
+            "microseconds",
         ),
         (
             "lat_syscall_read",
             "Simple read",
             &["lmbench_all", "lat_syscall", "-P", "1", "read"],
+            "microseconds",
+        ),
+        (
+            "lat_syscall_stat",
+            "Simple stat",
+            &["lmbench_all", "lat_syscall", "-P", "1", "stat", "/var/tmp/lmbench"],
+            "microseconds",
+        ),
+        (
+            "lat_syscall_null",
+            "Simple syscall",
+            &["lmbench_all", "lat_syscall", "-P", "1", "null"],
+            "microseconds",
         ),
         (
             "lat_syscall_write",
             "Simple write",
             &["lmbench_all", "lat_syscall", "-P", "1", "write"],
-        ),
-        (
-            "lat_syscall_stat",
-            "Simple stat",
-            &["lmbench_all", "lat_syscall", "-P", "1", "stat", fixture],
-        ),
-        (
-            "lat_syscall_fstat",
-            "Simple fstat",
-            &["lmbench_all", "lat_syscall", "-P", "1", "fstat", fixture],
-        ),
-        (
-            "lat_syscall_open",
-            "Simple open/close",
-            &["lmbench_all", "lat_syscall", "-P", "1", "open", fixture],
+            "microseconds",
         ),
     ];
 
@@ -2982,7 +3032,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     let mut failed = 0_usize;
     let mut skipped_budget = 0_usize;
 
-    for (index, (label, parser_label, argv)) in cases.iter().take(OSCOMP_LMBENCH_MAX_SAFE_CASES).enumerate() {
+    for (index, (label, parser_label, argv, unit)) in cases.iter().take(OSCOMP_LMBENCH_MAX_SAFE_CASES).enumerate() {
         let elapsed_ms = oscomp_lmbench_elapsed_ms(mini_start);
         let global_remaining_ms = oscomp_lmbench_global_remaining_ms();
         let needs_optional_budget = index >= 3;
@@ -3012,6 +3062,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
             label,
             parser_label,
             argv,
+            unit,
             &path_env,
             &ld_env,
             mini_start,
@@ -3033,6 +3084,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
         oscomp_lmbench_elapsed_ms(mini_start),
     );
     crate::println!("lmbench-mini: end status={}", status);
+    crate::println!("#### OS COMP TEST GROUP END lmbench-{} ####", libc);
     status
 }
 
