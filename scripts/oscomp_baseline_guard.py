@@ -314,7 +314,8 @@ def main() -> int:
           "fn oscomp_run_lmbench_mini" in user_rs
           and "lat_syscall_null" in user_rs
           and "lat_syscall_read" in user_rs
-          and "pass={}/2" in user_rs)
+          and "lat_syscall_write" in user_rs
+          and "pass={}/3" in user_rs)
 
     # ── P10-R2 fs/iozone compat ──
     check(PASS, "FDATASYNC exists", "SYS_FDATASYNC" in user_rs or "FDATASYNC" in user_rs)

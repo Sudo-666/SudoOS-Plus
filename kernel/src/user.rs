@@ -2531,8 +2531,15 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     ) {
         passed += 1;
     }
-    crate::println!("lmbench-mini summary libc={} pass={}/2", libc, passed);
-    if passed == 2 { 0 } else { 1 }
+    if oscomp_run_lmbench_case(
+        &binary, &cwd, "lat_syscall_write",
+        &["lmbench_all", "lat_syscall", "-P", "1", "write"],
+        &path_env, &ld_env,
+    ) {
+        passed += 1;
+    }
+    crate::println!("lmbench-mini summary libc={} pass={}/3", libc, passed);
+    if passed == 3 { 0 } else { 1 }
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
