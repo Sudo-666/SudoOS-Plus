@@ -85,6 +85,8 @@ const SYS_BRK: usize = crate::syscall::number::BRK;
 const SYS_MUNMAP: usize = crate::syscall::number::MUNMAP;
 const SYS_CLONE: usize = crate::syscall::number::CLONE;
 const SYS_CLONE3: usize = crate::syscall::number::CLONE3;
+const SYS_RSEQ: usize = crate::syscall::number::RSEQ;
+const SYS_SIGALTSTACK: usize = crate::syscall::number::SIGALTSTACK;
 const SYS_EXECVE: usize = crate::syscall::number::EXECVE;
 const SYS_MMAP: usize = crate::syscall::number::MMAP;
 const SYS_MPROTECT: usize = crate::syscall::number::MPROTECT;
@@ -3456,6 +3458,8 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_WAIT4 => set_syscall_result(frame, sys_wait4(arguments[0], arguments[1], arguments[2], arguments[3])),
         SYS_CLONE => set_syscall_result(frame, sys_clone(frame, arguments)),
         SYS_CLONE3 => set_syscall_result(frame, sys_clone3(frame, arguments[0], arguments[1])),
+        SYS_RSEQ => set_syscall_result(frame, sys_rseq(arguments[0], arguments[1], arguments[2], arguments[3])),
+        SYS_SIGALTSTACK => set_syscall_result(frame, sys_sigaltstack(arguments[0], arguments[1])),
         SYS_EXECVE => {
             let result = sys_execve(frame, arguments);
             set_syscall_result(frame, result);
@@ -4718,6 +4722,47 @@ fn sys_set_robust_list(head: usize, length: usize) -> isize {
     let thread = crate::task::current_user_thread()
         .expect("set_robust_list arrived without current user Thread");
     thread.set_robust_list_head(head);
+    0
+}
+
+/// rseq (restartable sequences) — stub: return ENOSYS so glibc falls
+/// back to the normal clone-based pthread_create path.
+fn sys_rseq(_rseq: usize, _rseq_len: usize, flags: usize, _sig: usize) -> isize {
+    if flags != 0 {
+        return -EINVAL;
+    }
+    -(crate::syscall::errno::ENOSYS)
+}
+
+/// sigaltstack — minimal stub: accept NULL ss (query-only) and valid
+/// stack_t structures so pthread initialization doesn't fail.
+fn sys_sigaltstack(ss: usize, old_ss: usize) -> isize {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KernelStackT {
+        ss_sp: usize,
+        ss_flags: i32,
+        ss_size: usize,
+    }
+    const SS_DISABLE: i32 = 2;
+
+    if old_ss != 0 {
+        let old = KernelStackT {
+            ss_sp: 0,
+            ss_flags: SS_DISABLE,
+            ss_size: 0,
+        };
+        let result = copy_plain_to_user(old_ss, &old);
+        if result != 0 {
+            return result;
+        }
+    }
+    if ss != 0 {
+        let _new = match copy_plain_from_user::<KernelStackT>(ss) {
+            Ok(v) => v,
+            Err(errno) => return errno,
+        };
+    }
     0
 }
 

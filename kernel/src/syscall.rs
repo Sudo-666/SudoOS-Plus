@@ -75,6 +75,8 @@ pub mod number {
     pub const MUNMAP: usize = 215;
     pub const CLONE: usize = 220;
     pub const CLONE3: usize = 435;
+    pub const RSEQ: usize = 293;
+    pub const SIGALTSTACK: usize = 132;
     pub const EXECVE: usize = 221;
     pub const MMAP: usize = 222;
     pub const MPROTECT: usize = 226;
