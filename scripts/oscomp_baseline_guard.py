@@ -315,7 +315,14 @@ def main() -> int:
           and "lat_syscall_null" in user_rs
           and "lat_syscall_read" in user_rs
           and "lat_syscall_write" in user_rs
-          and "pass={}/3" in user_rs)
+          and "lat_syscall_stat" in user_rs
+          and "lat_syscall_fstat" in user_rs
+          and "lat_syscall_open" in user_rs
+          and "OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS" in user_rs
+          and "lmbench-mini: case-start" in user_rs
+          and "lmbench-mini: case-end" in user_rs
+          and "lmbench-mini: budget-stop" in user_rs
+          and "skipped_budget" in user_rs)
 
     # ── P10-R2 fs/iozone compat ──
     check(PASS, "FDATASYNC exists", "SYS_FDATASYNC" in user_rs or "FDATASYNC" in user_rs)

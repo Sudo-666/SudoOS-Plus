@@ -2489,7 +2489,14 @@ fn oscomp_run_lmbench_case(
     argv: &[&str],
     path_env: &str,
     ld_env: &str,
+    mini_start: crate::time::MonotonicInstant,
 ) -> bool {
+    let case_start = crate::time::now();
+    crate::println!(
+        "lmbench-mini: case-start {} elapsed_ms={}",
+        label,
+        oscomp_lmbench_elapsed_ms(mini_start),
+    );
     crate::println!("lmbench-mini: exec {} cwd={} argv={:?}", binary, cwd, argv);
     let raw = run_rootfs_program_with_cwd(
         binary,
@@ -2499,14 +2506,51 @@ fn oscomp_run_lmbench_case(
     )
     .unwrap_or(-127);
     let status = if raw == 0 { "PASS" } else { "FAIL" };
-    crate::println!("lmbench-mini {} {} raw={}", label, status, raw);
+    crate::println!(
+        "lmbench-mini: case-end {} {} raw={} elapsed_ms={} total_ms={}",
+        label,
+        status,
+        raw,
+        oscomp_lmbench_elapsed_ms(case_start),
+        oscomp_lmbench_elapsed_ms(mini_start),
+    );
     raw == 0
 }
 
+fn oscomp_lmbench_elapsed_ms(start: crate::time::MonotonicInstant) -> u64 {
+    u64::try_from(crate::time::now().duration_since(start).as_millis()).unwrap_or(u64::MAX)
+}
+
+fn oscomp_lmbench_global_remaining_ms() -> u64 {
+    let deadline = OSCOMP_DEADLINE_CYCLES.load(Ordering::Acquire);
+    if deadline == 0 {
+        return u64::MAX;
+    }
+
+    let now = crate::time::now().cycles();
+    if now >= deadline {
+        return 0;
+    }
+
+    let remaining_cycles = deadline - now;
+    let frequency = crate::time::clock_frequency_hz();
+    u64::try_from(
+        u128::from(remaining_cycles)
+            .saturating_mul(1_000)
+            / u128::from(frequency),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn oscomp_run_lmbench_mini(script: &str) -> isize {
+    const OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS: u64 = 145_000;
+    const OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS: u64 = 50_000;
+    const OSCOMP_LMBENCH_GLOBAL_SAFETY_MS: u64 = 8_000;
+
     let libc = if script.contains("/glibc/") { "glibc" } else { "musl" };
     let cwd = alloc::format!("/mnt/sdcard/{}", libc);
     let binary = alloc::format!("{}/lmbench_all", cwd);
+    let fixture = "/var/tmp/lmbench";
     let path_env = alloc::format!(
         "PATH=.:{}:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/usr/bin",
         cwd,
@@ -2516,30 +2560,104 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
         cwd, cwd,
     );
 
-    let mut passed = 0;
-    if oscomp_run_lmbench_case(
-        &binary, &cwd, "lat_syscall_null",
-        &["lmbench_all", "lat_syscall", "-P", "1", "null"],
-        &path_env, &ld_env,
-    ) {
-        passed += 1;
+    let cases: [(&str, &[&str]); 6] = [
+        (
+            "lat_syscall_null",
+            &["lmbench_all", "lat_syscall", "-P", "1", "null"],
+        ),
+        (
+            "lat_syscall_read",
+            &["lmbench_all", "lat_syscall", "-P", "1", "read"],
+        ),
+        (
+            "lat_syscall_write",
+            &["lmbench_all", "lat_syscall", "-P", "1", "write"],
+        ),
+        (
+            "lat_syscall_stat",
+            &["lmbench_all", "lat_syscall", "-P", "1", "stat", fixture],
+        ),
+        (
+            "lat_syscall_fstat",
+            &["lmbench_all", "lat_syscall", "-P", "1", "fstat", fixture],
+        ),
+        (
+            "lat_syscall_open",
+            &["lmbench_all", "lat_syscall", "-P", "1", "open", fixture],
+        ),
+    ];
+
+    let mini_start = crate::time::now();
+    let fixture_ready = crate::fs::open(
+        fixture,
+        myos_vfs::OpenFlags::O_CREAT.union(myos_vfs::OpenFlags::O_RDWR),
+    )
+    .is_ok();
+    crate::println!(
+        "lmbench-mini: begin budget_ms={} next_case_reserve_ms={} global_safety_ms={} fixture={} ready={}",
+        OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS,
+        OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS,
+        OSCOMP_LMBENCH_GLOBAL_SAFETY_MS,
+        fixture,
+        fixture_ready,
+    );
+
+    let mut attempted = 0_usize;
+    let mut passed = 0_usize;
+    let mut failed = 0_usize;
+    let mut skipped_budget = 0_usize;
+
+    for (index, (label, argv)) in cases.iter().enumerate() {
+        let elapsed_ms = oscomp_lmbench_elapsed_ms(mini_start);
+        let global_remaining_ms = oscomp_lmbench_global_remaining_ms();
+        let needs_optional_budget = index >= 3;
+        let mini_budget_short = elapsed_ms
+            .saturating_add(OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS)
+            > OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS;
+        let global_budget_short = global_remaining_ms
+            < OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS
+                .saturating_add(OSCOMP_LMBENCH_GLOBAL_SAFETY_MS);
+
+        if needs_optional_budget && (mini_budget_short || global_budget_short) {
+            skipped_budget = cases.len() - index;
+            crate::println!(
+                "lmbench-mini: budget-stop before {} elapsed_ms={} global_remaining_ms={} skipped_budget={}",
+                label,
+                elapsed_ms,
+                global_remaining_ms,
+                skipped_budget,
+            );
+            break;
+        }
+
+        attempted += 1;
+        if oscomp_run_lmbench_case(
+            &binary,
+            &cwd,
+            label,
+            argv,
+            &path_env,
+            &ld_env,
+            mini_start,
+        ) {
+            passed += 1;
+        } else {
+            failed += 1;
+        }
     }
-    if oscomp_run_lmbench_case(
-        &binary, &cwd, "lat_syscall_read",
-        &["lmbench_all", "lat_syscall", "-P", "1", "read"],
-        &path_env, &ld_env,
-    ) {
-        passed += 1;
-    }
-    if oscomp_run_lmbench_case(
-        &binary, &cwd, "lat_syscall_write",
-        &["lmbench_all", "lat_syscall", "-P", "1", "write"],
-        &path_env, &ld_env,
-    ) {
-        passed += 1;
-    }
-    crate::println!("lmbench-mini summary libc={} pass={}/3", libc, passed);
-    if passed == 3 { 0 } else { 1 }
+
+    let status = if attempted >= 3 && failed == 0 { 0 } else { 1 };
+    crate::println!(
+        "lmbench-mini: summary libc={} attempted={} pass={} fail={} skipped_budget={} total_ms={}",
+        libc,
+        attempted,
+        passed,
+        failed,
+        skipped_budget,
+        oscomp_lmbench_elapsed_ms(mini_start),
+    );
+    crate::println!("lmbench-mini: end status={}", status);
+    status
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
