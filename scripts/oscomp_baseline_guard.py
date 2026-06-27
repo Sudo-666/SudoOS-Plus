@@ -330,6 +330,8 @@ def main() -> int:
     check(PASS, "pipe2 validates flags", "allowed" in user_rs.split("sys_pipe2")[1][:500]
           if "sys_pipe2" in user_rs else False)
     check(PASS, "WNOHANG appears", "WNOHANG" in user_rs)
+    check(PASS, "WUNTRACED uses Linux value 2",
+          "const WUNTRACED: usize = 2;" in user_rs)
     check(PASS, "wait4 accepts 4 args", "rusage_address" in user_rs)
     check(PASS, "PR_SET_NAME appears", "PR_SET_NAME" in user_rs)
     check(PASS, "PR_GET_NAME appears", "PR_GET_NAME" in user_rs)

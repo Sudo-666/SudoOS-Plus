@@ -2,10 +2,14 @@ use crate::PAGE_SIZE;
 
 /// free_area[0..MAX_ORDER]。
 ///
-/// 最大有效 order 为 10：
+/// 最大有效 order 为 11：
 ///
-/// 2^10 × 4 KiB = 4 MiB。
-pub const MAX_ORDER: usize = 11;
+/// 2^11 × 4 KiB = 8 MiB。
+///
+/// The contest glibc LoongArch Lua image is about 5.9 MiB.  Ext4 snapshots
+/// store regular files in one Vec, so the heap must be able to satisfy the
+/// resulting 8 MiB buddy allocation.
+pub const MAX_ORDER: usize = 12;
 pub const MAX_ORDER_NR_PAGES: usize = 1_usize << (MAX_ORDER - 1);
 
 pub const DMA32_LIMIT: usize = 0x1_0000_0000;

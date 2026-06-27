@@ -356,8 +356,26 @@ impl UserMm {
             return Ok(());
         }
 
+        {
+            let state = self.state.lock();
+            validate_range(&state, address, input.len(), FaultAccess::Write)?;
+        }
+
+        // Linux uaccess faults in a valid demand-mapped destination. Do the
+        // same before taking the state lock used for the physical copy;
+        // otherwise untouched .bss buffers incorrectly produce EFAULT.
+        let end = address
+            .checked_add(input.len())
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let mut page = address & !(PAGE_SIZE - 1);
+        while page < end {
+            self.populate_page(VirtAddr::new(page))?;
+            page = page
+                .checked_add(PAGE_SIZE)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        }
+
         let state = self.state.lock();
-        validate_range(&state, address, input.len(), FaultAccess::Write)?;
         let page_table = state
             .page_table
             .as_ref()

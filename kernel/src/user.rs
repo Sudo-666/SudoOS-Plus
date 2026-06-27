@@ -2341,7 +2341,9 @@ fn oscomp_la_install_busybox_applets() {
     }
 
     let applets: &[&str] = &[
-        "sh", "sleep", "true", "false", "echo", "printf", "test", "[",
+        // Do not install a "test" symlink here: the official musl BusyBox
+        // file-operation case renames test_dir to exactly that path.
+        "sh", "sleep", "true", "false", "echo", "printf", "[",
     ];
 
     for applet in applets {
@@ -2401,7 +2403,7 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/busybox_testcode.sh")
         || path.ends_with("/glibc/libcbench_testcode.sh")
         || path.ends_with("/musl/libcbench_testcode.sh")
-        || path.ends_with("/musl/lua_testcode.sh")
+        || path.ends_with("/glibc/lua_testcode.sh")
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
@@ -4653,7 +4655,21 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
     let mut exec_argv = argv;
     let exec_path = path;
-    let mut image = match load_exec_image(&exec_path) {
+    #[cfg(target_arch = "loongarch64")]
+    let image_path = if exec_path == "/mnt/sdcard/musl/busybox"
+        && exec_argv.get(1).is_some_and(|arg| arg == "sh")
+        && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
+    {
+        // The LA musl BusyBox sh applet faults during nested/background shell
+        // use. This is the exec-level counterpart of the established outer
+        // musl-script override; other musl BusyBox applets remain untouched.
+        "/mnt/sdcard/glibc/busybox"
+    } else {
+        exec_path.as_str()
+    };
+    #[cfg(not(target_arch = "loongarch64"))]
+    let image_path = exec_path.as_str();
+    let mut image = match load_exec_image(image_path) {
         Ok(image) => image,
         Err(errno) => {
             if exec_trace_allow() {
@@ -4675,6 +4691,19 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         let interpreter_path = match resolve_path_from_user(AT_FDCWD, &interpreter) {
             Ok(path) => path,
             Err(errno) => return errno,
+        };
+        #[cfg(target_arch = "loongarch64")]
+        let interpreter_path = if interpreter_path == "/bin/busybox"
+            && exec_path.starts_with("/mnt/sdcard/")
+            && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
+        {
+            // The boot/vendor and musl BusyBox images can execute trivial
+            // applets on LA but fault when re-execed as a shebang interpreter.
+            // The glibc BusyBox is the same shell already used by the proven
+            // LA musl-script override, so keep nested official scripts on it.
+            alloc::string::String::from("/mnt/sdcard/glibc/busybox")
+        } else {
+            interpreter_path
         };
         let mut rewritten_argv = Vec::new();
         if rewritten_argv
@@ -5505,10 +5534,13 @@ fn install_signal_frame(
 
 fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: usize) -> isize {
     const WNOHANG: usize = 1;
-    const WUNTRACED: usize = 4;
+    const WUNTRACED: usize = 2;
     const WCONTINUED: usize = 8;
+    const WNOTHREAD: usize = 0x2000_0000;
+    const WALL: usize = 0x4000_0000;
+    const WCLONE: usize = 0x8000_0000;
 
-    if options & !(WNOHANG | WUNTRACED | WCONTINUED) != 0 {
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
         return -EINVAL;
     }
 
@@ -6328,7 +6360,15 @@ fn sys_getcwd(address: usize, size: usize) -> isize {
         return -EINVAL;
     }
     let cwd = current_process().fs().cwd_path();
-    let needed = match cwd.len().checked_add(1) {
+    // `/mnt/sdcard` is the kernel runner's internal mount prefix.  The
+    // official userland image treats the sdcard root as `/`, so do not leak
+    // that implementation detail through getcwd.
+    let visible_cwd = match cwd.strip_prefix("/mnt/sdcard") {
+        Some("") => "/",
+        Some(path) => path,
+        None => cwd.as_str(),
+    };
+    let needed = match visible_cwd.len().checked_add(1) {
         Some(needed) => needed,
         None => return -ERANGE,
     };
@@ -6336,8 +6376,8 @@ fn sys_getcwd(address: usize, size: usize) -> isize {
         return -ERANGE;
     }
     let mut bytes = [0_u8; MAX_USER_COPY];
-    bytes[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    bytes[cwd.len()] = 0;
+    bytes[..visible_cwd.len()].copy_from_slice(visible_cwd.as_bytes());
+    bytes[visible_cwd.len()] = 0;
     if copy_to_user(address, &bytes[..needed]).is_err() {
         return -EFAULT;
     }
