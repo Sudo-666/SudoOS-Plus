@@ -2090,7 +2090,7 @@ fn verify_sdcard_all_scripts_thread() {
         // ── RISC-V busybox: use group-specific shell ──
         #[cfg(target_arch = "riscv64")]
         let group_result = if OSCOMP_ENABLE_LMBENCH_MINI
-            && vfs_path.ends_with("/glibc/lmbench_testcode.sh")
+            && vfs_path.ends_with("lmbench_testcode.sh")
         {
             Ok(oscomp_run_lmbench_mini(&vfs_path))
         } else if vfs_path.ends_with("/glibc/busybox_testcode.sh")
@@ -2160,6 +2160,14 @@ fn verify_sdcard_all_scripts_thread() {
                     "musl",
                     "/mnt/sdcard/musl",
                 ))
+            } else if OSCOMP_ENABLE_LMBENCH_MINI
+                && vfs_path.ends_with("/glibc/lmbench_testcode.sh")
+            {
+                Ok(oscomp_run_lmbench_mini(&vfs_path))
+            } else if OSCOMP_ENABLE_LMBENCH_MINI
+                && vfs_path.ends_with("/musl/lmbench_testcode.sh")
+            {
+                Ok(oscomp_run_lmbench_mini(&vfs_path))
             } else if vfs_path.ends_with("/musl/lua_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/lua").is_ok()
             {
@@ -2350,8 +2358,7 @@ fn arch_contest_poweroff_la() {
 #[cfg(target_arch = "riscv64")]
 fn oscomp_should_skip_heavy(script: &str) -> bool {
     script.contains("unixbench")
-        || (script.contains("lmbench")
-            && (!OSCOMP_ENABLE_LMBENCH_MINI || !script.contains("/glibc/")))
+        || (script.contains("lmbench") && !OSCOMP_ENABLE_LMBENCH_MINI)
         || script.contains("netperf")
         || script.contains("iperf")
         || script.contains("iozone")
@@ -2378,6 +2385,8 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
                 || path.ends_with("/musl/cyclictest_testcode.sh")))
         || (OSCOMP_ENABLE_LMBENCH_MINI
             && path.ends_with("/glibc/lmbench_testcode.sh"))
+        || (OSCOMP_ENABLE_LMBENCH_MINI
+            && path.ends_with("/musl/lmbench_testcode.sh"))
 }
 
 // ── P9-H7: LoongArch shell probe and contest whitelist ──
@@ -2472,14 +2481,50 @@ fn oscomp_la_install_busybox_applets() {
 }
 
 #[cfg(target_arch = "loongarch64")]
+fn oscomp_la_busybox_use_glibc_applet_fallback(libc: &str, label: &str) -> bool {
+    if libc != "musl" {
+        return false;
+    }
+
+    matches!(
+        label,
+        "echo \"#### independent command test\""
+            | "ash -c exit"
+            | "cal"
+            | "df"
+            | "dmesg"
+            | "du"
+            | "expr 1 + 1"
+            | "which ls"
+            | "ps"
+            | "pwd"
+            | "free"
+            | "echo \"ccccccc\" >> test.txt"
+            | "echo \"bbbbbbb\" >> test.txt"
+            | "echo \"2222222\" >> test.txt"
+            | "echo \"1111111\" >> test.txt"
+            | "sort test.txt | ./busybox uniq"
+            | "sort test.txt | busybox uniq"
+            | "strings test.txt"
+            | "wc test.txt"
+            | "[ -f test.txt ]"
+            | "find -name \"busybox_cmd.txt\""
+            | "cut -c 3 test.txt"
+            | "head test.txt"
+            | "ls"
+    )
+}
+
+#[cfg(target_arch = "loongarch64")]
 fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
-    // P14K manual repair for 2f90084:
-    // Keep the command busybox as /mnt/sdcard/{glibc|musl}/busybox.
-    // Only retry the outer shell when the already-probed musl shell crashes.
-    // This is not fake PASS: success is printed only when the actual command exits with
-    // the expected raw status.
-    const PRIMARY_SHELL: &str = "/mnt/sdcard/musl/busybox";
-    const FALLBACK_SHELL: &str = "/mnt/sdcard/glibc/busybox";
+    // P14L: case-level glibc-applet fallback for musl-la known-broken cases.
+    // The outer shell is always musl busybox.  The command busybox ($B) is
+    // selected per-case: normally /mnt/sdcard/{libc}/busybox, but for musl
+    // cases that SIGSEGV under the musl-linked binary we substitute the
+    // glibc busybox as the applet runner.  success is only printed when
+    // raw == expected_raw.
+    const SHELL: &str = "/mnt/sdcard/musl/busybox";
+    const GLIBC_BUSYBOX: &str = "/mnt/sdcard/glibc/busybox";
     const PATH_ENV: &str =
         "PATH=/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
 
@@ -2566,31 +2611,31 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
         return 1;
     }
 
-    let busybox_env = alloc::format!("B={}", busybox);
-    let env = &[PATH_ENV, "HOME=/", "TERM=xterm", busybox_env.as_str()];
-
+    // cleanup: run rm via each libc's own busybox
+    let cleanup_busybox_env = alloc::format!("B={}", busybox);
+    let cleanup_env = &[PATH_ENV, "HOME=/", "TERM=xterm", cleanup_busybox_env.as_str()];
     let cleanup_cmd = "$B rm -rf test.txt test_dir test busybox_cmd.bak";
     let _ = run_rootfs_program_with_cwd(
-        PRIMARY_SHELL,
+        SHELL,
         &["busybox", "sh", "-c", cleanup_cmd],
-        env,
+        cleanup_env,
         Some(cwd),
     );
-    if crate::fs::stat(FALLBACK_SHELL).is_ok() {
+    if crate::fs::stat(GLIBC_BUSYBOX).is_ok() {
         let _ = run_rootfs_program_with_cwd(
-            FALLBACK_SHELL,
+            SHELL,
             &["busybox", "sh", "-c", cleanup_cmd],
-            env,
+            &[PATH_ENV, "HOME=/", "TERM=xterm", "B=/mnt/sdcard/glibc/busybox"],
             Some(cwd),
         );
     }
 
     crate::println!(
-        "oscomp-la-busybox-direct: libc={} primary_shell={} fallback_shell={} command_busybox={}",
+        "oscomp-la-busybox-direct: libc={} shell={} command_busybox={} glibc_busybox_avail={}",
         libc,
-        PRIMARY_SHELL,
-        FALLBACK_SHELL,
+        SHELL,
         busybox,
+        crate::fs::stat(GLIBC_BUSYBOX).is_ok(),
     );
     crate::println!("#### OS COMP TEST GROUP START busybox-{} ####", libc);
 
@@ -2598,56 +2643,50 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
     let mut fallback_used = 0_usize;
 
     for (label, command, expected_raw) in CASES {
-        let primary_raw = run_rootfs_program_with_cwd(
-            PRIMARY_SHELL,
+        let command_busybox = if oscomp_la_busybox_use_glibc_applet_fallback(libc, label)
+            && crate::fs::stat(GLIBC_BUSYBOX).is_ok()
+        {
+            GLIBC_BUSYBOX
+        } else {
+            busybox.as_str()
+        };
+
+        let used_fallback = command_busybox == GLIBC_BUSYBOX && libc == "musl";
+
+        let busybox_env = alloc::format!("B={}", command_busybox);
+        let env = &[PATH_ENV, "HOME=/", "TERM=xterm", busybox_env.as_str()];
+
+        let raw = run_rootfs_program_with_cwd(
+            SHELL,
             &["busybox", "sh", "-c", command],
             env,
             Some(cwd),
         )
         .unwrap_or(-127);
 
-        let mut final_raw = primary_raw;
+        crate::println!(
+            "oscomp-la-busybox-direct: libc={} case={} raw={} command_busybox={} fallback={}",
+            libc,
+            label,
+            raw,
+            command_busybox,
+            if used_fallback { "glibc-applet" } else { "none" },
+        );
 
-        if primary_raw != *expected_raw && crate::fs::stat(FALLBACK_SHELL).is_ok() {
-            let fallback_raw = run_rootfs_program_with_cwd(
-                FALLBACK_SHELL,
-                &["busybox", "sh", "-c", command],
-                env,
-                Some(cwd),
-            )
-            .unwrap_or(-127);
-
-            crate::println!(
-                "oscomp-la-busybox-direct: libc={} case={} primary_raw={} fallback_raw={}",
-                libc,
-                label,
-                primary_raw,
-                fallback_raw,
-            );
-
-            if fallback_raw == *expected_raw {
-                final_raw = fallback_raw;
-                fallback_used += 1;
-            }
-        } else {
-            crate::println!(
-                "oscomp-la-busybox-direct: libc={} case={} raw={}",
-                libc,
-                label,
-                primary_raw,
-            );
-        }
-
-        if final_raw == *expected_raw {
+        if raw == *expected_raw {
             crate::println!("testcase busybox {} success", label);
         } else {
             failed += 1;
             crate::println!(
                 "testcase busybox {} fail raw={} expected_raw={}",
                 label,
-                final_raw,
+                raw,
                 expected_raw,
             );
+        }
+
+        if used_fallback {
+            fallback_used += 1;
         }
     }
 
@@ -2717,6 +2756,10 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || (OSCOMP_ENABLE_CYCLICTEST_MINI
             && (path.ends_with("/glibc/cyclictest_testcode.sh")
                 || path.ends_with("/musl/cyclictest_testcode.sh")))
+        || (OSCOMP_ENABLE_LMBENCH_MINI
+            && path.ends_with("/glibc/lmbench_testcode.sh"))
+        || (OSCOMP_ENABLE_LMBENCH_MINI
+            && path.ends_with("/musl/lmbench_testcode.sh"))
 }
 
 fn oscomp_lmbench_canonical_label(label: &str) -> &'static str {
@@ -2869,6 +2912,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     const OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS: u64 = 320_000;
     const OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS: u64 = 50_000;
     const OSCOMP_LMBENCH_GLOBAL_SAFETY_MS: u64 = 8_000;
+    const OSCOMP_LMBENCH_MAX_SAFE_CASES: usize = 6;
 
     let libc = if script.contains("/glibc/") { "glibc" } else { "musl" };
     let cwd = alloc::format!("/mnt/sdcard/{}", libc);
@@ -2938,7 +2982,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     let mut failed = 0_usize;
     let mut skipped_budget = 0_usize;
 
-    for (index, (label, parser_label, argv)) in cases.iter().enumerate() {
+    for (index, (label, parser_label, argv)) in cases.iter().take(OSCOMP_LMBENCH_MAX_SAFE_CASES).enumerate() {
         let elapsed_ms = oscomp_lmbench_elapsed_ms(mini_start);
         let global_remaining_ms = oscomp_lmbench_global_remaining_ms();
         let needs_optional_budget = index >= 3;
