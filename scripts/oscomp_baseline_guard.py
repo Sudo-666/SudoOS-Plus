@@ -332,6 +332,23 @@ def main() -> int:
     check(PASS, "WNOHANG appears", "WNOHANG" in user_rs)
     check(PASS, "WUNTRACED uses Linux value 2",
           "const WUNTRACED: usize = 2;" in user_rs)
+
+    # ── P10-SCORE-FIX1 ──
+    check(PASS, "RV busybox direct: kind=glibc",
+          'oscomp-rv-busybox-direct: kind=glibc' in user_rs)
+    check(PASS, "RV busybox direct: kind=musl",
+          'oscomp-rv-busybox-direct: kind=musl' in user_rs)
+    check(PASS, "RV musl direct shell path exists",
+          '/mnt/sdcard/musl/busybox' in user_rs)
+    check(PASS, "LA whitelist includes glibc lua",
+          '/glibc/lua_testcode.sh' in user_rs.split('oscomp_la_whitelist')[1][:300]
+          if 'oscomp_la_whitelist' in user_rs else False)
+    check(PASS, "LA whitelist includes musl lua",
+          '/musl/lua_testcode.sh' in user_rs.split('oscomp_la_whitelist')[1][:300]
+          if 'oscomp_la_whitelist' in user_rs else False)
+    check(PASS, "LA musl lua log exists",
+          'oscomp-la-musl-lua' in user_rs)
+
     check(PASS, "wait4 accepts 4 args", "rusage_address" in user_rs)
     check(PASS, "PR_SET_NAME appears", "PR_SET_NAME" in user_rs)
     check(PASS, "PR_GET_NAME appears", "PR_GET_NAME" in user_rs)

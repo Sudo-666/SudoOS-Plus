@@ -2023,7 +2023,7 @@ fn verify_sdcard_all_scripts_thread() {
         }
 
         // Run the script using the verified spawn/exec/task lifecycle.
-        // ── RISC-V glibc/busybox: use group-specific shell ──
+        // ── RISC-V busybox: use group-specific shell ──
         #[cfg(target_arch = "riscv64")]
         let group_result = if vfs_path.ends_with("/glibc/busybox_testcode.sh")
             && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
@@ -2033,7 +2033,24 @@ fn verify_sdcard_all_scripts_thread() {
             let rv_path_env = "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
             let rv_ld_env = "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib";
             crate::println!(
-                "oscomp-rv-busybox-direct: shell={} cwd={} script={}",
+                "oscomp-rv-busybox-direct: kind=glibc shell={} cwd={} script={}",
+                rv_shell, rv_cwd, vfs_path,
+            );
+            run_rootfs_program_with_cwd(
+                rv_shell,
+                &["busybox", "sh", &vfs_path],
+                &[rv_path_env, rv_ld_env, "HOME=/"],
+                Some(rv_cwd),
+            )
+        } else if vfs_path.ends_with("/musl/busybox_testcode.sh")
+            && crate::fs::stat("/mnt/sdcard/musl/busybox").is_ok()
+        {
+            let rv_shell = "/mnt/sdcard/musl/busybox";
+            let rv_cwd = "/mnt/sdcard/musl";
+            let rv_path_env = "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin";
+            let rv_ld_env = "LD_LIBRARY_PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib";
+            crate::println!(
+                "oscomp-rv-busybox-direct: kind=musl shell={} cwd={} script={}",
                 rv_shell, rv_cwd, vfs_path,
             );
             run_rootfs_program_with_cwd(
@@ -2074,6 +2091,12 @@ fn verify_sdcard_all_scripts_thread() {
                     "oscomp-la-musl-shell: use glibc busybox script={}",
                     vfs_path,
                 );
+                if vfs_path.ends_with("/musl/lua_testcode.sh") {
+                    crate::println!(
+                        "oscomp-la-musl-lua: shell=/mnt/sdcard/glibc/busybox cwd={} script={}",
+                        cwd, vfs_path,
+                    );
+                }
                 let musl_fixed_env = alloc::format!(
                     "PATH=.:/mnt/sdcard/glibc/basic:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin"
                 );
@@ -2404,6 +2427,7 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || path.ends_with("/glibc/libcbench_testcode.sh")
         || path.ends_with("/musl/libcbench_testcode.sh")
         || path.ends_with("/glibc/lua_testcode.sh")
+        || path.ends_with("/musl/lua_testcode.sh")
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
