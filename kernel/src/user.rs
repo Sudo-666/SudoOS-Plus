@@ -213,6 +213,10 @@ static OSCOMP_LA_SLEEP_TRACE: AtomicBool = AtomicBool::new(false);
 static OSCOMP_LA_SLEEP_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
 static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 
+// ── P11B: pthread create trace (default false) ──
+const OSCOMP_TRACE_PTHREAD_CREATE: bool = false;
+static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(4000);
+
 // ── P9-H14: LoongArch FPD fixup counter ──
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_FPD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
@@ -3394,6 +3398,41 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         } else {
             OSCOMP_LA_SLEEP_TRACE.store(false, Ordering::Relaxed);
         }
+    }
+
+    // ── P11B: pthread create trace ──
+    if OSCOMP_TRACE_PTHREAD_CREATE {
+        let budget = OSCOMP_PTHREAD_TRACE_BUDGET.load(Ordering::Relaxed);
+        if budget > 0
+            && matches!(number,
+              220 | 435 | 293 | 132 |   // clone/clone3/rseq/sigaltstack
+              96 | 99 |                 // set_tid_address/set_robust_list
+              135 |                     // rt_sigprocmask
+              222 | 226 | 215 |         // mmap/mprotect/munmap
+              98 |                      // futex
+              261 |                     // prlimit64
+              123 | 122 |               // sched_get/setaffinity
+              228 | 230                 // mlock/mlockall
+            )
+        {
+            OSCOMP_PTHREAD_TRACE_BUDGET.store(budget - 1, Ordering::Relaxed);
+            let pid = current_process().id().get();
+            crate::println!(
+                "pthread-trace: enter pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                pid, number, arguments[0], arguments[1], arguments[2],
+                arguments[3], arguments[4], arguments[5],
+            );
+        }
+    }
+
+    // ── P11B: pthread trace — save nr for exit trace ──
+    if OSCOMP_TRACE_PTHREAD_CREATE
+        && matches!(number,
+            220 | 435 | 293 | 132 | 96 | 99 | 135 |
+            222 | 226 | 215 | 98 | 261 | 123 | 122 | 228 | 230
+        )
+    {
+        LAST_TRACED_SYSCALL_NR.store(number | 0x1_0000, Ordering::Relaxed);
     }
 
     let _interrupt_guard = SyscallInterruptGuard::enable_until_trap_return();
@@ -7806,6 +7845,18 @@ fn set_syscall_result(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
         let nr = LAST_TRACED_SYSCALL_NR.swap(0, Ordering::Relaxed);
         if nr != 0 {
             crate::println!("oscomp-la-sleep-syscall: exit nr={} ret={}", nr, result);
+        }
+    }
+    // ── P11B: pthread trace exit (all archs) ──
+    if OSCOMP_TRACE_PTHREAD_CREATE {
+        let pthread_nr = LAST_TRACED_SYSCALL_NR.swap(0, Ordering::Relaxed);
+        if pthread_nr & 0x1_0000 != 0 {
+            let nr = pthread_nr & !0x1_0000;
+            let pid = current_process().id().get();
+            crate::println!(
+                "pthread-trace: exit pid={} nr={} ret={}",
+                pid, nr, result,
+            );
         }
     }
     crate::syscall::abi::set_result(frame, result);
