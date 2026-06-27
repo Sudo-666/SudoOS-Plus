@@ -556,6 +556,24 @@ def main() -> int:
               grp in user_rs.split('oscomp_should_skip_heavy')[1][:800]
               if 'oscomp_should_skip_heavy' in user_rs else True)
 
+    # ── P14A futex/thread ABI ──
+    check(PASS, "get_robust_list exists",
+          "sys_get_robust_list" in user_rs)
+    check(PASS, "clear_child_tid_on_exit exists",
+          "clear_child_tid_on_exit" in user_rs)
+    check(PASS, "clock_getres accepts 0-7",
+          "clock_id > 7" in user_rs.split("sys_clock_getres")[1][:200]
+          if "sys_clock_getres" in user_rs else False)
+    check(PASS, "sched_rr_get_interval exists",
+          "sys_sched_rr_get_interval" in user_rs)
+    check(PASS, "sched_get_priority exists",
+          "sys_sched_get_priority" in user_rs)
+    check(PASS, "FUTEX_CLOCK_REALTIME handled",
+          "FUTEX_CLOCK_REALTIME" in user_rs)
+    check(PASS, "futex ETIMEDOUT in timed wait",
+          "ETIMEDOUT" in user_rs.split("sys_futex")[1][:500]
+          if "sys_futex" in user_rs else False)
+
     # ── Remaining-score staged group switches ──
     # Heavy groups must be enabled one at a time only after local validation.
     staged_flags = {

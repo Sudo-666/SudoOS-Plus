@@ -52,6 +52,7 @@ const SYS_EXIT: usize = crate::syscall::number::EXIT;
 const SYS_EXIT_GROUP: usize = crate::syscall::number::EXIT_GROUP;
 const SYS_SET_TID_ADDRESS: usize = crate::syscall::number::SET_TID_ADDRESS;
 const SYS_SET_ROBUST_LIST: usize = crate::syscall::number::SET_ROBUST_LIST;
+const SYS_GET_ROBUST_LIST: usize = crate::syscall::number::GET_ROBUST_LIST;
 const SYS_NANOSLEEP: usize = crate::syscall::number::NANOSLEEP;
 const SYS_CLOCK_GETTIME: usize = crate::syscall::number::CLOCK_GETTIME;
 const SYS_CLOCK_GETRES: usize = crate::syscall::number::CLOCK_GETRES;
@@ -3449,6 +3450,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_SET_ROBUST_LIST => {
             set_syscall_result(frame, sys_set_robust_list(arguments[0], arguments[1]))
         }
+
+        SYS_GET_ROBUST_LIST => {
+            set_syscall_result(frame, sys_get_robust_list(arguments[0], arguments[1], arguments[2]))
+        }
         SYS_SETSID => set_syscall_result(frame, current_process().setsid()),
         SYS_SETPGID => set_syscall_result(frame, sys_setpgid(arguments[0], arguments[1])),
         SYS_GETPGID => set_syscall_result(frame, sys_getpgid(arguments[0])),
@@ -4736,6 +4741,25 @@ fn sys_set_robust_list(head: usize, length: usize) -> isize {
     let thread = crate::task::current_user_thread()
         .expect("set_robust_list arrived without current user Thread");
     thread.set_robust_list_head(head);
+    0
+}
+
+fn sys_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> isize {
+    if pid != 0 && pid != current_process().id().get() {
+        return -(crate::syscall::errno::ESRCH);
+    }
+    let thread = crate::task::current_user_thread()
+        .expect("get_robust_list without current user Thread");
+    let head = thread.robust_list_head();
+    if head_ptr != 0 && copy_to_user(head_ptr, &head.to_ne_bytes()).is_err() {
+        return -EFAULT;
+    }
+    if len_ptr != 0 {
+        let len: usize = 24;
+        if copy_to_user(len_ptr, &len.to_ne_bytes()).is_err() {
+            return -EFAULT;
+        }
+    }
     0
 }
 

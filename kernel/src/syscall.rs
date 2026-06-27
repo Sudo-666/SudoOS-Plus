@@ -40,6 +40,7 @@ pub mod number {
     pub const EXIT_GROUP: usize = 94;
     pub const SET_TID_ADDRESS: usize = 96;
     pub const SET_ROBUST_LIST: usize = 99;
+    pub const GET_ROBUST_LIST: usize = 273;
     pub const NANOSLEEP: usize = 101;
     pub const CLOCK_GETTIME: usize = 113;
     pub const CLOCK_GETRES: usize = 114;
