@@ -1587,7 +1587,7 @@ const OSCOMP_PROBE_UNIXBENCH: bool = false;
 #[allow(dead_code)]
 const OSCOMP_ENABLE_LIBCBENCH_EXTRA: bool = false;
 #[allow(dead_code)]
-const OSCOMP_ENABLE_CYCLICTEST_MINI: bool = true; // P12B dryrun
+const OSCOMP_ENABLE_CYCLICTEST_MINI: bool = false;
 #[allow(dead_code)]
 const OSCOMP_ENABLE_LMBENCH_MINI: bool = true;
 #[allow(dead_code)]
@@ -2833,34 +2833,6 @@ fn oscomp_la_run_musl_lua_direct() -> isize {
 /// External watchdog kernel thread.  If the contest runner blocks
 /// inside a script group, the watchdog prints a partial summary and
 /// shuts down when the global deadline expires.
-/// Spawn a long-lived sleep process so that busybox "kill 10" has a valid PID.
-pub(crate) fn spawn_dummy_sleep(shell_path: &str) {
-    let image = match load_exec_image(shell_path) {
-        Ok(img) => img,
-        Err(_) => return,
-    };
-    let exec = match crate::exec::exec_elf(
-        &image,
-        crate::exec::ExecConfig {
-            argv: &["sleep", "999"],
-            envp: &["PATH=/", "HOME=/"],
-            stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
-            heap_start: VirtAddr::new(USER_HEAP_START),
-            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
-            extra_areas: &[],
-        },
-    ) {
-        Ok(exec) => exec,
-        Err(_) => return,
-    };
-    let pid = exec.process.id();
-    let _task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
-    // Leak the process and thread — they stay alive serving as kill target.
-    core::mem::forget(exec.thread);
-    core::mem::forget(exec.process);
-    crate::println!("oscomp: dummy-sleep pid={}", pid.get());
-}
-
 fn contest_watchdog_main() {
     loop {
         if !OSCOMP_ACTIVE.load(Ordering::Acquire) {
