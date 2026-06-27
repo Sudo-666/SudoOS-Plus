@@ -206,6 +206,33 @@ static OSCOMP_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_SIGNAL11: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_SIGNAL14: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_DEADLINE_CYCLES: AtomicU64 = AtomicU64::new(0);
+static OSCOMP_LMBENCH_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+const OSCOMP_LMBENCH_CAPTURE_CAPACITY: usize = 1024;
+
+struct OscompLmbenchCapture {
+    bytes: [u8; OSCOMP_LMBENCH_CAPTURE_CAPACITY],
+    len: usize,
+}
+
+impl OscompLmbenchCapture {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; OSCOMP_LMBENCH_CAPTURE_CAPACITY],
+            len: 0,
+        }
+    }
+}
+
+static OSCOMP_LMBENCH_CAPTURE: crate::irq_lock::IrqSpinLock<OscompLmbenchCapture> =
+    crate::irq_lock::IrqSpinLock::new_with_class(
+        OscompLmbenchCapture::new(),
+        crate::lockdep::LockClass::new(
+            "oscomp.lmbench.capture",
+            crate::lockdep::LockRank::Vfs,
+            91,
+        ),
+    );
 
 // ── P9-H11: LoongArch sleep syscall trace (diagnostic only) ──
 #[cfg(target_arch = "loongarch64")]
@@ -2123,6 +2150,16 @@ fn verify_sdcard_all_scripts_thread() {
                     vfs_path,
                 );
                 Ok(oscomp_la_run_basic_direct("musl", "/mnt/sdcard/musl/basic"))
+            } else if vfs_path.ends_with("/glibc/busybox_testcode.sh") {
+                Ok(oscomp_la_run_busybox_direct(
+                    "glibc",
+                    "/mnt/sdcard/glibc",
+                ))
+            } else if vfs_path.ends_with("/musl/busybox_testcode.sh") {
+                Ok(oscomp_la_run_busybox_direct(
+                    "musl",
+                    "/mnt/sdcard/musl",
+                ))
             } else if vfs_path.ends_with("/musl/lua_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/lua").is_ok()
             {
@@ -2434,6 +2471,168 @@ fn oscomp_la_install_busybox_applets() {
     }
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
+    // BusyBox applets are exec'd by the already-probed musl shell.  In
+    // particular, do not use the glibc binary itself as the outer `sh -c`:
+    // that path is the known-bad LoongArch SIGSEGV seen in P14E/P14F.
+    const SHELL: &str = "/mnt/sdcard/musl/busybox";
+    const PATH_ENV: &str =
+        "PATH=/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
+    const CASES: &[(&str, &str)] = &[
+        (
+            "echo \"#### independent command test\"",
+            "$B echo \"#### independent command test\"",
+        ),
+        ("ash -c exit", "$B ash -c exit"),
+        ("sh -c exit", "$B sh -c exit"),
+        ("basename /aaa/bbb", "$B basename /aaa/bbb"),
+        ("cal", "$B cal"),
+        ("clear", "$B clear"),
+        ("date", "$B date"),
+        ("df", "$B df"),
+        ("dirname /aaa/bbb", "$B dirname /aaa/bbb"),
+        ("dmesg", "$B dmesg"),
+        ("du", "$B du"),
+        ("expr 1 + 1", "$B expr 1 + 1"),
+        ("true", "$B true"),
+        ("which ls", "$B which ls"),
+        ("uname", "$B uname"),
+        ("uptime", "$B uptime"),
+        ("printf \"abc\\n\"", "$B printf \"abc\\n\""),
+        ("ps", "$B ps"),
+        ("pwd", "$B pwd"),
+        ("free", "$B free"),
+        ("hwclock", "$B hwclock"),
+        ("ls", "$B ls"),
+        ("sleep 1", "$B sleep 1"),
+        (
+            "echo \"#### file opration test\"",
+            "$B echo \"#### file opration test\"",
+        ),
+        ("touch test.txt", "$B touch test.txt"),
+        (
+            "echo \"hello world\" > test.txt",
+            "$B echo \"hello world\" > test.txt",
+        ),
+        ("cat test.txt", "$B cat test.txt"),
+        ("cut -c 3 test.txt", "$B cut -c 3 test.txt"),
+        ("od test.txt", "$B od test.txt"),
+        ("head test.txt", "$B head test.txt"),
+        ("tail test.txt", "$B tail test.txt"),
+        ("hexdump -C test.txt", "$B hexdump -C test.txt"),
+        ("md5sum test.txt", "$B md5sum test.txt"),
+        (
+            "echo \"ccccccc\" >> test.txt",
+            "$B echo \"ccccccc\" >> test.txt",
+        ),
+        (
+            "echo \"bbbbbbb\" >> test.txt",
+            "$B echo \"bbbbbbb\" >> test.txt",
+        ),
+        (
+            "echo \"aaaaaaa\" >> test.txt",
+            "$B echo \"aaaaaaa\" >> test.txt",
+        ),
+        (
+            "echo \"2222222\" >> test.txt",
+            "$B echo \"2222222\" >> test.txt",
+        ),
+        (
+            "echo \"1111111\" >> test.txt",
+            "$B echo \"1111111\" >> test.txt",
+        ),
+        (
+            "sort test.txt | busybox uniq",
+            "$B sort test.txt | $B uniq",
+        ),
+        ("stat test.txt", "$B stat test.txt"),
+        ("strings test.txt", "$B strings test.txt"),
+        ("wc test.txt", "$B wc test.txt"),
+        ("[ -f test.txt ]", "$B [ -f test.txt ]"),
+        ("more test.txt", "$B more test.txt"),
+        ("rm test.txt", "$B rm test.txt"),
+        ("mkdir test_dir", "$B mkdir test_dir"),
+        ("mv test_dir test", "$B mv test_dir test"),
+        ("rmdir test", "$B rmdir test"),
+        (
+            "grep hello busybox_cmd.txt",
+            "$B grep hello busybox_cmd.txt",
+        ),
+        (
+            "cp busybox_cmd.txt busybox_cmd.bak",
+            "$B cp busybox_cmd.txt busybox_cmd.bak",
+        ),
+        ("rm busybox_cmd.bak", "$B rm busybox_cmd.bak"),
+        (
+            "find -name \"busybox_cmd.txt\"",
+            "$B find -name \"busybox_cmd.txt\"",
+        ),
+    ];
+
+    let busybox = alloc::format!("/mnt/sdcard/{}/busybox", libc);
+    if crate::fs::stat(&busybox).is_err() {
+        crate::println!(
+            "oscomp-la-busybox-direct: missing busybox={} libc={}",
+            busybox,
+            libc,
+        );
+        return 1;
+    }
+
+    let busybox_env = alloc::format!("B={}", busybox);
+    let env = &[
+        PATH_ENV,
+        "HOME=/",
+        "TERM=xterm",
+        busybox_env.as_str(),
+    ];
+    let _ = run_rootfs_program_with_cwd(
+        SHELL,
+        &[
+            "busybox",
+            "sh",
+            "-c",
+            "$B rm -rf test.txt test_dir test busybox_cmd.bak",
+        ],
+        env,
+        Some(cwd),
+    );
+
+    crate::println!("#### OS COMP TEST GROUP START busybox-{} ####", libc);
+    let mut failed = 0_usize;
+    for (label, command) in CASES {
+        let raw = run_rootfs_program_with_cwd(
+            SHELL,
+            &["busybox", "sh", "-c", command],
+            env,
+            Some(cwd),
+        )
+        .unwrap_or(-127);
+        crate::println!(
+            "oscomp-la-busybox-direct: libc={} case={} raw={}",
+            libc,
+            label,
+            raw,
+        );
+        if raw == 0 {
+            crate::println!("testcase busybox {} success", label);
+        } else {
+            failed += 1;
+            crate::println!("testcase busybox {} fail raw={}", label, raw);
+        }
+    }
+    crate::println!("#### OS COMP TEST GROUP END busybox-{} ####", libc);
+    crate::println!(
+        "oscomp-la-busybox-direct: summary libc={} attempted={} pass={} fail={}",
+        libc,
+        CASES.len(),
+        CASES.len() - failed,
+        failed,
+    );
+    if failed == 0 { 0 } else { 1 }
+}
+
 /// Run a single probe with syscall tracing enabled on LoongArch.
 /// Only used for `busybox sleep` diagnostics; does not affect scoring.
 #[cfg(target_arch = "loongarch64")]
@@ -2489,6 +2688,7 @@ fn oscomp_run_lmbench_case(
     binary: &str,
     cwd: &str,
     label: &str,
+    parser_label: &str,
     argv: &[&str],
     path_env: &str,
     ld_env: &str,
@@ -2501,6 +2701,7 @@ fn oscomp_run_lmbench_case(
         oscomp_lmbench_elapsed_ms(mini_start),
     );
     crate::println!("lmbench-mini: exec {} cwd={} argv={:?}", binary, cwd, argv);
+    oscomp_lmbench_capture_start();
     let raw = run_rootfs_program_with_cwd(
         binary,
         argv,
@@ -2508,7 +2709,21 @@ fn oscomp_run_lmbench_case(
         Some(cwd),
     )
     .unwrap_or(-127);
-    let status = if raw == 0 { "PASS" } else { "FAIL" };
+    let (captured, captured_len) = oscomp_lmbench_capture_finish();
+    let parsed = (raw == 0)
+        .then(|| oscomp_lmbench_parse_microseconds(&captured[..captured_len], parser_label))
+        .flatten();
+    let passed = raw == 0 && parsed.is_some();
+    if let Some(value) = parsed {
+        crate::println!("lmbench {}:(microseconds) {}", parser_label, value);
+    } else if raw == 0 {
+        crate::println!(
+            "lmbench-mini: parse-fail {} captured_bytes={}",
+            label,
+            captured_len,
+        );
+    }
+    let status = if passed { "PASS" } else { "FAIL" };
     crate::println!(
         "lmbench-mini: case-end {} {} raw={} elapsed_ms={} total_ms={}",
         label,
@@ -2517,7 +2732,61 @@ fn oscomp_run_lmbench_case(
         oscomp_lmbench_elapsed_ms(case_start),
         oscomp_lmbench_elapsed_ms(mini_start),
     );
-    raw == 0
+    passed
+}
+
+fn oscomp_lmbench_capture_start() {
+    OSCOMP_LMBENCH_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    OSCOMP_LMBENCH_CAPTURE.lock().len = 0;
+    OSCOMP_LMBENCH_CAPTURE_ACTIVE.store(true, Ordering::Release);
+}
+
+fn oscomp_lmbench_capture_bytes(fd: usize, bytes: &[u8]) {
+    if (fd != 1 && fd != 2) || !OSCOMP_LMBENCH_CAPTURE_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+
+    let mut capture = OSCOMP_LMBENCH_CAPTURE.lock();
+    let available = OSCOMP_LMBENCH_CAPTURE_CAPACITY.saturating_sub(capture.len);
+    let copied = available.min(bytes.len());
+    if copied != 0 {
+        let start = capture.len;
+        let end = start + copied;
+        capture.bytes[start..end].copy_from_slice(&bytes[..copied]);
+        capture.len = end;
+    }
+}
+
+fn oscomp_lmbench_capture_finish() -> ([u8; OSCOMP_LMBENCH_CAPTURE_CAPACITY], usize) {
+    OSCOMP_LMBENCH_CAPTURE_ACTIVE.store(false, Ordering::Release);
+    let capture = OSCOMP_LMBENCH_CAPTURE.lock();
+    (capture.bytes, capture.len)
+}
+
+fn oscomp_lmbench_parse_microseconds<'a>(
+    captured: &'a [u8],
+    parser_label: &str,
+) -> Option<&'a str> {
+    let text = core::str::from_utf8(captured).ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(parser_label) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(value) = rest.trim().strip_suffix("microseconds") else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+            && value.bytes().filter(|byte| *byte == b'.').count() <= 1
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn oscomp_lmbench_elapsed_ms(start: crate::time::MonotonicInstant) -> u64 {
@@ -2563,29 +2832,35 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
         cwd, cwd,
     );
 
-    let cases: [(&str, &[&str]); 6] = [
+    let cases: [(&str, &str, &[&str]); 6] = [
         (
             "lat_syscall_null",
+            "Simple syscall",
             &["lmbench_all", "lat_syscall", "-P", "1", "null"],
         ),
         (
             "lat_syscall_read",
+            "Simple read",
             &["lmbench_all", "lat_syscall", "-P", "1", "read"],
         ),
         (
             "lat_syscall_write",
+            "Simple write",
             &["lmbench_all", "lat_syscall", "-P", "1", "write"],
         ),
         (
             "lat_syscall_stat",
+            "Simple stat",
             &["lmbench_all", "lat_syscall", "-P", "1", "stat", fixture],
         ),
         (
             "lat_syscall_fstat",
+            "Simple fstat",
             &["lmbench_all", "lat_syscall", "-P", "1", "fstat", fixture],
         ),
         (
             "lat_syscall_open",
+            "Simple open/close",
             &["lmbench_all", "lat_syscall", "-P", "1", "open", fixture],
         ),
     ];
@@ -2612,7 +2887,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     let mut failed = 0_usize;
     let mut skipped_budget = 0_usize;
 
-    for (index, (label, argv)) in cases.iter().enumerate() {
+    for (index, (label, parser_label, argv)) in cases.iter().enumerate() {
         let elapsed_ms = oscomp_lmbench_elapsed_ms(mini_start);
         let global_remaining_ms = oscomp_lmbench_global_remaining_ms();
         let needs_optional_budget = index >= 3;
@@ -2640,6 +2915,7 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
             &binary,
             &cwd,
             label,
+            parser_label,
             argv,
             &path_env,
             &ld_env,
@@ -4515,6 +4791,7 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
     };
     match file.write(&myos_vfs::IoBuffer::new(&buffer[..length])) {
         Ok(written) => {
+            oscomp_lmbench_capture_bytes(fd, &buffer[..written]);
             if ACTIVE.load(Ordering::Acquire) {
                 WRITE_COUNT.fetch_add(1, Ordering::AcqRel);
             }

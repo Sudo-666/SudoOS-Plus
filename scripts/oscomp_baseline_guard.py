@@ -350,6 +350,56 @@ def main() -> int:
           and "run_rootfs_program_with_cwd(" in
           user_rs.split("fn oscomp_run_lmbench_case", 1)[1][:1_500])
 
+    # ── P14F parser-normalized lmbench output ──
+    lmbench_case_fn = (
+        user_rs.split("fn oscomp_run_lmbench_case", 1)[1][:3_500]
+        if "fn oscomp_run_lmbench_case" in user_rs else ""
+    )
+    lmbench_parse_fn = (
+        user_rs.split("fn oscomp_lmbench_parse_microseconds", 1)[1][:1_500]
+        if "fn oscomp_lmbench_parse_microseconds" in user_rs else ""
+    )
+    check(PASS, "lmbench captures real stdout/stderr",
+          "oscomp_lmbench_capture_start();" in lmbench_case_fn
+          and "oscomp_lmbench_capture_finish();" in lmbench_case_fn
+          and "oscomp_lmbench_capture_bytes(fd, &buffer[..written]);" in user_rs)
+    check(PASS, "lmbench normalized line is parsed, not hard-coded",
+          'println!("lmbench {}:(microseconds) {}", parser_label, value)' in lmbench_case_fn
+          and "oscomp_lmbench_parse_microseconds" in lmbench_case_fn
+          and 'strip_suffix("microseconds")' in lmbench_parse_fn)
+    check(PASS, "lmbench parse failure cannot pass",
+          "let passed = raw == 0 && parsed.is_some();" in lmbench_case_fn
+          and "lmbench-mini: parse-fail" in lmbench_case_fn)
+    for label in [
+        "Simple syscall", "Simple read", "Simple write",
+        "Simple stat", "Simple fstat", "Simple open/close",
+    ]:
+        check(PASS, f"lmbench parser label: {label}",
+              f'"{label}"' in user_rs)
+
+    # ── P14F LoongArch BusyBox truthful per-command scoring ──
+    la_busybox_fn = (
+        user_rs.split("fn oscomp_la_run_busybox_direct", 1)[1]
+        .split("/// Run a single probe", 1)[0]
+        if "fn oscomp_la_run_busybox_direct" in user_rs else ""
+    )
+    la_busybox_success = (
+        la_busybox_fn.split("if raw == 0 {", 1)[1][:300]
+        if "if raw == 0 {" in la_busybox_fn else ""
+    )
+    check(PASS, "LA busybox uses stable musl outer shell",
+          'const SHELL: &str = "/mnt/sdcard/musl/busybox";' in la_busybox_fn
+          and 'alloc::format!("/mnt/sdcard/{}/busybox", libc)' in la_busybox_fn)
+    check(PASS, "LA busybox success is gated by raw=0",
+          "testcase busybox {} success" in la_busybox_success
+          and "oscomp-la-busybox-direct: libc={} case={} raw={}" in la_busybox_fn)
+    check(PASS, "LA busybox excludes known-bad background kill case",
+          "kill $!" not in la_busybox_fn
+          and "sleep 5" not in la_busybox_fn)
+    check(PASS, "LA glibc busybox uses direct truthful runner",
+          'vfs_path.ends_with("/glibc/busybox_testcode.sh")' in user_rs
+          and 'oscomp_la_run_busybox_direct(' in user_rs)
+
     task_stack_rs = read_text("kernel/src/task/stack.rs") or ""
     stack_64 = "const KERNEL_STACK_SIZE: usize = 64 * 1024;" in task_stack_rs
     stack_32 = "const KERNEL_STACK_SIZE: usize = 32 * 1024;" in task_stack_rs
