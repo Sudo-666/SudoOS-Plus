@@ -1,5 +1,8 @@
 use myos_mm::{PAGE_SIZE, VirtRange};
 
+#[cfg(target_arch = "riscv64")]
+const KERNEL_STACK_SIZE: usize = 64 * 1024;
+#[cfg(not(target_arch = "riscv64"))]
 const KERNEL_STACK_SIZE: usize = 32 * 1024;
 const KERNEL_STACK_ALIGNMENT: usize = PAGE_SIZE;
 // M6-B r3: architecture-owned fresh-task bootstrap reserve.

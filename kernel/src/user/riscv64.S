@@ -554,11 +554,11 @@ __m12_m13_user_probe:
     ecall
     blez a0, .Lriscv_m12_m13_failed
     mv s2, a0
-    li a7, 132
+    li a7, 155
     ecall
     bne a0, s2, .Lriscv_m12_m13_failed
     li a0, 0
-    li a7, 155
+    li a7, 156
     ecall
     bne a0, s2, .Lriscv_m12_m13_failed
 

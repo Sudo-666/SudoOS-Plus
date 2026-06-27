@@ -501,11 +501,11 @@ __m12_m13_user_probe:
     syscall 0
     bge $r0, $r4, .Lloong_m12_m13_failed
     or $r25, $r4, $r0
-    addi.d $r11, $r0, 132
+    addi.d $r11, $r0, 155
     syscall 0
     bne $r4, $r25, .Lloong_m12_m13_failed
     or $r4, $r0, $r0
-    addi.d $r11, $r0, 155
+    addi.d $r11, $r0, 156
     syscall 0
     bne $r4, $r25, .Lloong_m12_m13_failed
 

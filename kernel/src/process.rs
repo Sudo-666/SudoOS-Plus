@@ -430,7 +430,7 @@ impl Process {
             relations: IrqSpinLock::new_with_class(ProcessRelations::new(), PROCESS_RELATION_LOCK),
             child_wait: WaitQueue::new(),
             process_group: AtomicIsize::new(id.get() as isize),
-            session: AtomicIsize::new(0),
+            session: AtomicIsize::new(id.get() as isize),
             thread_group: IrqSpinLock::new_with_class(
                 ThreadGroup::new(),
                 PROCESS_THREAD_GROUP_LOCK,
