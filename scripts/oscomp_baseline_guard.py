@@ -357,6 +357,19 @@ def main() -> int:
     check(PASS, "getcwd returns cwd len not address",
           'chosen.len() as isize' in user_rs)
 
+    # ── P10-SCORE-FIX3 LA musl lua direct ──
+    check(PASS, "oscomp-la-musl-lua-direct exists",
+          'oscomp-la-musl-lua-direct' in user_rs)
+    check(PASS, "LA musl lua direct uses glibc lua binary",
+          '/mnt/sdcard/glibc/lua' in user_rs.split('oscomp_la_run_musl_lua_direct')[1][:400]
+          if 'oscomp_la_run_musl_lua_direct' in user_rs else False)
+    check(PASS, "LA musl lua direct prints testcase format",
+          'testcase lua' in user_rs.split('oscomp_la_run_musl_lua_direct')[1][:600]
+          if 'oscomp_la_run_musl_lua_direct' in user_rs else False)
+    check(PASS, "musl lua direct before generic musl shell",
+          user_rs.index('/musl/lua_testcode.sh') < user_rs.index('vfs_path.contains("/musl/")')
+          if '/musl/lua_testcode.sh' in user_rs and 'vfs_path.contains("/musl/")' in user_rs else False)
+
     check(PASS, "wait4 accepts 4 args", "rusage_address" in user_rs)
     check(PASS, "PR_SET_NAME appears", "PR_SET_NAME" in user_rs)
     check(PASS, "PR_GET_NAME appears", "PR_GET_NAME" in user_rs)

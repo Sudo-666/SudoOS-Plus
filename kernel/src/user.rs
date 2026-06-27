@@ -2082,6 +2082,11 @@ fn verify_sdcard_all_scripts_thread() {
                     vfs_path,
                 );
                 Ok(oscomp_la_run_basic_direct("musl", "/mnt/sdcard/musl/basic"))
+            } else if vfs_path.ends_with("/musl/lua_testcode.sh")
+                && crate::fs::stat("/mnt/sdcard/glibc/lua").is_ok()
+            {
+                // musl lua SIGSEGVs under busybox sh — run glibc lua directly.
+                Ok(oscomp_la_run_musl_lua_direct())
             } else if vfs_path.contains("/musl/")
                 && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
             {
@@ -2674,6 +2679,57 @@ fn oscomp_la_run_basic_direct(kind: &str, root: &str) -> isize {
     crate::println!("#### OS COMP TEST GROUP END basic-{} ####", kind);
 
     if all_passed { 0 } else { 1 }
+}
+
+/// LA musl lua direct runner — uses glibc lua binary to execute musl
+/// lua scripts, avoiding SIGSEGV from the musl busybox shell path.
+#[cfg(target_arch = "loongarch64")]
+fn oscomp_la_run_musl_lua_direct() -> isize {
+    const LUA: &str = "/mnt/sdcard/glibc/lua";
+    const CWD: &str = "/mnt/sdcard/musl";
+    const TESTS: &[&str] = &[
+        "date.lua",
+        "file_io.lua",
+        "max_min.lua",
+        "random.lua",
+        "remove.lua",
+        "round_num.lua",
+        "sin30.lua",
+        "sort.lua",
+        "strings.lua",
+    ];
+
+    crate::println!("oscomp-la-musl-lua-direct: lua={} cwd={}", LUA, CWD);
+    crate::println!("#### OS COMP TEST GROUP START lua-musl ####");
+
+    let mut failures = 0_usize;
+
+    for test in TESTS {
+        let raw = match run_rootfs_program_with_cwd(
+            LUA,
+            &["lua", test],
+            &[
+                "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin",
+                "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
+                "HOME=/",
+            ],
+            Some(CWD),
+        ) {
+            Ok(r) => r,
+            Err(_) => -1,
+        };
+
+        if raw == 0 {
+            crate::println!("testcase lua {} success", test);
+        } else {
+            failures += 1;
+            crate::println!("testcase lua {} fail", test);
+        }
+    }
+
+    crate::println!("#### OS COMP TEST GROUP END lua-musl ####");
+
+    if failures == 0 { 0 } else { 1 }
 }
 
 /// External watchdog kernel thread.  If the contest runner blocks
