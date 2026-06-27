@@ -2591,6 +2591,8 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
         // lock held; the user trap frame has already been consumed.
         unsafe { crate::arch::interrupt::enable() };
     }
+    crate::user::cleanup_robust_list_on_exit(&thread);
+    crate::user::clear_child_tid_on_exit(&thread);
     thread
         .exit(result)
         .expect("M9-B user Thread failed to publish exit state");

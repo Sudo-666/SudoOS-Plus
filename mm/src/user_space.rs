@@ -79,8 +79,8 @@ impl StackGrowth {
 
 /// Conservative defaults used by the architecture-neutral user-fault planner.
 pub const DEFAULT_STACK_GUARD_GAP: usize = PAGE_SIZE;
-pub const DEFAULT_STACK_GROWTH_STEP: usize = PAGE_SIZE * 8;
-pub const DEFAULT_STACK_SP_DISTANCE: usize = PAGE_SIZE * 8;
+pub const DEFAULT_STACK_GROWTH_STEP: usize = PAGE_SIZE * 256;
+pub const DEFAULT_STACK_SP_DISTANCE: usize = PAGE_SIZE * 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserFaultPlan {

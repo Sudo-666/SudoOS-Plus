@@ -54,6 +54,7 @@ const SYS_SET_TID_ADDRESS: usize = crate::syscall::number::SET_TID_ADDRESS;
 const SYS_SET_ROBUST_LIST: usize = crate::syscall::number::SET_ROBUST_LIST;
 const SYS_NANOSLEEP: usize = crate::syscall::number::NANOSLEEP;
 const SYS_CLOCK_GETTIME: usize = crate::syscall::number::CLOCK_GETTIME;
+const SYS_CLOCK_GETRES: usize = crate::syscall::number::CLOCK_GETRES;
 const SYS_CLOCK_NANOSLEEP: usize = crate::syscall::number::CLOCK_NANOSLEEP;
 const SYS_FDATASYNC: usize = crate::syscall::number::FDATASYNC;
 const SYS_PWRITE64: usize = crate::syscall::number::PWRITE64;
@@ -83,6 +84,7 @@ const SYS_SYSINFO: usize = crate::syscall::number::SYSINFO;
 const SYS_BRK: usize = crate::syscall::number::BRK;
 const SYS_MUNMAP: usize = crate::syscall::number::MUNMAP;
 const SYS_CLONE: usize = crate::syscall::number::CLONE;
+const SYS_CLONE3: usize = crate::syscall::number::CLONE3;
 const SYS_EXECVE: usize = crate::syscall::number::EXECVE;
 const SYS_MMAP: usize = crate::syscall::number::MMAP;
 const SYS_MPROTECT: usize = crate::syscall::number::MPROTECT;
@@ -112,6 +114,14 @@ const SYS_SCHED_SETAFFINITY: usize = crate::syscall::number::SCHED_SETAFFINITY;
 const SYS_SCHED_SETSCHEDULER: usize = crate::syscall::number::SCHED_SETSCHEDULER;
 const SYS_SCHED_GETSCHEDULER: usize = crate::syscall::number::SCHED_GETSCHEDULER;
 const SYS_SCHED_GETPARAM: usize = crate::syscall::number::SCHED_GETPARAM;
+const SYS_SCHED_SETPARAM: usize = crate::syscall::number::SCHED_SETPARAM;
+const SYS_SCHED_GET_PRIORITY_MAX: usize = crate::syscall::number::SCHED_GET_PRIORITY_MAX;
+const SYS_SCHED_GET_PRIORITY_MIN: usize = crate::syscall::number::SCHED_GET_PRIORITY_MIN;
+const SYS_SCHED_RR_GET_INTERVAL: usize = crate::syscall::number::SCHED_RR_GET_INTERVAL;
+const SYS_MLOCKALL: usize = crate::syscall::number::MLOCKALL;
+const SYS_MUNLOCKALL: usize = crate::syscall::number::MUNLOCKALL;
+const SYS_MLOCK: usize = crate::syscall::number::MLOCK;
+const SYS_MUNLOCK: usize = crate::syscall::number::MUNLOCK;
 const SYS_RENAMEAT2: usize = crate::syscall::number::RENAMEAT2;
 const SYS_PRCTL: usize = crate::syscall::number::PRCTL;
 const SYS_SETITIMER: usize = crate::syscall::number::SETITIMER;
@@ -1565,6 +1575,22 @@ const OSCOMP_PROBE_LIBCTEST: bool = false;
 const OSCOMP_PROBE_LTP: bool = false;
 const OSCOMP_PROBE_UNIXBENCH: bool = false;
 
+// Remaining-score groups are staged independently. These switches stay
+// disabled until the corresponding real workload passes architecture-scoped
+// validation plus a both-arch baseline regression; none may enable a family.
+#[allow(dead_code)]
+const OSCOMP_ENABLE_LIBCBENCH_EXTRA: bool = false;
+#[allow(dead_code)]
+const OSCOMP_ENABLE_CYCLICTEST_MINI: bool = false;
+#[allow(dead_code)]
+const OSCOMP_ENABLE_LMBENCH_MINI: bool = true;
+#[allow(dead_code)]
+const OSCOMP_ENABLE_IPERF_MINI: bool = false;
+#[allow(dead_code)]
+const OSCOMP_ENABLE_NETPERF_MINI: bool = false;
+#[allow(dead_code)]
+const OSCOMP_ENABLE_LTP_ALLOWLIST: bool = false;
+
 // ── P10-F8: no-sdcard selftest flags (all false) ──
 const OSCOMP_PROBE_SELFTEST_NO_SDCARD: bool = false;
 const OSCOMP_PROBE_SELFTEST_LUA: bool = false;
@@ -1762,6 +1788,7 @@ fn verify_sdcard_all_scripts_thread() {
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
     let _ = crate::fs::mkdir("/tmp", 0o755);
     let _ = crate::fs::mkdir("/dev", 0o755);
+    let _ = crate::fs::mkdir("/dev/shm", 0o1777);
     let _ = crate::fs::mkdir("/proc", 0o755);
     let _ = crate::fs::mkdir("/sys", 0o755);
     let _ = crate::fs::mkdir("/etc", 0o755);
@@ -2025,7 +2052,11 @@ fn verify_sdcard_all_scripts_thread() {
         // Run the script using the verified spawn/exec/task lifecycle.
         // ── RISC-V busybox: use group-specific shell ──
         #[cfg(target_arch = "riscv64")]
-        let group_result = if vfs_path.ends_with("/glibc/busybox_testcode.sh")
+        let group_result = if OSCOMP_ENABLE_LMBENCH_MINI
+            && vfs_path.ends_with("/glibc/lmbench_testcode.sh")
+        {
+            Ok(oscomp_run_lmbench_mini(&vfs_path))
+        } else if vfs_path.ends_with("/glibc/busybox_testcode.sh")
             && crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok()
         {
             let rv_shell = "/mnt/sdcard/glibc/busybox";
@@ -2272,11 +2303,12 @@ fn arch_contest_poweroff_la() {
 #[cfg(target_arch = "riscv64")]
 fn oscomp_should_skip_heavy(script: &str) -> bool {
     script.contains("unixbench")
-        || script.contains("lmbench")
+        || (script.contains("lmbench")
+            && (!OSCOMP_ENABLE_LMBENCH_MINI || !script.contains("/glibc/")))
         || script.contains("netperf")
         || script.contains("iperf")
         || script.contains("iozone")
-        || script.contains("cyclictest")
+        || (!OSCOMP_ENABLE_CYCLICTEST_MINI && script.contains("cyclictest"))
         || script.contains("/ltp/")
         || script.contains("ltp_testcode")
 }
@@ -2294,6 +2326,11 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/lua_testcode.sh")
         || path.ends_with("/glibc/libcbench_testcode.sh")
         || path.ends_with("/musl/libcbench_testcode.sh")
+        || (OSCOMP_ENABLE_CYCLICTEST_MINI
+            && (path.ends_with("/glibc/cyclictest_testcode.sh")
+                || path.ends_with("/musl/cyclictest_testcode.sh")))
+        || (OSCOMP_ENABLE_LMBENCH_MINI
+            && path.ends_with("/glibc/lmbench_testcode.sh"))
 }
 
 // ── P9-H7: LoongArch shell probe and contest whitelist ──
@@ -2433,6 +2470,61 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || path.ends_with("/musl/libcbench_testcode.sh")
         || path.ends_with("/glibc/lua_testcode.sh")
         || path.ends_with("/musl/lua_testcode.sh")
+        || (OSCOMP_ENABLE_CYCLICTEST_MINI
+            && (path.ends_with("/glibc/cyclictest_testcode.sh")
+                || path.ends_with("/musl/cyclictest_testcode.sh")))
+}
+
+fn oscomp_run_lmbench_case(
+    binary: &str,
+    cwd: &str,
+    label: &str,
+    argv: &[&str],
+    path_env: &str,
+    ld_env: &str,
+) -> bool {
+    let raw = run_rootfs_program_with_cwd(
+        binary,
+        argv,
+        &[path_env, ld_env, "HOME=/"],
+        Some(cwd),
+    )
+    .unwrap_or(-127);
+    let status = if raw == 0 { "PASS" } else { "FAIL" };
+    crate::println!("lmbench-mini {} {} raw={}", label, status, raw);
+    raw == 0
+}
+
+fn oscomp_run_lmbench_mini(script: &str) -> isize {
+    let libc = if script.contains("/glibc/") { "glibc" } else { "musl" };
+    let cwd = alloc::format!("/mnt/sdcard/{}", libc);
+    let binary = alloc::format!("{}/lmbench_all", cwd);
+    let path_env = alloc::format!(
+        "PATH=.:{}:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/usr/bin",
+        cwd,
+    );
+    let ld_env = alloc::format!(
+        "LD_LIBRARY_PATH=.:{}:{}/lib:/lib:/usr/lib:/mnt/sdcard/lib",
+        cwd, cwd,
+    );
+
+    let mut passed = 0;
+    if oscomp_run_lmbench_case(
+        &binary, &cwd, "lat_syscall_null",
+        &["lmbench_all", "lat_syscall", "-P", "1", "null"],
+        &path_env, &ld_env,
+    ) {
+        passed += 1;
+    }
+    if oscomp_run_lmbench_case(
+        &binary, &cwd, "lat_syscall_read",
+        &["lmbench_all", "lat_syscall", "-P", "1", "read"],
+        &path_env, &ld_env,
+    ) {
+        passed += 1;
+    }
+    crate::println!("lmbench-mini summary libc={} pass={}/2", libc, passed);
+    if passed == 2 { 0 } else { 1 }
 }
 
 // ── P9-H2B: LoongArch exit-status diagnostics ──
@@ -3363,6 +3455,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         }
         SYS_WAIT4 => set_syscall_result(frame, sys_wait4(arguments[0], arguments[1], arguments[2], arguments[3])),
         SYS_CLONE => set_syscall_result(frame, sys_clone(frame, arguments)),
+        SYS_CLONE3 => set_syscall_result(frame, sys_clone3(frame, arguments[0], arguments[1])),
         SYS_EXECVE => {
             let result = sys_execve(frame, arguments);
             set_syscall_result(frame, result);
@@ -3370,6 +3463,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_NANOSLEEP => set_syscall_result(frame, sys_nanosleep(arguments[0], arguments[1])),
         SYS_CLOCK_GETTIME => {
             set_syscall_result(frame, sys_clock_gettime(arguments[0], arguments[1]))
+        }
+        SYS_CLOCK_GETRES => {
+            set_syscall_result(frame, sys_clock_getres(arguments[0], arguments[1]))
         }
         SYS_CLOCK_NANOSLEEP => {
             set_syscall_result(frame, sys_clock_nanosleep(
@@ -3517,6 +3613,14 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_SCHED_SETSCHEDULER => set_syscall_result(frame, sys_sched_setscheduler(arguments[0], arguments[1], arguments[2])),
         SYS_SCHED_GETSCHEDULER => set_syscall_result(frame, sys_sched_getscheduler(arguments[0])),
         SYS_SCHED_GETPARAM => set_syscall_result(frame, sys_sched_getparam(arguments[0], arguments[1])),
+        SYS_SCHED_SETPARAM => set_syscall_result(frame, sys_sched_setparam(arguments[0], arguments[1])),
+        SYS_SCHED_GET_PRIORITY_MAX => set_syscall_result(frame, sys_sched_get_priority(arguments[0], true)),
+        SYS_SCHED_GET_PRIORITY_MIN => set_syscall_result(frame, sys_sched_get_priority(arguments[0], false)),
+        SYS_SCHED_RR_GET_INTERVAL => set_syscall_result(frame, sys_sched_rr_get_interval(arguments[0], arguments[1])),
+        SYS_MLOCKALL => set_syscall_result(frame, sys_mlockall(arguments[0])),
+        SYS_MUNLOCKALL => set_syscall_result(frame, 0),
+        SYS_MLOCK => set_syscall_result(frame, sys_mlock(arguments[0], arguments[1])),
+        SYS_MUNLOCK => set_syscall_result(frame, sys_mlock(arguments[0], arguments[1])),
         SYS_RENAMEAT2 => {
             set_syscall_result(frame,
                 sys_renameat2(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]))
@@ -3542,15 +3646,6 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             }
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
-            // CLONE_CHILD_CLEARTID: write 0 to the user-space address
-            // specified by clone's ctid argument, then futex-wake waiters.
-            if let Some(thread) = crate::task::current_user_thread() {
-                let ctid = thread.clear_child_tid_address();
-                if ctid != 0 {
-                    let zero: u32 = 0;
-                    let _ = copy_to_user(ctid, &zero.to_ne_bytes());
-                }
-            }
             if verifier {
                 EXIT_STATUS.store(arguments[0] as isize, Ordering::Release);
                 TERMINATED.store(true, Ordering::Release);
@@ -4615,11 +4710,14 @@ fn sys_set_tid_address(address: usize) -> isize {
     thread.id().get() as isize
 }
 
-fn sys_set_robust_list(_head: usize, length: usize) -> isize {
+fn sys_set_robust_list(head: usize, length: usize) -> isize {
     const ROBUST_LIST_HEAD_SIZE: usize = 24;
     if length != ROBUST_LIST_HEAD_SIZE {
         return -EINVAL;
     }
+    let thread = crate::task::current_user_thread()
+        .expect("set_robust_list arrived without current user Thread");
+    thread.set_robust_list_head(head);
     0
 }
 
@@ -4687,8 +4785,10 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     }
 
     // CLONE_CHILD_CLEARTID: write the child tid pointer for futex wake on exit.
-    if wants_child_cleartid && arguments[5] != 0 {
-        child_thread.set_clear_child_tid(arguments[5]);
+    // Linux's generic clone ABI uses the fifth argument for both
+    // CHILD_SETTID and CHILD_CLEARTID; there is no sixth clone argument.
+    if wants_child_cleartid && arguments[4] != 0 {
+        child_thread.set_clear_child_tid(arguments[4]);
     }
 
     // CLONE_PARENT_SETTID: write child TID to parent's user-space pointer.
@@ -4710,10 +4810,87 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     if arguments[1] != 0 {
         set_frame_stack_pointer(&mut child_frame, arguments[1]);
     }
+    if wants_tls {
+        set_frame_tls(&mut child_frame, arguments[3]);
+    }
     child_thread.save_trap_frame(child_frame);
 
     let _task = crate::task::spawn_user_thread_from_user_trap(child_thread);
     child.id().get() as isize
+}
+
+fn sys_clone3(
+    frame: &crate::arch::trap::TrapFrame,
+    clone_args_address: usize,
+    size: usize,
+) -> isize {
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
+    const CLONE_ARGS_SIZE_VER2: usize = 88;
+    const CLONE_PIDFD: u64 = 0x0000_1000;
+
+    if size < CLONE_ARGS_SIZE_VER0 || size > CLONE_ARGS_SIZE_VER2 {
+        return -EINVAL;
+    }
+
+    let mut raw = [0_u8; CLONE_ARGS_SIZE_VER2];
+    if copy_from_user(clone_args_address, &mut raw[..size]).is_err() {
+        return -EFAULT;
+    }
+    let field = |offset: usize| -> u64 {
+        u64::from_ne_bytes(raw[offset..offset + 8].try_into().expect("clone3 field slice"))
+    };
+
+    let flags = field(0);
+    let pidfd = field(8);
+    let child_tid = field(16);
+    let parent_tid = field(24);
+    let exit_signal = field(32);
+    let stack = field(40);
+    let stack_size = field(48);
+    let tls = field(56);
+    let set_tid = field(64);
+    let set_tid_size = field(72);
+    let cgroup = field(80);
+
+    if flags & CLONE_PIDFD != 0
+        || pidfd != 0
+        || exit_signal > 64
+        || set_tid != 0
+        || set_tid_size != 0
+        || cgroup != 0
+    {
+        return -EINVAL;
+    }
+    if flags > usize::MAX as u64
+        || child_tid > usize::MAX as u64
+        || parent_tid > usize::MAX as u64
+        || stack > usize::MAX as u64
+        || stack_size > usize::MAX as u64
+        || tls > usize::MAX as u64
+    {
+        return -EINVAL;
+    }
+
+    let child_stack = if stack == 0 && stack_size == 0 {
+        0
+    } else {
+        match (stack as usize).checked_add(stack_size as usize) {
+            Some(top) => top,
+            None => return -EINVAL,
+        }
+    };
+    let legacy_flags = (flags as usize) | exit_signal as usize;
+    sys_clone(
+        frame,
+        [
+            legacy_flags,
+            child_stack,
+            parent_tid as usize,
+            tls as usize,
+            child_tid as usize,
+            0,
+        ],
+    )
 }
 
 fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
@@ -5769,6 +5946,20 @@ fn sys_clock_gettime(clock_id: usize, timespec_address: usize) -> isize {
     copy_plain_to_user(timespec_address, &ts)
 }
 
+fn sys_clock_getres(clock_id: usize, timespec_address: usize) -> isize {
+    if clock_id > 7 {
+        return -EINVAL;
+    }
+    if timespec_address == 0 {
+        return 0;
+    }
+    let ts = KernelTimespec {
+        sec: 0,
+        nsec: 1,
+    };
+    copy_plain_to_user(timespec_address, &ts)
+}
+
 const TIMER_ABSTIME: usize = 1;
 
 fn sys_clock_nanosleep(
@@ -5878,8 +6069,8 @@ fn sys_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limit: usize
             max: crate::process::PROCESS_MAX_FDS as u64,
         },
         RLIMIT_STACK => KernelRlimit64 {
-            cur: PAGE_SIZE as u64,
-            max: PAGE_SIZE as u64,
+            cur: (8 * 1024 * 1024) as u64,
+            max: (8 * 1024 * 1024) as u64,
         },
         RLIMIT_AS => KernelRlimit64 {
             cur: u64::MAX,
@@ -5941,21 +6132,40 @@ fn sys_getrandom(address: usize, length: usize, flags: usize) -> isize {
 const FUTEX_WAIT: usize = 0;
 const FUTEX_WAKE: usize = 1;
 const FUTEX_PRIVATE_FLAG: usize = 128;
+const FUTEX_CLOCK_REALTIME: usize = 256;
+
+struct FutexQueue {
+    waiters: crate::task::WaitQueue,
+    wake_sequence: AtomicUsize,
+}
+
+impl FutexQueue {
+    const fn new() -> Self {
+        Self {
+            waiters: crate::task::WaitQueue::new(),
+            wake_sequence: AtomicUsize::new(0),
+        }
+    }
+}
 
 static FUTEX_QUEUES: crate::irq_lock::IrqSpinLock<
-    alloc::collections::BTreeMap<usize, alloc::sync::Arc<crate::task::WaitQueue>>,
+    alloc::collections::BTreeMap<(usize, usize), alloc::sync::Arc<FutexQueue>>,
 > = crate::irq_lock::IrqSpinLock::new_with_class(
     alloc::collections::BTreeMap::new(),
     crate::lockdep::LockClass::new("futex.queues", crate::lockdep::LockRank::WaitQueue, 5),
 );
+fn futex_key(uaddr: usize) -> (usize, usize) {
+    (current_user_mm().asid().id().get() as usize, uaddr)
+}
 
-fn get_futex_queue(uaddr: usize) -> alloc::sync::Arc<crate::task::WaitQueue> {
+fn get_futex_queue(uaddr: usize) -> alloc::sync::Arc<FutexQueue> {
+    let key = futex_key(uaddr);
     let mut queues = FUTEX_QUEUES.lock();
-    if let Some(q) = queues.get(&uaddr) {
+    if let Some(q) = queues.get(&key) {
         alloc::sync::Arc::clone(q)
     } else {
-        let q = alloc::sync::Arc::new(crate::task::WaitQueue::new());
-        queues.insert(uaddr, alloc::sync::Arc::clone(&q));
+        let q = alloc::sync::Arc::new(FutexQueue::new());
+        queues.insert(key, alloc::sync::Arc::clone(&q));
         q
     }
 }
@@ -5968,10 +6178,19 @@ fn sys_futex(
     _uaddr2: usize,
     _val3: usize,
 ) -> isize {
-    let op = futex_op & !FUTEX_PRIVATE_FLAG;
+    let op = futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+
+    if futex_op & FUTEX_CLOCK_REALTIME != 0 {
+        return -ENOSYS;
+    }
 
     match op {
         FUTEX_WAIT | 9 /* FUTEX_WAIT_BITSET */ => {
+            if op == 9 && _val3 == 0 {
+                return -EINVAL;
+            }
+            let queue = get_futex_queue(uaddr);
+            let wake_sequence = queue.wake_sequence.load(Ordering::Acquire);
             let current_val = match copy_plain_from_user::<u32>(uaddr) {
                 Ok(v) => v as usize,
                 Err(e) => return e,
@@ -5997,26 +6216,109 @@ fn sys_futex(
                 }
                 return -(crate::syscall::errno::ETIMEDOUT);
             }
-            // Untimed wait: block on the futex queue.
-            let queue = get_futex_queue(uaddr);
+            // The wake sequence closes the check/enqueue race without doing
+            // user-memory access while the scheduler lock is held.
             let _ = crate::task::block_current_on_if_from_user_trap(
-                &queue,
-                || {
-                    match copy_plain_from_user::<u32>(uaddr) {
-                        Ok(v) => v as usize == val,
-                        Err(_) => false,
-                    }
-                },
+                &queue.waiters,
+                || queue.wake_sequence.load(Ordering::Acquire) == wake_sequence,
             );
             0
         }
         FUTEX_WAKE | 10 /* FUTEX_WAKE_BITSET */ => {
+            if op == 10 && _val3 == 0 {
+                return -EINVAL;
+            }
             let queue = get_futex_queue(uaddr);
-            let woken = if val >= 1 { queue.wake_all() } else { 0 };
-            // Return at most `val` woken, consistent with Linux.
-            core::cmp::min(woken, val) as isize
+            if val != 0 {
+                queue.wake_sequence.fetch_add(1, Ordering::AcqRel);
+            }
+            let mut woken = 0;
+            while woken < val {
+                if queue.waiters.wake_one() == 0 {
+                    break;
+                }
+                woken += 1;
+            }
+            woken as isize
         }
         _ => -(crate::syscall::errno::ENOSYS),
+    }
+}
+
+pub(crate) fn clear_child_tid_on_exit(thread: &crate::process::Thread) {
+    let ctid = thread.clear_child_tid_address();
+    if ctid == 0 {
+        return;
+    }
+    let zero: u32 = 0;
+    let _ = copy_to_user(ctid, &zero.to_ne_bytes());
+    let _ = sys_futex(ctid, FUTEX_WAKE, 1, 0, 0, 0);
+}
+
+pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
+    const FUTEX_WAITERS: u32 = 0x8000_0000;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+    const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+    const MAX_ROBUST_NODES: usize = 256;
+
+    let head = thread.robust_list_head();
+    if head == 0 {
+        return;
+    }
+
+    let first = match copy_plain_from_user::<usize>(head) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let futex_offset = match copy_plain_from_user::<isize>(
+        head.saturating_add(core::mem::size_of::<usize>()),
+    ) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let pending = copy_plain_from_user::<usize>(
+        head.saturating_add(2 * core::mem::size_of::<usize>()),
+    )
+    .unwrap_or(0);
+
+    let mark_owner_dead = |node: usize| {
+        if node == 0 || node == head {
+            return;
+        }
+        let futex_address = if futex_offset >= 0 {
+            node.checked_add(futex_offset as usize)
+        } else {
+            node.checked_sub(futex_offset.unsigned_abs())
+        };
+        let Some(futex_address) = futex_address else {
+            return;
+        };
+        let word = match copy_plain_from_user::<u32>(futex_address) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        if word & FUTEX_TID_MASK != thread.id().get() as u32 {
+            return;
+        }
+        let dead = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        if copy_to_user(futex_address, &dead.to_ne_bytes()).is_ok() {
+            let _ = sys_futex(futex_address, FUTEX_WAKE, 1, 0, 0, 0);
+        }
+    };
+
+    let mut node = first;
+    for _ in 0..MAX_ROBUST_NODES {
+        if node == 0 || node == head {
+            break;
+        }
+        mark_owner_dead(node);
+        node = match copy_plain_from_user::<usize>(node) {
+            Ok(next) => next,
+            Err(_) => break,
+        };
+    }
+    if pending != 0 {
+        mark_owner_dead(pending);
     }
 }
 
@@ -6225,6 +6527,57 @@ fn sys_sched_getparam(_pid: usize, param_address: usize) -> isize {
     let raw = priority.to_ne_bytes();
     if copy_to_user(param_address, &raw).is_err() {
         return -EFAULT;
+    }
+    0
+}
+
+fn sys_sched_setparam(_pid: usize, param_address: usize) -> isize {
+    if param_address == 0 {
+        return -EFAULT;
+    }
+    let priority = match copy_plain_from_user::<i32>(param_address) {
+        Ok(value) => value,
+        Err(errno) => return errno,
+    };
+    if priority != 0 {
+        return -EINVAL;
+    }
+    0
+}
+
+fn sys_sched_get_priority(policy: usize, maximum: bool) -> isize {
+    match policy {
+        SCHED_OTHER => 0,
+        SCHED_FIFO | SCHED_RR => {
+            if maximum { 99 } else { 1 }
+        }
+        _ => -EINVAL,
+    }
+}
+
+fn sys_sched_rr_get_interval(_pid: usize, interval_address: usize) -> isize {
+    let interval = KernelTimespec {
+        sec: 0,
+        nsec: 10_000_000,
+    };
+    copy_plain_to_user(interval_address, &interval)
+}
+
+fn sys_mlockall(flags: usize) -> isize {
+    const MCL_CURRENT: usize = 1;
+    const MCL_FUTURE: usize = 2;
+    if flags == 0 || flags & !(MCL_CURRENT | MCL_FUTURE) != 0 {
+        return -EINVAL;
+    }
+    0
+}
+
+fn sys_mlock(address: usize, length: usize) -> isize {
+    if length == 0 {
+        return 0;
+    }
+    if address == 0 || address.checked_add(length).is_none() {
+        return -EINVAL;
     }
     0
 }

@@ -303,6 +303,18 @@ def main() -> int:
     check(PASS, "sched_getaffinity mask==0 → EFAULT",
           "mask == 0" in user_rs.split("sys_sched_getaffinity")[1][:200]
           if "sys_sched_getaffinity" in user_rs else False)
+    check(PASS, "cyclictest scheduler/time ABI is present",
+          "fn sys_sched_setparam" in user_rs
+          and "fn sys_mlockall" in user_rs
+          and "fn sys_mlock(" in user_rs
+          and "fn sys_clock_getres" in user_rs
+          and "fn sys_sched_get_priority" in user_rs
+          and "fn sys_sched_rr_get_interval" in user_rs)
+    check(PASS, "lmbench mini runs only explicit real subcommands",
+          "fn oscomp_run_lmbench_mini" in user_rs
+          and "lat_syscall_null" in user_rs
+          and "lat_syscall_read" in user_rs
+          and "pass={}/2" in user_rs)
 
     # ── P10-R2 fs/iozone compat ──
     check(PASS, "FDATASYNC exists", "SYS_FDATASYNC" in user_rs or "FDATASYNC" in user_rs)
@@ -332,6 +344,21 @@ def main() -> int:
     check(PASS, "WNOHANG appears", "WNOHANG" in user_rs)
     check(PASS, "WUNTRACED uses Linux value 2",
           "const WUNTRACED: usize = 2;" in user_rs)
+    check(PASS, "clone clear_child_tid uses fifth ABI argument",
+          "child_thread.set_clear_child_tid(arguments[4]);" in user_rs)
+    check(PASS, "clone installs TLS in child trap frame",
+          "set_frame_tls(&mut child_frame, arguments[3]);" in user_rs)
+    check(PASS, "clone3 v0 maps real Linux clone_args",
+          "fn sys_clone3(" in user_rs
+          and "const CLONE_ARGS_SIZE_VER0: usize = 64;" in user_rs
+          and "SYS_CLONE3 =>" in user_rs)
+    check(PASS, "thread exit wakes clear_child_tid futex",
+          "clear_child_tid_on_exit(&thread)" in (read_text("kernel/src/task/mod.rs") or "")
+          and "sys_futex(ctid, FUTEX_WAKE, 1, 0, 0, 0)" in user_rs)
+    check(PASS, "futex key includes mm ASID",
+          "(current_user_mm().asid().id().get() as usize, uaddr)" in user_rs)
+    check(PASS, "futex wait recheck avoids uaccess under scheduler lock",
+          "wake_sequence.load(Ordering::Acquire) == wake_sequence" in user_rs)
 
     # ── P10-SCORE-FIX1 ──
     check(PASS, "RV busybox direct: kind=glibc",
@@ -377,6 +404,10 @@ def main() -> int:
     check(PASS, "PR_SET_TIMERSLACK appears", "PR_SET_TIMERSLACK" in user_rs)
     check(PASS, "sys_prctl no longer all-0", "PR_SET_DUMPABLE" in user_rs)
     check(PASS, "set_robust_list length 24", "ROBUST_LIST_HEAD_SIZE" in user_rs or "24" in user_rs)
+    check(PASS, "robust list is saved and cleaned on every thread exit",
+          "thread.set_robust_list_head(head);" in user_rs
+          and "cleanup_robust_list_on_exit(&thread)" in (read_text("kernel/src/task/mod.rs") or "")
+          and "FUTEX_OWNER_DIED" in user_rs)
 
     # ── P10-R4 signal/kill compat ──
     check(PASS, "EINTR exists", "EINTR" in user_rs or "pub const EINTR" in (open("kernel/src/syscall.rs").read() if False else ""))
@@ -413,6 +444,9 @@ def main() -> int:
           if "sys_getrandom" in user_rs else False)
     check(PASS, "prlimit64 validates new_limit", "new.cur > new.max" in user_rs.split("sys_prlimit64")[1][:300]
           if "sys_prlimit64" in user_rs else False)
+    check(PASS, "RLIMIT_STACK supports pthread minimums",
+          "cur: (8 * 1024 * 1024) as u64" in user_rs
+          and "max: (8 * 1024 * 1024) as u64" in user_rs)
     check(PASS, "MAP_NORESERVE accepted", "0x4000" in user_rs.split("MAP_ACCEPTED")[1][:100]
           if "MAP_ACCEPTED" in user_rs else False)
     check(PASS, "MAP_STACK accepted", "0x20000" in user_rs.split("MAP_ACCEPTED")[1][:100]
@@ -460,6 +494,24 @@ def main() -> int:
         check(FAIL, "kill_process_group absent", False, "FOUND — dangerous!")
     else:
         check(PASS, "kill_process_group absent", True)
+
+    # ── Remaining-score staged group switches ──
+    # Heavy groups must be enabled one at a time only after local validation.
+    staged_flags = {
+        "OSCOMP_ENABLE_LIBCBENCH_EXTRA": False,
+        "OSCOMP_ENABLE_CYCLICTEST_MINI": False,
+        # RV/glibc null+read is the only staged group enabled after a complete
+        # both-architecture regression. LA and musl remain explicitly skipped.
+        "OSCOMP_ENABLE_LMBENCH_MINI": True,
+        "OSCOMP_ENABLE_IPERF_MINI": False,
+        "OSCOMP_ENABLE_NETPERF_MINI": False,
+        "OSCOMP_ENABLE_LTP_ALLOWLIST": False,
+    }
+    for flag, enabled in staged_flags.items():
+        check(PASS, f"{flag} exists", f"const {flag}: bool =" in user_rs)
+        expected = str(enabled).lower()
+        check(PASS, f"{flag} expected {expected}",
+              f"const {flag}: bool = {expected};" in user_rs)
 
     # ── WARN: old diagnostic cruft ──
     if "oscomp-la-basic-probe" in user_rs:

@@ -702,6 +702,7 @@ impl Process {
             trap_frame: IrqSpinLock::new_with_class(None, THREAD_TRAP_FRAME_LOCK),
             tls: AtomicUsize::new(0),
             clear_child_tid: AtomicUsize::new(0),
+            robust_list_head: AtomicUsize::new(0),
             blocked_signals: AtomicU64::new(0),
             scheduler_task: AtomicUsize::new(UNBOUND_SCHEDULER_TASK),
             visited_cpus: AtomicUsize::new(0),
@@ -806,6 +807,7 @@ pub struct Thread {
     /// CLONE_CHILD_CLEARTID: user-space address where 0 is written
     /// and a futex wake is performed when this thread exits.
     clear_child_tid: AtomicUsize,
+    robust_list_head: AtomicUsize,
     blocked_signals: AtomicU64,
     scheduler_task: AtomicUsize,
     visited_cpus: AtomicUsize,
@@ -984,6 +986,14 @@ impl Thread {
     /// Return the clear_child_tid address, or 0 if none was set.
     pub fn clear_child_tid_address(&self) -> usize {
         self.clear_child_tid.load(Ordering::Acquire)
+    }
+
+    pub fn set_robust_list_head(&self, address: usize) {
+        self.robust_list_head.store(address, Ordering::Release);
+    }
+
+    pub fn robust_list_head(&self) -> usize {
+        self.robust_list_head.load(Ordering::Acquire)
     }
 
     #[allow(dead_code)]
