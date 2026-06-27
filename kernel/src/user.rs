@@ -2489,6 +2489,7 @@ fn oscomp_run_lmbench_case(
     path_env: &str,
     ld_env: &str,
 ) -> bool {
+    crate::println!("lmbench-mini: exec {} cwd={} argv={:?}", binary, cwd, argv);
     let raw = run_rootfs_program_with_cwd(
         binary,
         argv,
