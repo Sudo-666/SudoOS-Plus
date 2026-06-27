@@ -1597,6 +1597,8 @@ const OSCOMP_ENABLE_IPERF_MINI: bool = false;
 const OSCOMP_ENABLE_NETPERF_MINI: bool = false;
 #[allow(dead_code)]
 const OSCOMP_ENABLE_LTP_ALLOWLIST: bool = false;
+const OSCOMP_RV_TOTAL_BUDGET_MS: u64 = 420_000;
+const OSCOMP_LA_TOTAL_BUDGET_MS: u64 = 240_000;
 
 // ── P10-F8: no-sdcard selftest flags (all false) ──
 const OSCOMP_PROBE_SELFTEST_NO_SDCARD: bool = false;
@@ -1857,19 +1859,20 @@ fn verify_sdcard_all_scripts_thread() {
     crate::println!("sdcard scripts: discovered {}", scripts.len());
     crate::println!("sdcard scripts: using shell {}", shell_path);
 
-    // Arch-specific total budget so RV can get deeper results.
+    // Arch-specific total budget so RV can run the verified lmbench mini
+    // without reducing the time reserved for existing scoring groups.
     #[cfg(target_arch = "riscv64")]
-    const TOTAL_BUDGET_MS: u64 = 180_000;
+    let total_budget_ms = OSCOMP_RV_TOTAL_BUDGET_MS;
     #[cfg(target_arch = "loongarch64")]
-    const TOTAL_BUDGET_MS: u64 = 60_000;
+    let total_budget_ms = OSCOMP_LA_TOTAL_BUDGET_MS;
     let freq_hz = crate::time::clock_frequency_hz();
     let budget_ms_to_cycles = |ms: u64| ms * freq_hz / 1000;
     let budget_start = crate::time::now().cycles();
-    let budget_deadline = budget_start + budget_ms_to_cycles(TOTAL_BUDGET_MS);
+    let budget_deadline = budget_start + budget_ms_to_cycles(total_budget_ms);
 
     crate::println!(
         "oscomp: arch={} total_budget_ms={}",
-        crate::arch::ARCH_NAME, TOTAL_BUDGET_MS,
+        crate::arch::ARCH_NAME, total_budget_ms,
     );
 
     // ── initialise contest atomics and launch external watchdog ──
@@ -2543,7 +2546,7 @@ fn oscomp_lmbench_global_remaining_ms() -> u64 {
 }
 
 fn oscomp_run_lmbench_mini(script: &str) -> isize {
-    const OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS: u64 = 145_000;
+    const OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS: u64 = 320_000;
     const OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS: u64 = 50_000;
     const OSCOMP_LMBENCH_GLOBAL_SAFETY_MS: u64 = 8_000;
 
@@ -2594,7 +2597,9 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     )
     .is_ok();
     crate::println!(
-        "lmbench-mini: begin budget_ms={} next_case_reserve_ms={} global_safety_ms={} fixture={} ready={}",
+        "lmbench-mini: start arch={} libc={} budget_ms={} next_case_reserve_ms={} global_safety_ms={} fixture={} ready={}",
+        crate::arch::ARCH_NAME,
+        libc,
         OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS,
         OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS,
         OSCOMP_LMBENCH_GLOBAL_SAFETY_MS,

@@ -37,6 +37,19 @@ def read_text(rel: str) -> str | None:
     return p.read_text()
 
 
+def rust_u64_const(text: str, name: str) -> int | None:
+    prefix = f"const {name}: u64 ="
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix) and stripped.endswith(";"):
+            raw = stripped.removeprefix(prefix).removesuffix(";").strip()
+            try:
+                return int(raw.replace("_", ""))
+            except ValueError:
+                return None
+    return None
+
+
 def main() -> int:
     user_rs = read_text("kernel/src/user.rs")
     if user_rs is None:
@@ -323,6 +336,19 @@ def main() -> int:
           and "lmbench-mini: case-end" in user_rs
           and "lmbench-mini: budget-stop" in user_rs
           and "skipped_budget" in user_rs)
+
+    rv_budget = rust_u64_const(user_rs, "OSCOMP_RV_TOTAL_BUDGET_MS")
+    la_budget = rust_u64_const(user_rs, "OSCOMP_LA_TOTAL_BUDGET_MS")
+    check(PASS, "RV contest budget is bounded",
+          rv_budget is not None and 300_000 <= rv_budget <= 600_000,
+          f"value={rv_budget}")
+    check(PASS, "LA contest budget is bounded",
+          la_budget is not None and 180_000 <= la_budget <= 600_000,
+          f"value={la_budget}")
+    check(PASS, "lmbench uses verified cwd runner",
+          "fn oscomp_run_lmbench_case" in user_rs
+          and "run_rootfs_program_with_cwd(" in
+          user_rs.split("fn oscomp_run_lmbench_case", 1)[1][:1_500])
 
     # ── P10-R2 fs/iozone compat ──
     check(PASS, "FDATASYNC exists", "SYS_FDATASYNC" in user_rs or "FDATASYNC" in user_rs)
