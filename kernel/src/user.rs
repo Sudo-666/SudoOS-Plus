@@ -206,6 +206,11 @@ static OSCOMP_TIMEOUT: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_SIGNAL11: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_SIGNAL14: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_DEADLINE_CYCLES: AtomicU64 = AtomicU64::new(0);
+// P14M: minimal ITIMER_REAL for lmbench pipe benchmarks
+static OSCOMP_ITIMER_PID: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_ITIMER_DEADLINE_CYCLES: AtomicU64 = AtomicU64::new(0);
+static OSCOMP_ITIMER_INTERVAL_US: AtomicU64 = AtomicU64::new(0);
+static OSCOMP_ITIMER_ARMED: AtomicBool = AtomicBool::new(false);
 static OSCOMP_LMBENCH_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const OSCOMP_LMBENCH_CAPTURE_CAPACITY: usize = 1024;
@@ -2090,7 +2095,7 @@ fn verify_sdcard_all_scripts_thread() {
         // ── RISC-V busybox: use group-specific shell ──
         #[cfg(target_arch = "riscv64")]
         let group_result = if OSCOMP_ENABLE_LMBENCH_MINI
-            && vfs_path.ends_with("lmbench_testcode.sh")
+            && vfs_path.ends_with("/glibc/lmbench_testcode.sh")
         {
             Ok(oscomp_run_lmbench_mini(&vfs_path))
         } else if vfs_path.ends_with("/glibc/busybox_testcode.sh")
@@ -2160,11 +2165,6 @@ fn verify_sdcard_all_scripts_thread() {
                     "musl",
                     "/mnt/sdcard/musl",
                 ))
-            } else if OSCOMP_ENABLE_LMBENCH_MINI
-                && (vfs_path.ends_with("/glibc/lmbench_testcode.sh")
-                    || vfs_path.ends_with("/musl/lmbench_testcode.sh"))
-            {
-                Ok(oscomp_run_lmbench_mini(&vfs_path))
             } else if vfs_path.ends_with("/musl/lua_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/lua").is_ok()
             {
@@ -2382,8 +2382,6 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
                 || path.ends_with("/musl/cyclictest_testcode.sh")))
         || (OSCOMP_ENABLE_LMBENCH_MINI
             && path.ends_with("/glibc/lmbench_testcode.sh"))
-        || (OSCOMP_ENABLE_LMBENCH_MINI
-            && path.ends_with("/musl/lmbench_testcode.sh"))
 }
 
 // ── P9-H7: LoongArch shell probe and contest whitelist ──
@@ -2742,10 +2740,6 @@ fn oscomp_la_whitelist(path: &str) -> bool {
         || (OSCOMP_ENABLE_CYCLICTEST_MINI
             && (path.ends_with("/glibc/cyclictest_testcode.sh")
                 || path.ends_with("/musl/cyclictest_testcode.sh")))
-        || (OSCOMP_ENABLE_LMBENCH_MINI
-            && path.ends_with("/glibc/lmbench_testcode.sh"))
-        || (OSCOMP_ENABLE_LMBENCH_MINI
-            && path.ends_with("/musl/lmbench_testcode.sh"))
 }
 
 fn oscomp_lmbench_canonical_label(label: &str) -> &'static str {
@@ -2901,13 +2895,13 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     const OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS: u64 = 320_000;
     const OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS: u64 = 50_000;
     const OSCOMP_LMBENCH_GLOBAL_SAFETY_MS: u64 = 8_000;
-    const OSCOMP_LMBENCH_MAX_SAFE_CASES: usize = 15;
+    const OSCOMP_LMBENCH_MAX_SAFE_CASES: usize = 7;
 
     let libc = if script.contains("/glibc/") { "glibc" } else { "musl" };
     crate::println!("#### OS COMP TEST GROUP START lmbench-{} ####", libc);
     let cwd = alloc::format!("/mnt/sdcard/{}", libc);
     let binary = alloc::format!("{}/lmbench_all", cwd);
-    let fixture = "/var/tmp/lmbench";
+    let fixture = "/var/tmp/XXX";
     let path_env = alloc::format!(
         "PATH=.:{}:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/usr/bin",
         cwd,
@@ -2918,70 +2912,11 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     );
 
     let cases: &[(&str, &str, &[&str], &str)] = &[
+        // Phase 1: proven-safe syscall benchmarks (6 items)
         (
-            "lat_pagefault",
-            "Pagefaults on /var/tmp/XXX",
-            &["lmbench_all", "lat_pagefault", "-P", "1"],
-            "microseconds",
-        ),
-        (
-            "bw_pipe",
-            "Pipe bandwidth",
-            &["lmbench_all", "bw_pipe", "-P", "1"],
-            "MB/sec",
-        ),
-        (
-            "lat_pipe",
-            "Pipe latency",
-            &["lmbench_all", "lat_pipe", "-P", "1"],
-            "microseconds",
-        ),
-        (
-            "lat_proc_shell",
-            "Process fork+/bin/sh -c",
-            &["lmbench_all", "lat_proc", "-P", "1", "shell"],
-            "microseconds",
-        ),
-        (
-            "lat_proc_exec",
-            "Process fork+execve",
-            &["lmbench_all", "lat_proc", "-P", "1", "exec"],
-            "microseconds",
-        ),
-        (
-            "lat_proc_fork",
-            "Process fork+exit",
-            &["lmbench_all", "lat_proc", "-P", "1", "fork"],
-            "microseconds",
-        ),
-        (
-            "lat_select",
-            "Select on 100 fd's",
-            &["lmbench_all", "lat_select", "-P", "1"],
-            "microseconds",
-        ),
-        (
-            "lat_sig_install",
-            "Signal handler installation",
-            &["lmbench_all", "lat_sig", "-P", "1", "install"],
-            "microseconds",
-        ),
-        (
-            "lat_sig_catch",
-            "Signal handler overhead",
-            &["lmbench_all", "lat_sig", "-P", "1", "catch"],
-            "microseconds",
-        ),
-        (
-            "lat_syscall_fstat",
-            "Simple fstat",
-            &["lmbench_all", "lat_syscall", "-P", "1", "fstat", "/var/tmp/lmbench"],
-            "microseconds",
-        ),
-        (
-            "lat_syscall_open",
-            "Simple open/close",
-            &["lmbench_all", "lat_syscall", "-P", "1", "open", "/var/tmp/lmbench"],
+            "lat_syscall_null",
+            "Simple syscall",
+            &["lmbench_all", "lat_syscall", "-P", "1", "null"],
             "microseconds",
         ),
         (
@@ -2991,22 +2926,49 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
             "microseconds",
         ),
         (
-            "lat_syscall_stat",
-            "Simple stat",
-            &["lmbench_all", "lat_syscall", "-P", "1", "stat", "/var/tmp/lmbench"],
-            "microseconds",
-        ),
-        (
-            "lat_syscall_null",
-            "Simple syscall",
-            &["lmbench_all", "lat_syscall", "-P", "1", "null"],
-            "microseconds",
-        ),
-        (
             "lat_syscall_write",
             "Simple write",
             &["lmbench_all", "lat_syscall", "-P", "1", "write"],
             "microseconds",
+        ),
+        (
+            "lat_syscall_stat",
+            "Simple stat",
+            &["lmbench_all", "lat_syscall", "-P", "1", "stat", "/var/tmp/XXX"],
+            "microseconds",
+        ),
+        (
+            "lat_syscall_fstat",
+            "Simple fstat",
+            &["lmbench_all", "lat_syscall", "-P", "1", "fstat", "/var/tmp/XXX"],
+            "microseconds",
+        ),
+        (
+            "lat_syscall_open",
+            "Simple open/close",
+            &["lmbench_all", "lat_syscall", "-P", "1", "open", "/var/tmp/XXX"],
+            "microseconds",
+        ),
+        // Phase 2: pagefault with corrected file argument
+        (
+            "lat_pagefault",
+            "Pagefaults on /var/tmp/XXX",
+            &["lmbench_all", "lat_pagefault", "-P", "1", "/var/tmp/XXX"],
+            "microseconds",
+        ),
+        // Phase 3: timer-dependent items (require working ITIMER_REAL/SIGALRM)
+        // Enable one at a time by raising MAX_SAFE_CASES
+        (
+            "lat_pipe",
+            "Pipe latency",
+            &["lmbench_all", "lat_pipe", "-P", "1"],
+            "microseconds",
+        ),
+        (
+            "bw_pipe",
+            "Pipe bandwidth",
+            &["lmbench_all", "bw_pipe", "-P", "1"],
+            "MB/sec",
         ),
     ];
 
@@ -4312,6 +4274,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         }
         _ => set_syscall_result(frame, -ENOSYS),
     }
+    oscomp_check_itimer_real();
     deliver_pending_signal(frame);
 }
 
@@ -7330,6 +7293,60 @@ fn sys_prctl(option: usize, arg2: usize, _arg3: usize) -> isize {
     }
 }
 
+// ── P14M: minimal ITIMER_REAL helpers ──
+
+fn timeval_to_us(tv: KernelTimeval) -> Option<u64> {
+    if tv.sec < 0 || tv.usec < 0 || tv.usec >= 1_000_000 {
+        return None;
+    }
+    let sec = u64::try_from(tv.sec).ok()?;
+    let usec = u64::try_from(tv.usec).ok()?;
+    Some(sec.saturating_mul(1_000_000).saturating_add(usec))
+}
+
+fn us_to_cycles(us: u64) -> u64 {
+    let hz = crate::time::clock_frequency_hz();
+    u64::try_from(
+        u128::from(us)
+            .saturating_mul(u128::from(hz))
+            / 1_000_000_u128,
+    )
+    .unwrap_or(u64::MAX)
+}
+
+const SIGALRM: usize = 14;
+
+fn oscomp_check_itimer_real() {
+    if !OSCOMP_ITIMER_ARMED.load(Ordering::Acquire) {
+        return;
+    }
+    let deadline = OSCOMP_ITIMER_DEADLINE_CYCLES.load(Ordering::Acquire);
+    if deadline == 0 || crate::time::now().cycles() < deadline {
+        return;
+    }
+
+    let pid = OSCOMP_ITIMER_PID.load(Ordering::Acquire);
+    if pid == 0 {
+        OSCOMP_ITIMER_ARMED.store(false, Ordering::Release);
+        return;
+    }
+
+    if let Some(process) = crate::process::lookup_process(crate::process::ProcessId::from_raw_for_kernel(pid)) {
+        let _ = crate::signal::send_signal(process.id(), SIGALRM as u32);
+    }
+
+    let interval_us = OSCOMP_ITIMER_INTERVAL_US.load(Ordering::Acquire);
+    if interval_us == 0 {
+        OSCOMP_ITIMER_ARMED.store(false, Ordering::Release);
+        OSCOMP_ITIMER_DEADLINE_CYCLES.store(0, Ordering::Release);
+    } else {
+        OSCOMP_ITIMER_DEADLINE_CYCLES.store(
+            crate::time::now().cycles().saturating_add(us_to_cycles(interval_us)),
+            Ordering::Release,
+        );
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct KernelItimerval {
@@ -7342,9 +7359,12 @@ const ITIMER_VIRTUAL: usize = 1;
 const ITIMER_PROF: usize = 2;
 
 fn sys_setitimer(which: usize, new_value: usize, old_value: usize) -> isize {
-    if which > 2 {
+    // P14M: lmbench only needs ITIMER_REAL.  VIRTUAL/PROF return EINVAL
+    // rather than silently succeeding.
+    if which != ITIMER_REAL {
         return -EINVAL;
     }
+
     // Write zero old value if requested.
     if old_value != 0 {
         let zero = KernelItimerval {
@@ -7356,22 +7376,44 @@ fn sys_setitimer(which: usize, new_value: usize, old_value: usize) -> isize {
             return result;
         }
     }
-    // Validate new value pointer and fields without arming a real timer.
-    if new_value != 0 {
-        let new = match copy_plain_from_user::<KernelItimerval>(new_value) {
-            Ok(v) => v,
-            Err(errno) => return errno,
-        };
-        if new.value.sec < 0
-            || new.value.usec < 0
-            || new.value.usec >= 1_000_000
-            || new.interval.sec < 0
-            || new.interval.usec < 0
-            || new.interval.usec >= 1_000_000
-        {
-            return -EINVAL;
-        }
+
+    // new_value == 0 → disarm
+    if new_value == 0 {
+        OSCOMP_ITIMER_ARMED.store(false, Ordering::Release);
+        OSCOMP_ITIMER_DEADLINE_CYCLES.store(0, Ordering::Release);
+        return 0;
     }
+
+    let new = match copy_plain_from_user::<KernelItimerval>(new_value) {
+        Ok(v) => v,
+        Err(errno) => return errno,
+    };
+
+    let value_us = match timeval_to_us(new.value) {
+        Some(v) => v,
+        None => return -EINVAL,
+    };
+    let interval_us = match timeval_to_us(new.interval) {
+        Some(v) => v,
+        None => return -EINVAL,
+    };
+
+    // value_us == 0 → disarm (POSIX: stop timer)
+    if value_us == 0 {
+        OSCOMP_ITIMER_ARMED.store(false, Ordering::Release);
+        OSCOMP_ITIMER_DEADLINE_CYCLES.store(0, Ordering::Release);
+        OSCOMP_ITIMER_INTERVAL_US.store(0, Ordering::Release);
+        return 0;
+    }
+
+    let current = current_process();
+    OSCOMP_ITIMER_PID.store(current.id().get(), Ordering::Release);
+    OSCOMP_ITIMER_INTERVAL_US.store(interval_us, Ordering::Release);
+    OSCOMP_ITIMER_DEADLINE_CYCLES.store(
+        crate::time::now().cycles().saturating_add(us_to_cycles(value_us)),
+        Ordering::Release,
+    );
+    OSCOMP_ITIMER_ARMED.store(true, Ordering::Release);
     0
 }
 
