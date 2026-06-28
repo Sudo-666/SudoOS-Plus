@@ -1,628 +1,983 @@
-# SudoOS (MyOS)
+# SudoOS-Plus：双架构 Rust 操作系统设计方案与 OSCOMP 进展报告
 
-一个使用 **Rust** 编写的业余操作系统内核，目标平台为 **RISC-V 64** 和 **LoongArch 64**。
+> 本文档面向项目设计评审、阶段汇报、比赛提交与后续开发交接。
+> 状态日期：2026-06-28（Asia/Shanghai）
+> 当前分支：`6.28`
+> 当前提交：`a7da2b93923a2039be590d249e6f2837c7e9a669`（`a7da2b9`）
+> 工具链：`nightly-2025-01-18`，Rust 2024 Edition
+> 评分来源：2026-06-28 平台截图
+> 评分总计：**741.9279616944203**
 
-启动期内存管理已成形，双架构均运行于高半内核且通过 MMU 硬件验证。LoongArch TLB refill 已接入，vmalloc/ioremap 均可硬件访问。SMP bring-up、抢占式内核调度、IPI 协作和 kernel-wide TLB shootdown 已在 RISC-V/LoongArch QEMU smoke 中验证。
+## 1. 项目摘要
 
-## 运行效果
+SudoOS-Plus 是一个以 Rust `no_std` 为主体、同时支持 **RISC-V 64** 与
+**LoongArch 64** 的教学/比赛型操作系统内核。项目已从最初的双架构高半内核启动，
+逐步扩展到内存管理、SMP、抢占调度、进程与线程、Linux asm-generic 64 位系统调用、
+ELF 装载、VFS、ext4 只读访问、VirtIO 设备、基础网络接口与 OSCOMP sdcard 测试调度。
 
-**RISC-V 64**
+当前平台截图表明，四个架构/LibC 组合已经在 `basic`、`busybox`、`libcbench` 和
+`lua` 四组形成有效得分，合计 **741.9279616944203**。另一方面，
+`cyclictest`、`iozone`、`iperf`、`libctest`、`lmbench`、`ltp` 和 `netperf`
+仍为 0 分或未计分，说明项目已经拥有可运行的 Linux-like 基础，但距离完整性能、
+网络、文件系统与兼容性覆盖仍有明显空间。
 
+本文严格区分三类事实：
+
+1. **源码存在**：当前提交中可以定位到实现；
+2. **本地验证**：本轮实际执行的静态审计、单元测试或现有构建产物证据；
+3. **平台评分**：仅以附件截图为依据，不用源码推测平台结果。
+
+“实现存在”不自动等同于“平台已通过”；“历史曾通过”也不自动等同于“当前 HEAD
+已回归通过”。
+
+## 2. 当前结论
+
+### 2.1 已经形成的能力
+
+- 双架构裸机启动、高半内核、FDT 解析和统一 `BootInfo`；
+- RISC-V Sv39 与 LoongArch DMW + 四级页表；
+- buddy、slab、large allocation、vmalloc/ioremap 与用户地址空间；
+- 双架构 trap/IRQ、timer、SMP、IPI、TLB shootdown、抢占式调度；
+- Process/Thread 强所有权、fd table、signal state、进程组与 session；
+- Linux asm-generic 64 位 syscall 编号与大规模兼容实现；
+- ELF64、`PT_LOAD`、`PT_INTERP`、auxv、初始用户栈和 `execve`；
+- tmpfs/devfs/procfs/sysfs、pipe、TTY、PTY、mount table；
+- VirtIO block、buffer/page cache、ext4 只读目录和文件路径访问；
+- VirtIO-Net/smoltcp 接口骨架与 socket syscall；
+- OSCOMP sdcard 扫描、测试分组、预算、summary、score 与关机路径。
+
+### 2.2 当前最重要的事实边界
+
+- 附件总分是 **741.9279616944203**，但仓库中没有与截图一一对应的完整平台日志；
+- 当前 `kernel-rv`、`kernel-la` 已存在，并与现有专项文档记录的 hash 一致；
+- `cargo test -p myos-mm` 本轮为 **45 passed / 0 failed**，现有 README 中“24
+  tests”的旧口径已经过时；
+- `oscomp-audit.py` 本轮为 **11 PASS / 2 WARN / 0 FAIL**；
+- newtest 静态审计中 P0、P3、P5、P6 通过，P2、P4 未全部通过；
+- `oscomp_baseline_guard.py` 输出 240 PASS / 9 WARN / 0 FAIL，但其 `check()`
+  函数没有使用 `ok` 参数，当前输出不能作为可信质量门禁；
+- 当前提交是将 P14L/P14M/P14N 整体回退到 P14K 后的基线，仍需同一 HEAD 下的
+  双架构完整 contest 日志闭环。
+
+## 3. 当前平台得分
+
+### 3.1 截图原始数据
+
+| 测试点 | glibc-la | glibc-rv | musl-la | musl-rv | 总分 |
+|---|---:|---:|---:|---:|---:|
+| basic | 97 | 97 | 97 | 97 | 388 |
+| busybox | 53 | 54 | 53 | 54 | 214 |
+| cyclictest | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| iozone | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| iperf | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| libcbench | 27.143920815559106 | 28.37984327461565 | 22.936107443964225 | 25.468090160281417 | 103.9279616944203 |
+| libctest | - | - | 0 | 0 | 0 |
+| lmbench | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| ltp | 0 | 0 | 0 | 0 | 0 |
+| lua | 9 | 9 | 9 | 9 | 36 |
+| netperf | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| **总分** | **186.1439208155591** | **188.37984327461564** | **181.93610744396423** | **185.4680901602814** | **741.9279616944203** |
+
+### 3.2 得分结构
+
+| 维度 | 得分 | 占总分 |
+|---|---:|---:|
+| basic | 388 | 52.30% |
+| busybox | 214 | 28.84% |
+| libcbench | 103.9279616944203 | 14.01% |
+| lua | 36 | 4.85% |
+| 其余七组 | 0 | 0% |
+
+架构与 LibC 汇总：
+
+| 汇总维度 | 得分 |
+|---|---:|
+| RISC-V（glibc + musl） | 373.8479334348971 |
+| LoongArch（glibc + musl） | 368.0800282595234 |
+| glibc（LA + RV） | 374.5237640901747 |
+| musl（LA + RV） | 367.4041976042456 |
+
+### 3.3 得分解读
+
+- 四个组合的 `basic` 都是 97，说明基础 syscall/进程/VFS 路径覆盖较均衡；
+- RISC-V 的 `busybox` 比 LoongArch 每个 LibC 多 1 分，LoongArch 仍有 applet、
+  shell 或动态装载边界；
+- `libcbench` 是四组合差异最大的组，musl-la 最低，表明 libc 线程、同步、
+  调度或时间 ABI 仍是重点；
+- `lua` 四组合均为 9，动态 ELF、基础文件访问和用户态运行链已具备可见成果；
+- 网络测试为 0 不能简单解释为“没有网络源码”：当前确有 socket/VirtIO-Net/smoltcp
+  代码，但评分开关关闭、真实数据面与测试闭环尚未完成；
+- `lmbench` 截图为 0，与仓库中“RV glibc 六项 mini runner”的源码并不矛盾：
+  runner 存在不代表平台评分器已采纳当前输出。
+
+## 4. 设计目标与边界
+
+### 4.1 设计目标
+
+1. 双架构共享尽可能多的内核策略，只把硬件机制留在 `arch/*`；
+2. 采用 Linux asm-generic 64 位 ABI，降低 glibc/musl/BusyBox 移植成本；
+3. 让内存、调度、进程、VFS、驱动形成可组合的真实闭环，而不是测试桩；
+4. 所有评分 PASS 可追溯到真实二进制、参数、退出码和解析结果；
+5. 通过离线 vendor、固定工具链和 `make all` 满足比赛可复现构建。
+
+### 4.2 当前非目标或未完成目标
+
+- 完整 POSIX/Linux signal 语义与 syscall restart；
+- 完整写入型 ext4、日志、崩溃一致性与持久化根文件系统；
+- 完整 TCP/IP 稳定性、DNS、TLS 与真实网络评分；
+- 完整 LTP、libctest、iozone、cyclictest、netperf；
+- 高性能 COW fork、页缓存统一、NUMA/IOMMU 等高级能力；
+- 实体机驱动覆盖；当前主要验证环境仍是 QEMU。
+
+## 5. 总体架构
+
+```text
+固件 / QEMU / OpenSBI
+        │
+        ▼
+arch/riscv64 或 arch/loongarch64
+  启动汇编、MMU、trap、timer、SMP、上下文切换
+        │
+        ▼
+boot + firmware/fdt
+  统一 BootInfo、FDT 验证与硬件资源枚举
+        │
+        ▼
+kernel
+  ├─ memory / heap / vm / user_mm
+  ├─ irq / timer / task / smp / ipi / tlb
+  ├─ process / signal / syscall / exec / user
+  ├─ fs / pipe / tty / devpts / procfs / sysfs
+  ├─ virtio / block / ext4 / device
+  └─ net / rng / rtc
+        │
+        ├────────► mm：通用地址、页表、buddy、slab、VMA
+        ├────────► sync：底层 SpinLock
+        ├────────► runtime：早期控制台
+        └────────► vfs：File/Inode/Errno/flags 等核心抽象
 ```
+
+Cargo workspace 当前包含 9 个成员：
+
+| Crate | 路径 | 主要职责 |
+|---|---|---|
+| `myos-kernel` | `kernel/` | 内核入口与全部系统服务集成 |
+| `arch-riscv64` | `arch/riscv64/` | RISC-V 启动、Sv39、SBI、trap、SMP |
+| `arch-loongarch64` | `arch/loongarch64/` | LoongArch DMW/页表、trap、SMP、QEMU virt |
+| `myos-boot` | `boot/` | 跨架构启动参数模型 |
+| `myos-fdt` | `firmware/fdt/` | FDT blob 验证、解析与资源枚举 |
+| `myos-mm` | `mm/` | 通用内存管理策略与数据结构 |
+| `myos-runtime` | `runtime/` | 字节控制台和格式化适配 |
+| `myos-sync` | `sync/` | 最底层无依赖自旋锁 |
+| `myos-vfs` | `vfs/` | VFS 公共类型、FileOperations 与 fd 语义 |
+
+第三方依赖包括本地 `vendor/virtio-drivers`、`vendor/fdt-reader` 和离线
+`vendor/cargo`。网络协议依赖 `smoltcp 0.11`，启用了 Ethernet、IPv4、IPv6、
+TCP、UDP 与 raw socket 特性。
+
+## 6. 启动与初始化流程
+
+### 6.1 RISC-V 64
+
+```text
+OpenSBI
+  → 0x80200000 低地址 _start
+  → 构造临时 Sv39 页表
+  → 写 satp / sfence.vma
+  → 跳转 0xffffffff80000000 高半内核
+  → 设置 gp、sp、清 BSS
+  → rust_entry
+  → kernel_main
+```
+
+### 6.2 LoongArch 64
+
+```text
+QEMU direct boot
+  → 0x200000 _start
+  → 配置 DMW0（uncached）/ DMW1（cached）
+  → CRMD.PG 开启
+  → 切换 cached 高地址执行
+  → 解析 EFI-style 参数与 FDT
+  → rust_entry
+  → kernel_main
+```
+
+### 6.3 公共 `kernel_main` 顺序
+
+当前源码中的关键顺序如下：
+
+1. 读取并验证 FDT；
+2. 枚举内存、CPU、VirtIO MMIO、PCI host 和 initrd；
+3. 构造物理内存排除表；
+4. 验证分页策略和 early frame allocator；
+5. 映射 FDT、内核镜像、direct map 与 SMP trampoline；
+6. 安装最终页表，结束 early allocator 生命周期；
+7. 初始化 buddy page allocator 和全局 heap；
+8. 初始化 trap、IRQ、clock、timer、vmalloc；
+9. 初始化 VirtIO、设备模型、RNG、网络、RTC、fault；
+10. 初始化 VFS，挂载 `/proc`、`/sys`，解包 initramfs；
+11. 发现并挂载 `/dev/vda`，建立 `/mnt/sdcard` 测试环境；
+12. 初始化 TTY、任务系统、SMP secondary CPU 与 workqueue；
+13. 运行用户态/BusyBox/sdcard verifier；
+14. 输出 `SMOKE_TEST: PASS` 或 OSCOMP summary/score；
+15. 比赛模式统一关机，普通 smoke 进入 idle。
+
+初始化顺序的核心约束是：页分配器先于 heap，trap/IRQ 在中断打开前完成，任务系统
+先于 secondary CPU 正式参与调度，VFS 与动态装载依赖的设备/内存子系统必须先就绪。
+
+## 7. 各子系统详细实现
+
+### 7.1 架构抽象与启动协议
+
+- `rust_entry(arg0, arg1, arg2)` 是双架构公共 Rust 入口；
+- 每个架构把固件参数转换为 `BootContext`，再生成公共 `BootInfo`；
+- 架构 crate 负责 CSR/寄存器、页表格式、trap frame、timer 与上下文切换；
+- 内核策略代码通过 `crate::arch` 选择当前架构；
+- 非 RISC-V/LoongArch 架构会在编译期失败，避免静默构建错误目标。
+
+### 7.2 物理内存与内核堆
+
+启动期先使用固定容量 `MemoryMap` 和 `EarlyFrameAllocator`，从 FDT RAM 中排除固件、
+内核镜像、FDT、initrd、启动栈和架构保留区。正式阶段把剩余内存交给 buddy，
+按 DMA32/Normal zone 管理，并维护页引用计数。
+
+堆分为两条路径：
+
+- 小对象：9 个 size class（8 B 到 2048 B）的 slab cache；
+- 大对象：向 page provider 申请连续页，并在 allocation header 中记录元数据。
+
+`KernelVirtualAllocator` 为 vmalloc/ioremap 预留带 guard page 的虚拟区间；
+`RuntimePageTable` 负责运行期 map/protect/unmap/translate。释放 API 消费 token，
+降低 double free/unmap 风险。
+
+### 7.3 页表、VMA 与用户地址空间
+
+- RISC-V：3 级 Sv39、512 项页表、39 位虚拟地址；
+- LoongArch：4 级页表、DMW 直映、TLB refill 与硬件页表 CSR；
+- 通用 `MappingOptions` 强制 W^X，拒绝不安全的 writable + executable；
+- `VmAreaSet` 提供有序插入、gap 查找、split/coalesce；
+- `AddressSpace` 管理 brk、mmap、munmap、mprotect；
+- `UserMm` 管理独立根页表、ASID generation、active CPU mask 与 per-mm TLB；
+- fault pipeline 区分 anonymous、file、device、COW、protection 与 segv；
+- 用户拷贝失败按 `-EFAULT` 返回，内核 fault 默认 fail-fast。
+
+### 7.4 中断、时间与并发
+
+- `trap` 安装双架构入口并验证 frame guard；
+- `irq` 把 timer/software/external/platform 中断统一分类；
+- `time` 提供 monotonic tick 与 clockevent；
+- `timer` 提供 one-shot、取消、timeout 与队列；
+- `workqueue` 支持普通与 delayed work；
+- `IrqSpinLock` 保存/恢复本地中断状态；
+- `lockdep` 记录 LockClass/LockRank 和当前 CPU 持锁链；
+- `tracked_spin` 增加 owner、迁移固定与 lockdep 跟踪。
+
+### 7.5 SMP、IPI、调度与 TLB
+
+双架构最多按 `MAX_CPUS=8` 管理 CPU。CPU 生命周期区分 discovered、online、
+active 与 IPI-ready。secondary CPU 使用独立启动栈、trap 状态和 timer。
+
+调度器当前实现：
+
+- per-CPU FIFO round-robin；
+- idle task；
+- 抢占与 `sched_yield`；
+- WaitQueue/Completion；
+- work stealing 与任务迁移；
+- task reaper 与 deferred 资源回收；
+- 64 KiB guarded kernel stack。
+
+IPI mailbox 支持 reschedule、TLB shootdown 和 call-function。TLB request 使用
+request ID、target mask、completion mask，支持 page/range 与长范围 fallback。
+
+### 7.6 进程、线程与 futex
+
+`Process` 拥有：
+
+- `UserMm`；
+- `FileTable`；
+- `SignalState`；
+- `Credentials`；
+- root/cwd；
+- child/zombie 状态；
+- process group/session。
+
+`Thread` 拥有用户 trap frame、TLS、clear-child-tid、robust list、signal mask 和
+scheduler task。`clone`/`clone3` 支持 fork-like 进程和 `CLONE_VM` 线程分支，
+处理 `CLONE_SETTLS`、`CLONE_CHILD_CLEARTID`；futex key 包含 mm ASID，避免不同
+地址空间同虚拟地址相互干扰。
+
+### 7.7 ELF、动态装载与用户栈
+
+`elf.rs` 负责 ELF64 header/program header 校验与 metadata；`exec.rs` 负责真正
+构造进程镜像：
+
+- 映射 `PT_LOAD`，按 ELF flags 设置权限；
+- 处理 BSS 清零；
+- 支持静态 ELF 与 `ET_DYN`；
+- 支持 `PT_INTERP` 动态解释器交接；
+- 构造 argc/argv/envp/auxv；
+- 提供 `AT_PAGESZ`、`AT_ENTRY`、`AT_PHDR`、`AT_PHNUM`、`AT_RANDOM`、
+  UID/GID、HWCAP、PLATFORM 等；
+- `execve` 替换当前 mm，执行 `CLOEXEC`，销毁旧地址空间。
+
+sdcard 启动路径会把 glibc/musl loader 和共享库从 ext4 物化到 `/lib`、`/lib64`
+与 `/usr/lib`。当前 LoongArch 的 loader 别名与 P4 审计规则仍有契约不一致。
+
+### 7.8 系统调用兼容
+
+`syscall.rs` 当前声明 118 个 asm-generic 编号常量；`user.rs` 负责 dispatch 和
+具体策略。主要覆盖：
+
+| 类别 | 代表 syscall |
+|---|---|
+| 文件 | openat/close/read/write/readv/writev/pread64/pwrite64/lseek/fstat/statx |
+| 目录/VFS | getcwd/chdir/getdents64/mkdirat/unlinkat/renameat/renameat2/linkat/symlinkat |
+| fd | dup/dup3/fcntl/ioctl/pipe2/fsync/fdatasync/ftruncate |
+| 内存 | brk/mmap/munmap/mprotect/pkey_mprotect/mlock/munlock |
+| 进程 | clone/clone3/execve/exit/exit_group/wait4/getpid/getppid/gettid |
+| 线程 | set_tid_address/set_robust_list/get_robust_list/futex/rseq |
+| signal | kill/tkill/tgkill/rt_sigaction/rt_sigprocmask/rt_sigreturn/altstack |
+| 时间 | nanosleep/clock_gettime/clock_getres/clock_nanosleep/gettimeofday/setitimer |
+| 调度 | sched_yield/affinity/scheduler/param/priority/rr_get_interval |
+| 系统 | uname/sysinfo/prlimit64/getrusage/getrandom/prctl/syslog |
+| 网络 | socket/bind/listen/accept/connect/sendto/recvfrom/shutdown/sockopt |
+
+并非每个兼容 syscall 都实现了 Linux 的全部 flag、竞态和边界语义；表格表示当前
+存在可定位实现，不表示 LTP 全通过。
+
+### 7.9 VFS、文件系统与终端
+
+`myos-vfs` 定义 `File`、`FileOperations`、open flags、poll events、stat、
+dirent 和 errno。内核 `fs` 层在其上提供：
+
+- tmpfs 根；
+- devfs 与标准设备；
+- initramfs `newc` 解包；
+- mount table；
+- procfs 与 sysfs；
+- symlink/hardlink；
+- path resolve、cwd/root；
+- ext4 subtree/单文件物化；
+- 标准 fd 0/1/2。
+
+pipe 支持 blocking read/write、EOF、`EPIPE`、nonblock 和 poll。TTY 支持
+canonical input、echo、backspace、Ctrl-C、termios/winsize 与前台进程组；
+`devpts` 提供 `/dev/ptmx` 和 `/dev/pts/<N>`。
+
+ext4 当前重点是只读 superblock、inode、extent/indirect block、目录遍历与文件读取。
+尚未形成完整写入、journal 与崩溃一致性闭环。
+
+### 7.10 设备、VirtIO 与块层
+
+`device.rs` 提供类似 Linux 的 Bus/Device/Driver 抽象。`virtio.rs` 从 FDT
+VirtIO-MMIO 或 PCI host 探测设备，通过 `SudoHal` 提供 DMA、物理/虚拟地址转换。
+
+块层包括：
+
+- `BlockDevice` trait 与注册表；
+- request queue；
+- read_at/write_at；
+- bounded buffer cache；
+- page cache；
+- flush；
+- memory block device 自测；
+- VirtIO block 包装和 `/dev/vda`。
+
+### 7.11 网络、随机数与 RTC
+
+网络目录已经包含：
+
+- `NetDevice` trait 和接口注册表；
+- VirtIO-Net raw 驱动包装；
+- AF_INET socket；
+- TCP/UDP socket state；
+- socket、bind、listen、accept、connect、sendto、recvfrom、shutdown；
+- poll、FIONBIO、部分 setsockopt/getsockopt。
+
+但当前 `OSCOMP_ENABLE_IPERF_MINI=false`、`OSCOMP_ENABLE_NETPERF_MINI=false`，
+且平台截图两组均为 0。因此网络应标记为“源码路径存在、静态 P6 审计通过、评分未
+闭环”，不能标记为完整完成。
+
+RNG 使用 ChaCha20 DRBG，并可从 VirtIO-RNG 播种；RTC 提供统一读取和 `/dev/rtc`
+框架。P2 审计当前指出 `rtc.rs` 缺少其期待的 `RTC_RD_TIME` ioctl 常量。
+
+### 7.12 OSCOMP 评分执行器
+
+当前流程为：
+
+```text
+ext4 / sdcard
+  → bounded 目录扫描与测试脚本发现
+  → arch × libc × group 分类
+  → whitelist / heavy-skip / preflight
+  → direct runner 或 shell runner
+  → 真实退出状态 raw
+  → PASS / FAIL / SKIP / timeout / signal
+  → OS COMP SUMMARY + score
+  → 平台关机
+```
+
+当前关键开关：
+
+| 开关 | 值 | 影响 |
+|---|---:|---|
+| `OSCOMP_ENABLE_LMBENCH_MINI` | `true` | 仅 RV glibc mini 路径 |
+| `OSCOMP_ENABLE_LIBCBENCH_EXTRA` | `false` | 不扩展 libcbench |
+| `OSCOMP_ENABLE_CYCLICTEST_MINI` | `false` | cyclictest 关闭 |
+| `OSCOMP_ENABLE_IPERF_MINI` | `false` | iperf 关闭 |
+| `OSCOMP_ENABLE_NETPERF_MINI` | `false` | netperf 关闭 |
+| `OSCOMP_ENABLE_LTP_ALLOWLIST` | `false` | LTP 关闭 |
+| RV 总预算 | 420,000 ms | 到期停止并保留关机余量 |
+| LA 总预算 | 240,000 ms | 到期停止并保留关机余量 |
+| RV glibc lmbench 预算 | 320,000 ms | 六项 mini workload |
+
+RV glibc lmbench mini 运行 `lat_syscall` 的 null/read/write/stat/fstat/open 六项，
+捕获真实 stdout/stderr 后解析 microseconds。解析失败必须 fail-closed。
+
+当前 P14K 的 LA busybox direct runner 含 55 个 case，并重新包含后台
+`sleep 5` + `kill $!`，同时允许 glibc outer-shell fallback；这两条路径均有历史
+不稳定证据，是当前最高优先级风险之一。
+
+## 8. 当前进度矩阵
+
+| 子系统 | 源码状态 | 本轮证据 | 平台得分关联 | 判定 |
+|---|---|---|---|---|
+| 双架构构建 | 已实现 | 两个内核产物存在；总审计 PASS | 四组合均有分 | 稳定基线 |
+| 启动/FDT/高半 | 已实现 | 构建产物 + 大量审计脚本 | basic | 稳定基线 |
+| 内存管理 | 已实现 | 45/45 单测通过 | basic/libcbench | 已验证 |
+| SMP/调度 | 已实现 | P3 静态审计通过；历史 smoke 文档 | libcbench | 已实现，需当前动态回归 |
+| 进程/线程/futex | 已实现 | P5 静态审计通过 | busybox/libcbench | 已实现 |
+| syscall ABI | 大规模实现 | P0 静态审计通过 | basic/busybox/lua | 已实现 |
+| ELF/exec | 静态/动态路径存在 | P4 审计未全通过 | busybox/lua | 部分闭环 |
+| VFS/tmpfs/devfs | 已实现 | basic/busybox 有平台分 | basic/busybox | 已验证一部分 |
+| procfs/sysfs | 已实现 | 源码与启动挂载路径 | busybox/LTP | 未单独评分 |
+| TTY/PTY/pipe | 已实现基础 | BusyBox 得分 | busybox | 基础闭环 |
+| VirtIO block | 已实现 | 总审计 PASS | sdcard/全部组 | 已形成底座 |
+| ext4 | 只读路径为主 | 总审计 PASS；P2 有 RTC 缺口 | sdcard/全部组 | 部分闭环 |
+| 网络 | 接口与 syscall 存在 | P6 静态审计通过 | iperf/netperf | 评分为 0 |
+| signal | 基础 delivery/return | syscall 与审计证据 | libcbench/LTP | 不完整 |
+| lmbench mini | 源码存在 | 当前截图 0 分 | lmbench | 未形成评分闭环 |
+| 质量门禁 | 脚本丰富 | baseline guard 逻辑失真 | 提交可靠性 | P0 修复项 |
+
+## 9. 本轮可复现实测
+
+### 9.1 `myos-mm` 单元测试
+
+```text
+45 passed
+0 failed
+0 ignored
+```
+
+覆盖地址空间、ASID、CPU mask、early allocator、fault、MemoryMap、页表几何、
+W^X、用户栈增长、TLB generation handshake、VMA split/coalesce、buddy refcount
+和 vmalloc guard。
+
+当前仍有 6 条 `unused_parens` 编译 warning，不影响测试结果，但应在冻结后清理。
+
+### 9.2 提交总审计
+
+```text
+PASS=11
+WARN=2
+FAIL=0
+```
+
+两条 WARN：
+
+1. 本地 `.cargo` 存在，不能依赖 judge clone 保留隐藏目录；
+2. 原始 `Makefile.project` 含 smoke/QEMU/stress，必须确保根 `Makefile all`
+   只走比赛构建包装。
+
+### 9.3 newtest 静态里程碑
+
+| 审计 | 结果 | 说明 |
+|---|---|---|
+| P0 ABI | PASS | uname、auxv、platform/HWCAP、console lockdep |
+| P2 VFS | FAIL | `rtc.rs` 未满足 `RTC_RD_TIME` 常量检查 |
+| P3 scheduler | PASS | scheduler/affinity/param/priority ABI |
+| P4 dynamic ELF | FAIL | LA loader 路径与 `/lib64 → /lib` 审计契约不满足 |
+| P5 clone/futex/TLS | PASS | CLONE_VM、TLS、clear-child-tid、robust list |
+| P6 network | PASS | socket syscall、poll、FIONBIO、sockopt |
+
+P4 的第二项与当前源码设计存在直接冲突：源码明确把 `/lib64` 作为真实目录而不是
+指向 `/lib` 的 symlink。后续必须选择并统一“运行时真实需求”和“审计契约”，不能
+只为通过字符串检查破坏动态链接器路径。
+
+### 9.4 baseline guard
+
+脚本当前打印：
+
+```text
+PASS: 240
+WARN: 9
+FAIL: 0
+BASELINE GUARD: OK
+```
+
+但 `check(level, name, ok, detail)` 直接按调用方 `level` 归类，`ok` 没有参与判断。
+因此即使 `ok=False`，`check(PASS, ..., False)` 仍会进入 PASS。当前还存在可复现
+反例：guard 宣称 LA busybox 排除了后台 kill case，而 `kernel/src/user.rs` 实际仍有
+`sh -c 'sleep 5' & ./busybox kill $!`。
+
+结论：这 240 个 PASS 只能视为检查清单被执行，不能作为可信 CI gate。
+
+## 10. 当前构建产物
+
+| 产物 | 大小 | SHA-256 | 文件时间 |
+|---|---:|---|---|
+| `kernel-rv` | 9,761,048 B | `b48ef6588457a4f7655bcbcb65e1fb5aee6518812e8badc75caa1c24a1bdc496` | 2026-06-28 19:40:41 +0800 |
+| `kernel-la` | 8,003,496 B | `3e587b092589abce624aa74d624e909d9bbb9724ac7529f2e6aaeef39400c7f0` | 2026-06-28 19:40:41 +0800 |
+
+这只能证明对应二进制存在且可被审计识别，不等同于当前 HEAD 已完成一轮完整 contest。
+
+## 11. 构建、运行与验证
+
+### 11.1 比赛构建
+
+```bash
+make all
+```
+
+根 `Makefile` 的 `all` 只调用 `scripts/oscomp-build.sh`，目标是生成
+`kernel-rv` 和 `kernel-la`，不应触发 QEMU、smoke、stress 或网络操作。
+
+### 11.2 开发构建与 QEMU
+
+```bash
+make build ARCH=riscv64
+make build ARCH=loongarch64
 make run ARCH=riscv64
-```
-
-```
-MyOS
-  architecture : riscv64    boot cpu: 0    device tree: 0x8fe00000
-
-fdt:             model: riscv-virtio,qemu   compatible: riscv-virtio
-  cpu: 1    memory: 256 MiB    virtio-mmio: 8 devices
-
-physical memory:         253 MiB usable
-virtual memory:          Sv39, kernel @ 0xffffffff80000000
-
-kernel image mapping:
-  text             phys 0x80400000 → virt 0xffffffff80000000
-  rodata           phys 0x80415000 → virt 0xffffffff80015000
-  data/bss/stack   phys 0x8041f000 → virt 0xffffffff8001f000
-
-RISC-V final address space:
-  current PC      : 0xffffffff800035b0
-  high text       : 0xffffffff80000000
-  direct map      : verified
-  low boot mapping: removed
-```
-
-**LoongArch 64**
-
-```
 make run ARCH=loongarch64
 ```
 
-```
-MyOS
-  architecture : loongarch64    device tree: 0x100000    system table: 0x200
+普通开发目标会转发到 `Makefile.project`。
 
-LoongArch DMW:
-  DMW0 (uncached): 0x8000000000000001   DMW1 (cached): 0x9000000000000011
-  high execution: verified
-
-fdt:             compatible: linux,dummy-loongson3   cpu: 1   memory: 256 MiB
-
-physical memory:         251 MiB usable
-virtual memory:          LA64 DMW + 4-level paging, kernel @ 0x9000000000400000
-
-kernel image mapping:
-  text             phys 0x400000 → virt 0x9000000000400000
-  rodata           phys 0x41b000 → virt 0x900000000041b000
-  data/bss/stack   phys 0x425000 → virt 0x9000000000425000
-```
-
-## ELF 布局验证
-
-RISC-V ELF program headers（`llvm-readelf -lW`）：
-
-```
-Entry point: 0x80200000
-
-Type  VirtAddr            PhysAddr            Flg
-LOAD  0x80200000          0x80200000          R E   (.boot.text)
-LOAD  0x80201000          0x80201000          R     (.boot.rodata)
-LOAD  0x80202000          0x80202000          RW    (.boot.bss, NOBITS)
-LOAD  0xffffffff80000000  0x80400000          R E   (.text)
-LOAD  0xffffffff80015000  0x80415000          R     (.rodata)
-LOAD  0xffffffff8001f000  0x8041f000          RW    (.bss + .boot_stack)
-```
-
-关键不变量：
-- boot 段 `VirtAddr == PhysAddr`，全部位于 `0x80200000` 附近
-- kernel 段 `VirtAddr` 位于 `0xffffffff80000000`，`PhysAddr` 位于 `0x80400000`
-- ELF 无运行时重定位
-
-## 目标架构
-
-| 架构 | 页表 | 内核链接 | 内核物理 | Boot 物理 | MMU | 状态 |
-|------|------|---------|---------|----------|-----|------|
-| RISC-V 64 | Sv39 (3级) | `0xffffffff80000000` | `0x80400000` | `0x80200000` | SATP | ✅ |
-| LoongArch 64 | LA64 (4级) + DMW | `0x9000000000400000` | `0x400000` | `0x200000` | DMW | ✅ |
-
-## Crate 架构
-
-```
-kernel ← boot, fdt, mm, runtime, arch-riscv64, arch-loongarch64
-```
-
-| Crate | 路径 | 职责 |
-|-------|------|------|
-| `myos-kernel` | `kernel/` | 入口 → 设备发现 → 内存初始化 → 页表构造 → MMU 切换 |
-| `myos-boot` | `boot/` | `BootInfo` builder, `BootAddress` |
-| `myos-fdt` | `firmware/fdt/` | FDT 验证 + parser 封装 + 设备枚举 |
-| `myos-mm` | `mm/` | `PhysAddr`, `MemoryMap`, `PagePermissions`, `MappingOptions`, `EarlyFrameAllocator` |
-| `myos-runtime` | `runtime/` | `ByteConsole` trait + `ConsoleWriter<C>` |
-| `arch-riscv64` | `arch/riscv64/` | 两阶段启动汇编、Sv39 页表、direct-map、UART |
-| `arch-loongarch64` | `arch/loongarch64/` | DMW 窗口启动、EFI system table、LA64 页表 |
-
-## 启动流程
-
-```
-RISC-V:                               LoongArch:
-  OpenSBI → _start (0x80200000)          QEMU → _start (0x200000)
-    ├─ 临时 Sv39 页表构造                  ├─ DMW 窗口配置
-    ├─ satp 写入                           ├─ CRMD.PG=1
-    ├─ jr KERNEL_VIRT_BASE                ├─ jirl → cached DMW
-    └─ __riscv_high_entry                  └─ rust_entry (高地址)
-      ├─ BSS 清零 / gp / sp
-      └─ rust_entry (高地址)
-           └─ kernel_main
-                 ├─ FDT 解析
-                 ├─ 物理内存映射 (6 步排除)
-                 ├─ 虚拟布局 + 页表策略
-                 ├─ EarlyFrameAllocator + BootPageTable
-                 ├─ 内核镜像映射 (高半)
-                 ├─ direct-map 构造
-                 ├─ switch_sv39_root / DMW 验证
-                 ├─ trap vector 安装
-                 ├─ IRQ dispatch 初始化
-                 ├─ time/tick 计数初始化
-                 └─ wfi / idle 0
-```
-
-## 单元测试
+### 11.3 常用验证
 
 ```bash
-cargo test -p myos-mm    # 24 tests
+cargo test -p myos-mm
+make oscomp-audit
+make oscomp-baseline-check
+make oscomp-newtest-full-audit
+make check
+make verify
 ```
 
-## 构建 & 运行
+注意：在 baseline guard 修复前，`make oscomp-baseline-check` 返回 0 不能证明所有
+条件为真；`make oscomp-newtest-full-audit` 当前会因 P2/P4 失败而停止。
+
+### 11.4 本地 contest
+
+需要 `sdcard-rv.img` / `sdcard-la.img`：
 
 ```bash
-make build ARCH=riscv64    # 构建
-make run ARCH=riscv64      # 构建 + 运行
-make run-riscv64           # 快捷命令
-make run-loongarch64
-
-make debug ARCH=riscv64    # GDB (端口 1234)
-cargo test -p myos-mm      # 单元测试 (24 tests)
-make check                 # source tree + fmt + host tests + 双架构 build/clippy
-make smoke-all             # 双架构 QEMU 串口 smoke
-make smoke-smp-all         # 双架构 SMP QEMU smoke
-make stress-smp            # 可配置 SMP smoke 矩阵
-make verify                # check + smoke-all + smoke-smp-all
-make clean
+make contest-rv
+make contest-la
 ```
 
-常用 stress 示例：
-
-```bash
-make stress-smp STRESS_ARCHES="riscv64 loongarch64" STRESS_SMPS="1 2 4 8"
-make stress-smp STRESS_ARCHES="riscv64 loongarch64" STRESS_PROFILES="debug release" STRESS_MEMS="64M 256M 1G"
-```
-
-stress 日志会写入 `build/stress-smp/`，每个 case 保存配置和串口输出，便于定位偶发失败。
-
-## 工程文档
-
-- [`docs/boot-order.md`](docs/boot-order.md)：当前启动顺序和初始化依赖。
-- [`docs/context-rules.md`](docs/context-rules.md)：early/task/idle/hardirq/panic 上下文规则。
-- [`docs/locking.md`](docs/locking.md)：当前锁、锁顺序草案和 M5 lockdep-lite 前置约束。
-- [`docs/cpu-lifecycle.md`](docs/cpu-lifecycle.md)：CPU discovered/online/active/IPI-ready 生命周期。
-- [`docs/scheduler-state-machine.md`](docs/scheduler-state-machine.md)：任务状态机、M4C/M4C2 verifier 证明边界。
-- [`docs/m10-completion.md`](docs/m10-completion.md)：M10 ELF64 loader、initramfs、初始 exec 路径完成记录。
-- [`docs/m12-m13-process-tty.md`](docs/m12-m13-process-tty.md)：M12/M13 pipe、signal 基础、process/session ABI、TTY 完成记录。
-- [`docs/m11-vfs.md`](docs/m11-vfs.md)：M11 VFS/fd table 集成记录和剩余边界。
-
-## 当前进度
-
-| 子系统 | 状态 | 说明 |
-|--------|------|------|
-| 构建系统 | ✅ | Cargo workspace（8 crates + 5 vendor），双架构 build/clippy/smoke 全绿 |
-| RISC-V 两阶段启动 | ✅ | 低物理 entry.S → 静态 Sv39 → 高半内核 |
-| LoongArch DMW 启动 | ✅ | DMW0/1 窗口 → cached high execution |
-| FDT 设备枚举 | ✅ | model/compatible/cpu/memory/virtio-mmio |
-| 物理内存映射 | ✅ | 6 步排除管线, MemoryMap 事务语义 |
-| 虚拟内存布局 | ✅ | Sv39 + LA64 双策略 |
-| 页表策略 | ✅ | W^X 强制, MappingOptions 校验 |
-| 早期帧分配器 | ✅ | checkpoint/restore |
-| 启动页表构造 | ✅ | BootPageTable + map_page + translate |
-| 内核镜像映射 | ✅ | 高半 text/rodata/data |
-| RAM direct-map | ✅ | Sv39 页表 / DMW 窗口 |
-| MMU 启用 | ✅ | RISC-V SATP/Sv39 + LoongArch TLB refill 均已硬件验证 |
-| 低地址映射撤销 | ✅ | RISC-V: removed / LoongArch: DMW2=0 |
-| trap 分发 | ✅ | 双架构 TrapFrame、frame guard、连续异常 + 寄存器恢复自检、breakpoint 验证 |
-| IRQ 子系统 | ✅ | 统一 InterruptSource dispatch，未处理 IRQ fail-fast |
-| time/tick | ✅ | monotonic tick 计数 + 周期 timer armed + timer IRQ 验证 |
-| 物理页分配器 | ✅ | buddy allocator, DMA32/Normal zone, page refcount, early handoff 校验 |
-| 内核堆 | ✅ | global allocator (alloc crate), slab 小对象, buddy-backed large allocation |
-| VMA/address space | ✅ | VmAreaSet、AddressSpace、brk metadata、mmap gap search |
-| page fault policy | ✅ | anonymous/file/device/COW/protection/segv 分类模型 |
-| page fault handler | ✅ | 双架构 fault trap 解码、统一 PageFault pipeline、kernel fail-fast; user demand paging 待 P4b |
-| runtime page table | ✅ | 双架构 buddy-backed table pages、map/protect/unmap/translate，RISC-V 写入活动页表 |
-| kernel vmalloc | ✅ | vmalloc/vfree/ioremap/iounmap API，guard page，双架构硬件生命周期验证 |
-| TLB 模型 | ✅ | RISC-V sfence.vma + LoongArch TLB refill/invtlb；kernel TLB request v2 + request ID/target/completion mask |
-| IRQ-safe 锁 | ✅ | IrqSpinLock 保存/恢复本地中断状态，嵌套锁自检 |
-| SMP bring-up | ✅ | 双架构 secondary CPU 启动、online/ready mask、per-CPU trap/timer/stack、IPI delivery |
-| 内核调度器 | ✅ | 抢占式 per-CPU FIFO round-robin、idle task、wait queue、work stealing、任务迁移、资源回收 |
-| lockdep | ✅ | LockClass/LockRank、instance-aware runtime 违规检测、IRQ-off 周期追踪 |
-| WaitQueue / Completion | ✅ | 阻塞/唤醒语义、switching-out race 检测、complete-all、quiescent reinit |
-| IPI mailbox | ✅ | publish/coalesce/drain、AtomicU64 doorbell、payload 消息传递 |
-| cross-CPU call-function | ✅ | 预分配请求槽、many-target/single-target 回调、completion ordering |
-| TLB shootdown | ✅ | 显式 request ID、target/completion mask、page/range/long-range fallback、remote ACK |
-| CPU lifecycle | ✅ | discovered/online/active/IPI-ready 显式状态机、IPI_READY_MASK 与 ONLINE_MASK 解耦 |
-| tracked spin lock | ✅ | Rank-aware SpinLock、IRQ-enabled contention、migration pinning、instance-aware lockdep |
-| idle/IPI 确定性验证 | ✅ | target timer disable、IRQ-disabled recheck、pending IPI at wait、single reschedule IPI |
-| M5 并发基础 | ✅ | m5-quick 4/4 PASS、双架构 SMP=1/2/4/8 smoke 全绿、200 轮 pressure test |
-| 系统调用 | ✅ | Linux 通用 64 位 ABI 核心；M14 已补 symlink/link、ppoll、termios、nanosleep、musl 基础 syscall |
-| ELF / initramfs | ✅ | ELF64 PT_LOAD loader、newc initramfs、Linux 初始用户栈、kernel execve `/init` 路径 |
-| VFS / fd table | ✅ | myos-vfs、per-process fd table、tmpfs/devfs、目录 syscall、dup/fcntl、cwd、symlink/hardlink |
-| 设备驱动 | 🚧 | virtio-mmio probe、vendor virtio-blk 初始化、DMA32 HAL、block device 包装、`/dev/vda` 注册已接；virtio-net 待后续 |
-| 文件系统 | 🚧 | tmpfs/devfs 已接 VFS；mount table、block devfs、buffer/page cache、`fsync` 和 ext4 superblock gate 已验证；完整 lwext4 文件操作待后续 |
-
-## 下一步
-
-M5–M13 的可运行底座已冻结。M10 已完成 ELF64 loader、newc initramfs、Linux
-初始用户栈和 kernel execve `/init` 路径；M11 已完成 VFS/fd table、tmpfs/devfs、
-目录 syscall、cwd 相对路径和 fd 复制/控制；M12/M13 已完成 fork-like `clone(2)`、
-`wait4(2)` 阻塞回收、用户态 `execve(2)` 当前镜像替换、blocking pipe、signal mask/
-pending 基础、process group/session ABI、console TTY 和 BusyBox 相邻基础 syscall。
-M14 已推进静态 BusyBox 相邻 syscall、tmpfs symlink/hardlink、TTY termios/winsize、
-pipe readiness 和 `nanosleep(2)`。M15 已接入 vendor `virtio-drivers` 的
-virtio-mmio/virtio-blk 初始化、DMA32 HAL、内核 block layer、bounded buffer/page
-cache、VFS mount table、block devfs 节点和 ext4 superblock gate；完整 lwext4 文件操作
-与 M16 动态 ELF/musl 仍未完成，真实边界见
-[`docs/m14-m16-progress.md`](docs/m14-m16-progress.md)。
-
-## M5 之后完整路线图
-
-M11 完成后内核底座已具备：双架构启动、高半内核、SMP、抢占、等待队列、IPI、TLB
-shootdown、lockdep、独立用户 MM、Process/Thread 强所有权、scheduler loaded-mm、
-Linux 通用 64 位 syscall ABI、ELF/initramfs 启动路径、VFS/fd table 和 tmpfs/devfs。
-M12/M13 进一步补上 fork-like clone、execve 当前镜像替换、wait4 阻塞回收、blocking
-pipe 和 console TTY。M14 进一步补上 symlink/hardlink、termios/ioctl、ppoll、
-nanosleep 和 musl 基础 syscall。仍待完成 COW、完整 signal delivery、select、
-块设备、mount table、根文件系统和动态链接。
-
-接下来的目标按依赖顺序分为以下几层。
-
-### 目标阶梯
-
-| 目标 | 里程碑 | 核心依赖 |
-|------|--------|---------|
-| hello-user | M7/M8 | 最小用户态 + syscall write/exit |
-| 简易 Shell | M13 | Process、ELF、VFS、fork/exec/wait、pipe、基础 signal、console TTY |
-| 静态 BusyBox | M14 | musl 静态编译、更完整 syscall、mmap/brk、signal/ioctl/poll |
-| Vim | M14 | 与 BusyBox 同组 syscall：terminal I/O + signal + 文件读写 |
-| 本地 Git | M17 | VFS 正确性（fsync/rename/lockfile）+ mmap + zlib |
-| GitHub clone/push | M18 | TCP/IP、DNS、TLS、CA、libcurl |
-
-### 推荐最近执行顺序
-
-```
-M5  ← 已完成
-  ↓
-M6  timer queue / timeout / workqueue
-  ↓
-M7  U-mode / PLV3 + write/exit
-  ↓
-M8  per-process AddressSpace + user fault
-  ↓
-M9  Process/Thread + Linux syscall ABI  ← 已完成
-  ↓
-M10 ELF + kernel execve + initramfs  ← 已完成
-  ↓
-M11 VFS + fd table  ← 已完成
-  ↓
-M12 fork/exec/wait/pipe/signal  ← 已完成
-  ↓
-M13 console TTY + 简易 shell 基础  ← 已完成
-  ↓
-M14 静态 BusyBox
-  ↓
-M15 virtio-blk + ext4
-  ↓
-M16 动态 musl
-  ↓
-M17 本地 Git
-  ↓
-M18 网络栈 + TLS + GitHub
-```
-
-**建议 M10（ELF/initramfs）和 M11（VFS/fd table）换序**：先做最小 VFS
-（tmpfs + devfs + 几个 fd syscall）再 execve，这样 hello-user 之后立刻能
-`open("/dev/console")` 和 `write(fd)`，不用把文件操作硬编码在 syscall 里。
-
-### M6：时间、超时和工作队列
-
-在进入用户态前先补齐内核基础设施：
-
-- monotonic clock
-- one-shot timer
-- timer queue
-- sleep
-- WaitQueue timeout
-- Completion timeout
-- delayed work
-- workqueue
-- I/O timeout 基础
-
-**为什么先做**：`nanosleep` 需要 timer queue，驱动需要 timeout，网络需要
-retransmission timer，异步资源回收需要 workqueue，用户进程不能依赖 scheduler
-tick 轮询等待。
-
-**验收**：`sleep 10ms`、`sleep 1s`、取消 timer、timer 与 task exit 并发、
-多 CPU 同时添加 timer、无 tick 时 one-shot 唤醒。
-
-### M7：最小用户模式
-
-只做最小闭环：内核创建地址空间 → 映射一页用户代码 → 映射用户栈 → 进入
-U-mode/PLV3 → 用户执行 syscall → 内核返回用户态 → `sys_exit`。
-
-先只实现 `write(1, "hello user\n", 11)` + `exit(0)`。
-
-需要：
-- RISC-V U-mode 入口 / LoongArch PLV3 入口
-- 用户 trap frame
-- syscall entry/return
-- 用户栈
-- 用户地址检查
-- `copy_from_user/copy_to_user`
-- `sys_write`
-- `sys_exit`
-
-这一阶段不要做 fork、动态链接、ext4。
-
-### M8：真正的用户 MM
-
-每进程独立页表根、内核高半映射共享、地址空间切换、ASID、`mm.active_cpus`、
-per-mm TLB shootdown、用户 anonymous page、demand paging、用户栈增长、brk、
-mmap、munmap、mprotect、page fault recovery、用户指针异常恢复。
-
-建议对象结构：
-```rust
-struct AddressSpace {
-    root: PageTableRoot,
-    asid: Asid,
-    active_cpus: AtomicCpuMask,
-    vmas: VmaTree,
-    page_table_lock: SpinLock<()>,
-}
-```
-
-### M9：Process、Thread 和 syscall ABI
-
-把 kernel task 扩展成：
-```
-Process
- ├── AddressSpace
- ├── FileTable
- ├── SignalState
- ├── Credentials
- ├── cwd/root
- └── Threads
-```
-
-每个 Thread 拥有 trap frame、kernel stack、user stack、TLS、signal mask、
-scheduler state。
-
-ABI：尽量采用 Linux 通用 64 位 syscall ABI（RISC-V 用 Linux RISC-V ABI、
-LoongArch 用 Linux LoongArch ABI），syscall number、参数寄存器、错误返回
-尽量兼容 Linux，这样 musl、BusyBox 只需极少补丁。
-
-**状态：已完成。** scheduler `TaskKind::UserThread`、独立 guarded kernel stack、
-per-CPU `loaded_mm: Arc<UserMm>`、IRQ-off `switch_mm_irqs_off()`、用户态 timer/IPI
-抢占、deferred task reap，以及 `sched_yield`/`exit_group` 双架构回归已接入。
-完整契约见 [`docs/m9-completion.md`](docs/m9-completion.md)。
-
-### M10：ELF、execve 和 initramfs
-
-ELF64 loader、PT_LOAD、RX/RW 权限、BSS 清零、用户栈布局、argc/argv/envp、
-auxiliary vector、`execve()`、内嵌 initramfs。
-
-第一阶段使用静态链接，无动态链接器，无共享库。
-
-用户栈至少需要 argc、argv[]、envp[]、auxv[]、AT_PAGESZ、AT_ENTRY、AT_PHDR、
-AT_PHNUM、AT_RANDOM。完成后内核可以启动 `/init`。
-
-### M11：文件描述符和 VFS
-
-```rust
-struct FileTable;
-struct File;
-trait FileOperations;
-trait InodeOperations;
-trait SuperBlockOperations;
-```
-
-先实现 initramfs、tmpfs、devfs、console device、`/dev/null`、`/dev/zero`、
-`/dev/console`。
-
-核心 syscall：`openat`、`close`、`read`、`write`、`pread/pwrite`、`lseek`、
-`fstat`、`newfstatat`、`getdents64`、`mkdirat`、`unlinkat`、`renameat`、
-`readlinkat`、`chdir`、`getcwd`、`dup`、`dup3`、`fcntl`、`ioctl`。
-
-**状态：已完成。** 当前完成项见 [`docs/m11-vfs.md`](docs/m11-vfs.md)。M11 已接入
-`openat/read/write/close/lseek/fstat/newfstatat/getdents64/mkdirat/unlinkat/renameat`
-以及 `chdir/getcwd/dup/dup3/fcntl/ioctl/fsync/ftruncate`；`readlinkat` 对非 symlink
-按 Linux 语义返回 `EINVAL`。mount table、ext4、symlink/hardlink、权限和持久化写回
-属于后续文件系统里程碑。
-
-为了稳健运行 Git，文件系统必须支持：原子 rename、正确 truncate、
-fsync/fdatasync、文件锁定语义、symlink、hardlink、可执行位、时间戳、目录一致性。
-
-### M12：fork、exec、wait、pipe、signal
-
-Shell 的核心不是 ELF，而是进程控制。
-
-**第一版 fork**：完整地址空间复制，不立即做 COW。速度慢但状态机简单。稳定后再
-升级到 COW。
-
-**Signal 最小集合**：SIGCHLD、SIGINT、SIGTERM、SIGKILL、SIGPIPE、SIGSEGV、
-SIGILL、SIGBUS、`rt_sigaction`、`rt_sigprocmask`、`rt_sigreturn`。
-
-**Pipe**：pipe buffer、读端等待、写端等待、EOF、SIGPIPE、关闭引用计数、
-poll readiness。
-
-**状态：已完成第一版 Linux-like 语义。** 当前完成项见
-[`docs/m12-m13-process-tty.md`](docs/m12-m13-process-tty.md)。`clone` 已支持 fork-like
-进程创建：独立 eager-copied `UserMm`、复制 open-file description、复制 cwd/root 和
-signal mask、子进程 trap-frame resume；`wait4` 会阻塞并回收 zombie child；用户态
-`execve` 会替换当前进程镜像、切换 scheduler loaded-mm、执行 `CLOEXEC` 并销毁旧 mm。
-`pipe2` 支持 blocking read/write、EOF、`EPIPE`、`O_CLOEXEC`/`O_NONBLOCK`；`kill`、
-`rt_sigaction`、`rt_sigprocmask`、基础用户 signal frame/`rt_sigreturn`、
-pid/session/process-group syscall、`clock_gettime`、`nanosleep`、`uname`、`getrandom`
-均由双架构 smoke 覆盖。后续再做 COW、`siginfo`/`ucontext`/altstack/restart 等完整
-signal 语义和 poll/select。
-
-### M13：TTY 和基础 Shell
-
-console TTY、canonical/raw mode、echo、backspace、Ctrl-C、foreground process
-group、session、process group、`setsid`、`setpgid`、`tcsetpgrp`、
-`TIOCGPGRP/TIOCSPGRP`。
-
-第一版可以暂时不做完整 job control，只支持前台命令：`/bin/sh`、`ls`、`cat`、
-`echo`、`cd`、`pwd`、`prog1 | prog2`、`prog > file`。
-
-**状态：TTY 基础完成，shell 依赖的核心进程原语已接上。** `/dev/console` 已接
-TTY canonical 输入、echo、backspace、Ctrl-C 到 foreground process group，以及
-`TIOCGPGRP/TIOCSPGRP`。blocking pipe/TTY、fork-like `clone`、`execve` 和 `wait4`
-已由 M12/M13 smoke 覆盖；完整 shell 还需要 raw/termios、poll/select、更完整的
-signal/job-control 语义和更完整的用户程序集合。
-
-### M14：静态 BusyBox
+推荐把完整串口日志保存到独立目录，并至少扫描：
 
 ```text
-CONFIG_STATIC=y
-CONFIG_ASH=y
-CONFIG_FEATURE_SH_STANDALONE=y
-CONFIG_FEATURE_PREFER_APPLETS=y
+OS COMP SUMMARY
+score=
+panic
+kernel page fault
+known-bad
+SIGSEGV
+signal=11
+signal=14
+timeout
+lmbench-mini: summary
+oscomp-la-busybox-direct: summary
 ```
 
-第一批 applet：sh、echo、cat、ls、pwd、mkdir、rm、cp、mv、ln、sleep、true、
-false、mount、dmesg、ps。不要一开始启用所有网络工具。
+## 12. 文件与目录功能说明
 
-**BusyBox 常用 syscall 最小集合**：
+### 12.1 根目录
 
-| 类别 | syscall |
-|------|---------|
-| 进程 | clone/fork、execve、exit_group、wait4、getpid、getppid、getpgid、setpgid、setsid |
-| 内存 | brk、mmap、munmap、mprotect |
-| 文件 | openat、close、read、write、lseek、fstat、newfstatat、getdents64、dup、dup3、pipe2、fcntl、ioctl |
-| Signal | rt_sigaction、rt_sigprocmask、rt_sigreturn、kill |
-| 时间 | clock_gettime、nanosleep |
-| musl 基础 | set_tid_address、set_robust_list、getrandom、uname |
+| 文件/目录 | 功能 |
+|---|---|
+| `Cargo.toml` | workspace、统一 edition/lint/profile |
+| `Cargo.lock` | 锁定依赖版本 |
+| `rust-toolchain.toml` | 固定 nightly |
+| `Makefile` | 比赛提交入口与 OSCOMP 专项审计 |
+| `Makefile.project` | 原始开发构建、QEMU、smoke、stress、里程碑门禁 |
+| `README.md` | 当前中文设计方案与进展报告 |
+| `README-OSCOMP-6.28.md` | 6.28 评分路径专项风险审计 |
+| `LAST_UPDATE.md` / `update.md` | 历史更新与交接记录 |
+| `newtest_fullscore_gap_plan.md` | newtest 满分缺口规划 |
+| `.cargo/config.toml` | 当前 Cargo 离线源与 target-dir |
+| `cargo-dot/config.toml` | 可被比赛 clone 保留的 Cargo 配置源 |
+| `outputs/` | 汇报幻灯片等交付物 |
+| `vendor/` | 第三方源码、离线 crates 与 BusyBox 资源 |
 
-当前 M14 已完成其中的大部分基础 ABI，并额外补上 `symlinkat`、`linkat`、
-`readlinkat` 的 symlink 语义、`ppoll`、uid/gid/gettid、`faccessat`、`prlimit64`
-和 `sysinfo`。基础用户 handler delivery/`rt_sigreturn` 已由双架构 smoke 覆盖；
-RISC-V 外部 vendor BusyBox initramfs 已能解包并执行 `/bin/busybox true`。后续
-仍需把 `/init` 发布为长驻用户态 init，扩大到 `sh`、`ls`、`ps` 等 applet 级
-smoke，并补齐 `siginfo`/`ucontext`、altstack、syscall restart 等高级 signal 语义。
+### 12.2 `kernel/src`
 
-### M15：块设备和 ext4
+| 文件 | 功能 |
+|---|---|
+| `main.rs` | 公共入口、初始化顺序、sdcard 挂载与比赛执行器接入 |
+| `console.rs` | 架构早期串口到 Rust 格式化输出的适配 |
+| `panic.rs` | panic 串口输出、单次 panic 防重入与停机 |
+| `linker.rs` | 链接脚本符号和内核镜像物理/虚拟段描述 |
+| `memory.rs` | FDT 内存排除、启动页表、direct-map、buddy handoff |
+| `page_alloc.rs` | 全局 buddy 页分配 API 和页清零 |
+| `heap.rs` | Rust global allocator，连接 slab/large allocation |
+| `runtime_page_table.rs` | buddy-backed 运行期页表 |
+| `vm.rs` | vmalloc/vfree/ioremap/iounmap 与 kernel VA 管理 |
+| `fault.rs` | 双架构 page fault 统一分类与统计 |
+| `user_mm.rs` | per-process 页表、ASID、fault、copy-on-write/复制辅助 |
+| `context.rs` | IRQ save guard 与上下文约束 |
+| `irq.rs` | 通用中断分类与 dispatch |
+| `irq_lock.rs` | IRQ-safe spin lock |
+| `lockdep.rs` | lock class/rank、持锁链和违规检测 |
+| `tracked_spin.rs` | 带 owner/lockdep/迁移约束的自旋锁 |
+| `time.rs` | monotonic clock、tick 与 clockevent 策略 |
+| `timer.rs` | timer queue、timeout、取消和 one-shot |
+| `workqueue.rs` | work、delayed work 与 worker 管理 |
+| `smp.rs` | CPU 生命周期、secondary bring-up、online/active mask |
+| `ipi.rs` | IPI mailbox 与 reschedule/TLB/call-function 消息 |
+| `call_function.rs` | 跨 CPU 回调请求槽和 completion |
+| `tlb.rs` | kernel/per-mm TLB shootdown |
+| `trap.rs` | 通用 trap 初始化、解码和分发 |
+| `task/mod.rs` | 调度器、任务状态、per-CPU run queue |
+| `task/stack.rs` | 64 KiB guarded kernel stack |
+| `task/wait_queue.rs` | intrusive WaitQueue/Completion |
+| `task/idle_verify.rs` | tickless idle/IPI 唤醒验证 |
+| `task/m4c_verify.rs` | 抢占、迁移、wait queue 验证 |
+| `task/m4c2_verify.rs` | context/TLB/迁移扩展验证 |
+| `process.rs` | Process/Thread、fd table、signal state、child/zombie |
+| `signal.rs` | signal 编号、action、mask 与发送 |
+| `syscall.rs` | asm-generic syscall 编号事实表 |
+| `user.rs` | 用户入口、syscall dispatch、OSCOMP runner；当前最大集成文件 |
+| `user/riscv64.S` | RISC-V 用户态切换/返回汇编 |
+| `user/loongarch64.S` | LoongArch PLV3 切换/返回汇编 |
+| `elf.rs` | ELF64 解析、program header 与 relocation metadata |
+| `exec.rs` | ELF 映射、动态解释器、auxv、exec image |
+| `initramfs.rs` | `newc` CPIO 解析与 symlink 解析 |
+| `fs/mod.rs` | tmpfs/devfs/mount/path/ext4 物化集成 |
+| `pipe.rs` | pipe buffer、blocking、EOF、poll |
+| `tty.rs` | console TTY、termios、winsize、前台进程组 |
+| `devpts.rs` | PTY master/slave 与 `/dev/pts` |
+| `procfs.rs` | `/proc` 动态文件 |
+| `sysfs.rs` | `/sys` 设备与内核对象视图 |
+| `device.rs` | Bus/Device/Driver 模型 |
+| `virtio.rs` | VirtIO transport、DMA HAL、设备探测 |
+| `block.rs` | block registry、request、buffer/page cache |
+| `ext4.rs` | ext4 只读 superblock/inode/directory/file |
+| `rng.rs` | ChaCha20 DRBG 与 VirtIO-RNG |
+| `rtc.rs` | RTC 抽象与 `/dev/rtc` |
+| `net/mod.rs` | 网络接口注册与 NetDevice trait |
+| `net/socket.rs` | AF_INET TCP/UDP socket 与 syscall |
+| `net/virtio_net.rs` | VirtIO-Net raw 设备包装 |
+
+### 12.3 `mm/src`
+
+| 文件 | 功能 |
+|---|---|
+| `address.rs` | PhysAddr/VirtAddr 与页对齐 |
+| `range.rs` | 半开物理范围 |
+| `frame.rs` | 物理页帧与连续 frame block |
+| `virtual_address.rs` | 虚拟地址运算 |
+| `virtual_page.rs` | 虚拟页抽象 |
+| `virtual_range.rs` | 虚拟区间 |
+| `layout.rs` | 虚拟布局 region 与重叠校验 |
+| `map.rs` | 启动物理 MemoryMap 的 merge/reserve |
+| `early_allocator.rs` | 启动期连续页分配 |
+| `paging/geometry.rs` | 多级页表 index 几何 |
+| `paging/mapping.rs` | 权限、内存类型、W^X |
+| `paging/table.rs` | 原始 64 位页表页访问 |
+| `buddy/page.rs` | buddy 页 metadata/refcount |
+| `buddy/zone.rs` | zone 类型与 free list |
+| `buddy/allocator.rs` | order 分配/释放 |
+| `slab/size_class.rs` | 9 个小对象 size class |
+| `slab/slab.rs` | 单 slab 对象与 freelist |
+| `slab/cache.rs` | 每 size class cache |
+| `slab/provider.rs` | slab 页后端 trait |
+| `slab/allocator.rs` | 多 cache 分配器 |
+| `heap/allocator.rs` | slab + large 统一 heap |
+| `heap/large.rs` | 大对象连续页分配 |
+| `heap/error.rs` | heap 错误模型 |
+| `vma.rs` | VMA 集合、split、coalesce、gap |
+| `address_space.rs` | 用户 VMA/brk/mmap 元数据 |
+| `user_space.rs` | 用户 fault plan、stack growth、active CPU |
+| `fault.rs` | fault access/source/plan |
+| `asid.rs` | ASID token、generation 与 rollover |
+| `cpu_mask.rs` | 原子 CPU mask |
+| `tlb.rs` | TLB scope/request 抽象 |
+| `vmalloc.rs` | kernel 虚拟区间预留与 guard |
+| `lib.rs` | 模块导出与 45 项单元测试入口 |
+
+### 12.4 `arch/riscv64`
+
+| 文件 | 功能 |
+|---|---|
+| `linker.ld` | RISC-V 低地址 boot + 高半 kernel ELF 布局 |
+| `asm/entry.S` | boot CPU 两阶段启动 |
+| `asm/secondary.S` | secondary hart 入口 |
+| `boot.rs` | RISC-V 启动参数到 BootInfo |
+| `cpu.rs` | WFI/FPU/CPU 原语 |
+| `early_console.rs` | 16550 UART |
+| `interrupt.rs` | SSTATUS/SIE 中断状态 |
+| `sbi.rs` | TIME/IPI/HSM/SRST SBI 调用 |
+| `smp.rs` | hart 启动与 per-CPU 状态 |
+| `time.rs` | time CSR 与 SBI timer |
+| `trap/entry.S` | trap 保存/恢复 |
+| `trap/frame.rs` | RISC-V TrapFrame |
+| `trap/mod.rs` | stvec/sscratch 安装与解码 |
+| `task/context.rs` | callee-saved Context |
+| `task/switch.S` | 任务上下文切换 |
+| `memory/layout.rs` | Sv39 用户/内核布局 |
+| `memory/phys_access.rs` | direct-map 物理访问 |
+| `memory/paging/*` | Sv39 entry/geometry/map/activate/boot |
+
+### 12.5 `arch/loongarch64`
+
+| 文件 | 功能 |
+|---|---|
+| `linker.ld` | LoongArch boot/kernel 布局 |
+| `asm/entry.S` | DMW 启动入口 |
+| `asm/secondary.S` | secondary CPU 入口 |
+| `boot.rs` | QEMU/EFI-style 参数转换 |
+| `cpu.rs` | idle、FPU 与 CPU 原语 |
+| `early_console.rs` | 平台串口转发 |
+| `interrupt.rs` | CRMD/ECFG 中断状态 |
+| `smp.rs` | secondary CPU 与硬件 CPU ID |
+| `time.rs` | CSR timer |
+| `trap/entry.S` | trap 保存/恢复 |
+| `trap/frame.rs` | LoongArch TrapFrame |
+| `trap/mod.rs` | EENTRY/SAVE CSR 安装与解码 |
+| `task/context.rs` | callee-saved Context |
+| `task/switch.S` | 上下文切换 |
+| `memory/dmw.rs` | cached/uncached DMW |
+| `memory/layout.rs` | LA64 用户/内核布局 |
+| `memory/phys_access.rs` | DMW 物理访问 |
+| `memory/paging/refill.S` | TLB refill 汇编 |
+| `memory/paging/*` | 四级页表 entry/geometry/map/hardware |
+| `platform/qemu_virt/boot.rs` | EFI system table/FDT 定位 |
+| `platform/qemu_virt/console.rs` | QEMU UART |
+| `platform/qemu_virt/memory.rs` | QEMU 启动保留区 |
+
+### 12.6 基础 crate
+
+| 文件 | 功能 |
+|---|---|
+| `boot/src/address.rs` | BootAddress |
+| `boot/src/info.rs` | BootInfo builder 与启动元数据 |
+| `firmware/fdt/src/blob.rs` | FDT header/blob 验证 |
+| `firmware/fdt/src/tree.rs` | CPU/memory/initrd/VirtIO/PCI 枚举 |
+| `firmware/fdt/src/region.rs` | MemoryRegion |
+| `firmware/fdt/src/error.rs` | FDT 错误 |
+| `runtime/src/console.rs` | ByteConsole/ConsoleWriter |
+| `sync/src/spin_lock.rs` | 无依赖 SpinLock |
+| `vfs/src/lib.rs` | VFS 公共对象、flags、errno、poll、dirent |
+
+### 12.7 `scripts/`
+
+脚本按职责分组如下；`.bak` 文件是历史备份，不属于当前正式流程。
+
+| 脚本组 | 代表文件 | 功能 |
+|---|---|---|
+| 提交构建 | `oscomp-build.sh`、`build.sh` | 生成双架构比赛内核 |
+| 总审计 | `oscomp-audit.py` | 检查工具链、vendor、产物与评分入口 |
+| 评分门禁 | `oscomp_baseline_guard.py` | 检查评分路径；当前有 `ok` 未生效缺陷 |
+| newtest 审计 | `oscomp-newtest-p0/p2/p3/p4/p5/p6-*.py` | ABI、VFS、调度、动态 ELF、clone/futex、网络 |
+| RISC-V 启动修复审计 | `oscomp-riscv-*.py/.sh` | high-half、lowmap、linker、allocator、stack handoff |
+| Rust 兼容 | `oscomp-rust2025-*.sh/.py` | edition 2024、feature gate、rust-src |
+| sdcard | `oscomp-sdcard-*.py` | bounded discovery、测试执行链 |
+| preflight | `oscomp-full-contest-preflight.sh` | contest 前置检查 |
+| M5–M9 | `m5-*` 至 `m9*` | 并发、timer、用户态、用户 MM、进程 ABI 门禁 |
+| M14–M16 | `m14-*`、`m15a-*`、`m16*` | BusyBox、ext4、动态 ELF |
+| QEMU/smoke | `run-qemu.sh`、`smoke.py` | 启动与串口 marker 验证 |
+| stress | `stress-smp.py/.sh` | 架构/SMP/内存/profile 矩阵 |
+| BusyBox/initramfs | `build-static-busybox-initramfs.*` | 构建静态用户态归档 |
+| ext4 工具 | `ext4_read.py` | 主机侧 ext4 读取辅助 |
+| vendor | `oscomp-vendor.sh` | 离线依赖准备 |
+
+### 12.8 `docs/`
+
+| 文档 | 内容 |
+|---|---|
+| `boot-order.md` | 启动初始化依赖 |
+| `context-rules.md` | early/task/idle/hardirq/panic 上下文 |
+| `locking.md` | 锁顺序与 lockdep |
+| `cpu-lifecycle.md` | CPU 状态机 |
+| `scheduler-state-machine.md` | 任务状态机 |
+| `ipi-mailbox.md` | IPI publish/coalesce/drain |
+| `call-function.md` | 跨 CPU 回调 |
+| `tlb-request-v2.md` | TLB request ID/target/completion |
+| `m5-completion.md` | 并发基础封版 |
+| `m6-*.md` | timer、workqueue、wait queue 与鲁棒性 |
+| `m7-*.md` | 最小用户模式 |
+| `m8*.md` | 用户 MM、demand fault、per-mm TLB |
+| `m9*.md` | Process/Thread 与 syscall ABI |
+| `m10-completion.md` | ELF/initramfs |
+| `m11-vfs.md` | VFS/fd table |
+| `m12-m13-process-tty.md` | clone/exec/wait/pipe/signal/TTY |
+| `m14-*.md` | BusyBox 与双 vendor 用户态 |
+| `m15a-ext4-ro.md` | ext4 只读阶段 |
+| `m16*.md` | 动态 ELF/auxv/preflight |
+| `oscomp_group_matrix.md` | 测试组分类矩阵 |
+| `oscomp-submit-checklist.md` | 提交检查清单 |
+| `ci.md` | 本地 release gate 与 CI 说明 |
+
+## 13. 当前问题与风险
+
+| 风险 | 级别 | 当前证据 | 影响 |
+|---|---|---|---|
+| baseline guard 忽略 `ok` | P0 | 源码直接确认 | 虚假 PASS，破坏证据链 |
+| 当前 HEAD 缺完整 contest 日志 | P0 | 仅有截图和构建产物 | 无法逐项复现总分 |
+| LA busybox 后台 kill | P0 | 当前源码存在；历史 known-bad | SIGSEGV/残留子进程 |
+| glibc outer-shell fallback | P0 | 当前 P14K 存在；历史 0/52 等失败 | busybox 组不稳定 |
+| P2 RTC 审计失败 | P1 | 本轮可复现 | VFS/device ABI 缺口 |
+| P4 动态 ELF 审计失败 | P1 | 本轮可复现 | LA loader/目录契约未统一 |
+| 网络评分为 0 | P1 | 截图 | socket 源码未转化为评分 |
+| lmbench 源码与评分脱节 | P1 | mini runner 存在、截图 0 | parser/预算/平台格式待闭环 |
+| ext4 以只读为主 | P1 | `ext4.rs` 设计 | iozone/真实 rootfs 受限 |
+| signal 语义不完整 | P1 | 仅基础 frame/return | libcbench/LTP 边界 |
+| `user.rs` 过大 | P2 | 8352 行 | 评测、syscall、用户态强耦合 |
+| 大量未跟踪备份/vendor 文件 | P2 | 工作树状态 | 容易误提交或污染审查 |
+| 编译 warning | P2 | mm 单测 6 条 | 质量债务，不阻塞当前功能 |
+
+## 14. 更新后的实施方案
+
+### 阶段 A：恢复可信门禁（P0）
+
+1. 修复 `oscomp_baseline_guard.py::check()`，当 `ok=False` 时真实进入 FAIL；
+2. 为 PASS/FAIL/WARN/退出码增加自测；
+3. 删除与当前源码事实冲突的“字符串即 PASS”规则；
+4. 使 LA busybox 后台 kill 规则在当前 P14K 上真实失败。
+
+完成标准：人工构造一个 false condition 时脚本退出码为 1，恢复后才为 0。
+
+### 阶段 B：冻结并复现当前 741.9279 基线（P0）
+
+1. 不开启新重测试组；
+2. 强制重建双架构内核并记录 commit/hash；
+3. 当前 HEAD 各运行一次 RV/LA 完整 contest；
+4. 保存全部 testcase、group summary、signal、timeout 与 score；
+5. 把日志结果与截图矩阵逐格对齐。
+
+完成标准：同一 HEAD 下能解释四列总分，且 summary、case 行与平台截图无矛盾。
+
+### 阶段 C：稳定 LoongArch busybox（P0）
+
+1. 记录 55 case 的 primary/fallback raw；
+2. 移除后台 `sleep 5`/`kill $!` known-bad；
+3. 禁止不稳定的 glibc outer shell；
+4. 仅允许可追溯的 case-level applet fallback；
+5. 连续两轮 LA 无 panic、SIGSEGV、timeout。
+
+目标：先把 53 稳定复现，再追平 RV 的 54。
+
+### 阶段 D：修复 P2/P4 契约（P1）
+
+1. 实现或明确替代 `RTC_RD_TIME` ioctl；
+2. 审计动态 loader 的真实 `PT_INTERP` 名称；
+3. 决定 `/lib64` 是真实目录还是 symlink，并让代码、审计、测试镜像一致；
+4. 增加 glibc/musl × RV/LA 动态 hello 与 Lua smoke。
+
+### 阶段 E：提高 libcbench（P1）
+
+优先排查四列差异：
+
+- futex timeout/wake；
+- robust list 清理；
+- clone TLS/child tid；
+- signal mask/delivery；
+- scheduler affinity/priority；
+- clock/getrusage；
+- mmap/mprotect 边界。
+
+每个修复必须先跑单 case，再跑 libcbench 组，最后跑完整 contest。
+
+### 阶段 F：形成 lmbench 得分（P1）
+
+1. 保持 RV glibc 六项最小范围；
+2. 确认平台需要的 normalized 格式；
+3. 每个值只来自真实 stdout；
+4. 保留 420 s 总预算、320 s 组预算与安全余量；
+5. 当前六项稳定后，再考虑 musl 或 LoongArch。
+
+### 阶段 G：ext4 与 iozone（P2）
+
+1. 完成 ext4 write/truncate/create/unlink/rename；
+2. 统一 buffer cache/page cache 与 inode dirty state；
+3. 实现 fsync/fdatasync 持久化；
+4. 增加崩溃一致性和重复挂载；
+5. 从小文件 smoke 逐步进入 iozone。
+
+### 阶段 H：网络评分（P2）
+
+1. 确认 VirtIO-Net RX/TX queue 在两架构真实工作；
+2. 完成接口地址、ARP/IPv4、route 与 loopback；
+3. socket 阻塞/nonblock/poll/timeout；
+4. UDP echo → TCP connect/listen → iperf；
+5. 最后开启 netperf，避免同时扩大两组风险面。
+
+### 阶段 I：兼容性扩展（P3）
+
+在前述门禁稳定后，依次推进 cyclictest、libctest、LTP allowlist。每次只改变一个
+架构、一个 LibC、一个测试组，并保留可回滚提交。
+
+## 15. 里程碑与完成定义
+
+### 15.1 已完成或基本完成
+
+- M0–M5：双架构内核底座、SMP/并发；
+- M6：timer/timeout/workqueue；
+- M7：最小用户模式；
+- M8：per-process 用户 MM；
+- M9：Process/Thread/syscall ABI；
+- M10：ELF/initramfs；
+- M11：VFS/fd table；
+- M12/M13：clone/exec/wait/pipe/signal/TTY 基础；
+- M14：静态 BusyBox 相邻能力；
+- M15A：VirtIO block + ext4 只读；
+- M16A/B：auxv 与动态 ELF 基础。
+
+### 15.2 当前阶段完成定义
+
+- [ ] baseline guard 能真实失败；
+- [x] 两个内核产物存在且总审计识别成功；
+- [x] `myos-mm` 45/45；
+- [x] P0/P3/P5/P6 静态审计通过；
+- [ ] P2/P4 静态审计通过或完成合理的契约更新；
+- [ ] 当前 HEAD RV 完整 contest 日志；
+- [ ] 当前 HEAD LA 完整 contest 日志；
+- [ ] 741.9279616944203 可逐项复现；
+- [ ] LA busybox 无 known-bad 后仍判 PASS；
+- [ ] panic=0、scoring signal11=0、signal14=0、timeout=0；
+- [ ] `git diff --check` 通过；
+- [ ] 只提交预期源码、文档与交付物。
+
+## 16. 维护与提交约束
+
+- 不批量删除 `.bak`、`.oscomp_patch_backup/` 或未跟踪 vendor；它们可能是用户现场；
+- 不把“有函数名”写成“运行通过”；
+- 不用写死 `testcase ... success` 或 benchmark 数值替代真实执行；
+- 不在一次提交中同时扩展 workload、修改 parser、改预算、改 signal/timer；
+- 比赛入口 `make all` 必须保持离线、有界、无 QEMU；
+- 每次 contest 保存 commit、kernel hash、完整日志、summary 和异常扫描；
+- 双架构和双 LibC 的 fallback 必须记录实际执行二进制与 raw；
+- 若文档、审计脚本和运行时设计冲突，先明确正确契约，再一起修改。
+
+## 17. 最终判断
+
+SudoOS-Plus 已经不是“只能启动”的实验内核：当前得分证明它能在四个
+架构/LibC 组合上运行基础测试、BusyBox、libcbench 和 Lua；源码则显示其已经具备
+双架构内存、SMP、调度、进程、VFS、动态 ELF、VirtIO 与 socket 的系统化底座。
+
+当前瓶颈不是单纯“继续堆 syscall”，而是把三个层次重新对齐：
 
 ```text
-virtio-mmio → virtqueue → DMA → virtio-blk → block layer → buffer/page cache → ext4
+当前源码实现
+    = 当前 HEAD 可复现日志
+    = 平台评分截图
 ```
 
-当前已完成 FDT virtio-mmio 枚举、`ioremap`-backed MMIO transport probe、vendor
-`virtio-drivers` HAL/DMA、virtio-blk 初始化、内核 `BlockDevice` 包装、bounded
-buffer/page cache、VFS mount table、block devfs 节点、`fsync` 写回路径和 ext4
-superblock magic gate；带 raw virtio-blk 磁盘的 RISC-V QEMU smoke 已验证 `/dev/vda`
-设备注册。
-
-剩余路径是 lwext4 blockdev adapter → ext4 inode/dentry/file operations → 持久化根文件系统。
-实体机还需要 cache coherent/non-coherent DMA、DMA barrier、地址宽度、
-scatter-gather、IOMMU 后续支持、中断 affinity。
-
-### M16：动态链接和 musl
-
-当前已支持 `ET_DYN` metadata、Linux-like auxv、`argv/envp` 栈面，以及无
-`PT_INTERP` 的 static PIE `R_RELATIVE` 重定位。下一步是 PT_INTERP、动态链接器
-启动、shared object mmap、TLS、符号 relocations、`mprotect` RELRO。`dlopen`
-和 vDSO 可后置。
-
-### M17：本地 Git
-
-目标：`git init`、`git add`、`git commit`、`git status`、`git log`、`git checkout`、
-`git branch`。
-
-重点验证：大量小文件、深目录、原子 `.lock → rename`、fsync、mmap pack/index、
-stat 时间精度、symlink、executable bit、zlib、SHA 实现、环境变量、子进程、pipe、
-临时文件。**一个看似能用但 rename/fsync 错误的文件系统可能直接损坏仓库。**
-
-### M18：网络 Git
-
-```text
-git clone https://github.com/... / git fetch / git push
-```
-
-需要：Ethernet、ARP/NDP、IPv4/IPv6、ICMP、UDP、TCP、socket、bind/connect/listen/accept、
-sendmsg/recvmsg、getsockopt/setsockopt、poll/ppoll、nonblocking I/O；
-DNS（UDP + TCP fallback + resolver timeout）；TLS（cryptographic RNG、wall clock、
-monotonic clock、CA certificate store、TLS library、libcurl）。
-
-没有正确的真实时间和随机数，HTTPS Git 不能算可靠。
-
-### 最重要的阶段性验收点
-
-```
- 1. hello-user
- 2. /init 启动
- 3. exec 两个不同程序
- 4. fork + wait
- 5. pipe + shell 重定向
- 6. 静态 BusyBox ash
- 7. BusyBox 在 ext4 根目录运行
- 8. 本地 git init/add/commit
- 9. TCP socket
-10. HTTPS git clone
-```
-
-每通过一个阶段，都做双架构、SMP、内存泄漏和长期压力验证。
-
-### 交接注意
-
-- `build/` 已加入 `.gitignore`，之前清理缓存时有大量 tracked build artifacts staged for deletion；不要把这些当成源码删除事故。
-- 当前 `myos-mm` 单测数是 24。
-- `kernel vmalloc` 已有稳定 token API：`vmalloc/vfree/ioremap/iounmap`。释放函数消费 token，避免双重释放。
-- RISC-V vmalloc 映射写入当前活动页表；LoongArch runtime page table/TLB refill 已接入，vmalloc VA 已可硬件解引用。
-- page fault trap 入口已经接入；当前 kernel fault fail-fast，user demand paging 不能在 P4b 前假装完成。
-- SMP bring-up、抢占调度、wait queue、work stealing、任务迁移和 kernel-wide TLB shootdown 已完成；后续 P7 指的是用户地址空间级别的 range/ASID 优化。
-- 不要为了快速完成把用户态、VFS、SMP 依赖伪造成 stub 成品；这些必须按依赖顺序接入。
-
-
-## M5 并发基础封版
-
-M5 已完成 CPU 生命周期、instance-aware lockdep、WaitQueue/Completion、
-task reaper、timer-off idle 唤醒、per-CPU IPI mailbox、CallFunction request
-slot，以及显式 TLB request ID/target/completion mask。
-
-```bash
-make harness-test
-make m5-quick
-make m5-full
-make m5-release M5_SOAK_LOOPS=200 M5_RELEASE_SOAK_LOOPS=20
-```
-
-每个 smoke case 都生成结构化 `result.json`，超时会区分仍在推进、真正停滞、
-无输出、QEMU 提前退出和内核 panic。完整规则见 `docs/m5-completion.md`。
-
-M5 后进入 M6：monotonic/one-shot timer、timer queue、timeout 和通用
-workqueue，随后开始最小用户态与 syscall 闭环。
-
-## M6-C 封版状态
-
-<!-- M6-C closure: reproducible local release gate -->
-
-M0–M5 已冻结，M6 的 timer、timeout、workqueue、delayed work 与 tickless
-idle 核心已经完成。M6-C 增加的是可重复的工程封版门禁，而不是另一套运行时状态机。
-
-```bash
-make m6-audit    # 静态检查 M6 跨文件不变量
-make m6-quick    # 双架构 Debug SMP=1/4
-make m6-full     # 双架构 SMP=1/2/4/8 × 64M/256M/1G × Debug/Release
-make m6-soak     # 双架构 SMP=4 重复压力
-make m6-release  # 干净工作树上的完整封版证据
-make m6-tag      # 仅接受当前 commit 的通过报告
-```
-
-完整边界和验收见 [`docs/m6-completion.md`](docs/m6-completion.md)、
-[`docs/m6-robustness.md`](docs/m6-robustness.md) 与
-[`docs/ci.md`](docs/ci.md)。GitHub Actions 默认不启用；本地 release gate 是 M6 的
-正式门禁。
-
-## M7 最小用户模式 ⬅ 已完成
-
-M7 已完成并正式冻结。双架构 U-mode/PLV3 入口、用户 trap stack、Linux 风格
-`write=64`/`exit=93` ABI、受检用户拷贝、未知 syscall (`-ENOSYS`)、非法用户指针
-(`-EFAULT`)、RX 写保护 fault 隔离和 session 重复回收均已实现。
-
-M7 release gate 全部通过：
-
-```text
-matrix-full    48/48 PASS   (SMP=1/2/4/8 × 64M/256M/1G × Debug/Release)
-soak-debug    200/200 PASS   (SMP=4 × 256M × 100轮 × 双架构)
-soak-release   40/40 PASS    (SMP=4 × 256M × 20轮 × 双架构)
-```
-
-```bash
-make m7-quick      # 快速门禁
-make m7-release    # 完整 release gate
-make m7-tag        # 创建 m7-complete 标签
-```
-
-封版契约见 [`docs/m7-completion.md`](docs/m7-completion.md)。M7 冻结后进入
-M8：独立 per-process AddressSpace、ASID、per-mm TLB shootdown 与用户 fault
-恢复。
-
-## M8 Linux-like 重构基线
-
-M8 从 `main@c85b611` 重建，采用单一同步 verifier session 所有权：
-`UserImage -> Box<UserMm>`。独立用户根、共享内核映射、ASID generation、
-`active_cpus`、per-mm TLB request、anonymous demand paging、栈增长以及
-`brk/mmap/munmap/mprotect` 已接入。
-
-M8 没有伪造 scheduler current-mm；该冻结边界现已由 M9 的 Process/Thread
-强所有权、per-CPU loaded-mm 和 `switch_mm_irqs_off()` 正式接管。M8 原始
-不变量见 [`docs/m8-linuxlike-contract.md`](docs/m8-linuxlike-contract.md)，M9
-闭环见 [`docs/m9-completion.md`](docs/m9-completion.md)。
+最优先工作应是修复失真的 baseline guard、稳定 LoongArch busybox、补齐当前 HEAD
+双架构 contest 证据，再处理 P2/P4 契约。完成这些后，libcbench、lmbench、ext4
+和网络才会成为可持续的增分路径，而不是一次性、难归因的试验。
