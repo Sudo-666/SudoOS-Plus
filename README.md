@@ -1,9 +1,10 @@
 # SudoOS-Plus：双架构 Rust 操作系统设计方案与 OSCOMP 进展报告
 
 > 本文档面向项目设计评审、阶段汇报、比赛提交与后续开发交接。
-> 状态日期：2026-06-28（Asia/Shanghai）
+> 文档版本：正式提交版 v1.0
+> 状态日期：2026-06-30（Asia/Shanghai）
 > 当前分支：`6.28`
-> 当前提交：`a7da2b93923a2039be590d249e6f2837c7e9a669`（`a7da2b9`）
+> 当前提交：`2030f7ff71345ba821d49bb0f743267deea809f4`（`2030f7f`）
 > 工具链：`nightly-2025-01-18`，Rust 2024 Edition
 > 评分来源：2026-06-28 平台截图
 > 评分总计：**741.9279616944203**
@@ -29,6 +30,78 @@ ELF 装载、VFS、ext4 只读访问、VirtIO 设备、基础网络接口与 OSC
 
 “实现存在”不自动等同于“平台已通过”；“历史曾通过”也不自动等同于“当前 HEAD
 已回归通过”。
+
+### 1.1 正式交付物
+
+| 交付物 | 文件名 | 用途 |
+|---|---|---|
+| 源码与在线设计说明 | `README.md` | 仓库首页、设计审查与开发交接 |
+| 设计方案 PDF | `SudoOS-Plus-设计方案与进展报告.pdf` | 正式书面材料 |
+| 进展汇报 PPT | `SudoOS-Plus-设计方案与进展汇报.pptx` | 答辩与阶段汇报 |
+| 演示视频 | [百度网盘链接](https://pan.baidu.com/s/1LZEN_b_1_7spW5jR0Y4cXA)，提取码：`77FB` | 系统运行与项目成果演示 |
+| AI 使用声明 | `AI-使用声明.md` | 四份材料统一声明的独立文本源 |
+
+PDF 由本 README 的正式提交版直接生成，因此章节、数据、AI 声明和第三方代码声明
+与 README 保持一致。PPT 使用相同事实口径，并在末尾单列 AI 使用声明和附录 B 摘要。
+
+> 演示视频备用说明：复制链接和提取码后，可使用浏览器或百度网盘 APP 打开。
+
+### 1.2 项目来源与参考边界
+
+本仓库现有 Git 历史中可追溯的最早内部基线为：
+
+| 项目 | 内容 |
+|---|---|
+| 内部参考版本 | `453eb91`（`competition: final-test submission`） |
+| 基线日期 | 2026-06-22 |
+| 当前比较版本 | `2030f7f` |
+| 外部竞赛 OS 源码基线 | 未发现；项目不是从其他参赛队仓库整体派生 |
+| 第三方代码 | 仅限 `vendor/` 和 Cargo 依赖，详见附录 B |
+
+架构和 ABI 设计会参考公开规范及 Linux 行为，但“参考规范”不等于复制 Linux
+内核源码。项目自研代码与第三方源码通过目录边界、Cargo 依赖和许可证文件区分。
+
+### 1.3 基线对比口径
+
+为避免把离线依赖体积误写成团队代码贡献，增量统计排除 `vendor/**` 和二进制 PPT：
+
+```text
+453eb91..2030f7f
+首方文件：117 个
+新增：18,084 行
+删除：3,072 行
+新增文件：67 个
+修改文件：50 个
+```
+
+完整仓库 diff 会包含离线 Cargo、Rust 源码和工具链快照，规模远大于首方统计；
+这些文件的引入属于可复现构建工作，不作为原创内核代码行数。
+
+### 1.4 参考版本与增量贡献
+
+相对于内部参考版本 `453eb91`，当前版本的主要增量贡献如下：
+
+1. **双架构比赛构建链**：重构根 `Makefile`、保留 `Makefile.project`，加入离线
+   Cargo、rust-src、双内核产物和提交审计；
+2. **RISC-V 启动稳定性**：修复链接段对齐、高半栈切换、早期 trap、正式页表和
+   buddy handoff；
+3. **LoongArch 兼容性**：补充 FPU/FPD、用户异常、动态 loader、BusyBox 与
+   glibc/musl 组合路径；
+4. **Linux-like ABI**：扩展文件、进程、线程、signal、时间、调度、futex、
+   socket 和资源限制 syscall；
+5. **用户态运行链**：完善 ELF/ET_DYN/PT_INTERP、auxv、TLS、clone/futex 与
+   当前镜像替换；
+6. **VFS 与设备**：增加 procfs、sysfs、devpts、RTC、RNG、设备模型、VirtIO
+   block/net 和 ext4 只读访问；
+7. **评分执行器**：实现 sdcard 有界发现、架构/LibC 分组、预算、真实退出码、
+   summary、score 与统一关机；
+8. **验证工程**：新增 P0-P6、M5-M16、启动/页分配/动态 ELF/网络等静态审计和
+   smoke/stress/preflight；
+9. **文档与交付**：形成当前 README、正式 PDF、汇报 PPT、AI 声明与第三方代码
+   附录。
+
+团队成员通过 Git 作者信息保留人的贡献归属；生成式 AI 仅作为辅助工具，不作为作者
+或共同作者。具体声明见附录 A。
 
 ## 2. 当前结论
 
@@ -981,3 +1054,44 @@ SudoOS-Plus 已经不是“只能启动”的实验内核：当前得分证明�
 最优先工作应是修复失真的 baseline guard、稳定 LoongArch busybox、补齐当前 HEAD
 双架构 contest 证据，再处理 P2/P4 契约。完成这些后，libcbench、lmbench、ext4
 和网络才会成为可持续的增分路径，而不是一次性、难归因的试验。
+
+## 附录 A：生成式人工智能使用声明
+
+> 本项目在代码分析、方案整理、测试与调试辅助、文档撰写和演示文稿排版过程中使用了
+> Anthropic Claude 与 OpenAI Codex。生成式人工智能的输出仅作为辅助建议；所有纳入
+> 仓库的代码、脚本、测试结果和文档均由团队成员审查、修改并验证，团队对最终成果的
+> 正确性、原创性、许可证合规性和提交内容承担全部责任。生成式人工智能不作为项目作者
+> 或共同作者。第三方代码及其许可证另见附录 B。
+
+该声明的规范文本同时用于 `README.md`、由 README 生成的 PDF、PPT 和
+`AI-使用声明.md`；若后续更新，四处必须同步。
+
+## 附录 B：第三方代码与依赖声明
+
+### B.1 直接 vendored 项目
+
+| 组件 | 仓库内路径 | 版本/快照 | 上游来源 | 许可证 | 使用与修改说明 |
+|---|---|---|---|---|---|
+| fdt | `vendor/fdt-reader` | `0.2.0-alpha2` | `github.com/repnop/fdt` | MPL-2.0 | FDT 解析；通过 `myos-fdt` 封装 |
+| virtio-drivers | `vendor/virtio-drivers` | `0.13.0` | `github.com/rcore-os/virtio-drivers` | MIT | VirtIO transport/device；由 `SudoHal` 适配 |
+| smoltcp | `vendor/cargo/smoltcp-0.11.0` | `0.11.0` | `github.com/smoltcp-rs/smoltcp` | 0BSD | TCP/UDP/IP 协议基础；当前评分网络组未闭环 |
+| vte | `vendor/vte` | `0.15.0` | `github.com/alacritty/vte` | Apache-2.0 OR MIT | 终端解析相关依赖 |
+| lwext4 | `vendor/lwext4` | 仓库快照，未记录上游 tag | `github.com/gkostka/lwext4` | GPL-2.0；部分文件 BSD-3-Clause | ext4 参考/适配；许可证以各文件头和目录 LICENSE 为准 |
+| musl-cross-make | `vendor/musl-cross-make` | 仓库快照，未记录上游 tag | `github.com/richfelker/musl-cross-make` | MIT | 构建 musl 交叉工具链 |
+| Rust source | `vendor/rust-src` | nightly-2025-01-18 对应快照 | `github.com/rust-lang/rust` | MIT OR Apache-2.0 | 离线 `build-std`；不计为团队原创代码 |
+
+### B.2 Cargo 离线依赖
+
+`vendor/cargo/` 保存 `Cargo.lock` 对应的离线 crates。具体版本由 `Cargo.lock`
+锁定，每个 crate 的 `.cargo-checksum.json`、`Cargo.toml` 和许可证文件保留原始
+归属。除为 Rust 2024/离线构建兼容所做的必要补丁外，不宣称这些依赖为团队原创。
+
+### B.3 许可证与再分发说明
+
+- 项目首方 crate 在 workspace 中声明 `MIT OR Apache-2.0`；
+- 第三方目录继续遵守各自许可证，目录内许可证优先于本项目声明；
+- `lwext4` 含 GPL-2.0 文件，若其代码被链接进最终分发物，必须按 GPL-2.0 履行
+  源码与许可证义务；当前 Rust `kernel/src/ext4.rs` 为自研只读实现，不等同于
+  已链接完整 lwext4；
+- 正式提交不得删除 `vendor/` 中的版权、许可证、NOTICE 或 checksum；
+- 新增第三方代码时，必须同步更新本附录的来源、版本、许可证和修改说明。
