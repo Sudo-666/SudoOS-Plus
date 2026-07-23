@@ -11,6 +11,7 @@ use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 
 const RTC_LOCK: LockClass = LockClass::new("rtc.device", LockRank::Vfs, 12);
+pub const RTC_RD_TIME: usize = 0x8024_7009;
 
 /// RTC 时间值（Unix 时间戳，秒）。
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +22,9 @@ pub struct RtcTime {
 /// Linux RTC ioctl: _IOR('p', 0x09, struct rtc_time)
 /// Match any encoding: check type='p', nr=0x09, accepting any size/direction.
 fn is_rtc_rd_time(cmd: usize) -> bool {
+    if cmd == RTC_RD_TIME {
+        return true;
+    }
     let typ = (cmd >> 8) & 0xff;
     let nr = cmd & 0xff;
     typ == b'p' as usize && nr == 0x09
@@ -77,7 +81,11 @@ fn days_from_civil(y: i32, m: i32, d: i32) -> i32 {
 
 fn civil_from_days(z: i32) -> (i32, i32, i32) {
     let z = z + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
@@ -105,7 +113,11 @@ pub fn initialize() {
     crate::println!("rtc:");
     crate::println!(
         "  hardware       : {}",
-        if available { "available" } else { "unavailable" }
+        if available {
+            "available"
+        } else {
+            "unavailable"
+        }
     );
     crate::println!("  device         : /dev/rtc");
 }
@@ -119,11 +131,7 @@ pub fn read_rtc_time() -> Option<RtcTime> {
         // 退化为系统启动以来的单调时间
         let now = crate::time::now().cycles();
         let freq = crate::time::clock_frequency_hz();
-        let seconds = if freq != 0 {
-            (now / freq) as i64
-        } else {
-            0
-        };
+        let seconds = if freq != 0 { (now / freq) as i64 } else { 0 };
         Some(RtcTime {
             unix_seconds: seconds,
         })
@@ -147,8 +155,5 @@ pub fn verify() {
 
     crate::println!("M16 RTC gate:");
     crate::println!("  read_rtc_time      : verified");
-    crate::println!(
-        "  unix_seconds       : {}",
-        time.unwrap().unix_seconds,
-    );
+    crate::println!("  unix_seconds       : {}", time.unwrap().unix_seconds,);
 }

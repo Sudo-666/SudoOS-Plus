@@ -129,9 +129,23 @@ impl Pipe {
         self.wake_writers();
     }
 
+    fn exit_reader(&self) {
+        let mut state = self.state.lock();
+        state.readers = 0;
+        drop(state);
+        self.wake_writers();
+    }
+
     fn close_writer(&self) {
         let mut state = self.state.lock();
         state.writers = state.writers.saturating_sub(1);
+        drop(state);
+        self.wake_readers();
+    }
+
+    fn exit_writer(&self) {
+        let mut state = self.state.lock();
+        state.writers = 0;
         drop(state);
         self.wake_readers();
     }
@@ -183,13 +197,21 @@ impl FileOperations for PipeReader {
 
     fn fstat(&self, _file: &File) -> Result<Stat, Errno> {
         let mut stat = Stat::zeroed();
-        stat.mode = myos_vfs::FileMode::S_IFCHR | 0o600;
+        stat.mode = myos_vfs::FileMode::S_IFIFO | 0o600;
         stat.nlink = 1;
         Ok(stat)
     }
 
     fn release(&self, _file: &File) {
+        crate::println!(
+            "pipe-release: kind=reader pipe={:#x}",
+            Arc::as_ptr(&self.pipe) as usize,
+        );
         self.pipe.close_reader();
+    }
+
+    fn process_exit(&self, _file: &File) {
+        self.pipe.exit_reader();
     }
 
     fn poll(&self, _file: &File, requested: PollEvents) -> PollEvents {
@@ -208,13 +230,21 @@ impl FileOperations for PipeWriter {
 
     fn fstat(&self, _file: &File) -> Result<Stat, Errno> {
         let mut stat = Stat::zeroed();
-        stat.mode = myos_vfs::FileMode::S_IFCHR | 0o600;
+        stat.mode = myos_vfs::FileMode::S_IFIFO | 0o600;
         stat.nlink = 1;
         Ok(stat)
     }
 
     fn release(&self, _file: &File) {
+        crate::println!(
+            "pipe-release: kind=writer pipe={:#x}",
+            Arc::as_ptr(&self.pipe) as usize,
+        );
         self.pipe.close_writer();
+    }
+
+    fn process_exit(&self, _file: &File) {
+        self.pipe.exit_writer();
     }
 
     fn poll(&self, _file: &File, requested: PollEvents) -> PollEvents {
@@ -233,6 +263,7 @@ pub fn create_pipe(flags: OpenFlags) -> Result<(myos_vfs::ArcFile, myos_vfs::Arc
         OpenFlags::empty()
     };
     let pipe = Pipe::new();
+    crate::println!("pipe-create: pipe={:#x}", Arc::as_ptr(&pipe) as usize);
     let reader = File::new(
         OpenFlags::O_RDONLY.union(status_flags),
         Arc::new(PipeReader {

@@ -3,7 +3,7 @@ use core::{
     ptr::{NonNull, null_mut},
 };
 
-use myos_mm::{HeapAllocator, HeapStats, PageAllocation, PageProvider};
+use myos_mm::{HeapAllocator, HeapError, HeapStats, PageAllocation, PageProvider, SlabError};
 
 use crate::{
     irq_lock::IrqSpinLock,
@@ -65,7 +65,6 @@ impl KernelGlobalAllocator {
         Ok(())
     }
 
-    
     #[cfg(target_arch = "riscv64")]
     pub unsafe fn install_boot(&self) -> Result<(), HeapInstallError> {
         let heap = unsafe { self.heap.get_mut_unchecked() };
@@ -127,11 +126,20 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        #[cfg(target_arch = "riscv64")]
+        let caller: usize;
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: reading ra does not alter machine state.
+        unsafe {
+            core::arch::asm!("mv {}, ra", out(reg) caller, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        let caller = 0_usize;
         let Some(pointer) = NonNull::new(pointer) else {
             fatal_heap_corruption();
         };
 
-        let failed = {
+        let error = {
             let mut slot = self.heap.lock();
 
             let Some(heap) = slot.as_mut() else {
@@ -140,11 +148,11 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
             };
 
             // SAFETY: GlobalAlloc::dealloc 的调用者保证 pointer/layout 来自此前分配。
-            unsafe { heap.deallocate(pointer, layout) }.is_err()
+            unsafe { heap.deallocate(pointer, layout) }.err()
         };
 
-        if failed {
-            fatal_heap_corruption();
+        if let Some(error) = error {
+            fatal_heap_deallocation(error, pointer, layout, caller);
         }
     }
 }
@@ -278,7 +286,8 @@ pub fn initialize_boot() {
         panic!("unable to install kernel heap through boot path: {error:?}");
     });
     riscv_heap_print_installed();
-} /// allocator 损坏时不能 panic：panic 路径可能再次分配并导致递归。
+}
+/// allocator 损坏时不能 panic：panic 路径可能再次分配并导致递归。
 fn fatal_heap_corruption() -> ! {
     /*
      * 这里只输出静态字符串，不构造任何堆对象。
@@ -286,6 +295,54 @@ fn fatal_heap_corruption() -> ! {
     crate::println!();
     crate::println!("FATAL: kernel heap corruption");
 
+    loop {
+        crate::arch::cpu::wait_for_interrupt();
+    }
+}
+
+fn fatal_heap_deallocation(
+    error: HeapError<GlobalPageAllocatorError>,
+    pointer: NonNull<u8>,
+    layout: Layout,
+    caller: usize,
+) -> ! {
+    let reason = match error {
+        HeapError::Slab(SlabError::CorruptHeader) => "slab-corrupt-header",
+        HeapError::Slab(SlabError::CorruptFreeList) => "slab-corrupt-free-list",
+        HeapError::Slab(SlabError::InvalidObjectPointer) => "slab-invalid-pointer",
+        HeapError::Slab(SlabError::WrongSizeClass { .. }) => "slab-wrong-size-class",
+        HeapError::Slab(SlabError::DoubleFree) => "slab-double-free",
+        HeapError::Slab(_) => "slab-other",
+        HeapError::CorruptLargeAllocation => "large-corrupt-header",
+        HeapError::LayoutMismatch => "large-layout-mismatch",
+        HeapError::Provider(_) => "page-provider",
+        HeapError::ZeroSizedLayout => "zero-sized-layout",
+        HeapError::AllocationTooLarge => "allocation-too-large",
+        HeapError::AddressOverflow => "address-overflow",
+        HeapError::CounterOverflow => "counter-overflow",
+    };
+    crate::println!();
+    crate::println!(
+        "FATAL: kernel heap deallocation {} ptr={:#x} size={} align={} caller={:#x} cpu={}",
+        reason,
+        pointer.as_ptr() as usize,
+        layout.size(),
+        layout.align(),
+        caller,
+        crate::smp::current_cpu_id().get(),
+    );
+    let header = (pointer.as_ptr() as *const usize).wrapping_sub(4);
+    // SAFETY: a large-allocation header immediately precedes the still-mapped
+    // allocation supplied to dealloc; this is fatal-path diagnostics only.
+    unsafe {
+        crate::println!(
+            "FATAL: heap header words {:#x} {:#x} {:#x} {:#x}",
+            header.read(),
+            header.add(1).read(),
+            header.add(2).read(),
+            header.add(3).read(),
+        );
+    }
     loop {
         crate::arch::cpu::wait_for_interrupt();
     }

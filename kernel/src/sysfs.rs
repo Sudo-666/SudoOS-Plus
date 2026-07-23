@@ -52,8 +52,7 @@ impl ProcFileGenerator for KernelOsTypeFile {
     }
 }
 
-pub fn kernel_entries(
-) -> Vec<(&'static str, Arc<dyn ProcFileGenerator>)> {
+pub fn kernel_entries() -> Vec<(&'static str, Arc<dyn ProcFileGenerator>)> {
     vec![
         ("version", Arc::new(KernelVersionFile)),
         ("ostype", Arc::new(KernelOsTypeFile)),
@@ -89,8 +88,7 @@ impl ProcFileGenerator for DeviceListFile {
     }
 }
 
-pub fn devices_entries(
-) -> Vec<(&'static str, Arc<dyn ProcFileGenerator>)> {
+pub fn devices_entries() -> Vec<(&'static str, Arc<dyn ProcFileGenerator>)> {
     vec![("list", Arc::new(DeviceListFile))]
 }
 
@@ -136,8 +134,7 @@ impl ProcFileGenerator for NetClassFile {
     }
 }
 
-pub fn class_entries(
-) -> Vec<(&'static str, Arc<dyn ProcFileGenerator>)> {
+pub fn class_entries() -> Vec<(&'static str, Arc<dyn ProcFileGenerator>)> {
     vec![
         ("block", Arc::new(BlockClassFile)),
         ("net", Arc::new(NetClassFile)),

@@ -537,10 +537,6 @@ fn validate_area(area: VmArea) -> Result<(), VmAreaError> {
 
     let flags = area.flags();
 
-    if !flags.is_readable() && !flags.is_writable() && !flags.is_executable() {
-        return Err(VmAreaError::InvalidFlags);
-    }
-
     if flags.is_writable() && !flags.is_readable() {
         return Err(VmAreaError::InvalidFlags);
     }
@@ -720,5 +716,22 @@ mod tests {
             set.protect_range(range(0x5000, 0x6000), VmAreaFlags::READ),
             Err(VmAreaError::NotFound),
         );
+    }
+
+    #[test]
+    fn mprotect_accepts_prot_none() {
+        let mut set: VmAreaSet<8> = VmAreaSet::new();
+        set.insert(VmArea::new(
+            range(0x1000, 0x5000),
+            VmAreaFlags::user_rw(),
+            VmAreaKind::Anonymous,
+        ))
+        .unwrap();
+
+        set.protect_range(range(0x2000, 0x3000), VmAreaFlags::empty())
+            .unwrap();
+        let flags = set.find(VirtAddr::new(0x2800)).unwrap().flags();
+        assert!(flags.contains(VmAreaFlags::USER));
+        assert_eq!(flags.access_only(), VmAreaFlags::empty());
     }
 }

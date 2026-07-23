@@ -4,11 +4,16 @@
 //! architecture-specific register handling cannot drift as the table grows.
 
 pub mod number {
+    pub const EVENTFD2: usize = 19;
+    pub const EPOLL_CREATE1: usize = 20;
+    pub const EPOLL_CTL: usize = 21;
+    pub const EPOLL_PWAIT: usize = 22;
     pub const GETCWD: usize = 17;
     pub const DUP: usize = 23;
     pub const DUP3: usize = 24;
     pub const FCNTL: usize = 25;
     pub const IOCTL: usize = 29;
+    pub const FLOCK: usize = 32;
     pub const MKDIRAT: usize = 34;
     pub const UNLINKAT: usize = 35;
     pub const SYMLINKAT: usize = 36;
@@ -29,6 +34,7 @@ pub mod number {
     pub const WRITEV: usize = 66;
     pub const PREAD64: usize = 67;
     pub const PWRITE64: usize = 68;
+    pub const SENDFILE: usize = 71;
     pub const PSELECT6: usize = 72;
     pub const PPOLL: usize = 73;
     pub const READLINKAT: usize = 78;
@@ -85,6 +91,7 @@ pub mod number {
     pub const MUNLOCK: usize = 229;
     pub const MLOCKALL: usize = 230;
     pub const MUNLOCKALL: usize = 231;
+    pub const MADVISE: usize = 233;
     pub const WAIT4: usize = 260;
     pub const PRLIMIT64: usize = 261;
     pub const GETRANDOM: usize = 278;
@@ -94,6 +101,7 @@ pub mod number {
     pub const MKNODAT: usize = 33;
     // Socket syscalls (Linux asm-generic)
     pub const SOCKET: usize = 198;
+    pub const SOCKETPAIR: usize = 199;
     pub const BIND: usize = 200;
     pub const LISTEN: usize = 201;
     pub const ACCEPT: usize = 202;
@@ -103,13 +111,16 @@ pub mod number {
     pub const SENDTO: usize = 206;
     pub const RECVFROM: usize = 207;
     pub const SHUTDOWN: usize = 210;
+    pub const SENDMSG: usize = 211;
+    pub const RECVMSG: usize = 212;
+    pub const ACCEPT4: usize = 242;
     pub const SETSOCKOPT: usize = 208;
     pub const GETSOCKOPT: usize = 209;
     pub const UTIMENSAT: usize = 88;
     pub const STATFS: usize = 43;
     pub const FSTATFS: usize = 44;
     pub const SYSLOG: usize = 116;
-    pub const PKEY_MPROTECT: usize = 288;  // RISC-V asm-generic pkey_mprotect
+    pub const PKEY_MPROTECT: usize = 288; // RISC-V asm-generic pkey_mprotect
     pub const SCHED_GETAFFINITY: usize = 123;
     pub const SCHED_SETAFFINITY: usize = 122;
     pub const SCHED_SETSCHEDULER: usize = 119;
@@ -236,6 +247,7 @@ pub fn verify_contract() {
     assert_eq!(number::LSEEK, 62);
     assert_eq!(number::READ, 63);
     assert_eq!(number::WRITE, 64);
+    assert_eq!(number::SENDFILE, 71);
     assert_eq!(number::PSELECT6, 72);
     assert_eq!(number::PPOLL, 73);
     assert_eq!(number::READLINKAT, 78);

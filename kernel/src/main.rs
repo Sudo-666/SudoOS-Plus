@@ -23,6 +23,7 @@ mod linker;
 mod lockdep;
 mod memory;
 mod net;
+mod oscomp;
 mod page_alloc;
 mod panic;
 mod pipe;
@@ -33,8 +34,8 @@ mod rtc;
 mod runtime_page_table;
 mod signal;
 mod smp;
-mod sysfs;
 mod syscall;
+mod sysfs;
 mod task;
 mod time;
 mod timer;
@@ -136,7 +137,6 @@ fn print_boot_info(boot: &BootInfo) {
     println!("entered Rust kernel successfully");
 }
 
-
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 pub extern "C" fn __riscv_early_trap_panic() -> ! {
@@ -174,6 +174,7 @@ pub extern "C" fn __riscv_early_trap_panic() -> ! {
 
 fn kernel_main(boot: BootInfo) -> ! {
     println!("kernel_main: initialization started");
+    println!("BOOT00 entry");
 
     #[cfg(target_arch = "loongarch64")]
     memory::verify_loongarch_high_mapping();
@@ -199,7 +200,14 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
 
-    let (memory_layout, firmware_timer_frequency, virtio_regions, pci_hosts, initrd_range) = {
+    let (
+        memory_layout,
+        firmware_timer_frequency,
+        virtio_regions,
+        pci_hosts,
+        initrd_range,
+        explicit_oscomp_mode,
+    ) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
@@ -221,6 +229,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         smp::initialize(&tree, boot_hardware_cpu_id(&boot));
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
+        let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs());
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
@@ -238,8 +247,13 @@ fn kernel_main(boot: BootInfo) -> ! {
             virtio_regions,
             pci_hosts,
             initrd_range,
+            explicit_oscomp_mode,
         )
     };
+
+    println!("BOOT01 fdt-valid");
+    println!("BOOT02 memory-map");
+    println!("BOOT08 smp-discovery count={}", smp::discovered_cpu_count());
 
     memory::print_boot_memory_map(memory_layout.free());
     memory::print_virtual_layout();
@@ -247,6 +261,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     memory::verify_early_frame_allocator(memory_layout.free());
 
     let mut early_memory = memory::initialize_early_memory(memory_layout.free());
+    println!("BOOT03 early-page-table");
 
     memory::map_boot_fdt_page(&mut early_memory, fdt_address);
 
@@ -269,17 +284,27 @@ fn kernel_main(boot: BootInfo) -> ! {
          * 高半 kernel image 之前已经由
          * prepare_kernel_image() 写入正式页表。
          */
-        memory::install_riscv_final_page_table(&early_memory);   }
+        memory::install_riscv_final_page_table(&early_memory);
+    }
+
+    println!("BOOT04 final-page-table");
 
     /*
      * 从此处开始，不再允许使用 EarlyFrameAllocator。
-     */  let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory);   #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
+     */
+    let kernel_memory = memory::initialize_page_allocator(&memory_layout, early_memory);
+    println!("BOOT05 buddy-ready");
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     page_alloc::verify();
 
     /*
      * 必须在全局页分配器安装后启用 heap。
      */
-    #[cfg(target_arch = "riscv64")] heap::initialize_boot(); #[cfg(not(target_arch = "riscv64"))] heap::initialize();
+    #[cfg(target_arch = "riscv64")]
+    heap::initialize_boot();
+    #[cfg(not(target_arch = "riscv64"))]
+    heap::initialize();
+    println!("BOOT06 heap-ready");
 
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     heap::verify();
@@ -291,11 +316,13 @@ fn kernel_main(boot: BootInfo) -> ! {
      * 此时仍保持本地中断关闭。
      */
     trap::initialize();
+    println!("BOOT07 bsp-trap-ready");
     irq::initialize();
     time::initialize(firmware_timer_frequency);
     timer::initialize();
     vm::initialize(kernel_memory);
     virtio::initialize(&virtio_regions, &pci_hosts);
+    println!("BOOT12 virtio-ready");
     device::initialize();
     rng::initialize();
     net::initialize();
@@ -306,6 +333,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     mount_sys();
     install_external_initramfs(initrd_range);
     mount_sdcard_if_present();
+    println!("BOOT13 rootfs-ready");
     tty::initialize();
 
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
@@ -345,6 +373,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     task::initialize();
     smp::start_secondaries();
     task::finalize_cpu_bringup();
+    println!("BOOT11 all-ap-online");
     workqueue::initialize();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     timer::verify();
@@ -359,8 +388,9 @@ fn kernel_main(boot: BootInfo) -> ! {
     if initrd_range.is_some() {
         user::verify_busybox_rootfs();
     }
-    user::verify_sdcard_sample();
-    let contest_ran = user::verify_sdcard_all_scripts();
+    let oscomp_mode = oscomp::select_mode(explicit_oscomp_mode);
+    println!("BOOT14 user-entry");
+    let contest_ran = oscomp::run(oscomp_mode);
 
     println!("kernel_main: initialization completed");
     println!("SMOKE_TEST: PASS");
@@ -397,9 +427,7 @@ fn mount_proc() {
         Ok(()) => {
             crate::println!("procfs:");
             crate::println!("  mount          : /proc (proc)");
-            crate::println!(
-                "  files          : version cpuinfo meminfo uptime mounts self"
-            );
+            crate::println!("  files          : version cpuinfo meminfo uptime mounts self");
         }
         Err(error) => panic!("failed to mount /proc: {error:?}"),
     }
@@ -473,7 +501,9 @@ fn mount_sdcard_if_present() {
             } else {
                 crate::println!(
                     "sdcard: vendor LA busybox accepted size={} entry={:#x} phnum={}",
-                    vendor_data.len(), entry, phnum,
+                    vendor_data.len(),
+                    entry,
+                    phnum,
                 );
                 // Install as VFS regular file using the raw byte content.
                 let _ = fs::unlink("/bin/busybox", false);
@@ -482,8 +512,8 @@ fn mount_sdcard_if_present() {
                 let _ = fs::mkdir("/usr/bin", 0o755);
                 let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
                 for applet in &[
-                    "sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep",
-                    "kill", "head", "tail", "grep", "dd", "mount", "ps", "id", "uname", "df",
+                    "sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep", "kill",
+                    "head", "tail", "grep", "dd", "mount", "ps", "id", "uname", "df",
                 ] {
                     let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
                 }
@@ -498,88 +528,110 @@ fn mount_sdcard_if_present() {
     // If vendor busybox is already installed, skip sdcard sources entirely.
     let vendor_installed = fs::stat("/bin/busybox").is_ok() && fs::stat("/bin/sh").is_ok();
     if !vendor_installed {
-    // Try all ext4 busybox sources.  On LoongArch some static busybox
-    // binaries have unresolved linker relaxation placeholders (andi rX,r0,imm)
-    // that cause 0x0 crashes.  Prefer dynamic (PT_INTERP) busybox candidates.
-    let busybox_sources: &[&str] = if cfg!(target_arch = "loongarch64") {
-        &["/musl/busybox", "/glibc/busybox", "/busybox", "/busybox-static",
-          "/bin/busybox", "/usr/bin/busybox",
-          "/glibc/bin/busybox", "/musl/bin/busybox"]
-    } else {
-        &["/musl/busybox", "/busybox", "/busybox-static", "/bin/busybox", "/usr/bin/busybox"]
-    };
-    for busybox_ext4 in busybox_sources {
-        let _ = fs::unlink("/bin/busybox", false);
-        oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
-        if fs::stat("/bin/busybox").is_err() {
-            continue;
-        }
-        // Verify the installed binary is usable.
-        // On LA: reject the known-bad static busybox (phnum=4, entry=0x1201b640c)
-        // which has unresolved linker relaxation placeholders.
-        let mut ok = false;
-        if let Ok(file) = fs::open("/bin/busybox", myos_vfs::OpenFlags::O_RDONLY) {
-            let mut hdr = [0u8; 64];
-            let mut io = myos_vfs::MutableIoBuffer::new(&mut hdr);
-            if file.read(&mut io).is_ok() && io.len() >= 20 && &hdr[..4] == b"\x7fELF" {
-                ok = true;
-                #[cfg(target_arch = "loongarch64")]
-                {
-                    let entry = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
-                    let phnum = u16::from_le_bytes(hdr[56..58].try_into().unwrap()) as usize;
-                    // Reject the known-bad static busybox (ext4 offset 0x8600000).
-                    if entry == 0x1201b640c && phnum <= 4 {
-                        crate::println!(
-                            "sdcard: busybox from {} rejected (bad static, entry={:#x} phnum={})",
-                            busybox_ext4, entry, phnum,
-                        );
-                        ok = false;
+        // Try all ext4 busybox sources.  On LoongArch some static busybox
+        // binaries have unresolved linker relaxation placeholders (andi rX,r0,imm)
+        // that cause 0x0 crashes.  Prefer dynamic (PT_INTERP) busybox candidates.
+        let busybox_sources: &[&str] = if cfg!(target_arch = "loongarch64") {
+            &[
+                "/musl/busybox",
+                "/glibc/busybox",
+                "/busybox",
+                "/busybox-static",
+                "/bin/busybox",
+                "/usr/bin/busybox",
+                "/glibc/bin/busybox",
+                "/musl/bin/busybox",
+            ]
+        } else {
+            &[
+                "/musl/busybox",
+                "/busybox",
+                "/busybox-static",
+                "/bin/busybox",
+                "/usr/bin/busybox",
+            ]
+        };
+        for busybox_ext4 in busybox_sources {
+            let _ = fs::unlink("/bin/busybox", false);
+            oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
+            if fs::stat("/bin/busybox").is_err() {
+                continue;
+            }
+            // Verify the installed binary is usable.
+            // On LA: reject the known-bad static busybox (phnum=4, entry=0x1201b640c)
+            // which has unresolved linker relaxation placeholders.
+            let mut ok = false;
+            if let Ok(file) = fs::open("/bin/busybox", myos_vfs::OpenFlags::O_RDONLY) {
+                let mut hdr = [0u8; 64];
+                let mut io = myos_vfs::MutableIoBuffer::new(&mut hdr);
+                if file.read(&mut io).is_ok() && io.len() >= 20 && &hdr[..4] == b"\x7fELF" {
+                    ok = true;
+                    #[cfg(target_arch = "loongarch64")]
+                    {
+                        let entry = u64::from_le_bytes(hdr[24..32].try_into().unwrap());
+                        let phnum = u16::from_le_bytes(hdr[56..58].try_into().unwrap()) as usize;
+                        // Reject the known-bad static busybox (ext4 offset 0x8600000).
+                        if entry == 0x1201b640c && phnum <= 4 {
+                            crate::println!(
+                                "sdcard: busybox from {} rejected (bad static, entry={:#x} phnum={})",
+                                busybox_ext4,
+                                entry,
+                                phnum,
+                            );
+                            ok = false;
+                        }
                     }
                 }
             }
-        }
-        if !ok {
-            continue;
-        }
-        crate::println!(
-            "sdcard: shell {} selected ({})",
-            busybox_ext4,
-            if cfg!(target_arch = "loongarch64") { "LA" } else { "RV" },
-        );
-        let _ = fs::symlink("/bin/busybox", "/bin/sh");
-        let _ = fs::mkdir("/usr/bin", 0o755);
-        let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
-        for applet in &[
-            "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
-            "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
-            "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
-            "basename", "dirname", "readlink", "stat", "getopt", "env",
-            "sh", "id", "uname", "df",
-        ] {
-            let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
-        }
-        break;
-    }
-    // If no usable shell was found, install the first busybox source anyway
-    // in degraded mode.  Without /bin/sh, all no-shebang scripts fail ENOENT
-    // immediately.  A known-bad static busybox may still run simple commands
-    // before crashing; that's better than 100% ENOENT.
-    // If no good shell was found (all rejected) but a busybox VFS node
-    // exists, install /bin/sh in degraded mode.  Check /bin/sh existence,
-    // not /bin/busybox — the last rejected install leaves a VFS node.
-    if fs::stat("/bin/sh").is_err() {
-        if fs::stat("/bin/busybox").is_ok() {
-            crate::println!("sdcard: WARNING shell degraded mode — using known-bad static LA busybox");
+            if !ok {
+                continue;
+            }
+            crate::println!(
+                "sdcard: shell {} selected ({})",
+                busybox_ext4,
+                if cfg!(target_arch = "loongarch64") {
+                    "LA"
+                } else {
+                    "RV"
+                },
+            );
             let _ = fs::symlink("/bin/busybox", "/bin/sh");
             let _ = fs::mkdir("/usr/bin", 0o755);
             let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
-            for applet in &["sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep"] {
+            for applet in &[
+                "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls", "mkdir", "chmod",
+                "grep", "dd", "mount", "ps", "head", "tail", "test", "awk", "sed", "wc", "cut",
+                "tr", "which", "pidof", "printenv", "basename", "dirname", "readlink", "stat",
+                "getopt", "env", "sh", "id", "uname", "df",
+            ] {
                 let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
             }
-        } else {
-            crate::println!("sdcard: WARNING no shell found — shell-script tests will fail");
+            break;
         }
-    }
+        // If no usable shell was found, install the first busybox source anyway
+        // in degraded mode.  Without /bin/sh, all no-shebang scripts fail ENOENT
+        // immediately.  A known-bad static busybox may still run simple commands
+        // before crashing; that's better than 100% ENOENT.
+        // If no good shell was found (all rejected) but a busybox VFS node
+        // exists, install /bin/sh in degraded mode.  Check /bin/sh existence,
+        // not /bin/busybox — the last rejected install leaves a VFS node.
+        if fs::stat("/bin/sh").is_err() {
+            if fs::stat("/bin/busybox").is_ok() {
+                crate::println!(
+                    "sdcard: WARNING shell degraded mode — using known-bad static LA busybox"
+                );
+                let _ = fs::symlink("/bin/busybox", "/bin/sh");
+                let _ = fs::mkdir("/usr/bin", 0o755);
+                let _ = fs::symlink("/bin/busybox", "/usr/bin/env");
+                for applet in &[
+                    "sh", "cp", "echo", "ls", "mkdir", "test", "cat", "rm", "mv", "sleep",
+                ] {
+                    let _ = fs::symlink("/bin/busybox", &alloc::format!("/bin/{}", applet));
+                }
+            } else {
+                crate::println!("sdcard: WARNING no shell found — shell-script tests will fail");
+            }
+        }
     } // if !vendor_installed
 
     // P1-A: install ld-linux / ld-musl interpreters from their real ext4
@@ -609,7 +661,8 @@ fn mount_sdcard_if_present() {
     while index < dirs.len() && index < MAX_SCAN_DIRS {
         let dir = dirs[index].clone();
         index += 1;
-        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), &dir) else {
+        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), &dir)
+        else {
             continue;
         };
         for entry in entries {
@@ -618,7 +671,8 @@ fn mount_sdcard_if_present() {
                 if dirs.len() < MAX_SCAN_DIRS {
                     dirs.push(child);
                 }
-            } else if oscomp_sdcard_is_test_script(&child) && test_scripts.len() < MAX_TEST_SCRIPTS {
+            } else if oscomp_sdcard_is_test_script(&child) && test_scripts.len() < MAX_TEST_SCRIPTS
+            {
                 test_scripts.push(child);
             }
         }
@@ -704,12 +758,17 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
     };
 
     const EXT4_FT_DIR: u16 = 2;
-    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir) else {
+    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir)
+    else {
         // ext4_dir may be a regular file (e.g. /glibc/lua), not a directory.
         // Install it as a regular file instead of creating a false directory.
         oscomp_sdcard_install_ext4_path(ext4_dir, vfs_dir);
         if fs::stat(vfs_dir).is_ok() {
-            crate::println!("sdcard: installed {} -> {} (regular file)", ext4_dir, vfs_dir);
+            crate::println!(
+                "sdcard: installed {} -> {} (regular file)",
+                ext4_dir,
+                vfs_dir
+            );
             return 1;
         }
         crate::println!("sdcard: expand failed {} -> {}", ext4_dir, vfs_dir);
@@ -749,7 +808,10 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
 
     crate::println!(
         "sdcard: expanded {} -> {} : {} newly installed, {} already available",
-        ext4_dir, vfs_dir, newly_installed, already_available,
+        ext4_dir,
+        vfs_dir,
+        newly_installed,
+        already_available,
     );
     newly_installed + already_available
 }
@@ -758,24 +820,37 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
 /// on a path under /mnt/sdcard, try installing the parent directory's
 /// children from ext4 before giving up.
 pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
-    // Only handle paths under the sdcard mount point.
     let rel = match vfs_path.strip_prefix("/mnt/sdcard/") {
         Some(r) if !r.is_empty() => r,
         _ => return false,
     };
-    // Get the parent directory in ext4 space.
-    let ext4_parent = match rel.rfind('/') {
-        Some(pos) => &rel[..pos],
-        None => rel,
-    };
-    let vfs_parent = alloc::format!("/mnt/sdcard/{}", ext4_parent);
 
-    // Try materializing if the parent directory exists in VFS.
-    if crate::fs::stat(&vfs_parent).is_err() {
-        return false;
+    let parent = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let mut ext4_dir = alloc::string::String::from("/");
+    let mut vfs_dir = alloc::string::String::from("/mnt/sdcard");
+
+    // Directory snapshots initially contain only empty placeholders for
+    // children. Walk from the mounted root so deeply nested toolchain paths
+    // such as /usr/libexec/gcc/... can be populated on first access.
+    for component in parent.split('/').filter(|component| !component.is_empty()) {
+        let next_vfs = alloc::format!("{}/{}", vfs_dir, component);
+        if crate::fs::stat(&next_vfs).is_err() {
+            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096);
+        }
+        if crate::fs::stat(&next_vfs).is_err() {
+            return false;
+        }
+
+        if ext4_dir == "/" {
+            ext4_dir.push_str(component);
+        } else {
+            ext4_dir.push('/');
+            ext4_dir.push_str(component);
+        }
+        vfs_dir = next_vfs;
     }
-    let ext4_dir = alloc::format!("/{}", ext4_parent);
-    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_parent, 256);
+
+    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096);
     count > 0
 }
 
@@ -784,91 +859,60 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
 /// PT_INTERP encodes.
 fn oscomp_install_runtime_loader_aliases() {
     const ALIASES: &[(&str, &[&str])] = &[
-        (
-            "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
-            &[
-                "/lib/ld-linux-riscv64-lp64d.so.1",
-                "/lib64/ld-linux-riscv64-lp64d.so.1",
-            ],
-        ),
-        (
-            "/glibc/lib/ld-linux-riscv64-lp64.so.1",
-            &[
-                "/lib/ld-linux-riscv64-lp64.so.1",
-                "/lib64/ld-linux-riscv64-lp64.so.1",
-            ],
-        ),
-        (
-            "/glibc/lib/ld-linux-loongarch-lp64d.so.1",
-            &[
-                "/lib/ld-linux-loongarch-lp64d.so.1",
-                "/lib64/ld-linux-loongarch-lp64d.so.1",
-                "/lib64/ld-linux-loongarch64-lp64d.so.1",
-            ],
-        ),
-        (
-            "/glibc/lib/ld-linux-loongarch-lp64.so.1",
-            &[
-                "/lib/ld-linux-loongarch-lp64.so.1",
-                "/lib64/ld-linux-loongarch-lp64.so.1",
-                "/lib64/ld-linux-loongarch64-lp64.so.1",
-            ],
-        ),
-        (
-            "/musl/lib/ld-musl-riscv64.so.1",
-            &[
-                "/lib/ld-musl-riscv64.so.1",
-                "/lib64/ld-musl-riscv64.so.1",
-            ],
-        ),
-        (
-            "/musl/lib/ld-musl-riscv64-sf.so.1",
-            &[
-                "/lib/ld-musl-riscv64-sf.so.1",
-                "/lib64/ld-musl-riscv64-sf.so.1",
-            ],
-        ),
-        (
-            "/musl/lib/ld-musl-loongarch64.so.1",
-            &[
-                "/lib/ld-musl-loongarch64.so.1",
-                "/lib64/ld-musl-loongarch64.so.1",
-            ],
-        ),
-        (
-            "/musl/lib/ld-musl-loongarch64-sf.so.1",
-            &[
-                "/lib/ld-musl-loongarch64-sf.so.1",
-                "/lib64/ld-musl-loongarch64-sf.so.1",
-            ],
-        ),
+        ("/glibc/lib/ld-linux-riscv64-lp64d.so.1", &[
+            "/lib/ld-linux-riscv64-lp64d.so.1",
+            "/lib64/ld-linux-riscv64-lp64d.so.1",
+        ]),
+        ("/glibc/lib/ld-linux-riscv64-lp64.so.1", &[
+            "/lib/ld-linux-riscv64-lp64.so.1",
+            "/lib64/ld-linux-riscv64-lp64.so.1",
+        ]),
+        ("/glibc/lib/ld-linux-loongarch-lp64d.so.1", &[
+            "/lib/ld-linux-loongarch-lp64d.so.1",
+            "/lib/ld-linux-loongarch64-lp64d.so.1",
+            "/lib64/ld-linux-loongarch-lp64d.so.1",
+            "/lib64/ld-linux-loongarch64-lp64d.so.1",
+        ]),
+        ("/glibc/lib/ld-linux-loongarch-lp64.so.1", &[
+            "/lib/ld-linux-loongarch-lp64.so.1",
+            "/lib/ld-linux-loongarch64-lp64.so.1",
+            "/lib64/ld-linux-loongarch-lp64.so.1",
+            "/lib64/ld-linux-loongarch64-lp64.so.1",
+        ]),
+        ("/musl/lib/ld-musl-riscv64.so.1", &[
+            "/lib/ld-musl-riscv64.so.1",
+            "/lib64/ld-musl-riscv64.so.1",
+        ]),
+        ("/musl/lib/ld-musl-riscv64-sf.so.1", &[
+            "/lib/ld-musl-riscv64-sf.so.1",
+            "/lib64/ld-musl-riscv64-sf.so.1",
+        ]),
+        ("/musl/lib/ld-musl-loongarch64.so.1", &[
+            "/lib/ld-musl-loongarch64.so.1",
+            "/lib64/ld-musl-loongarch64.so.1",
+        ]),
+        ("/musl/lib/ld-musl-loongarch64-sf.so.1", &[
+            "/lib/ld-musl-loongarch64-sf.so.1",
+            "/lib64/ld-musl-loongarch64-sf.so.1",
+        ]),
         // B1-B2: musl LoongArch LP64D variants — the exact name that
         // PT_INTERP encodes on many LA musl binaries.
-        (
-            "/musl/lib/ld-musl-loongarch-lp64d.so.1",
-            &[
-                "/lib/ld-musl-loongarch-lp64d.so.1",
-                "/lib64/ld-musl-loongarch-lp64d.so.1",
-            ],
-        ),
+        ("/musl/lib/ld-musl-loongarch-lp64d.so.1", &[
+            "/lib/ld-musl-loongarch-lp64d.so.1",
+            "/lib64/ld-musl-loongarch-lp64d.so.1",
+        ]),
         // musl LA: ld-musl-loongarch64-lp64d name variant.
-        (
-            "/musl/lib/ld-musl-loongarch64-lp64d.so.1",
-            &[
-                "/lib/ld-musl-loongarch64-lp64d.so.1",
-                "/lib64/ld-musl-loongarch64-lp64d.so.1",
-            ],
-        ),
+        ("/musl/lib/ld-musl-loongarch64-lp64d.so.1", &[
+            "/lib/ld-musl-loongarch64-lp64d.so.1",
+            "/lib64/ld-musl-loongarch64-lp64d.so.1",
+        ]),
         // Fallback: if there's no separate ld-musl, the musl libc.so
         // itself can act as the dynamic linker.
-        (
-            "/musl/lib/libc.so",
-            &[
-                "/lib/ld-musl-loongarch-lp64d.so.1",
-                "/lib64/ld-musl-loongarch-lp64d.so.1",
-                "/lib/ld-musl-loongarch64-lp64d.so.1",
-            ],
-        ),
+        ("/musl/lib/libc.so", &[
+            "/lib/ld-musl-loongarch-lp64d.so.1",
+            "/lib64/ld-musl-loongarch-lp64d.so.1",
+            "/lib/ld-musl-loongarch64-lp64d.so.1",
+        ]),
     ];
 
     for (src, dsts) in ALIASES {
@@ -884,20 +928,30 @@ fn oscomp_install_runtime_loader_aliases() {
 /// them via openat.
 fn oscomp_install_runtime_lib_aliases() {
     const LIBS: &[&str] = &[
-        "libc.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1",
-        "libm.so.6", "libresolv.so.2", "libutil.so.1", "libnsl.so.1",
-        "libcrypt.so.1", "libgcc_s.so.1", "libstdc++.so.6",
-        "libc.so", "libm.so", "libpthread.so",
+        "libc.so.6",
+        "libpthread.so.0",
+        "libdl.so.2",
+        "librt.so.1",
+        "libm.so.6",
+        "libresolv.so.2",
+        "libutil.so.1",
+        "libnsl.so.1",
+        "libcrypt.so.1",
+        "libgcc_s.so.1",
+        "libstdc++.so.6",
+        "libc.so",
+        "libm.so",
+        "libpthread.so",
     ];
 
     let mut installed: usize = 0;
     for name in LIBS {
         let glibc_src = alloc::format!("/glibc/lib/{}", name);
-        let musl_src  = alloc::format!("/musl/lib/{}", name);
+        let musl_src = alloc::format!("/musl/lib/{}", name);
 
-        let lib_dst    = alloc::format!("/lib/{}", name);
-        let lib64_dst  = alloc::format!("/lib64/{}", name);
-        let usr_dst    = alloc::format!("/usr/lib/{}", name);
+        let lib_dst = alloc::format!("/lib/{}", name);
+        let lib64_dst = alloc::format!("/lib64/{}", name);
+        let usr_dst = alloc::format!("/usr/lib/{}", name);
 
         // Prefer glibc; fall back to musl only if glibc source is absent.
         oscomp_sdcard_install_ext4_path(&glibc_src, &lib_dst);
@@ -942,16 +996,25 @@ fn oscomp_install_runtime_lib_aliases() {
                 let mut io = myos_vfs::MutableIoBuffer::new(&mut buf);
                 let read_ret = file.read(&mut io);
                 let magic = if io.len() >= 4 {
-                    alloc::format!("{:02x}{:02x}{:02x}{:02x}",
-                        io.filled_bytes()[0], io.filled_bytes()[1],
-                        io.filled_bytes()[2], io.filled_bytes()[3])
+                    alloc::format!(
+                        "{:02x}{:02x}{:02x}{:02x}",
+                        io.filled_bytes()[0],
+                        io.filled_bytes()[1],
+                        io.filled_bytes()[2],
+                        io.filled_bytes()[3]
+                    )
                 } else {
                     alloc::string::String::from("????")
                 };
                 crate::println!(
                     "sdcard: alias {} size={} mode={:#o} read={} magic={}",
-                    check, stat.size, stat.mode,
-                    read_ret.as_ref().map_or_else(|e| alloc::format!("err({})", e.to_isize()), |n| alloc::format!("{}", n)),
+                    check,
+                    stat.size,
+                    stat.mode,
+                    read_ret.as_ref().map_or_else(
+                        |e| alloc::format!("err({})", e.to_isize()),
+                        |n| alloc::format!("{}", n)
+                    ),
                     magic,
                 );
             }
@@ -1030,11 +1093,12 @@ fn sdcard_is_test_script(path: &str) -> bool {
         || (path.ends_with(".sh") && path.contains("test"))
 }
 
-pub(crate) static SCANNED_TEST_SCRIPTS: crate::irq_lock::IrqSpinLock<alloc::vec::Vec<alloc::string::String>> =
-    crate::irq_lock::IrqSpinLock::new_with_class(
-        alloc::vec::Vec::new(),
-        crate::lockdep::LockClass::new("sdcard.scripts", crate::lockdep::LockRank::Vfs, 4),
-    );
+pub(crate) static SCANNED_TEST_SCRIPTS: crate::irq_lock::IrqSpinLock<
+    alloc::vec::Vec<alloc::string::String>,
+> = crate::irq_lock::IrqSpinLock::new_with_class(
+    alloc::vec::Vec::new(),
+    crate::lockdep::LockClass::new("sdcard.scripts", crate::lockdep::LockRank::Vfs, 4),
+);
 
 fn install_external_initramfs(range: Option<MemoryRegion>) {
     let Some(range) = range else {

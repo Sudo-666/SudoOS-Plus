@@ -9,7 +9,10 @@ use crate::PAGE_SIZE;
 /// The contest glibc LoongArch Lua image is about 5.9 MiB.  Ext4 snapshots
 /// store regular files in one Vec, so the heap must be able to satisfy the
 /// resulting 8 MiB buddy allocation.
-pub const MAX_ORDER: usize = 12;
+// BuildStorm's native Rust tools are tens of MiB. The kernel currently reads
+// an executable image into one Vec, so the global heap needs contiguous buddy
+// orders beyond the old 8 MiB ceiling on the official 8 GiB configuration.
+pub const MAX_ORDER: usize = 17;
 pub const MAX_ORDER_NR_PAGES: usize = 1_usize << (MAX_ORDER - 1);
 
 pub const DMA32_LIMIT: usize = 0x1_0000_0000;

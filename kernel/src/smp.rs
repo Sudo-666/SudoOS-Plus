@@ -410,6 +410,7 @@ pub fn start_secondaries() {
     for logical in 1..discovered {
         let cpu = CpuId::new(logical).expect("discovered CPU ID exceeded MAX_CPUS");
         let hardware = hardware_id(cpu);
+        crate::println!("BOOT09 ap-start-request cpu={}", logical);
         mark_cpu_starting(cpu);
         if let Err(error) = crate::arch::smp::start_secondary(logical, hardware, high_entry) {
             mark_cpu_start_failed(cpu);
@@ -463,6 +464,9 @@ pub fn start_secondaries() {
     }
 
     assert_bringup_complete();
+    for logical in 1..discovered {
+        crate::println!("BOOT10 ap-online cpu={}", logical);
+    }
 
     #[cfg(debug_assertions)]
     crate::ipi::verify();

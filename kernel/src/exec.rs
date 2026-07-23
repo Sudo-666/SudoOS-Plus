@@ -7,6 +7,20 @@ use myos_mm::{PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 use crate::process::{Process, Thread};
 use crate::user_mm::{UserMm, UserMmRuntimeError};
 
+pub const USER_SIGNAL_TRAMPOLINE: usize = 0x0000_0000_0051_0000;
+
+#[cfg(target_arch = "riscv64")]
+const SIGNAL_TRAMPOLINE_BYTES: &[u8] = &[
+    0x93, 0x08, 0xb0, 0x08, // addi a7, zero, 139 (rt_sigreturn)
+    0x73, 0x00, 0x00, 0x00, // ecall
+];
+
+#[cfg(target_arch = "loongarch64")]
+const SIGNAL_TRAMPOLINE_BYTES: &[u8] = &[
+    0x0b, 0x2c, 0xc2, 0x02, // addi.d r11, r0, 139 (rt_sigreturn)
+    0x00, 0x00, 0x2b, 0x00, // syscall 0
+];
+
 const AT_NULL: usize = 0;
 const AT_PHDR: usize = 3;
 const AT_PHENT: usize = 4;
@@ -15,7 +29,15 @@ const AT_PAGESZ: usize = 6;
 const AT_BASE: usize = 7;
 const AT_FLAGS: usize = 8;
 const AT_ENTRY: usize = 9;
-const AT_UID: usize = 11; const AT_EUID: usize = 12; const AT_GID: usize = 13; const AT_EGID: usize = 14; const AT_CLKTCK: usize = 17; const AT_PLATFORM: usize = 15; const AT_HWCAP: usize = 16; const AT_HWCAP2: usize = 26; const AT_SECURE: usize = 23;
+const AT_UID: usize = 11;
+const AT_EUID: usize = 12;
+const AT_GID: usize = 13;
+const AT_EGID: usize = 14;
+const AT_CLKTCK: usize = 17;
+const AT_PLATFORM: usize = 15;
+const AT_HWCAP: usize = 16;
+const AT_HWCAP2: usize = 26;
+const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 const AT_EXECFN: usize = 31;
 const DT_NULL: u64 = 0;
@@ -167,7 +189,7 @@ pub fn exec_elf(image: &[u8], config: ExecConfig<'_>) -> Result<ExecImage, ExecE
 /// Fixed load bias for the ELF interpreter (ld-linux). Must not overlap
 /// the main-PIE bias (0x4000_0000), the stack, or the user page at 0x400000.
 const INTERP_LOAD_BIAS: usize = 0x2000_0000;
-const MAX_EXEC_IMAGE: usize = 16 * 1024 * 1024;
+const MAX_EXEC_IMAGE: usize = 128 * 1024 * 1024;
 
 pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec, ExecError> {
     let elf = crate::elf::parse(image)?;
@@ -195,13 +217,23 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
     let main_phdr: Option<(VirtAddr, usize, usize)>;
 
     if let Some(interpreter_path) = elf.interpreter.as_ref() {
+        #[cfg(target_arch = "riscv64")]
+        const SYSTEM_INTERPRETER: &str = "/mnt/sdcard/system-glibc/ld-linux-riscv64-lp64d.so.1";
+        #[cfg(target_arch = "loongarch64")]
+        const SYSTEM_INTERPRETER: &str = "/mnt/sdcard/system-glibc/ld-linux-loongarch-lp64d.so.1";
+        let interpreter_load_path = if crate::fs::stat(SYSTEM_INTERPRETER).is_ok() {
+            SYSTEM_INTERPRETER
+        } else {
+            interpreter_path.as_str()
+        };
         // Read the interpreter binary from the VFS.
-        let interp_bytes = match load_exec_image_from_vfs(interpreter_path) {
+        let interp_bytes = match load_exec_image_from_vfs(interpreter_load_path) {
             Ok(bytes) => bytes,
             Err(e) => {
                 crate::println!(
                     "exec: interp={} open-failed reason={}",
-                    interpreter_path, e.reason(),
+                    interpreter_load_path,
+                    e.reason(),
                 );
                 return Err(e);
             }
@@ -214,18 +246,17 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         }
         crate::println!(
             "exec: interp={} kind={:?} entry={:#x} bias={:#x}",
-            interpreter_path, parsed.kind, parsed.entry.get(), INTERP_LOAD_BIAS,
+            interpreter_load_path,
+            parsed.kind,
+            parsed.entry.get(),
+            INTERP_LOAD_BIAS,
         );
         interp_entry = Some(parsed.entry);
         main_entry = Some(elf.entry);
         interp_base = Some(VirtAddr::new(INTERP_LOAD_BIAS));
-        main_phdr = elf.program_headers.map(|info| {
-            (
-                info.virtual_address,
-                info.entry_size,
-                info.count,
-            )
-        });
+        main_phdr = elf
+            .program_headers
+            .map(|info| (info.virtual_address, info.entry_size, info.count));
         interp_image = Some(interp_bytes);
         interp_elf = Some(parsed);
     } else {
@@ -239,10 +270,16 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
 
     // Combine areas: main ELF + interpreter ELF (if any) + extra + stack.
     let mut areas = Vec::new();
-    let area_count = elf.areas.len()
-        .checked_add(if interp_elf.is_some() { interp_elf.as_ref().unwrap().areas.len() } else { 0 })
+    let area_count = elf
+        .areas
+        .len()
+        .checked_add(if interp_elf.is_some() {
+            interp_elf.as_ref().unwrap().areas.len()
+        } else {
+            0
+        })
         .and_then(|count| count.checked_add(config.extra_areas.len()))
-        .and_then(|count| count.checked_add(1)) // stack
+        .and_then(|count| count.checked_add(2)) // signal trampoline + stack
         .ok_or(ExecError::AddressOverflow)?;
     areas
         .try_reserve(area_count)
@@ -252,6 +289,11 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         areas.extend_from_slice(&interp.areas);
     }
     areas.extend_from_slice(config.extra_areas);
+    areas.push(VmArea::new(
+        VirtRange::from_bounds(USER_SIGNAL_TRAMPOLINE, USER_SIGNAL_TRAMPOLINE + PAGE_SIZE),
+        VmAreaFlags::user_rw().union(VmAreaFlags::EXECUTE),
+        VmAreaKind::Anonymous,
+    ));
     areas.push(VmArea::new(
         config.stack,
         VmAreaFlags::user_rw().union(VmAreaFlags::GROW_DOWN),
@@ -287,6 +329,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
             // Apply static PIE relocations on interpreter.
             apply_static_pie_relocations(&mm, interp_data, interp)?;
         }
+        mm.copy_to_user(USER_SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE_BYTES)?;
         build_initial_stack(
             &mm,
             config.stack,
@@ -324,13 +367,14 @@ fn load_exec_image_from_vfs(path: &str) -> Result<Vec<u8>, ExecError> {
     match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
         Ok(file) => {
             let stat = file.fstat().map_err(ExecError::from)?;
-            let size = usize::try_from(stat.size)
-                .map_err(|_| ExecError::AddressOverflow)?;
+            let size = usize::try_from(stat.size).map_err(|_| ExecError::AddressOverflow)?;
             if size > MAX_EXEC_IMAGE {
                 return Err(ExecError::AddressOverflow);
             }
             let mut image = Vec::new();
-            image.try_reserve(size).map_err(|_| ExecError::MetadataOutOfMemory)?;
+            image
+                .try_reserve(size)
+                .map_err(|_| ExecError::MetadataOutOfMemory)?;
             image.resize(size, 0);
             let mut output = myos_vfs::MutableIoBuffer::new(&mut image);
             let read = file.read(&mut output).map_err(ExecError::from)?;
@@ -488,10 +532,12 @@ fn apply_static_pie_relocations(
                 addend as u64
             } else {
                 // R_RELATIVE: value = load_bias + addend.
-                u64::try_from((elf.load_bias as i128)
-                    .checked_add(addend as i128)
-                    .ok_or(ExecError::AddressOverflow)?)
-                    .map_err(|_| ExecError::AddressOverflow)?
+                u64::try_from(
+                    (elf.load_bias as i128)
+                        .checked_add(addend as i128)
+                        .ok_or(ExecError::AddressOverflow)?,
+                )
+                .map_err(|_| ExecError::AddressOverflow)?
             };
             loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
             applied += 1;
@@ -502,7 +548,10 @@ fn apply_static_pie_relocations(
     if applied > 0 || skipped > 0 {
         crate::println!(
             "exec-reloc: applied={} skipped={} jmprel={} pltrel={}",
-            applied, skipped, jmprel, pltrel_size,
+            applied,
+            skipped,
+            jmprel,
+            pltrel_size,
         );
     }
 
@@ -578,7 +627,15 @@ fn build_initial_stack(
     let execfn_ptr = argv_ptrs[0];
 
     let random = build_at_random_bytes(elf.entry, stack, execfn_ptr);
-    let random_ptr = push_stack_bytes(mm, stack, &mut cursor, &random)?; let platform = if cfg!(target_arch = "riscv64") { "riscv64" } else if cfg!(target_arch = "loongarch64") { "loongarch64" } else { "unknown" }; let platform_ptr = push_stack_string(mm, stack, &mut cursor, platform)?;
+    let random_ptr = push_stack_bytes(mm, stack, &mut cursor, &random)?;
+    let platform = if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else if cfg!(target_arch = "loongarch64") {
+        "loongarch64"
+    } else {
+        "unknown"
+    };
+    let platform_ptr = push_stack_string(mm, stack, &mut cursor, platform)?;
 
     cursor = align_down(cursor, 16);
 
@@ -612,7 +669,15 @@ fn build_initial_stack(
         (AT_FLAGS, 0),
         (AT_ENTRY, at_entry),
         (AT_PAGESZ, PAGE_SIZE),
-        (AT_UID, 0), (AT_EUID, 0), (AT_GID, 0), (AT_EGID, 0), (AT_CLKTCK, 100), (AT_PLATFORM, platform_ptr), (AT_HWCAP, 0), (AT_HWCAP2, 0), (AT_SECURE, 0),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_CLKTCK, 100),
+        (AT_PLATFORM, platform_ptr),
+        (AT_HWCAP, 0),
+        (AT_HWCAP2, 0),
+        (AT_SECURE, 0),
         (AT_RANDOM, random_ptr),
         (AT_EXECFN, execfn_ptr),
     ];

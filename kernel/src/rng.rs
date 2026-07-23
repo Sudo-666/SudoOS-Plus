@@ -166,8 +166,8 @@ impl EntropyPool {
         // 使用单调时钟 + 定时器计数作为退化熵源
         let now = crate::time::now().cycles();
         let ticks = crate::time::timer_ticks();
-        let mixed = now.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ ticks.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let mixed =
+            now.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ ticks.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         seed[..8].copy_from_slice(&mixed.to_le_bytes());
         seed[8..16].copy_from_slice(&(mixed >> 32).to_le_bytes());
         // 混合栈地址
@@ -278,7 +278,9 @@ pub fn entropy_available() -> usize {
 }
 
 /// 注册硬件 RNG 设备。被 virtio probe 调用。
-pub fn register_hardware_source(source: alloc::boxed::Box<dyn Fn(&mut [u8]) -> usize + Send + Sync>) {
+pub fn register_hardware_source(
+    source: alloc::boxed::Box<dyn Fn(&mut [u8]) -> usize + Send + Sync>,
+) {
     // 用硬件熵播种池
     {
         let mut pool = RNG_POOL.lock();
@@ -314,8 +316,14 @@ pub fn verify() {
     );
 
     // 字节分布应有变化
-    let unique1 = buf1.iter().collect::<alloc::collections::BTreeSet<_>>().len();
-    assert!(unique1 > 4, "RNG output has too few unique bytes: {unique1}");
+    let unique1 = buf1
+        .iter()
+        .collect::<alloc::collections::BTreeSet<_>>()
+        .len();
+    assert!(
+        unique1 > 4,
+        "RNG output has too few unique bytes: {unique1}"
+    );
 
     crate::println!("M16 RNG gate:");
     crate::println!("  ChaCha20 DRBG      : verified");

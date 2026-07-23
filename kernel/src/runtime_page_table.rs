@@ -188,6 +188,15 @@ impl RuntimePageTable {
         self.inner.allocated_runtime_tables()
     }
 
+    /// Detach every private user page-table page during final address-space
+    /// teardown. All user leaves and their backing records must be gone first.
+    pub fn retire_all_private_tables(
+        &mut self,
+        retired: &mut Vec<myos_mm::PageAllocation>,
+    ) -> Result<(), RuntimePageTableError> {
+        self.inner.retire_all_private_tables(retired)
+    }
+
     #[cfg(target_arch = "loongarch64")]
     pub fn hardware_state(&self) -> crate::arch::memory::paging::PagingHardwareState {
         self.inner.hardware_state()
@@ -287,6 +296,18 @@ mod imp {
 
         pub fn allocated_runtime_tables(&self) -> usize {
             self.runtime_tables.len()
+        }
+
+        pub fn retire_all_private_tables(
+            &mut self,
+            retired: &mut Vec<myos_mm::PageAllocation>,
+        ) -> Result<(), RuntimePageTableError> {
+            // User roots borrow only the high half from the kernel root.
+            for index in 0..ENTRIES_PER_TABLE / 2 {
+                write_entry(self.root, index, 0)?;
+            }
+            retired.append(&mut self.runtime_tables);
+            Ok(())
         }
 
         pub fn map_page(
@@ -729,6 +750,22 @@ mod imp {
 
         pub fn allocated_runtime_tables(&self) -> usize {
             self.runtime_tables.len()
+        }
+
+        pub fn retire_all_private_tables(
+            &mut self,
+            retired: &mut Vec<myos_mm::PageAllocation>,
+        ) -> Result<(), RuntimePageTableError> {
+            // PGDL is wholly private; restore each root slot to the permanent
+            // invalid PUD before releasing descendants.
+            let root_fill = TablePointerEntry::new(self.invalid_pud)
+                .map_err(|_| RuntimePageTableError::PageTableEntry)?
+                .raw();
+            for index in 0..ENTRIES_PER_TABLE {
+                write_entry(self.root, index, root_fill)?;
+            }
+            retired.append(&mut self.runtime_tables);
+            Ok(())
         }
 
         pub fn map_page(

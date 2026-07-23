@@ -25,7 +25,6 @@ const THREAD_RUNNING: u8 = 2;
 const THREAD_EXITING: u8 = 3;
 const THREAD_EXITED: u8 = 4;
 const UNBOUND_SCHEDULER_TASK: usize = usize::MAX;
-
 const PROCESS_MM_LOCK: LockClass = LockClass::new("process.mm", LockRank::Process, 0);
 const PROCESS_THREAD_GROUP_LOCK: LockClass =
     LockClass::new("process.thread_group", LockRank::Process, 1);
@@ -155,6 +154,19 @@ impl FileTable {
         drop(files);
         Ok(())
     }
+
+    pub fn close_all(&self) -> Result<(), myos_vfs::Errno> {
+        let mut files = Vec::new();
+        files
+            .try_reserve(PROCESS_MAX_FDS)
+            .map_err(|_| myos_vfs::Errno::Enomem)?;
+        self.table.lock().take_all(&mut files);
+        for file in &files {
+            file.process_exit();
+        }
+        drop(files);
+        Ok(())
+    }
 }
 
 /// Process-wide pending-signal anchor. Per-thread masks live in `Thread`.
@@ -222,6 +234,16 @@ impl SignalState {
                 .expect("parent signal action table lost a valid signal slot");
             self.set_action(signal, action)
                 .expect("child signal action table lost a valid signal slot");
+        }
+    }
+
+    pub fn reset_actions_for_exec(&self) {
+        const SIG_IGN: usize = 1;
+        let mut actions = self.actions.lock();
+        for action in actions.iter_mut() {
+            if action.handler != SIG_IGN {
+                *action = crate::signal::KernelSigAction::default();
+            }
         }
     }
 
@@ -493,7 +515,7 @@ impl Process {
         let shared_mm = self.mm_arc();
         // Create a new Process wrapper that shares the same UserMm.
         let child = self.create_from_shared_mm(shared_mm)?;
-        // Share file descriptor table (CLONE_FILES).
+        // Share file descriptor contents (CLONE_FILES approximation).
         {
             let mut child_files = child.files.table.lock();
             *child_files = self.files.table.lock().fork_clone();
@@ -732,9 +754,9 @@ impl Process {
         unregister_process(self.id);
         let Self { mm, .. } = self;
         let mm = mm.into_inner();
-        let mut mm = Arc::try_unwrap(mm)
-            .unwrap_or_else(|_| panic!("M9-B address space retained an unexpected owner"));
-        mm.destroy()?;
+        if let Ok(mut mm) = Arc::try_unwrap(mm) {
+            mm.destroy()?;
+        }
         LIVE_PROCESSES.fetch_sub(1, Ordering::AcqRel);
         Ok(())
     }
@@ -944,6 +966,9 @@ impl Thread {
                 Ordering::Acquire,
             )
             .map_err(|_| ProcessError::ThreadAlreadyExited)?;
+        if self.process.thread_count() <= 1 {
+            let _ = self.process.files().close_all();
+        }
         self.exit_status.store(status, Ordering::Relaxed);
         self.lifecycle.store(THREAD_EXITED, Ordering::Release);
         self.exited.complete_all();
@@ -1070,7 +1095,12 @@ impl Drop for Thread {
             let status = self
                 .exit_status()
                 .expect("Thread dropped before publishing an exit status");
-            let _ = parent.mark_child_zombie(Arc::clone(&self.process), status);
+            if parent
+                .mark_child_zombie(Arc::clone(&self.process), status)
+                .is_ok()
+            {
+                let _ = parent.signals().add_pending(crate::signal::SIGCHLD);
+            }
         }
         LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
     }

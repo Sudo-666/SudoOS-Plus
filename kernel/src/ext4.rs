@@ -39,6 +39,7 @@ pub enum Ext4Error {
     FileTooLarge,
     InvalidFeatureSet,
     InvalidSuperblock,
+    NotFound,
     OutOfMemory,
     Unsupported,
 }
@@ -71,6 +72,21 @@ pub struct Ext4DirEntry {
     pub file_type: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ext4NodeKind {
+    Directory,
+    Regular,
+    Symlink,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Ext4NodeInfo {
+    pub ino: u32,
+    pub mode: u32,
+    pub size: u64,
+    pub kind: Ext4NodeKind,
+}
+
 pub fn list_root_directory(
     device: Arc<dyn BlockDevice>,
 ) -> Result<alloc::vec::Vec<Ext4DirEntry>, Ext4Error> {
@@ -89,7 +105,6 @@ pub fn list_directory(
     fs.read_dir_entries_for_ino(ino, &mut entries)?;
     Ok(entries)
 }
-
 
 pub fn load_root_snapshot(device: Arc<dyn BlockDevice>) -> Result<Ext4SnapshotNode, Ext4Error> {
     let fs = Ext4FileSystem::open(device)?;
@@ -211,6 +226,75 @@ impl Ext4FileSystem {
         })
     }
 
+    pub fn root_info(&self) -> Result<Ext4NodeInfo, Ext4Error> {
+        self.inode_info(EXT4_ROOT_INO)
+    }
+
+    pub fn lookup_child_info(&self, parent: u32, name: &str) -> Result<Ext4NodeInfo, Ext4Error> {
+        let ino = self.lookup_child_ino(parent, name)?;
+        self.inode_info(ino)
+    }
+
+    pub fn list_directory_info(&self, ino: u32) -> Result<Vec<(String, Ext4NodeInfo)>, Ext4Error> {
+        let mut entries = Vec::new();
+        let mut raw = Vec::new();
+        self.read_dir_entries_for_ino(ino, &mut raw)?;
+        entries
+            .try_reserve(raw.len())
+            .map_err(|_| Ext4Error::OutOfMemory)?;
+        for entry in raw {
+            entries.push((entry.name, self.inode_info(entry.ino)?));
+        }
+        Ok(entries)
+    }
+
+    pub fn read_inode_at(
+        &self,
+        ino: u32,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<usize, Ext4Error> {
+        let inode = self.read_inode(ino)?;
+        if inode.file_type() != EXT4_S_IFREG {
+            return Err(Ext4Error::BadInode);
+        }
+        if offset >= inode.size || output.is_empty() {
+            return Ok(0);
+        }
+        let count = usize::try_from((inode.size - offset).min(output.len() as u64))
+            .map_err(|_| Ext4Error::AddressOverflow)?;
+        output[..count].fill(0);
+        if inode.flags & EXT4_EXTENTS_FL == 0 {
+            return Err(Ext4Error::Unsupported);
+        }
+        self.read_extent_range(&inode.block, offset, &mut output[..count], 0)?;
+        Ok(count)
+    }
+
+    pub fn read_symlink_inode(&self, ino: u32) -> Result<String, Ext4Error> {
+        let inode = self.read_inode(ino)?;
+        if inode.file_type() != EXT4_S_IFLNK {
+            return Err(Ext4Error::BadInode);
+        }
+        self.read_symlink(&inode)
+    }
+
+    fn inode_info(&self, ino: u32) -> Result<Ext4NodeInfo, Ext4Error> {
+        let inode = self.read_inode(ino)?;
+        let kind = match inode.file_type() {
+            EXT4_S_IFDIR => Ext4NodeKind::Directory,
+            EXT4_S_IFREG => Ext4NodeKind::Regular,
+            EXT4_S_IFLNK => Ext4NodeKind::Symlink,
+            _ => return Err(Ext4Error::Unsupported),
+        };
+        Ok(Ext4NodeInfo {
+            ino,
+            mode: linux_mode(inode.mode),
+            size: inode.size,
+            kind,
+        })
+    }
+
     fn load_inode_tree(
         &self,
         ino: u32,
@@ -290,67 +374,76 @@ impl Ext4FileSystem {
     }
 
     fn lookup_path_ino(&self, path: &str) -> Result<u32, Ext4Error> {
-    if path.is_empty() || path == "/" {
-        return Ok(EXT4_ROOT_INO);
-    }
-    let mut current = EXT4_ROOT_INO;
-    let mut saw_component = false;
-    for component in path.split('/') {
-        if component.is_empty() {
-            continue;
+        if path.is_empty() || path == "/" {
+            return Ok(EXT4_ROOT_INO);
         }
-        if component == "." || component == ".." || component.as_bytes().contains(&0) {
-            return Err(Ext4Error::BadDirectory);
-        }
-        saw_component = true;
-        current = self.lookup_child_ino(current, component)?;
-    }
-    if saw_component { Ok(current) } else { Ok(EXT4_ROOT_INO) }
-}
-
-fn read_dir_entries_for_ino(
-    &self,
-    ino: u32,
-    output: &mut alloc::vec::Vec<Ext4DirEntry>,
-) -> Result<(), Ext4Error> {
-    let inode = self.read_inode(ino)?;
-    if inode.file_type() != EXT4_S_IFDIR {
-        return Err(Ext4Error::BadDirectory);
-    }
-    let data = self.read_inode_bytes(&inode)?;
-    let mut offset = 0_usize;
-    while offset < data.len() {
-        if data.len() - offset < 8 {
-            break;
-        }
-        let child_ino = le_u32(&data, offset)?;
-        let rec_len = usize::from(le_u16(&data, offset + 4)?);
-        let name_len_raw = *data.get(offset + 6).ok_or(Ext4Error::BadDirectory)?;
-        let file_type_raw = *data.get(offset + 7).ok_or(Ext4Error::BadDirectory)?;
-        if rec_len == 0 || rec_len < 8 || offset + rec_len > data.len() {
-            return Err(Ext4Error::BadDirectory);
-        }
-        let name_len = usize::from(name_len_raw);
-        if name_len > rec_len - 8 {
-            return Err(Ext4Error::BadDirectory);
-        }
-        if child_ino != 0 {
-            let name_bytes = &data[offset + 8..offset + 8 + name_len];
-            if name_bytes != b"." && name_bytes != b".." && !name_bytes.contains(&0) && !name_bytes.contains(&b'/') {
-                let name = String::from_utf8(name_bytes.to_vec()).map_err(|_| Ext4Error::BadDirectory)?;
-                output.try_reserve(1).map_err(|_| Ext4Error::OutOfMemory)?;
-                output.push(Ext4DirEntry {
-                    name,
-                    ino: child_ino,
-                    file_type: u16::from(file_type_raw),
-                });
+        let mut current = EXT4_ROOT_INO;
+        let mut saw_component = false;
+        for component in path.split('/') {
+            if component.is_empty() {
+                continue;
             }
+            if component == "." || component == ".." || component.as_bytes().contains(&0) {
+                return Err(Ext4Error::BadDirectory);
+            }
+            saw_component = true;
+            current = self.lookup_child_ino(current, component)?;
         }
-        offset += rec_len;
+        if saw_component {
+            Ok(current)
+        } else {
+            Ok(EXT4_ROOT_INO)
+        }
     }
-    Ok(())
-}
-/// 读取根目录条目列表（仅名字、inode 号和文件类型，不递归加载）。
+
+    fn read_dir_entries_for_ino(
+        &self,
+        ino: u32,
+        output: &mut alloc::vec::Vec<Ext4DirEntry>,
+    ) -> Result<(), Ext4Error> {
+        let inode = self.read_inode(ino)?;
+        if inode.file_type() != EXT4_S_IFDIR {
+            return Err(Ext4Error::BadDirectory);
+        }
+        let data = self.read_inode_bytes(&inode)?;
+        let mut offset = 0_usize;
+        while offset < data.len() {
+            if data.len() - offset < 8 {
+                break;
+            }
+            let child_ino = le_u32(&data, offset)?;
+            let rec_len = usize::from(le_u16(&data, offset + 4)?);
+            let name_len_raw = *data.get(offset + 6).ok_or(Ext4Error::BadDirectory)?;
+            let file_type_raw = *data.get(offset + 7).ok_or(Ext4Error::BadDirectory)?;
+            if rec_len == 0 || rec_len < 8 || offset + rec_len > data.len() {
+                return Err(Ext4Error::BadDirectory);
+            }
+            let name_len = usize::from(name_len_raw);
+            if name_len > rec_len - 8 {
+                return Err(Ext4Error::BadDirectory);
+            }
+            if child_ino != 0 {
+                let name_bytes = &data[offset + 8..offset + 8 + name_len];
+                if name_bytes != b"."
+                    && name_bytes != b".."
+                    && !name_bytes.contains(&0)
+                    && !name_bytes.contains(&b'/')
+                {
+                    let name = String::from_utf8(name_bytes.to_vec())
+                        .map_err(|_| Ext4Error::BadDirectory)?;
+                    output.try_reserve(1).map_err(|_| Ext4Error::OutOfMemory)?;
+                    output.push(Ext4DirEntry {
+                        name,
+                        ino: child_ino,
+                        file_type: u16::from(file_type_raw),
+                    });
+                }
+            }
+            offset += rec_len;
+        }
+        Ok(())
+    }
+    /// 读取根目录条目列表（仅名字、inode 号和文件类型，不递归加载）。
     fn read_root_dir_entries(
         &self,
         output: &mut alloc::vec::Vec<Ext4DirEntry>,
@@ -451,7 +544,7 @@ fn read_dir_entries_for_ino(
             }
             offset += rec_len;
         }
-        Err(Ext4Error::BadDirectory)
+        Err(Ext4Error::NotFound)
     }
 
     fn read_symlink(&self, inode: &Ext4Inode) -> Result<String, Ext4Error> {
@@ -505,11 +598,11 @@ fn read_dir_entries_for_ino(
                 let entry = 12 + index * 12;
                 let logical = u64::from(le_u32(node, entry)?);
                 let raw_len = le_u16(node, entry + 4)?;
-                let initialized_len = u64::from(raw_len & 0x7fff);
+                let (initialized_len, unwritten) = Self::decode_extent_len(raw_len);
                 let start_hi = u64::from(le_u16(node, entry + 6)?);
                 let start_lo = u64::from(le_u32(node, entry + 8)?);
                 let physical = (start_hi << 32) | start_lo;
-                if initialized_len == 0 {
+                if initialized_len == 0 || unwritten {
                     continue;
                 }
                 self.copy_extent(logical, initialized_len, physical, output)?;
@@ -525,6 +618,95 @@ fn read_dir_entries_for_ino(
             self.read_extent_bytes(&block, output, depth_seen + 1)?;
         }
         Ok(())
+    }
+
+    fn read_extent_range(
+        &self,
+        node: &[u8],
+        file_offset: u64,
+        output: &mut [u8],
+        depth_seen: usize,
+    ) -> Result<(), Ext4Error> {
+        if depth_seen > MAX_EXTENT_TREE_DEPTH {
+            return Err(Ext4Error::BadExtentTree);
+        }
+        if node.len() < 12 || le_u16(node, 0)? != EXT4_EXTENT_MAGIC {
+            return Err(Ext4Error::BadExtentTree);
+        }
+        let entries = usize::from(le_u16(node, 2)?);
+        let max_entries = usize::from(le_u16(node, 4)?);
+        let depth = usize::from(le_u16(node, 6)?);
+        if entries > max_entries || 12 + entries * 12 > node.len() {
+            return Err(Ext4Error::BadExtentTree);
+        }
+        if depth != 0 {
+            for index in 0..entries {
+                let entry = 12 + index * 12;
+                let leaf_lo = u64::from(le_u32(node, entry + 4)?);
+                let leaf_hi = u64::from(le_u16(node, entry + 8)?);
+                let leaf = (leaf_hi << 32) | leaf_lo;
+                let block = self.read_block(leaf)?;
+                self.read_extent_range(&block, file_offset, output, depth_seen + 1)?;
+            }
+            return Ok(());
+        }
+
+        let request_end = file_offset
+            .checked_add(output.len() as u64)
+            .ok_or(Ext4Error::AddressOverflow)?;
+        for index in 0..entries {
+            let entry = 12 + index * 12;
+            let logical = u64::from(le_u32(node, entry)?);
+            let raw_len = le_u16(node, entry + 4)?;
+            let (len_blocks, unwritten) = Self::decode_extent_len(raw_len);
+            if unwritten {
+                continue;
+            }
+            if len_blocks == 0 {
+                continue;
+            }
+            let start_hi = u64::from(le_u16(node, entry + 6)?);
+            let start_lo = u64::from(le_u32(node, entry + 8)?);
+            let physical = (start_hi << 32) | start_lo;
+            let extent_start = logical
+                .checked_mul(self.block_size)
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let extent_end = extent_start
+                .checked_add(
+                    len_blocks
+                        .checked_mul(self.block_size)
+                        .ok_or(Ext4Error::AddressOverflow)?,
+                )
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let overlap_start = extent_start.max(file_offset);
+            let overlap_end = extent_end.min(request_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let disk_offset = physical
+                .checked_mul(self.block_size)
+                .and_then(|base| base.checked_add(overlap_start - extent_start))
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let output_start = usize::try_from(overlap_start - file_offset)
+                .map_err(|_| Ext4Error::AddressOverflow)?;
+            let count = usize::try_from(overlap_end - overlap_start)
+                .map_err(|_| Ext4Error::AddressOverflow)?;
+            read_exact(
+                &self.device,
+                disk_offset,
+                &mut output[output_start..output_start + count],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn decode_extent_len(raw_len: u16) -> (u64, bool) {
+        const EXT4_INIT_MAX_LEN: u16 = 0x8000;
+        if raw_len <= EXT4_INIT_MAX_LEN {
+            (u64::from(raw_len), false)
+        } else {
+            (u64::from(raw_len - EXT4_INIT_MAX_LEN), true)
+        }
     }
 
     fn copy_extent(

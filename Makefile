@@ -4,6 +4,16 @@
 
 .PHONY: all oscomp-all oscomp-audit oscomp-vendor oscomp-clean oscomp-local help oscomp-riscv-boot-to-runtime-big-repair-audit
 
+FINAL_IMAGE_RV ?= /Volumes/U/sudoos-final-2026/images/sdcard-rv-pub.img
+FINAL_IMAGE_LA ?= /Volumes/U/sudoos-final-2026/images/sdcard-la-pub.img
+FINAL_LOG_DIR ?= artifacts/final-2026/logs
+FINAL_CPUS ?= 8
+FINAL_MEM ?= 8G
+FINAL_RUN_ID ?= $(shell date +%Y%m%d-%H%M%S)
+FINAL_CAGENT_TIMEOUT ?= 300
+FINAL_CAGENT_REJECT_GUARD ?= --failure-regex '^testcase cagent .* reject [0-9]+$$'
+FINAL_BUILDSTORM_TIMEOUT ?= 15000
+
 all: oscomp-all
 
 oscomp-all:
@@ -223,3 +233,108 @@ contest-la: kernel-la
 		-device virtio-net-pci,netdev=net0 \
 		-netdev user,id=net0 \
 		-rtc base=utc
+
+.PHONY: final-cagent-rv
+final-cagent-rv: kernel-rv
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/cagent-rv-$(FINAL_RUN_ID).log \
+		--success-pattern "#### OS COMP TEST GROUP END cagent ####" \
+		--success-pattern "#### OS COMP SUMMARY END ####" \
+		$(FINAL_CAGENT_REJECT_GUARD) \
+		--failure-regex '^panicked at .*' --timeout $(FINAL_CAGENT_TIMEOUT) -- qemu-system-riscv64 \
+		-machine virt \
+		-kernel kernel-rv \
+		-m 1G \
+		-smp 1 \
+		-bios default \
+		-drive file=$(FINAL_IMAGE_RV),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-snapshot \
+		-no-reboot \
+		-device virtio-net-device,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc \
+		-append "sudoos.oscomp=final-cagent" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/cagent-rv-$(FINAL_RUN_ID).log
+
+.PHONY: final-cagent-la
+final-cagent-la: kernel-la
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/cagent-la-$(FINAL_RUN_ID).log \
+		--success-pattern "#### OS COMP TEST GROUP END cagent ####" \
+		--success-pattern "#### OS COMP SUMMARY END ####" \
+		$(FINAL_CAGENT_REJECT_GUARD) \
+		--failure-regex '^panicked at .*' --timeout $(FINAL_CAGENT_TIMEOUT) -- qemu-system-loongarch64 \
+		-kernel kernel-la \
+		-m 1G \
+		-smp 1 \
+		-drive file=$(FINAL_IMAGE_LA),if=none,format=raw,id=x0 \
+		-device virtio-blk-pci,drive=x0 \
+		-snapshot \
+		-no-reboot \
+		-device virtio-net-pci,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc \
+		-append "sudoos.oscomp=final-cagent" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/cagent-la-$(FINAL_RUN_ID).log
+
+.PHONY: final-buildstorm-rv
+final-buildstorm-rv: kernel-rv
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-rv-$(FINAL_RUN_ID).log \
+		--success-regex '^BUILDSTORM_COMPILE mode=multi ok=true .*cores=8 .*bytes=[1-9][0-9]{5,} .*' \
+		--success-pattern "#### OS COMP TEST GROUP END buildstorm ####" \
+		--failure-pattern "BUILDSTORM_TOOLCHAIN fail" --failure-pattern "BUILDSTORM_MINIBUILD fail" \
+		--failure-regex '^BUILDSTORM_COMPILE mode=multi ok=false .*' --failure-regex '^panicked at .*' \
+		--timeout $(FINAL_BUILDSTORM_TIMEOUT) -- qemu-system-riscv64 \
+		-machine virt \
+		-kernel kernel-rv \
+		-m $(FINAL_MEM) \
+		-smp $(FINAL_CPUS) \
+		-bios default \
+		-drive file=$(FINAL_IMAGE_RV),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-snapshot \
+		-no-reboot \
+		-device virtio-net-device,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc \
+		-append "sudoos.oscomp=final-buildstorm" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/buildstorm-rv-$(FINAL_RUN_ID).log
+
+.PHONY: final-buildstorm-la
+final-buildstorm-la: kernel-la
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-la-$(FINAL_RUN_ID).log \
+		--success-regex '^BUILDSTORM_COMPILE mode=multi ok=true .*cores=8 .*bytes=[1-9][0-9]{5,} .*' \
+		--success-pattern "#### OS COMP TEST GROUP END buildstorm ####" \
+		--failure-pattern "BUILDSTORM_TOOLCHAIN fail" --failure-pattern "BUILDSTORM_MINIBUILD fail" \
+		--failure-regex '^BUILDSTORM_COMPILE mode=multi ok=false .*' --failure-regex '^panicked at .*' \
+		--timeout $(FINAL_BUILDSTORM_TIMEOUT) -- qemu-system-loongarch64 \
+		-kernel kernel-la \
+		-m $(FINAL_MEM) \
+		-smp $(FINAL_CPUS) \
+		-drive file=$(FINAL_IMAGE_LA),if=none,format=raw,id=x0 \
+		-device virtio-blk-pci,drive=x0 \
+		-snapshot \
+		-no-reboot \
+		-device virtio-net-pci,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc \
+		-append "sudoos.oscomp=final-buildstorm" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/buildstorm-la-$(FINAL_RUN_ID).log
+
+.PHONY: final-buildstorm-rv-debug-small final-buildstorm-la-debug-small
+final-buildstorm-rv-debug-small:
+	@$(MAKE) final-buildstorm-rv FINAL_CPUS=1 FINAL_MEM=1G
+
+final-buildstorm-la-debug-small:
+	@$(MAKE) final-buildstorm-la FINAL_CPUS=1 FINAL_MEM=1G

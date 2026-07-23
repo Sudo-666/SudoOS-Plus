@@ -57,10 +57,7 @@ static INTERFACES: IrqSpinLock<Vec<RegisteredInterface>> =
 pub fn initialize() {
     let interfaces = INTERFACES.lock();
     crate::println!("net:");
-    crate::println!(
-        "  interfaces     : {}",
-        interfaces.len(),
-    );
+    crate::println!("  interfaces     : {}", interfaces.len(),);
     for iface in interfaces.iter() {
         crate::println!(
             "  {}           : MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} MTU {}",

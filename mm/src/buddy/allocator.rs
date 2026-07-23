@@ -271,8 +271,7 @@ impl BuddyAllocator {
         Ok(())
     }
 
-
- pub fn allocate(
+    pub fn allocate(
         &mut self,
         order: usize,
         class: AllocationClass,

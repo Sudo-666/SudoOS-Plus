@@ -47,6 +47,22 @@ pub trait BlockDevice: Send + Sync + 'static {
     fn read_block(&self, block: u64, output: &mut [u8]) -> Result<(), BlockError>;
     fn write_block(&self, block: u64, input: &[u8]) -> Result<(), BlockError>;
 
+    fn read_blocks(&self, block: u64, output: &mut [u8]) -> Result<(), BlockError> {
+        let block_size = self.block_size();
+        if output.is_empty() || output.len() % block_size != 0 {
+            return Err(BlockError::BadBlockSize);
+        }
+        for (index, chunk) in output.chunks_exact_mut(block_size).enumerate() {
+            self.read_block(
+                block
+                    .checked_add(index as u64)
+                    .ok_or(BlockError::AddressOverflow)?,
+                chunk,
+            )?;
+        }
+        Ok(())
+    }
+
     fn flush(&self) -> Result<(), BlockError> {
         Ok(())
     }
@@ -544,6 +560,16 @@ fn transfer_at(
     while done < output.len() && cursor < size {
         let block = cursor / block_size as u64;
         let block_offset = (cursor % block_size as u64) as usize;
+        if block_offset == 0 {
+            let available = (output.len() - done).min((size - cursor) as usize);
+            let bulk = (available / block_size) * block_size;
+            if bulk != 0 {
+                device.read_blocks(block, &mut output[done..done + bulk])?;
+                done += bulk;
+                cursor += bulk as u64;
+                continue;
+            }
+        }
         let count = (block_size - block_offset)
             .min(output.len() - done)
             .min((size - cursor) as usize);

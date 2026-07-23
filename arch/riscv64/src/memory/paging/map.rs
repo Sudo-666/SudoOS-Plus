@@ -1,6 +1,6 @@
 use myos_mm::{
-    EarlyFrameAllocator, EarlyFrameAllocatorError, MappingOptions, PAGE_SIZE, PageTableAccessError,
-    PhysAddr, PhysFrame, VirtAddr, VirtPage,
+    EarlyFrameAllocator, EarlyFrameAllocatorError, MappingOptions, PAGE_SHIFT,
+    PageTableAccessError, PhysAddr, PhysFrame, VirtAddr, VirtPage,
 };
 
 use super::{BootPageTable, LEVELS, PageTable, PageTableEntry, PageTableEntryError, indices};
@@ -41,6 +41,57 @@ impl From<PageTableAccessError> for MapPageError {
 }
 
 impl BootPageTable {
+    pub fn map_mega_page<const CAPACITY: usize>(
+        &mut self,
+        allocator: &mut EarlyFrameAllocator<CAPACITY>,
+        virtual_address: VirtAddr,
+        physical_address: PhysAddr,
+        options: MappingOptions,
+    ) -> Result<(), MapPageError> {
+        const MEGA_PAGE_SHIFT: usize = PAGE_SHIFT + 9;
+        const MEGA_PAGE_SIZE: usize = 1 << MEGA_PAGE_SHIFT;
+
+        if virtual_address.get() & (MEGA_PAGE_SIZE - 1) != 0
+            || physical_address.get() & (MEGA_PAGE_SIZE - 1) != 0
+        {
+            return Err(MapPageError::InvalidVirtualAddress);
+        }
+
+        let page_indices = indices(virtual_address).ok_or(MapPageError::InvalidVirtualAddress)?;
+        let frame = PhysFrame::from_start_address(physical_address)
+            .ok_or(MapPageError::InvalidVirtualAddress)?;
+        let leaf = PageTableEntry::leaf(frame, options)?;
+        let root_index = page_indices[0].get();
+        let raw = read_entry(self.root, root_index)?;
+
+        let level_one = if raw == 0 {
+            let table = allocator.allocate_frame()?;
+            initialize_zero_table(table);
+            let pointer = PageTableEntry::table(table)?;
+            write_entry(self.root, root_index, pointer.raw())?;
+            self.allocated_table_pages += 1;
+            table
+        } else {
+            let entry = PageTableEntry::from_raw(raw);
+            if entry.is_leaf() {
+                return Err(MapPageError::LeafWhereTableExpected { level: 0 });
+            }
+            if !entry.is_table() {
+                return Err(MapPageError::InvalidTableEntry { level: 0 });
+            }
+            entry
+                .frame()
+                .ok_or(MapPageError::InvalidTableEntry { level: 0 })?
+        };
+
+        let leaf_index = page_indices[1].get();
+        if read_entry(level_one, leaf_index)? != 0 {
+            return Err(MapPageError::AlreadyMapped);
+        }
+        write_entry(level_one, leaf_index, leaf.raw())?;
+        Ok(())
+    }
+
     pub fn map_page<const CAPACITY: usize>(
         &mut self,
         allocator: &mut EarlyFrameAllocator<CAPACITY>,
@@ -179,12 +230,9 @@ impl BootPageTable {
 
             let entry = PageTableEntry::from_raw(raw);
 
-            if level == LEVELS - 1 {
-                if !entry.is_leaf() {
-                    return Err(MapPageError::InvalidTableEntry { level });
-                }
-
-                let offset = address.get() & (PAGE_SIZE - 1);
+            if entry.is_leaf() {
+                let leaf_shift = PAGE_SHIFT + 9 * (LEVELS - 1 - level);
+                let offset = address.get() & ((1_usize << leaf_shift) - 1);
 
                 let physical = entry
                     .physical_address()
@@ -194,8 +242,8 @@ impl BootPageTable {
                 return Ok(Some(physical));
             }
 
-            if entry.is_leaf() {
-                return Err(MapPageError::LeafWhereTableExpected { level });
+            if level == LEVELS - 1 {
+                return Err(MapPageError::InvalidTableEntry { level });
             }
 
             if !entry.is_table() {

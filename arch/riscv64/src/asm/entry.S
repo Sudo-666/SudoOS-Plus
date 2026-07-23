@@ -41,6 +41,9 @@
  */
 .equ TEMP_KERNEL_LARGE_PAGES, 32
 
+/* Official final configuration exposes 8 GiB at PA 0x80000000. */
+.equ TEMP_DIRECT_MAP_GIB_PAGES, 8
+
 _start:
     /*
      * 在完整 trap 子系统建立之前禁止 supervisor interrupt。
@@ -182,9 +185,9 @@ _start:
     /*
      * 临时 RAM direct map。
      *
-     * PA 0x80000000..0xbfffffff
+     * PA 0x80000000..0x27fffffff
      *
-     * 映射到根索引 346 对应的 1 GiB 高地址区域。
+     * 映射到根索引 346 开始的 8 个 1 GiB 高地址区域。
      *
      * 这是启动期粗粒度映射。正式页表会根据实际 FDT RAM
      * 范围重新建立映射。
@@ -196,13 +199,21 @@ _start:
 
     .option pop
 
-    li t1, 0x80000000
-    srli t1, t1, 2
-    ori t1, t1, PTE_RWAD
-
     li t2, 346*8
     add t0, t0, t2
-    sd t1, 0(t0)
+    li t1, 0x80000000
+    li t2, TEMP_DIRECT_MAP_GIB_PAGES
+    li t3, 0x40000000
+
+.Lmap_temporary_direct:
+    srli t4, t1, 2
+    ori t4, t4, PTE_RWAD
+    sd t4, 0(t0)
+
+    addi t0, t0, 8
+    add t1, t1, t3
+    addi t2, t2, -1
+    bnez t2, .Lmap_temporary_direct
 
 .Lbuild_uart_mapping:
     /*
