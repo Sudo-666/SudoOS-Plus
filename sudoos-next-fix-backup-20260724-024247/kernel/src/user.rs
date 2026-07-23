@@ -4272,12 +4272,9 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
             let sub_vfs = alloc::format!("{}/{}", vfs_dir, entry.name);
             if crate::fs::stat(&sub_vfs).is_err() {
                 let _ = crate::fs::mkdir(&sub_vfs, 0o755);
+                // Recursively install files from the subdirectory
+                sdcard_install_ext4_dir_files(&sub_ext4);
             }
-            // SUDOOS_FINAL_NEXT_DIRECT_FIX_V1: a lazy ext4 directory can already exist as a VFS node
-            // while its descendants have not been materialised. Always recurse
-            // through a real ext4 directory so sysroots and nested libraries
-            // become visible to their actual guest programs.
-            sdcard_install_ext4_dir_files(&sub_ext4);
         }
     }
     crate::println!(
@@ -8303,43 +8300,23 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
         return;
     }
 
-    // SUDOOS_FINAL_NEXT_DIRECT_FIX_V1: teardown may run after scheduler-current state is detached.
-    // Every user-memory access and futex key below is tied to this thread's MM.
-    let mm = thread.process().mm();
-
-    let read_usize = |address: usize| -> Option<usize> {
-        let mut bytes = [0_u8; core::mem::size_of::<usize>()];
-        mm.copy_from_user(address, &mut bytes).ok()?;
-        Some(usize::from_ne_bytes(bytes))
+    let first = match copy_plain_from_user::<usize>(head) {
+        Ok(value) => value,
+        Err(_) => return,
     };
-    let read_isize = |address: usize| -> Option<isize> {
-        let mut bytes = [0_u8; core::mem::size_of::<isize>()];
-        mm.copy_from_user(address, &mut bytes).ok()?;
-        Some(isize::from_ne_bytes(bytes))
-    };
-    let read_u32 = |address: usize| -> Option<u32> {
-        let mut bytes = [0_u8; core::mem::size_of::<u32>()];
-        mm.copy_from_user(address, &mut bytes).ok()?;
-        Some(u32::from_ne_bytes(bytes))
-    };
-
-    let Some(first) = read_usize(head) else {
-        return;
-    };
-    let Some(futex_offset) =
-        read_isize(head.saturating_add(core::mem::size_of::<usize>()))
-    else {
-        return;
-    };
+    let futex_offset =
+        match copy_plain_from_user::<isize>(head.saturating_add(core::mem::size_of::<usize>())) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
     let pending =
-        read_usize(head.saturating_add(2 * core::mem::size_of::<usize>()))
+        copy_plain_from_user::<usize>(head.saturating_add(2 * core::mem::size_of::<usize>()))
             .unwrap_or(0);
 
     let mark_owner_dead = |node: usize| {
         if node == 0 || node == head {
             return;
         }
-
         let futex_address = if futex_offset >= 0 {
             node.checked_add(futex_offset as usize)
         } else {
@@ -8348,21 +8325,16 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
         let Some(futex_address) = futex_address else {
             return;
         };
-        let Some(word) = read_u32(futex_address) else {
-            return;
+        let word = match copy_plain_from_user::<u32>(futex_address) {
+            Ok(value) => value,
+            Err(_) => return,
         };
         if word & FUTEX_TID_MASK != thread.id().get() as u32 {
             return;
         }
-
         let dead = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
-        if mm
-            .copy_to_user(futex_address, &dead.to_ne_bytes())
-            .is_ok()
-        {
-            let queue = get_futex_queue_for_mm(mm, futex_address);
-            queue.wake_sequence.fetch_add(1, Ordering::AcqRel);
-            let _ = queue.waiters.wake_one();
+        if copy_to_user(futex_address, &dead.to_ne_bytes()).is_ok() {
+            let _ = sys_futex(futex_address, FUTEX_WAKE, 1, 0, 0, 0);
         }
     };
 
@@ -8372,12 +8344,11 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
             break;
         }
         mark_owner_dead(node);
-        let Some(next) = read_usize(node) else {
-            break;
+        node = match copy_plain_from_user::<usize>(node) {
+            Ok(next) => next,
+            Err(_) => break,
         };
-        node = next;
     }
-
     if pending != 0 {
         mark_owner_dead(pending);
     }
