@@ -31,7 +31,6 @@ impl<T> IrqSpinLock<T> {
 }
 
 impl<T> IrqSpinLock<T> {
-    
     /// # Safety
     ///
     /// Caller must prove that this is the single-CPU boot publication window:
@@ -41,7 +40,7 @@ impl<T> IrqSpinLock<T> {
         unsafe { self.inner.get_mut_unchecked() }
     }
 
-pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
+    pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
         let interrupt_guard = crate::context::IrqSaveGuard::new();
         let cpu = crate::smp::current_cpu_id();
         crate::lockdep::before_lock(

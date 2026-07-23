@@ -288,7 +288,6 @@ impl Task {
             .map(|thread| thread.process().mm_arc())
     }
 
-    #[cfg(debug_assertions)]
     fn stack_contains(&self, address: usize) -> bool {
         self.stack
             .as_ref()
@@ -571,7 +570,7 @@ impl Scheduler {
 
         let previous_mm = self.task(previous).user_mm();
         let next_mm = self.task(next).user_mm();
-        let loaded_mm = self.cpus[cpu.get()].loaded_mm.as_ref().cloned();
+        let mut loaded_mm = self.cpus[cpu.get()].loaded_mm.as_ref().cloned();
 
         let mismatch = match (&previous_mm, &loaded_mm) {
             (None, None) => false,
@@ -589,9 +588,12 @@ impl Scheduler {
             );
             // Deactivate stale loaded mm if present.
             if let Some(stale) = &loaded_mm {
-                let _ = stale.deactivate_current_cpu();
+                stale
+                    .deactivate_current_cpu()
+                    .unwrap_or_else(|error| panic!("M9-B failed to repair stale mm: {error:?}"));
             }
             self.cpus[cpu.get()].loaded_mm = None;
+            loaded_mm = None;
             // Fall through: the activation path below will set up the
             // correct mm for the incoming task.
         }
@@ -1411,10 +1413,6 @@ impl Scheduler {
 
     fn irq_enter(&mut self, cpu: CpuId) {
         let state = &mut self.cpus[cpu.get()];
-        assert!(
-            crate::smp::is_online(cpu),
-            "offline CPU entered IRQ context"
-        );
         state.irq_depth = state
             .irq_depth
             .checked_add(1)
@@ -1594,6 +1592,9 @@ pub fn initialize() {
 
 pub fn irq_enter() {
     let cpu = crate::smp::current_cpu_id();
+    if !crate::smp::is_online(cpu) {
+        return;
+    }
     let mut slot = SCHEDULER.lock();
     if let Some(scheduler) = slot.as_mut() {
         scheduler.irq_enter(cpu);
@@ -1602,6 +1603,9 @@ pub fn irq_enter() {
 
 pub fn irq_exit() {
     let cpu = crate::smp::current_cpu_id();
+    if !crate::smp::is_online(cpu) {
+        return;
+    }
     let should_preempt = {
         let mut slot = SCHEDULER.lock();
         slot.as_mut()
@@ -2342,12 +2346,48 @@ fn exit_current() -> ! {
     crate::context::assert_interrupts_enabled();
 
     let _interrupt_guard = crate::context::IrqSaveGuard::new();
-    let cpu = crate::smp::current_cpu_id();
+    let reported_cpu = crate::smp::current_cpu_id();
+    let running_sp = crate::arch::task::current_stack_pointer();
+    let actual_cpu = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        let reported_task = scheduler.current(reported_cpu);
+        if scheduler.task(reported_task).stack_contains(running_sp) {
+            reported_cpu
+        } else {
+            let mut owner = None;
+            for index in 0..scheduler.discovered_cpus {
+                let candidate = CpuId::new(index).expect("scheduler CPU index is invalid");
+                let task = scheduler.current(candidate);
+                if scheduler.task(task).stack_contains(running_sp) {
+                    assert!(owner.is_none(), "kernel stack is current on multiple CPUs");
+                    owner = Some(candidate);
+                }
+            }
+            let actual_cpu = owner.unwrap_or_else(|| {
+                panic!(
+                    "exiting task stack has no scheduler owner: reported_cpu={} task={:?} sp={running_sp:#x}",
+                    reported_cpu.get(),
+                    reported_task,
+                )
+            });
+            actual_cpu
+        }
+    };
+    if actual_cpu != reported_cpu {
+        crate::arch::smp::set_current_cpu_id(actual_cpu.get());
+        crate::println!(
+            "scheduler: repaired stale CPU identity on exit reported={} actual={} sp={:#x}",
+            reported_cpu.get(),
+            actual_cpu.get(),
+            running_sp,
+        );
+    }
     let (previous, next) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.assert_schedulable(cpu);
-        scheduler.prepare_exit(cpu)
+        scheduler.assert_schedulable(actual_cpu);
+        scheduler.prepare_exit(actual_cpu)
     };
     // SAFETY: the exiting task remains allocated and marked SwitchingOut
     // until the incoming context calls finish_switch() from a different stack.
@@ -2591,8 +2631,22 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
         // lock held; the user trap frame has already been consumed.
         unsafe { crate::arch::interrupt::enable() };
     }
+    // Linux closes an exiting process's descriptors before publishing the
+    // zombie. In particular, pipe readers must observe EOF without waiting
+    // for the parent to reap the child.
+    crate::println!(
+        "process-cleanup: tid={} close-files begin",
+        thread.id().get()
+    );
+    let _ = thread.process_arc().files().close_all();
+    crate::println!(
+        "process-cleanup: tid={} close-files done",
+        thread.id().get()
+    );
     crate::user::cleanup_robust_list_on_exit(&thread);
+    crate::println!("process-cleanup: tid={} robust done", thread.id().get());
     crate::user::clear_child_tid_on_exit(&thread);
+    crate::println!("process-cleanup: tid={} ctid done", thread.id().get());
     thread
         .exit(result)
         .expect("M9-B user Thread failed to publish exit state");

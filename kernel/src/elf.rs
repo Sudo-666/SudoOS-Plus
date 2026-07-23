@@ -219,14 +219,10 @@ fn parse_impl(image: &[u8], bias_override: Option<usize>) -> Result<ElfImage, El
                 }
 
                 let flags = segment_flags(raw_flags)?;
-                let area = VmArea::new(
-                    range,
-                    flags,
-                    VmAreaKind::FileBacked {
-                        object: 1,
-                        offset: align_down(file_offset, PAGE_SIZE) as u64,
-                    },
-                );
+                let area = VmArea::new(range, flags, VmAreaKind::FileBacked {
+                    object: 1,
+                    offset: align_down(file_offset, PAGE_SIZE) as u64,
+                });
                 reject_area_overlap(&areas, area.range())?;
 
                 areas.try_reserve(1).map_err(|_| ElfError::OutOfMemory)?;

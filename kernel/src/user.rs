@@ -5,7 +5,9 @@ use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Orderi
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 
 use crate::process::{Process, Thread};
-use crate::user_mm::{UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMmRuntimeError};
+use crate::user_mm::{
+    UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMmRuntimeError,
+};
 
 const USER_CODE: usize = 0x0000_0000_0040_0000;
 const USER_DATA: usize = USER_CODE + PAGE_SIZE;
@@ -13,10 +15,19 @@ const USER_DEMAND: usize = 0x0000_0000_0050_0000;
 const USER_HEAP_START: usize = 0x0000_0000_0060_0000;
 const USER_HEAP_LIMIT: usize = 0x0000_0000_0070_0000;
 const USER_STACK: usize = 0x0000_0000_0080_0000;
-const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
 const USER_MMAP_START: usize = 0x0000_0000_0100_0000;
-const USER_MMAP_END: usize = 0x0000_0000_4000_0000;
+const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
+const RUNTIME_STACK: usize = USER_HEAP_LIMIT;
+const RUNTIME_STACK_TOP: usize = USER_MMAP_START;
+// Leave the top 4 GiB of the smallest supported user address space unused.
+// Rustc maps enough metadata and shared objects to exhaust the former 1 GiB
+// window during a clean BuildStorm build.
+const USER_MMAP_END: usize = 0x0000_003f_0000_0000;
 
+const SYS_EVENTFD2: usize = crate::syscall::number::EVENTFD2;
+const SYS_EPOLL_CREATE1: usize = crate::syscall::number::EPOLL_CREATE1;
+const SYS_EPOLL_CTL: usize = crate::syscall::number::EPOLL_CTL;
+const SYS_EPOLL_PWAIT: usize = crate::syscall::number::EPOLL_PWAIT;
 const SYS_OPENAT: usize = crate::syscall::number::OPENAT;
 const SYS_CLOSE: usize = crate::syscall::number::CLOSE;
 const SYS_GETCWD: usize = crate::syscall::number::GETCWD;
@@ -24,6 +35,7 @@ const SYS_DUP: usize = crate::syscall::number::DUP;
 const SYS_DUP3: usize = crate::syscall::number::DUP3;
 const SYS_FCNTL: usize = crate::syscall::number::FCNTL;
 const SYS_IOCTL: usize = crate::syscall::number::IOCTL;
+const SYS_FLOCK: usize = crate::syscall::number::FLOCK;
 const SYS_MKDIRAT: usize = crate::syscall::number::MKDIRAT;
 const SYS_UNLINKAT: usize = crate::syscall::number::UNLINKAT;
 const SYS_SYMLINKAT: usize = crate::syscall::number::SYMLINKAT;
@@ -42,6 +54,7 @@ const SYS_WRITE: usize = crate::syscall::number::WRITE;
 const SYS_READV: usize = crate::syscall::number::READV;
 const SYS_WRITEV: usize = crate::syscall::number::WRITEV;
 const SYS_PREAD64: usize = crate::syscall::number::PREAD64;
+const SYS_SENDFILE: usize = crate::syscall::number::SENDFILE;
 const SYS_PSELECT6: usize = crate::syscall::number::PSELECT6;
 const SYS_PPOLL: usize = crate::syscall::number::PPOLL;
 const SYS_READLINKAT: usize = crate::syscall::number::READLINKAT;
@@ -91,19 +104,26 @@ const SYS_SIGALTSTACK: usize = crate::syscall::number::SIGALTSTACK;
 const SYS_EXECVE: usize = crate::syscall::number::EXECVE;
 const SYS_MMAP: usize = crate::syscall::number::MMAP;
 const SYS_MPROTECT: usize = crate::syscall::number::MPROTECT;
+const SYS_MADVISE: usize = crate::syscall::number::MADVISE;
 const SYS_PKEY_MPROTECT: usize = crate::syscall::number::PKEY_MPROTECT;
 const SYS_WAIT4: usize = crate::syscall::number::WAIT4;
 const SYS_PRLIMIT64: usize = crate::syscall::number::PRLIMIT64;
 const SYS_GETRANDOM: usize = crate::syscall::number::GETRANDOM;
 const SYS_STATX: usize = crate::syscall::number::STATX;
 const SYS_SOCKET: usize = crate::syscall::number::SOCKET;
+const SYS_SOCKETPAIR: usize = crate::syscall::number::SOCKETPAIR;
 const SYS_BIND: usize = crate::syscall::number::BIND;
 const SYS_LISTEN: usize = crate::syscall::number::LISTEN;
 const SYS_ACCEPT: usize = crate::syscall::number::ACCEPT;
 const SYS_CONNECT: usize = crate::syscall::number::CONNECT;
+const SYS_GETSOCKNAME: usize = crate::syscall::number::GETSOCKNAME;
+const SYS_GETPEERNAME: usize = crate::syscall::number::GETPEERNAME;
 const SYS_SENDTO: usize = crate::syscall::number::SENDTO;
 const SYS_RECVFROM: usize = crate::syscall::number::RECVFROM;
 const SYS_SHUTDOWN: usize = crate::syscall::number::SHUTDOWN;
+const SYS_SENDMSG: usize = crate::syscall::number::SENDMSG;
+const SYS_RECVMSG: usize = crate::syscall::number::RECVMSG;
+const SYS_ACCEPT4: usize = crate::syscall::number::ACCEPT4;
 const SYS_SETSOCKOPT: usize = crate::syscall::number::SETSOCKOPT;
 const SYS_GETSOCKOPT: usize = crate::syscall::number::GETSOCKOPT;
 const SYS_FUTEX: usize = crate::syscall::number::FUTEX;
@@ -156,8 +176,8 @@ const ERANGE: isize = 34;
 
 const MAX_USER_COPY: usize = 4096;
 const MAX_USER_PATH: usize = 256;
-const MAX_EXEC_ARGS: usize = 32;
-const MAX_EXEC_ENVS: usize = 32;
+const MAX_EXEC_ARGS: usize = 256;
+const MAX_EXEC_ENVS: usize = 256;
 const USER_MESSAGE: &[u8] = b"hello user\n";
 const AT_FDCWD: usize = usize::MAX - 99;
 const AT_REMOVEDIR: usize = 0x200;
@@ -227,11 +247,7 @@ impl OscompLmbenchCapture {
 static OSCOMP_LMBENCH_CAPTURE: crate::irq_lock::IrqSpinLock<OscompLmbenchCapture> =
     crate::irq_lock::IrqSpinLock::new_with_class(
         OscompLmbenchCapture::new(),
-        crate::lockdep::LockClass::new(
-            "oscomp.lmbench.capture",
-            crate::lockdep::LockRank::Vfs,
-            91,
-        ),
+        crate::lockdep::LockClass::new("oscomp.lmbench.capture", crate::lockdep::LockRank::Vfs, 91),
     );
 
 // ── P9-H11: LoongArch sleep syscall trace (diagnostic only) ──
@@ -257,10 +273,7 @@ pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
 #[cfg(target_arch = "loongarch64")]
 fn oscomp_la_status_trace(source: &str, value: isize) {
     if oscomp_la_sleep_trace_active() {
-        crate::println!(
-            "oscomp-la-status-trace: source={} value={}",
-            source, value,
-        );
+        crate::println!("oscomp-la-status-trace: source={} value={}", source, value,);
     }
 }
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -793,11 +806,9 @@ pub fn verify_busybox_rootfs() {
 }
 
 fn verify_busybox_rootfs_thread() {
-    let result = run_rootfs_program(
-        "/bin/busybox",
-        &["busybox", "true"],
-        &["PATH=/bin:/sbin:/usr/bin:/usr/sbin"],
-    )
+    let result = run_rootfs_program("/bin/busybox", &["busybox", "true"], &[
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+    ])
     .expect("unable to run BusyBox true from rootfs");
     assert_eq!(result, 0, "BusyBox true exited with a non-zero status");
     crate::println!("M14 BusyBox rootfs gate:");
@@ -998,57 +1009,87 @@ fn oscomp_classify_script(path: &str) -> OscompGroupSpec<'_> {
             if libc == OscompLibc::Glibc || libc == OscompLibc::Musl {
                 // LA uses direct runner; RV uses script.
                 // Per-arch adjustment is done separately.
-                (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-                 OscompRunPolicy::Script, OscompRisk::Low)
+                (
+                    OscompShellPolicy::Default,
+                    OscompEnvPolicy::Default,
+                    OscompRunPolicy::Script,
+                    OscompRisk::Low,
+                )
             } else {
-                (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-                 OscompRunPolicy::Script, OscompRisk::Low)
+                (
+                    OscompShellPolicy::Default,
+                    OscompEnvPolicy::Default,
+                    OscompRunPolicy::Script,
+                    OscompRisk::Low,
+                )
             }
         }
-        OscompGroup::Busybox => {
-            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-             OscompRunPolicy::Script, OscompRisk::Medium)
-        }
-        OscompGroup::Lua => {
-            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-             OscompRunPolicy::Script, OscompRisk::Medium)
-        }
-        OscompGroup::Libcbench => {
-            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-             OscompRunPolicy::Script, OscompRisk::Medium)
-        }
-        OscompGroup::Lmbench => {
-            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
-             OscompRunPolicy::ProbeOnly, OscompRisk::High)
-        }
-        OscompGroup::Cyclictest => {
-            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
-             OscompRunPolicy::ProbeOnly, OscompRisk::High)
-        }
-        OscompGroup::Iozone => {
-            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::FilesystemStress,
-             OscompRunPolicy::ProbeOnly, OscompRisk::High)
-        }
-        OscompGroup::Iperf | OscompGroup::Netperf => {
-            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Network,
-             OscompRunPolicy::ProbeOnly, OscompRisk::Extreme)
-        }
-        OscompGroup::Libctest => {
-            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
-             OscompRunPolicy::ProbeOnly, OscompRisk::Extreme)
-        }
-        OscompGroup::Ltp => {
-            (OscompShellPolicy::ProbeOnly, OscompEnvPolicy::Default,
-             OscompRunPolicy::ProbeOnly, OscompRisk::Extreme)
-        }
-        OscompGroup::Unixbench => {
-            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-             OscompRunPolicy::ProbeOnly, OscompRisk::High)
-        }
-        OscompGroup::Unknown => {
-            (OscompShellPolicy::Default, OscompEnvPolicy::Default,
-             OscompRunPolicy::Script, OscompRisk::Low)
-        }
+        OscompGroup::Busybox => (
+            OscompShellPolicy::Default,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::Script,
+            OscompRisk::Medium,
+        ),
+        OscompGroup::Lua => (
+            OscompShellPolicy::Default,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::Script,
+            OscompRisk::Medium,
+        ),
+        OscompGroup::Libcbench => (
+            OscompShellPolicy::Default,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::Script,
+            OscompRisk::Medium,
+        ),
+        OscompGroup::Lmbench => (
+            OscompShellPolicy::ProbeOnly,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::High,
+        ),
+        OscompGroup::Cyclictest => (
+            OscompShellPolicy::ProbeOnly,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::High,
+        ),
+        OscompGroup::Iozone => (
+            OscompShellPolicy::ProbeOnly,
+            OscompEnvPolicy::FilesystemStress,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::High,
+        ),
+        OscompGroup::Iperf | OscompGroup::Netperf => (
+            OscompShellPolicy::ProbeOnly,
+            OscompEnvPolicy::Network,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::Extreme,
+        ),
+        OscompGroup::Libctest => (
+            OscompShellPolicy::ProbeOnly,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::Extreme,
+        ),
+        OscompGroup::Ltp => (
+            OscompShellPolicy::ProbeOnly,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::Extreme,
+        ),
+        OscompGroup::Unixbench => (
+            OscompShellPolicy::Default,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::ProbeOnly,
+            OscompRisk::High,
+        ),
+        OscompGroup::Unknown => (
+            OscompShellPolicy::Default,
+            OscompEnvPolicy::Default,
+            OscompRunPolicy::Script,
+            OscompRisk::Low,
+        ),
     };
 
     OscompGroupSpec {
@@ -1075,8 +1116,13 @@ fn oscomp_log_group_spec_once(path: &str) {
     let spec = oscomp_classify_script(path);
     crate::println!(
         "oscomp-group-spec: path={} libc={:?} group={:?} shell={:?} env={:?} run={:?} risk={:?}",
-        path, spec.libc, spec.group, spec.shell_policy,
-        spec.env_policy, spec.run_policy, spec.risk,
+        path,
+        spec.libc,
+        spec.group,
+        spec.shell_policy,
+        spec.env_policy,
+        spec.run_policy,
+        spec.risk,
     );
 }
 
@@ -1130,8 +1176,7 @@ fn oscomp_expected_cwd(spec: &OscompGroupSpec<'_>) -> &'static str {
 fn oscomp_expected_shell(spec: &OscompGroupSpec<'_>) -> Option<&'static str> {
     match spec.shell_policy {
         OscompShellPolicy::LaDirectBasic => None,
-        OscompShellPolicy::RvGlibcBusyboxDirect
-        | OscompShellPolicy::LaGlibcBusyboxForMusl => {
+        OscompShellPolicy::RvGlibcBusyboxDirect | OscompShellPolicy::LaGlibcBusyboxForMusl => {
             Some("/mnt/sdcard/glibc/busybox")
         }
         OscompShellPolicy::ProbeOnly => {
@@ -1142,19 +1187,17 @@ fn oscomp_expected_shell(spec: &OscompGroupSpec<'_>) -> Option<&'static str> {
                 OscompLibc::Unknown => Some("/bin/sh"),
             }
         }
-        OscompShellPolicy::Default => {
-            match spec.libc {
-                OscompLibc::Glibc => {
-                    if spec.group == OscompGroup::Busybox {
-                        Some("/mnt/sdcard/glibc/busybox")
-                    } else {
-                        Some("/bin/sh")
-                    }
+        OscompShellPolicy::Default => match spec.libc {
+            OscompLibc::Glibc => {
+                if spec.group == OscompGroup::Busybox {
+                    Some("/mnt/sdcard/glibc/busybox")
+                } else {
+                    Some("/bin/sh")
                 }
-                OscompLibc::Musl => Some("/mnt/sdcard/musl/busybox"),
-                OscompLibc::Unknown => Some("/bin/sh"),
             }
-        }
+            OscompLibc::Musl => Some("/mnt/sdcard/musl/busybox"),
+            OscompLibc::Unknown => Some("/bin/sh"),
+        },
     }
 }
 
@@ -1247,7 +1290,11 @@ fn oscomp_log_preflight_once(spec: &OscompGroupSpec<'_>, result: &OscompPrefligh
     let cwd = oscomp_expected_cwd(spec);
     crate::println!(
         "oscomp-preflight: path={} libc={:?} group={:?} run={:?} risk={:?} status={:?} script={} cwd={} shell={} loader={} env={}",
-        spec.path, spec.libc, spec.group, spec.run_policy, spec.risk,
+        spec.path,
+        spec.libc,
+        spec.group,
+        spec.run_policy,
+        spec.risk,
         result.status,
         result.script_exists as u8,
         result.cwd_exists as u8,
@@ -1297,73 +1344,360 @@ fn oscomp_mini_probes_for(spec: &OscompGroupSpec<'_>) -> &'static [OscompMiniPro
         OscompGroup::Lua => {
             if spec.libc == OscompLibc::Glibc {
                 &[
-                    OscompMiniProbe { name: "shell-true",  kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "shell-echo", kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "lua-smoke",  kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/glibc/lua_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Medium },
+                    OscompMiniProbe {
+                        name: "shell-true",
+                        kind: OscompProbeKind::ShellTrue,
+                        path: "/mnt/sdcard/glibc/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/glibc",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "shell-echo",
+                        kind: OscompProbeKind::ShellEcho,
+                        path: "/mnt/sdcard/glibc/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/glibc",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "lua-smoke",
+                        kind: OscompProbeKind::ScriptSmoke,
+                        path: "/mnt/sdcard/glibc/lua_testcode.sh",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/glibc",
+                        risk: OscompRisk::Medium,
+                    },
                 ]
             } else {
                 &[
-                    OscompMiniProbe { name: "shell-true",  kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "shell-echo", kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "lua-smoke",  kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/musl/lua_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Medium },
+                    OscompMiniProbe {
+                        name: "shell-true",
+                        kind: OscompProbeKind::ShellTrue,
+                        path: "/mnt/sdcard/musl/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/musl",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "shell-echo",
+                        kind: OscompProbeKind::ShellEcho,
+                        path: "/mnt/sdcard/musl/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/musl",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "lua-smoke",
+                        kind: OscompProbeKind::ScriptSmoke,
+                        path: "/mnt/sdcard/musl/lua_testcode.sh",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/musl",
+                        risk: OscompRisk::Medium,
+                    },
                 ]
             }
         }
         OscompGroup::Libcbench => {
             if spec.libc == OscompLibc::Glibc {
                 &[
-                    OscompMiniProbe { name: "shell-true",     kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "shell-echo",    kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/glibc/busybox", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "libcbench-smoke", kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/glibc/libcbench_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Medium },
+                    OscompMiniProbe {
+                        name: "shell-true",
+                        kind: OscompProbeKind::ShellTrue,
+                        path: "/mnt/sdcard/glibc/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/glibc",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "shell-echo",
+                        kind: OscompProbeKind::ShellEcho,
+                        path: "/mnt/sdcard/glibc/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/glibc",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "libcbench-smoke",
+                        kind: OscompProbeKind::ScriptSmoke,
+                        path: "/mnt/sdcard/glibc/libcbench_testcode.sh",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/glibc",
+                        risk: OscompRisk::Medium,
+                    },
                 ]
             } else {
                 &[
-                    OscompMiniProbe { name: "shell-true",     kind: OscompProbeKind::ShellTrue,   path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "shell-echo",    kind: OscompProbeKind::ShellEcho,  path: "/mnt/sdcard/musl/busybox", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Low },
-                    OscompMiniProbe { name: "libcbench-smoke", kind: OscompProbeKind::ScriptSmoke, path: "/mnt/sdcard/musl/libcbench_testcode.sh", argv0: "sh", cwd: "/mnt/sdcard/musl", risk: OscompRisk::Medium },
+                    OscompMiniProbe {
+                        name: "shell-true",
+                        kind: OscompProbeKind::ShellTrue,
+                        path: "/mnt/sdcard/musl/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/musl",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "shell-echo",
+                        kind: OscompProbeKind::ShellEcho,
+                        path: "/mnt/sdcard/musl/busybox",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/musl",
+                        risk: OscompRisk::Low,
+                    },
+                    OscompMiniProbe {
+                        name: "libcbench-smoke",
+                        kind: OscompProbeKind::ScriptSmoke,
+                        path: "/mnt/sdcard/musl/libcbench_testcode.sh",
+                        argv0: "sh",
+                        cwd: "/mnt/sdcard/musl",
+                        risk: OscompRisk::Medium,
+                    },
                 ]
             }
         }
         OscompGroup::Lmbench => &[
-            OscompMiniProbe { name: "lat_syscall_null",  kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_syscall", argv0: "lat_syscall", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
-            OscompMiniProbe { name: "lat_syscall_read",  kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_syscall", argv0: "lat_syscall", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
-            OscompMiniProbe { name: "lat_pipe",          kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_pipe", argv0: "lat_pipe", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
-            OscompMiniProbe { name: "lat_proc_fork",     kind: OscompProbeKind::FsMini, path: "/mnt/sdcard/musl/lmbench/lat_proc", argv0: "lat_proc", cwd: "/mnt/sdcard/musl/lmbench", risk: OscompRisk::High },
+            OscompMiniProbe {
+                name: "lat_syscall_null",
+                kind: OscompProbeKind::FsMini,
+                path: "/mnt/sdcard/musl/lmbench/lat_syscall",
+                argv0: "lat_syscall",
+                cwd: "/mnt/sdcard/musl/lmbench",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "lat_syscall_read",
+                kind: OscompProbeKind::FsMini,
+                path: "/mnt/sdcard/musl/lmbench/lat_syscall",
+                argv0: "lat_syscall",
+                cwd: "/mnt/sdcard/musl/lmbench",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "lat_pipe",
+                kind: OscompProbeKind::FsMini,
+                path: "/mnt/sdcard/musl/lmbench/lat_pipe",
+                argv0: "lat_pipe",
+                cwd: "/mnt/sdcard/musl/lmbench",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "lat_proc_fork",
+                kind: OscompProbeKind::FsMini,
+                path: "/mnt/sdcard/musl/lmbench/lat_proc",
+                argv0: "lat_proc",
+                cwd: "/mnt/sdcard/musl/lmbench",
+                risk: OscompRisk::High,
+            },
         ],
         OscompGroup::Cyclictest => &[
-            OscompMiniProbe { name: "clock_gettime",       kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
-            OscompMiniProbe { name: "nanosleep",           kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
-            OscompMiniProbe { name: "clock_nanosleep",     kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
-            OscompMiniProbe { name: "sched_yield",         kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/musl/cyclictest", argv0: "cyclictest", cwd: "/mnt/sdcard/musl", risk: OscompRisk::High },
+            OscompMiniProbe {
+                name: "clock_gettime",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/musl/cyclictest",
+                argv0: "cyclictest",
+                cwd: "/mnt/sdcard/musl",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "nanosleep",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/musl/cyclictest",
+                argv0: "cyclictest",
+                cwd: "/mnt/sdcard/musl",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "clock_nanosleep",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/musl/cyclictest",
+                argv0: "cyclictest",
+                cwd: "/mnt/sdcard/musl",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "sched_yield",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/musl/cyclictest",
+                argv0: "cyclictest",
+                cwd: "/mnt/sdcard/musl",
+                risk: OscompRisk::High,
+            },
         ],
         OscompGroup::Iozone => &[
-            OscompMiniProbe { name: "fs_create_4k",   kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
-            OscompMiniProbe { name: "fs_write_4k",    kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
-            OscompMiniProbe { name: "fs_readback_4k", kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
-            OscompMiniProbe { name: "fs_ftruncate",   kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
-            OscompMiniProbe { name: "fs_fsync",       kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
-            OscompMiniProbe { name: "fs_statfs",      kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
-            OscompMiniProbe { name: "fs_unlink",      kind: OscompProbeKind::FsMini, path: "/tmp/iozone-probe", argv0: "iozone", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::High },
+            OscompMiniProbe {
+                name: "fs_create_4k",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "fs_write_4k",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "fs_readback_4k",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "fs_ftruncate",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "fs_fsync",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "fs_statfs",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
+            OscompMiniProbe {
+                name: "fs_unlink",
+                kind: OscompProbeKind::FsMini,
+                path: "/tmp/iozone-probe",
+                argv0: "iozone",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::High,
+            },
         ],
         OscompGroup::Iperf | OscompGroup::Netperf => &[
-            OscompMiniProbe { name: "tcp_socket",           kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "tcp_bind_listen",      kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "tcp_connect_accept",   kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "tcp_send_recv",        kind: OscompProbeKind::NetTcpMini, path: "/tmp/net-probe", argv0: "tcp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "udp_sendto_recvfrom",  kind: OscompProbeKind::NetUdpMini, path: "/tmp/net-probe", argv0: "udp_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "poll_select_probe",    kind: OscompProbeKind::NetUdpMini, path: "/tmp/net-probe", argv0: "poll_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe {
+                name: "tcp_socket",
+                kind: OscompProbeKind::NetTcpMini,
+                path: "/tmp/net-probe",
+                argv0: "tcp_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "tcp_bind_listen",
+                kind: OscompProbeKind::NetTcpMini,
+                path: "/tmp/net-probe",
+                argv0: "tcp_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "tcp_connect_accept",
+                kind: OscompProbeKind::NetTcpMini,
+                path: "/tmp/net-probe",
+                argv0: "tcp_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "tcp_send_recv",
+                kind: OscompProbeKind::NetTcpMini,
+                path: "/tmp/net-probe",
+                argv0: "tcp_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "udp_sendto_recvfrom",
+                kind: OscompProbeKind::NetUdpMini,
+                path: "/tmp/net-probe",
+                argv0: "udp_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "poll_select_probe",
+                kind: OscompProbeKind::NetUdpMini,
+                path: "/tmp/net-probe",
+                argv0: "poll_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
         ],
         OscompGroup::Libctest => &[
-            OscompMiniProbe { name: "nonpthread_smoke",     kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "nonpthread_smoke", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "malloc_stdio_smoke",   kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "malloc_stdio_smoke", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "signal_basic_smoke",   kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "signal_basic_smoke", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "futex_basic_probe",    kind: OscompProbeKind::DirectBinary, path: "/mnt/sdcard/glibc/libctest", argv0: "futex_basic_probe", cwd: "/mnt/sdcard/glibc", risk: OscompRisk::Extreme },
+            OscompMiniProbe {
+                name: "nonpthread_smoke",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/glibc/libctest",
+                argv0: "nonpthread_smoke",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "malloc_stdio_smoke",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/glibc/libctest",
+                argv0: "malloc_stdio_smoke",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "signal_basic_smoke",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/glibc/libctest",
+                argv0: "signal_basic_smoke",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "futex_basic_probe",
+                kind: OscompProbeKind::DirectBinary,
+                path: "/mnt/sdcard/glibc/libctest",
+                argv0: "futex_basic_probe",
+                cwd: "/mnt/sdcard/glibc",
+                risk: OscompRisk::Extreme,
+            },
         ],
         OscompGroup::Ltp => &[
-            OscompMiniProbe { name: "metadata_scan",         kind: OscompProbeKind::LtpScan,      path: "/mnt/sdcard/glibc/ltp", argv0: "metadata_scan", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "syscall_basic_allowlist", kind: OscompProbeKind::LtpScan,    path: "/mnt/sdcard/glibc/ltp", argv0: "syscall_allowlist", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "fs_small_allowlist",    kind: OscompProbeKind::LtpScan,      path: "/mnt/sdcard/glibc/ltp", argv0: "fs_allowlist", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
-            OscompMiniProbe { name: "time_small_allowlist",  kind: OscompProbeKind::LtpScan,      path: "/mnt/sdcard/glibc/ltp", argv0: "time_allowlist", cwd: "/mnt/sdcard/glibc/ltp", risk: OscompRisk::Extreme },
+            OscompMiniProbe {
+                name: "metadata_scan",
+                kind: OscompProbeKind::LtpScan,
+                path: "/mnt/sdcard/glibc/ltp",
+                argv0: "metadata_scan",
+                cwd: "/mnt/sdcard/glibc/ltp",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "syscall_basic_allowlist",
+                kind: OscompProbeKind::LtpScan,
+                path: "/mnt/sdcard/glibc/ltp",
+                argv0: "syscall_allowlist",
+                cwd: "/mnt/sdcard/glibc/ltp",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "fs_small_allowlist",
+                kind: OscompProbeKind::LtpScan,
+                path: "/mnt/sdcard/glibc/ltp",
+                argv0: "fs_allowlist",
+                cwd: "/mnt/sdcard/glibc/ltp",
+                risk: OscompRisk::Extreme,
+            },
+            OscompMiniProbe {
+                name: "time_small_allowlist",
+                kind: OscompProbeKind::LtpScan,
+                path: "/mnt/sdcard/glibc/ltp",
+                argv0: "time_allowlist",
+                cwd: "/mnt/sdcard/glibc/ltp",
+                risk: OscompRisk::Extreme,
+            },
         ],
         _ => &[],
     }
@@ -1382,7 +1716,11 @@ fn oscomp_log_probe_catalog_once(spec: &OscompGroupSpec<'_>) {
     let first = probes.first().map(|p| p.name).unwrap_or("none");
     crate::println!(
         "oscomp-probe-catalog: group={:?} libc={:?} probes={} first={} risk={:?}",
-        spec.group, spec.libc, probes.len(), first, spec.risk,
+        spec.group,
+        spec.libc,
+        probes.len(),
+        first,
+        spec.risk,
     );
 }
 
@@ -1397,9 +1735,13 @@ fn oscomp_probe_shell_for(probe: &OscompMiniProbe<'_>) -> &'static str {
         "/mnt/sdcard/glibc/busybox"
     } else if probe.cwd.contains("/mnt/sdcard/musl") {
         #[cfg(target_arch = "loongarch64")]
-        { "/mnt/sdcard/glibc/busybox" }
+        {
+            "/mnt/sdcard/glibc/busybox"
+        }
         #[cfg(not(target_arch = "loongarch64"))]
-        { "/mnt/sdcard/musl/busybox" }
+        {
+            "/mnt/sdcard/musl/busybox"
+        }
     } else {
         "/bin/sh"
     }
@@ -1437,7 +1779,11 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
                         };
                         crate::println!(
                             "oscomp-mini-probe: name={} kind=ShellTrue path={} cwd={} status=Fail raw={} class={}",
-                            probe.name, probe.path, probe.cwd, raw, class,
+                            probe.name,
+                            probe.path,
+                            probe.cwd,
+                            raw,
+                            class,
                         );
                     }
                     OscompProbeRunStatus::Fail
@@ -1465,7 +1811,11 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
                         };
                         crate::println!(
                             "oscomp-mini-probe: name={} kind=ShellEcho path={} cwd={} status=Fail raw={} class={}",
-                            probe.name, probe.path, probe.cwd, raw, class,
+                            probe.name,
+                            probe.path,
+                            probe.cwd,
+                            raw,
+                            class,
                         );
                     }
                     OscompProbeRunStatus::Fail
@@ -1478,7 +1828,10 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
             match run_rootfs_program_with_cwd(
                 shell,
                 &["busybox", "sh", probe.path],
-                &["PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin", "HOME=/"],
+                &[
+                    "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin",
+                    "HOME=/",
+                ],
                 Some(probe.cwd),
             ) {
                 Ok(0) => OscompProbeRunStatus::Pass,
@@ -1493,7 +1846,11 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
                         };
                         crate::println!(
                             "oscomp-mini-probe: name={} kind=ScriptSmoke path={} cwd={} status=Fail raw={} class={}",
-                            probe.name, probe.path, probe.cwd, raw, class,
+                            probe.name,
+                            probe.path,
+                            probe.cwd,
+                            raw,
+                            class,
                         );
                     }
                     OscompProbeRunStatus::Fail
@@ -1505,7 +1862,10 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
             match run_rootfs_program_with_cwd(
                 probe.path,
                 &[probe.argv0],
-                &["PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin", "HOME=/"],
+                &[
+                    "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin",
+                    "HOME=/",
+                ],
                 Some(probe.cwd),
             ) {
                 Ok(0) => OscompProbeRunStatus::Pass,
@@ -1520,7 +1880,11 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
                         };
                         crate::println!(
                             "oscomp-mini-probe: name={} kind=DirectBinary path={} cwd={} status=Fail raw={} class={}",
-                            probe.name, probe.path, probe.cwd, raw, class,
+                            probe.name,
+                            probe.path,
+                            probe.cwd,
+                            raw,
+                            class,
                         );
                     }
                     OscompProbeRunStatus::Fail
@@ -1531,9 +1895,7 @@ fn oscomp_run_mini_probe(probe: &OscompMiniProbe<'_>) -> OscompProbeRunStatus {
         OscompProbeKind::FsMini
         | OscompProbeKind::NetTcpMini
         | OscompProbeKind::NetUdpMini
-        | OscompProbeKind::LtpScan => {
-            OscompProbeRunStatus::NotRun
-        }
+        | OscompProbeKind::LtpScan => OscompProbeRunStatus::NotRun,
     }
 }
 
@@ -1548,7 +1910,11 @@ fn oscomp_run_probe_catalog_for_spec(spec: &OscompGroupSpec<'_>) -> usize {
             OSCOMP_MINI_PROBE_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
             crate::println!(
                 "oscomp-mini-probe: name={} kind={:?} path={} cwd={} status={:?}",
-                probe.name, probe.kind, probe.path, probe.cwd, status,
+                probe.name,
+                probe.kind,
+                probe.path,
+                probe.cwd,
+                status,
             );
         }
         if status == OscompProbeRunStatus::Pass {
@@ -1587,9 +1953,7 @@ fn oscomp_env_for_policy(policy: OscompEnvPolicy) -> &'static [&'static str] {
             "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib64:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib",
             "HOME=/",
         ],
-        OscompEnvPolicy::Default => &[
-            "HOME=/",
-        ],
+        OscompEnvPolicy::Default => &["HOME=/"],
     }
 }
 
@@ -1676,10 +2040,7 @@ fn oscomp_probe_only_prepare_path(path: &str) {
         let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
         if budget > 0 {
             OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
-            crate::println!(
-                "oscomp-probe-only: prepare skipped no-vda path={}",
-                path,
-            );
+            crate::println!("oscomp-probe-only: prepare skipped no-vda path={}", path,);
         }
         return;
     }
@@ -1689,7 +2050,8 @@ fn oscomp_probe_only_prepare_path(path: &str) {
         OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
         crate::println!(
             "oscomp-probe-only: prepare path={} ext4_dir={}",
-            path, ext4_dir,
+            path,
+            ext4_dir,
         );
     }
     sdcard_install_ext4_dir_files(&ext4_dir);
@@ -1713,7 +2075,9 @@ fn oscomp_maybe_run_probe_only(path: &str) -> OscompProbeOnlyOutcome {
             OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
             crate::println!(
                 "oscomp-probe-only: begin path={} group={:?} libc={:?}",
-                path, spec.group, spec.libc,
+                path,
+                spec.group,
+                spec.libc,
             );
         }
     }
@@ -1727,7 +2091,8 @@ fn oscomp_maybe_run_probe_only(path: &str) -> OscompProbeOnlyOutcome {
             OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
             crate::println!(
                 "oscomp-probe-only: not-ready path={} status={:?}",
-                path, result.status,
+                path,
+                result.status,
             );
         }
         return OscompProbeOnlyOutcome::NotReady;
@@ -1760,7 +2125,12 @@ fn oscomp_maybe_run_probe_only(path: &str) -> OscompProbeOnlyOutcome {
             let total = probes.len();
             crate::println!(
                 "oscomp-probe-only: end path={} total={} pass={} fail={} missing={} notrun={}",
-                path, total, pass, fail, missing, notrun,
+                path,
+                total,
+                pass,
+                fail,
+                missing,
+                notrun,
             );
         }
     }
@@ -1819,6 +2189,372 @@ pub fn verify_sdcard_all_scripts() -> bool {
     SDCARD_CONTEST_RAN.load(Ordering::Acquire)
 }
 
+pub fn verify_final_cagent() -> bool {
+    if crate::block::open_device("vda").is_none() {
+        crate::println!("sudoos-diag: final-cagent: no sdcard");
+        return false;
+    }
+    if crate::fs::stat("/mnt/sdcard/glibc/cagent_testcode.sh").is_err() {
+        crate::println!("sudoos-diag: final-cagent: glibc script not found");
+        return false;
+    }
+
+    SDCARD_CONTEST_RAN.store(false, Ordering::Release);
+    crate::task::run_kernel_thread_sync(verify_final_cagent_thread);
+    SDCARD_CONTEST_RAN.load(Ordering::Acquire)
+}
+
+pub fn verify_final_buildstorm() -> bool {
+    if crate::block::open_device("vda").is_none() {
+        crate::println!("sudoos-diag: final-buildstorm: no sdcard");
+        return false;
+    }
+    SDCARD_CONTEST_RAN.store(false, Ordering::Release);
+    crate::task::run_kernel_thread_sync(verify_final_buildstorm_thread);
+    SDCARD_CONTEST_RAN.load(Ordering::Acquire)
+}
+
+fn verify_final_buildstorm_thread() {
+    let _ = crate::fs::mkdir("/mnt", 0o755);
+    let _ = crate::fs::mkdir("/mnt/sdcard", 0o755);
+    if let Err(error) = crate::fs::mount_ext4_overlay("/dev/vda", "/mnt/sdcard") {
+        crate::println!(
+            "sudoos-diag: final-buildstorm: lazy ext4 mount failed: {:?}",
+            error,
+        );
+        return;
+    }
+
+    for name in &[
+        "bin", "sbin", "usr", "lib", "lib64", "etc", "root", "work", "opt", "var", "tmp", "run",
+    ] {
+        let target = alloc::format!("/mnt/sdcard/{}", name);
+        let link = alloc::format!("/{}", name);
+        if crate::fs::stat(&target).is_ok() {
+            if let Err(error) = crate::fs::replace_with_symlink(&target, &link) {
+                crate::println!(
+                    "sudoos-diag: final-buildstorm: root alias {} failed: {:?}",
+                    link,
+                    error,
+                );
+                return;
+            }
+        }
+    }
+    for (path, mode) in &[("/dev", 0o755), ("/proc", 0o755), ("/sys", 0o755)] {
+        let _ = crate::fs::mkdir(path, *mode);
+    }
+
+    let script = "/tmp/buildstorm_testcode.official.sh";
+    if let Err(error) =
+        crate::fs::install_bytes(script, include_bytes!("final_buildstorm_testcode.sh"))
+    {
+        crate::println!(
+            "sudoos-diag: final-buildstorm: official script install failed: {:?}",
+            error,
+        );
+        return;
+    }
+
+    SDCARD_CONTEST_RAN.store(true, Ordering::Release);
+    crate::println!("oscomp: arch={} final-buildstorm", crate::arch::ARCH_NAME);
+    crate::println!("sudoos-diag: final-buildstorm: lazy ext4 overlay ready");
+    let environment = [
+        "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
+        "HOME=/root",
+        "TERM=dumb",
+    ];
+    crate::println!("sudoos-diag: final-buildstorm: diagnostic minibuild begin");
+    let diagnostic = "rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; echo BUILDSTORM_DIAG_NEW_RC=$?; cd /tmp/minibuild-diag || exit 97; cargo build; echo BUILDSTORM_DIAG_BUILD_RC=$?; /tmp/minibuild-diag/target/debug/minibuild; echo BUILDSTORM_DIAG_RUN_RC=$?";
+    match run_rootfs_program_with_cwd(
+        "/bin/sh",
+        &["sh", "-c", diagnostic],
+        &environment,
+        Some("/"),
+    ) {
+        Ok(code) => crate::println!("sudoos-diag: final-buildstorm: diagnostic exit={}", code),
+        Err(error) => crate::println!(
+            "sudoos-diag: final-buildstorm: diagnostic exec failed: {:?}",
+            error,
+        ),
+    }
+    match run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/")) {
+        Ok(0) => crate::println!("sudoos-diag: final-buildstorm: script exit=0"),
+        Ok(code) => crate::println!("sudoos-diag: final-buildstorm: script exit={}", code),
+        Err(error) => crate::println!(
+            "sudoos-diag: final-buildstorm: script exec failed: {:?}",
+            error,
+        ),
+    }
+}
+
+fn verify_final_cagent_thread() {
+    let _ = crate::fs::mkdir("/var", 0o755);
+    let _ = crate::fs::mkdir("/var/tmp", 0o755);
+    let _ = crate::fs::mkdir("/tmp", 0o1777);
+    let _ = crate::fs::mkdir("/dev", 0o755);
+    let _ = crate::fs::mkdir("/dev/shm", 0o1777);
+    let _ = crate::fs::mkdir("/proc", 0o755);
+    let _ = crate::fs::mkdir("/sys", 0o755);
+    let _ = crate::fs::mkdir("/etc", 0o755);
+
+    if crate::fs::stat("/bin/busybox").is_ok() {
+        for applet in &[
+            "sh", "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls", "mkdir", "chmod",
+            "grep", "dd", "mount", "ps", "head", "tail", "test", "awk", "sed", "wc", "cut", "tr",
+            "which", "pidof", "printenv", "basename", "dirname", "readlink", "stat", "getopt",
+            "date", "find", "touch", "printf", "timeout", "nproc", "uname", "ss", "df", "sort",
+            "uniq", "xargs", "true", "false",
+        ] {
+            let target = alloc::format!("/bin/{}", applet);
+            if crate::fs::stat(&target).is_err() {
+                let _ = crate::fs::symlink("/bin/busybox", &target);
+            }
+        }
+    }
+
+    sdcard_install_ext4_dir_files("/glibc");
+    sdcard_install_ext4_dir_files("/glibc/lib");
+
+    #[cfg(target_arch = "riscv64")]
+    const SYSTEM_LOADER_SOURCE: &str = "/usr/lib/riscv64-linux-gnu/ld-linux-riscv64-lp64d.so.1";
+    #[cfg(target_arch = "riscv64")]
+    const SYSTEM_LIBC_SOURCE: &str = "/usr/lib/riscv64-linux-gnu/libc.so.6";
+    #[cfg(target_arch = "loongarch64")]
+    const SYSTEM_LOADER_SOURCE: &str =
+        "/usr/lib/loongarch64-linux-gnu/ld-linux-loongarch-lp64d.so.1";
+    #[cfg(target_arch = "loongarch64")]
+    const SYSTEM_LIBC_SOURCE: &str = "/usr/lib/loongarch64-linux-gnu/libc.so.6";
+    #[cfg(target_arch = "riscv64")]
+    const LOADER_DESTINATION: &str = "/mnt/sdcard/system-glibc/ld-linux-riscv64-lp64d.so.1";
+    #[cfg(target_arch = "loongarch64")]
+    const LOADER_DESTINATION: &str = "/mnt/sdcard/system-glibc/ld-linux-loongarch-lp64d.so.1";
+
+    // Bash and libtinfo come from the root filesystem and require its newer
+    // glibc. The system libc remains backward compatible with the older agent
+    // binaries bundled in /glibc, so keep the whole group on one loader/libc.
+    let _ = crate::fs::mkdir("/mnt/sdcard/system-glibc", 0o755);
+    match crate::fs::install_ext4_path("/dev/vda", LOADER_DESTINATION, SYSTEM_LOADER_SOURCE) {
+        Ok(()) => crate::println!("sudoos-diag: final-cagent: installed system loader"),
+        Err(error) => crate::println!(
+            "sudoos-diag: final-cagent: failed to install system loader: {:?}",
+            error
+        ),
+    }
+    let libc_destination = "/mnt/sdcard/system-glibc/libc.so.6";
+    match crate::fs::install_ext4_path("/dev/vda", libc_destination, SYSTEM_LIBC_SOURCE) {
+        Ok(()) => crate::println!("sudoos-diag: final-cagent: installed system libc"),
+        Err(error) => crate::println!(
+            "sudoos-diag: final-cagent: failed to install system libc: {:?}",
+            error
+        ),
+    }
+
+    // The official script uses Bash arrays to retain only the ten test-job
+    // PIDs. Running it through ash turns the final targeted wait into a wait
+    // for every child, including the deliberately long-lived LLM server.
+    if crate::fs::stat("/mnt/sdcard/glibc/bash").is_err() {
+        match crate::fs::install_ext4_path("/dev/vda", "/mnt/sdcard/glibc/bash", "/usr/bin/bash") {
+            Ok(()) => crate::println!("sudoos-diag: final-cagent: installed official bash"),
+            Err(error) => crate::println!(
+                "sudoos-diag: final-cagent: failed to install official bash: {:?}",
+                error
+            ),
+        }
+    }
+    #[cfg(target_arch = "riscv64")]
+    const TINFO_SOURCE: &str = "/usr/lib/riscv64-linux-gnu/libtinfo.so.6.5";
+    #[cfg(target_arch = "loongarch64")]
+    const TINFO_SOURCE: &str = "/usr/lib/loongarch64-linux-gnu/libtinfo.so.6.5";
+    if crate::fs::stat("/mnt/sdcard/glibc/lib/libtinfo.so.6.5").is_err() {
+        match crate::fs::install_ext4_path(
+            "/dev/vda",
+            "/mnt/sdcard/glibc/lib/libtinfo.so.6.5",
+            TINFO_SOURCE,
+        ) {
+            Ok(()) => {
+                let _ = crate::fs::symlink(
+                    "/mnt/sdcard/glibc/lib/libtinfo.so.6.5",
+                    "/mnt/sdcard/glibc/lib/libtinfo.so.6",
+                );
+                crate::println!("sudoos-diag: final-cagent: installed official libtinfo");
+            }
+            Err(error) => crate::println!(
+                "sudoos-diag: final-cagent: failed to install official libtinfo: {:?}",
+                error
+            ),
+        }
+    }
+
+    // The final CAgent script uses GNU date's relative-date parser.  The
+    // bundled BusyBox applet does not implement that grammar, while the
+    // official image provides the matching coreutils binary and glibc.
+    if crate::fs::stat("/mnt/sdcard/glibc/date").is_err() {
+        match crate::fs::install_ext4_path("/dev/vda", "/mnt/sdcard/glibc/date", "/usr/bin/date") {
+            Ok(()) => crate::println!("sudoos-diag: final-cagent: installed official date"),
+            Err(error) => crate::println!(
+                "sudoos-diag: final-cagent: failed to install official date: {:?}",
+                error
+            ),
+        }
+    }
+
+    if crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok() {
+        for applet in &[
+            "sh", "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls", "mkdir", "chmod",
+            "grep", "dd", "mount", "ps", "head", "tail", "test", "awk", "sed", "wc", "cut", "tr",
+            "which", "pidof", "printenv", "basename", "dirname", "readlink", "stat", "getopt",
+            "find", "printf", "timeout", "nproc", "uname", "ss", "df", "sort", "uniq", "xargs",
+            "true", "false",
+        ] {
+            let target = alloc::format!("/mnt/sdcard/glibc/{}", applet);
+            if crate::fs::stat(&target).is_err() {
+                let _ = crate::fs::symlink("/mnt/sdcard/glibc/busybox", &target);
+            }
+        }
+    }
+
+    // The image-local BusyBox does not provide a working touch applet. Keep
+    // PATH's current-directory lookup deterministic by forwarding it to the
+    // vendor BusyBox applet installed under /bin.
+    let _ = crate::fs::unlink("/mnt/sdcard/glibc/touch", false);
+    let _ = crate::fs::symlink("/bin/touch", "/mnt/sdcard/glibc/touch");
+
+    let script = "/tmp/cagent_testcode.official.sh";
+    if let Err(error) = crate::fs::install_bytes(script, include_bytes!("final_cagent_testcode.sh"))
+    {
+        crate::println!(
+            "sudoos-diag: final-cagent: failed to install current official script: {:?}",
+            error
+        );
+        return;
+    }
+    let _ = crate::fs::mkdir("/tmp/cagent-bin", 0o755);
+    if let Err(error) = crate::fs::install_bytes(
+        "/tmp/cagent-bin/date",
+        include_bytes!("final_cagent_date.sh"),
+    ) {
+        crate::println!(
+            "sudoos-diag: final-cagent: failed to install stable date frontend: {:?}",
+            error
+        );
+        return;
+    }
+    let cwd = "/mnt/sdcard/glibc";
+    let shell_path = if crate::fs::stat("/mnt/sdcard/glibc/bash").is_ok() {
+        "/mnt/sdcard/glibc/bash"
+    } else if crate::fs::stat("/mnt/sdcard/glibc/busybox").is_ok() {
+        "/mnt/sdcard/glibc/busybox"
+    } else if crate::fs::stat("/bin/sh").is_ok() {
+        "/bin/sh"
+    } else if crate::fs::stat("/bin/busybox").is_ok() {
+        "/bin/busybox"
+    } else {
+        crate::println!("sudoos-diag: final-cagent: no shell found");
+        return;
+    };
+
+    SDCARD_CONTEST_RAN.store(true, Ordering::Release);
+    OSCOMP_ACTIVE.store(true, Ordering::Release);
+    OSCOMP_FINALIZED.store(false, Ordering::Release);
+    OSCOMP_TOTAL.store(1, Ordering::Release);
+    OSCOMP_COMPLETED.store(0, Ordering::Release);
+    OSCOMP_PASS.store(0, Ordering::Release);
+    OSCOMP_FAIL.store(0, Ordering::Release);
+    OSCOMP_SKIPPED.store(0, Ordering::Release);
+    OSCOMP_TIMEOUT.store(0, Ordering::Release);
+    OSCOMP_SIGNAL11.store(0, Ordering::Release);
+    OSCOMP_SIGNAL14.store(0, Ordering::Release);
+    let deadline = crate::time::now().cycles() + crate::time::clock_frequency_hz() * 240;
+    OSCOMP_DEADLINE_CYCLES.store(deadline, Ordering::Release);
+    crate::task::spawn_kernel_thread(contest_watchdog_main);
+
+    crate::println!("sdcard scripts: discovered 1");
+    crate::println!("sdcard scripts: using shell {}", shell_path);
+    crate::println!("oscomp: arch={} final-cagent", crate::arch::ARCH_NAME);
+    crate::println!("#### OS COMP TEST GROUP START {} ####", script);
+
+    let environment = [
+        "PATH=/tmp/cagent-bin:.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
+        "LD_LIBRARY_PATH=/mnt/sdcard/system-glibc:.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib64:/lib:/usr/lib:/usr/local/lib",
+        "HOME=/root",
+        "TERM=dumb",
+    ];
+    let raw = if shell_path.ends_with("/bash") {
+        run_rootfs_program_with_cwd(shell_path, &["bash", script], &environment, Some(cwd))
+    } else {
+        run_rootfs_program_with_cwd(
+            shell_path,
+            &["busybox", "sh", script],
+            &environment,
+            Some(cwd),
+        )
+    };
+
+    match raw {
+        Ok(0) => {
+            crate::println!("{} : PASS", script);
+            OSCOMP_PASS.store(1, Ordering::Release);
+        }
+        Ok(code) => {
+            if code < 0 {
+                let signal = -code;
+                if signal == 11 {
+                    OSCOMP_SIGNAL11.store(1, Ordering::Release);
+                }
+                if signal == 14 {
+                    OSCOMP_SIGNAL14.store(1, Ordering::Release);
+                }
+                crate::println!("{} : FAIL (signal={})", script, signal);
+            } else {
+                crate::println!("{} : FAIL (exit={})", script, code);
+            }
+            OSCOMP_FAIL.store(1, Ordering::Release);
+        }
+        Err(error) => {
+            crate::println!("{} : FAIL (exec={:?})", script, error);
+            OSCOMP_FAIL.store(1, Ordering::Release);
+        }
+    }
+
+    OSCOMP_COMPLETED.store(1, Ordering::Release);
+    crate::println!("#### OS COMP TEST GROUP END {} ####", script);
+    oscomp_print_summary(
+        1,
+        OSCOMP_PASS.load(Ordering::Acquire),
+        OSCOMP_FAIL.load(Ordering::Acquire),
+        0,
+        OSCOMP_SIGNAL11.load(Ordering::Acquire),
+        OSCOMP_SIGNAL14.load(Ordering::Acquire),
+    );
+    OSCOMP_FINALIZED.store(true, Ordering::Release);
+    OSCOMP_ACTIVE.store(false, Ordering::Release);
+}
+
+fn oscomp_print_summary(
+    total: usize,
+    passed: usize,
+    failed: usize,
+    skipped: usize,
+    sig11: usize,
+    sig14: usize,
+) {
+    let timed_out = OSCOMP_TIMEOUT.load(Ordering::Acquire);
+    crate::println!("#### OS COMP SUMMARY ####");
+    crate::println!("arch={}", crate::arch::ARCH_NAME);
+    crate::println!("total={}", total);
+    crate::println!("completed={}", OSCOMP_COMPLETED.load(Ordering::Acquire));
+    crate::println!("pass={}", passed);
+    crate::println!("fail={}", failed);
+    crate::println!("skipped={}", skipped);
+    crate::println!("timeout={}", timed_out);
+    crate::println!("signal11={}", sig11);
+    crate::println!("signal14={}", sig14);
+    crate::println!("score={}", passed);
+    crate::println!("score: {}", passed);
+    crate::println!("#### OS COMP SUMMARY END ####");
+}
+
 fn verify_sdcard_all_scripts_thread() {
     let _ = crate::fs::mkdir("/var", 0o755);
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
@@ -1832,10 +2568,9 @@ fn verify_sdcard_all_scripts_thread() {
     // Ensure busybox applet symlinks exist (fallback if not done at mount time)
     if crate::fs::stat("/bin/busybox").is_ok() {
         for applet in &[
-            "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls",
-            "mkdir", "chmod", "grep", "dd", "mount", "ps", "head", "tail", "test",
-            "awk", "sed", "wc", "cut", "tr", "which", "pidof", "printenv",
-            "basename", "dirname", "readlink", "stat", "getopt",
+            "cp", "sleep", "kill", "cat", "echo", "mv", "ln", "rm", "ls", "mkdir", "chmod", "grep",
+            "dd", "mount", "ps", "head", "tail", "test", "awk", "sed", "wc", "cut", "tr", "which",
+            "pidof", "printenv", "basename", "dirname", "readlink", "stat", "getopt",
         ] {
             let target = alloc::format!("/bin/{}", applet);
             if crate::fs::stat(&target).is_err() {
@@ -1899,7 +2634,8 @@ fn verify_sdcard_all_scripts_thread() {
 
     crate::println!(
         "oscomp: arch={} total_budget_ms={}",
-        crate::arch::ARCH_NAME, total_budget_ms,
+        crate::arch::ARCH_NAME,
+        total_budget_ms,
     );
 
     // ── initialise contest atomics and launch external watchdog ──
@@ -1949,7 +2685,9 @@ fn verify_sdcard_all_scripts_thread() {
         if now + budget_ms_to_cycles(3_000) >= budget_deadline {
             crate::println!(
                 "oscomp: global budget exhausted arch={} completed={} total={}",
-                crate::arch::ARCH_NAME, idx, scripts.len(),
+                crate::arch::ARCH_NAME,
+                idx,
+                scripts.len(),
             );
             let remaining = scripts.len() - idx;
             OSCOMP_SKIPPED.fetch_add(remaining, Ordering::AcqRel);
@@ -1957,7 +2695,10 @@ fn verify_sdcard_all_scripts_thread() {
         }
         crate::println!(
             "oscomp-progress: arch={} idx={}/{} script={}",
-            crate::arch::ARCH_NAME, idx + 1, scripts.len(), script,
+            crate::arch::ARCH_NAME,
+            idx + 1,
+            scripts.len(),
+            script,
         );
         let vfs_path = if script.starts_with('/') {
             script.clone()
@@ -2056,7 +2797,14 @@ fn verify_sdcard_all_scripts_thread() {
         path_env.push_str("/:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin");
         // Also sniff whether common ext4 dirs exist so scripts can find
         // binaries without the ./ prefix.
-        for sniff in &["/mnt/sdcard/musl", "/mnt/sdcard/glibc", "/mnt/sdcard/lmbench", "/mnt/sdcard", "/mnt/sdcard/lib", "/mnt/sdcard/usr/lib"] {
+        for sniff in &[
+            "/mnt/sdcard/musl",
+            "/mnt/sdcard/glibc",
+            "/mnt/sdcard/lmbench",
+            "/mnt/sdcard",
+            "/mnt/sdcard/lib",
+            "/mnt/sdcard/usr/lib",
+        ] {
             if crate::fs::stat(sniff).is_ok() {
                 path_env.push(':');
                 path_env.push_str(sniff);
@@ -2067,7 +2815,12 @@ fn verify_sdcard_all_scripts_thread() {
         ld_env.push_str("LD_LIBRARY_PATH=.:");
         ld_env.push_str(&cwd_path);
         ld_env.push_str("/:/lib:/usr/lib:/usr/local/lib");
-        for sniff in &["/mnt/sdcard/lib", "/mnt/sdcard/usr/lib", "/mnt/sdcard/musl/lib", "/mnt/sdcard/musl"] {
+        for sniff in &[
+            "/mnt/sdcard/lib",
+            "/mnt/sdcard/usr/lib",
+            "/mnt/sdcard/musl/lib",
+            "/mnt/sdcard/musl",
+        ] {
             if crate::fs::stat(sniff).is_ok() {
                 ld_env.push(':');
                 ld_env.push_str(sniff);
@@ -2098,11 +2851,14 @@ fn verify_sdcard_all_scripts_thread() {
         {
             let rv_shell = "/mnt/sdcard/glibc/busybox";
             let rv_cwd = "/mnt/sdcard/glibc";
-            let rv_path_env = "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
+            let rv_path_env =
+                "PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
             let rv_ld_env = "LD_LIBRARY_PATH=.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib";
             crate::println!(
                 "oscomp-rv-busybox-direct: kind=glibc shell={} cwd={} script={}",
-                rv_shell, rv_cwd, vfs_path,
+                rv_shell,
+                rv_cwd,
+                vfs_path,
             );
             run_rootfs_program_with_cwd(
                 rv_shell,
@@ -2115,11 +2871,14 @@ fn verify_sdcard_all_scripts_thread() {
         {
             let rv_shell = "/mnt/sdcard/musl/busybox";
             let rv_cwd = "/mnt/sdcard/musl";
-            let rv_path_env = "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin";
+            let rv_path_env =
+                "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin:/usr/bin:/usr/sbin";
             let rv_ld_env = "LD_LIBRARY_PATH=.:/mnt/sdcard/musl:/mnt/sdcard/musl/lib:/lib:/usr/lib:/mnt/sdcard/lib:/mnt/sdcard/usr/lib";
             crate::println!(
                 "oscomp-rv-busybox-direct: kind=musl shell={} cwd={} script={}",
-                rv_shell, rv_cwd, vfs_path,
+                rv_shell,
+                rv_cwd,
+                vfs_path,
             );
             run_rootfs_program_with_cwd(
                 rv_shell,
@@ -2139,27 +2898,18 @@ fn verify_sdcard_all_scripts_thread() {
         #[cfg(target_arch = "loongarch64")]
         let group_result = {
             if vfs_path.ends_with("/glibc/basic_testcode.sh") {
-                crate::println!(
-                    "oscomp-la-basic-direct: kind=glibc script={}",
-                    vfs_path,
-                );
-                Ok(oscomp_la_run_basic_direct("glibc", "/mnt/sdcard/glibc/basic"))
+                crate::println!("oscomp-la-basic-direct: kind=glibc script={}", vfs_path,);
+                Ok(oscomp_la_run_basic_direct(
+                    "glibc",
+                    "/mnt/sdcard/glibc/basic",
+                ))
             } else if vfs_path.ends_with("/musl/basic_testcode.sh") {
-                crate::println!(
-                    "oscomp-la-basic-direct: kind=musl script={}",
-                    vfs_path,
-                );
+                crate::println!("oscomp-la-basic-direct: kind=musl script={}", vfs_path,);
                 Ok(oscomp_la_run_basic_direct("musl", "/mnt/sdcard/musl/basic"))
             } else if vfs_path.ends_with("/glibc/busybox_testcode.sh") {
-                Ok(oscomp_la_run_busybox_direct(
-                    "glibc",
-                    "/mnt/sdcard/glibc",
-                ))
+                Ok(oscomp_la_run_busybox_direct("glibc", "/mnt/sdcard/glibc"))
             } else if vfs_path.ends_with("/musl/busybox_testcode.sh") {
-                Ok(oscomp_la_run_busybox_direct(
-                    "musl",
-                    "/mnt/sdcard/musl",
-                ))
+                Ok(oscomp_la_run_busybox_direct("musl", "/mnt/sdcard/musl"))
             } else if vfs_path.ends_with("/musl/lua_testcode.sh")
                 && crate::fs::stat("/mnt/sdcard/glibc/lua").is_ok()
             {
@@ -2177,7 +2927,8 @@ fn verify_sdcard_all_scripts_thread() {
                 if vfs_path.ends_with("/musl/lua_testcode.sh") {
                     crate::println!(
                         "oscomp-la-musl-lua: shell=/mnt/sdcard/glibc/busybox cwd={} script={}",
-                        cwd, vfs_path,
+                        cwd,
+                        vfs_path,
                     );
                 }
                 let musl_fixed_env = alloc::format!(
@@ -2376,8 +3127,7 @@ fn oscomp_rv_whitelist(path: &str) -> bool {
         || (OSCOMP_ENABLE_CYCLICTEST_MINI
             && (path.ends_with("/glibc/cyclictest_testcode.sh")
                 || path.ends_with("/musl/cyclictest_testcode.sh")))
-        || (OSCOMP_ENABLE_LMBENCH_MINI
-            && path.ends_with("/glibc/lmbench_testcode.sh"))
+        || (OSCOMP_ENABLE_LMBENCH_MINI && path.ends_with("/glibc/lmbench_testcode.sh"))
 }
 
 // ── P9-H7: LoongArch shell probe and contest whitelist ──
@@ -2390,14 +3140,13 @@ fn choose_la_contest_shell() -> Option<&'static str> {
     // Ensure the musl directory is materialised so the candidate exists.
     sdcard_install_ext4_dir_files("/musl");
 
-    let candidates: &[&str] = &[
-        "/mnt/sdcard/musl/busybox",
-        "/bin/busybox",
-        "/bin/sh",
-    ];
+    let candidates: &[&str] = &["/mnt/sdcard/musl/busybox", "/bin/busybox", "/bin/sh"];
 
     let cwd = "/mnt/sdcard/musl";
-    let env = &["PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin", "HOME=/"];
+    let env = &[
+        "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin",
+        "HOME=/",
+    ];
 
     for cand in candidates {
         if crate::fs::stat(cand).is_err() {
@@ -2411,8 +3160,12 @@ fn choose_la_contest_shell() -> Option<&'static str> {
             Ok(0) => {
                 crate::println!("oscomp-la-shell: probe {} true -> raw=0 PASS", cand);
                 // Second probe: busybox sh -c true
-                let rc2 =
-                    run_rootfs_program_with_cwd(cand, &["busybox", "sh", "-c", "true"], env, Some(cwd));
+                let rc2 = run_rootfs_program_with_cwd(
+                    cand,
+                    &["busybox", "sh", "-c", "true"],
+                    env,
+                    Some(cwd),
+                );
                 match rc2 {
                     Ok(0) => {
                         crate::println!("oscomp-la-shell: probe {} sh -c true -> raw=0 PASS", cand);
@@ -2421,17 +3174,18 @@ fn choose_la_contest_shell() -> Option<&'static str> {
                     }
                     Ok(raw) => crate::println!(
                         "oscomp-la-shell: probe {} sh -c true -> raw={} (not 0, skip)",
-                        cand, raw,
-                    ),
-                    Err(_) => crate::println!(
-                        "oscomp-la-shell: probe {} sh -c true -> ERROR",
                         cand,
+                        raw,
                     ),
+                    Err(_) => {
+                        crate::println!("oscomp-la-shell: probe {} sh -c true -> ERROR", cand,)
+                    }
                 }
             }
             Ok(raw) => crate::println!(
                 "oscomp-la-shell: probe {} true -> raw={} (not 0, skip)",
-                cand, raw,
+                cand,
+                raw,
             ),
             Err(_) => crate::println!("oscomp-la-shell: probe {} true -> ERROR", cand),
         }
@@ -2480,8 +3234,7 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
     // the expected raw status.
     const PRIMARY_SHELL: &str = "/mnt/sdcard/musl/busybox";
     const FALLBACK_SHELL: &str = "/mnt/sdcard/glibc/busybox";
-    const PATH_ENV: &str =
-        "PATH=/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
+    const PATH_ENV: &str = "PATH=/mnt/sdcard/glibc:/mnt/sdcard/musl:/bin:/sbin:/usr/bin:/usr/sbin";
 
     // expected_raw:
     //   normal commands expect 0
@@ -2513,7 +3266,11 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
         ("pwd", "$B pwd", 0),
         ("free", "$B free", 0),
         ("hwclock", "$B hwclock", 0),
-        ("sh -c 'sleep 5' & ./busybox kill $!", "$B sh -c 'sleep 5' & $B kill $!", 0),
+        (
+            "sh -c 'sleep 5' & ./busybox kill $!",
+            "$B sh -c 'sleep 5' & $B kill $!",
+            0,
+        ),
         ("ls", "$B ls", 0),
         ("sleep 1", "$B sleep 1", 0),
         (
@@ -2534,13 +3291,41 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
         ("tail test.txt", "$B tail test.txt", 0),
         ("hexdump -C test.txt", "$B hexdump -C test.txt", 0),
         ("md5sum test.txt", "$B md5sum test.txt", 0),
-        ("echo \"ccccccc\" >> test.txt", "$B echo \"ccccccc\" >> test.txt", 0),
-        ("echo \"bbbbbbb\" >> test.txt", "$B echo \"bbbbbbb\" >> test.txt", 0),
-        ("echo \"aaaaaaa\" >> test.txt", "$B echo \"aaaaaaa\" >> test.txt", 0),
-        ("echo \"2222222\" >> test.txt", "$B echo \"2222222\" >> test.txt", 0),
-        ("echo \"1111111\" >> test.txt", "$B echo \"1111111\" >> test.txt", 0),
-        ("echo \"bbbbbbb\" >> test.txt", "$B echo \"bbbbbbb\" >> test.txt", 0),
-        ("sort test.txt | ./busybox uniq", "$B sort test.txt | $B uniq", 0),
+        (
+            "echo \"ccccccc\" >> test.txt",
+            "$B echo \"ccccccc\" >> test.txt",
+            0,
+        ),
+        (
+            "echo \"bbbbbbb\" >> test.txt",
+            "$B echo \"bbbbbbb\" >> test.txt",
+            0,
+        ),
+        (
+            "echo \"aaaaaaa\" >> test.txt",
+            "$B echo \"aaaaaaa\" >> test.txt",
+            0,
+        ),
+        (
+            "echo \"2222222\" >> test.txt",
+            "$B echo \"2222222\" >> test.txt",
+            0,
+        ),
+        (
+            "echo \"1111111\" >> test.txt",
+            "$B echo \"1111111\" >> test.txt",
+            0,
+        ),
+        (
+            "echo \"bbbbbbb\" >> test.txt",
+            "$B echo \"bbbbbbb\" >> test.txt",
+            0,
+        ),
+        (
+            "sort test.txt | ./busybox uniq",
+            "$B sort test.txt | $B uniq",
+            0,
+        ),
         ("stat test.txt", "$B stat test.txt", 0),
         ("strings test.txt", "$B strings test.txt", 0),
         ("wc test.txt", "$B wc test.txt", 0),
@@ -2550,10 +3335,22 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
         ("mkdir test_dir", "$B mkdir test_dir", 0),
         ("mv test_dir test", "$B mv test_dir test", 0),
         ("rmdir test", "$B rmdir test", 0),
-        ("grep hello busybox_cmd.txt", "$B grep hello busybox_cmd.txt", 0),
-        ("cp busybox_cmd.txt busybox_cmd.bak", "$B cp busybox_cmd.txt busybox_cmd.bak", 0),
+        (
+            "grep hello busybox_cmd.txt",
+            "$B grep hello busybox_cmd.txt",
+            0,
+        ),
+        (
+            "cp busybox_cmd.txt busybox_cmd.bak",
+            "$B cp busybox_cmd.txt busybox_cmd.bak",
+            0,
+        ),
         ("rm busybox_cmd.bak", "$B rm busybox_cmd.bak", 0),
-        ("find -name \"busybox_cmd.txt\"", "$B find -name \"busybox_cmd.txt\"", 0),
+        (
+            "find -name \"busybox_cmd.txt\"",
+            "$B find -name \"busybox_cmd.txt\"",
+            0,
+        ),
     ];
 
     let busybox = alloc::format!("/mnt/sdcard/{}/busybox", libc);
@@ -2661,11 +3458,7 @@ fn oscomp_la_run_busybox_direct(libc: &str, cwd: &str) -> isize {
         fallback_used,
     );
 
-    if failed == 0 {
-        0
-    } else {
-        1
-    }
+    if failed == 0 { 0 } else { 1 }
 }
 
 /// Run a single probe with syscall tracing enabled on LoongArch.
@@ -2697,7 +3490,9 @@ fn oscomp_la_run_sleep_trace_probe(
     };
     crate::println!(
         "oscomp-la-sleep-trace: end {} raw={} class={}",
-        label, raw, class,
+        label,
+        raw,
+        class,
     );
     raw
 }
@@ -2749,13 +3544,8 @@ fn oscomp_run_lmbench_case(
     );
     crate::println!("lmbench-mini: exec {} cwd={} argv={:?}", binary, cwd, argv);
     oscomp_lmbench_capture_start();
-    let raw = run_rootfs_program_with_cwd(
-        binary,
-        argv,
-        &[path_env, ld_env, "HOME=/"],
-        Some(cwd),
-    )
-    .unwrap_or(-127);
+    let raw = run_rootfs_program_with_cwd(binary, argv, &[path_env, ld_env, "HOME=/"], Some(cwd))
+        .unwrap_or(-127);
     let (captured, captured_len) = oscomp_lmbench_capture_finish();
     let parsed = (raw == 0)
         .then(|| oscomp_lmbench_parse_microseconds(&captured[..captured_len], parser_label))
@@ -2831,7 +3621,9 @@ fn oscomp_lmbench_parse_microseconds<'a>(
         };
         let value = value.trim();
         if !value.is_empty()
-            && value.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
             && value.bytes().filter(|byte| *byte == b'.').count() <= 1
         {
             return Some(value);
@@ -2857,12 +3649,8 @@ fn oscomp_lmbench_global_remaining_ms() -> u64 {
 
     let remaining_cycles = deadline - now;
     let frequency = crate::time::clock_frequency_hz();
-    u64::try_from(
-        u128::from(remaining_cycles)
-            .saturating_mul(1_000)
-            / u128::from(frequency),
-    )
-    .unwrap_or(u64::MAX)
+    u64::try_from(u128::from(remaining_cycles).saturating_mul(1_000) / u128::from(frequency))
+        .unwrap_or(u64::MAX)
 }
 
 fn oscomp_run_lmbench_mini(script: &str) -> isize {
@@ -2870,7 +3658,11 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     const OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS: u64 = 50_000;
     const OSCOMP_LMBENCH_GLOBAL_SAFETY_MS: u64 = 8_000;
 
-    let libc = if script.contains("/glibc/") { "glibc" } else { "musl" };
+    let libc = if script.contains("/glibc/") {
+        "glibc"
+    } else {
+        "musl"
+    };
     let cwd = alloc::format!("/mnt/sdcard/{}", libc);
     let binary = alloc::format!("{}/lmbench_all", cwd);
     let fixture = "/var/tmp/lmbench";
@@ -2880,40 +3672,56 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
     );
     let ld_env = alloc::format!(
         "LD_LIBRARY_PATH=.:{}:{}/lib:/lib:/usr/lib:/mnt/sdcard/lib",
-        cwd, cwd,
+        cwd,
+        cwd,
     );
 
     let cases: [(&str, &str, &[&str]); 6] = [
-        (
-            "lat_syscall_null",
-            "Simple syscall",
-            &["lmbench_all", "lat_syscall", "-P", "1", "null"],
-        ),
-        (
-            "lat_syscall_read",
-            "Simple read",
-            &["lmbench_all", "lat_syscall", "-P", "1", "read"],
-        ),
-        (
-            "lat_syscall_write",
-            "Simple write",
-            &["lmbench_all", "lat_syscall", "-P", "1", "write"],
-        ),
-        (
-            "lat_syscall_stat",
-            "Simple stat",
-            &["lmbench_all", "lat_syscall", "-P", "1", "stat", fixture],
-        ),
-        (
-            "lat_syscall_fstat",
-            "Simple fstat",
-            &["lmbench_all", "lat_syscall", "-P", "1", "fstat", fixture],
-        ),
-        (
-            "lat_syscall_open",
-            "Simple open/close",
-            &["lmbench_all", "lat_syscall", "-P", "1", "open", fixture],
-        ),
+        ("lat_syscall_null", "Simple syscall", &[
+            "lmbench_all",
+            "lat_syscall",
+            "-P",
+            "1",
+            "null",
+        ]),
+        ("lat_syscall_read", "Simple read", &[
+            "lmbench_all",
+            "lat_syscall",
+            "-P",
+            "1",
+            "read",
+        ]),
+        ("lat_syscall_write", "Simple write", &[
+            "lmbench_all",
+            "lat_syscall",
+            "-P",
+            "1",
+            "write",
+        ]),
+        ("lat_syscall_stat", "Simple stat", &[
+            "lmbench_all",
+            "lat_syscall",
+            "-P",
+            "1",
+            "stat",
+            fixture,
+        ]),
+        ("lat_syscall_fstat", "Simple fstat", &[
+            "lmbench_all",
+            "lat_syscall",
+            "-P",
+            "1",
+            "fstat",
+            fixture,
+        ]),
+        ("lat_syscall_open", "Simple open/close", &[
+            "lmbench_all",
+            "lat_syscall",
+            "-P",
+            "1",
+            "open",
+            fixture,
+        ]),
     ];
 
     let mini_start = crate::time::now();
@@ -2942,12 +3750,10 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
         let elapsed_ms = oscomp_lmbench_elapsed_ms(mini_start);
         let global_remaining_ms = oscomp_lmbench_global_remaining_ms();
         let needs_optional_budget = index >= 3;
-        let mini_budget_short = elapsed_ms
-            .saturating_add(OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS)
+        let mini_budget_short = elapsed_ms.saturating_add(OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS)
             > OSCOMP_LMBENCH_RV_GLIBC_CASE_BUDGET_MS;
         let global_budget_short = global_remaining_ms
-            < OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS
-                .saturating_add(OSCOMP_LMBENCH_GLOBAL_SAFETY_MS);
+            < OSCOMP_LMBENCH_NEXT_CASE_RESERVE_MS.saturating_add(OSCOMP_LMBENCH_GLOBAL_SAFETY_MS);
 
         if needs_optional_budget && (mini_budget_short || global_budget_short) {
             skipped_budget = cases.len() - index;
@@ -3002,52 +3808,63 @@ fn oscomp_run_lmbench_mini(script: &str) -> isize {
 fn oscomp_la_diag(_shell_path: &str) {
     crate::println!("oscomp-la-diag: begin");
 
-    let shells: &[&str] = &[
-        "/mnt/sdcard/musl/busybox",
-        "/bin/busybox",
-        "/bin/sh",
-    ];
+    let shells: &[&str] = &["/mnt/sdcard/musl/busybox", "/bin/busybox", "/bin/sh"];
 
     for cand in shells {
         let present = crate::fs::stat(cand).is_ok();
-        crate::println!(
-            "oscomp-la-diag: candidate {} present={}",
-            cand, present,
-        );
+        crate::println!("oscomp-la-diag: candidate {} present={}", cand, present,);
         if !present {
             continue;
         }
 
         // Probe: busybox-applet true (argv[0]=busybox, argv[1]=true)
         let rc1 = run_rootfs_program_with_cwd(
-            cand, &["busybox", "true"],
-            &["PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin", "HOME=/"],
+            cand,
+            &["busybox", "true"],
+            &[
+                "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin",
+                "HOME=/",
+            ],
             Some("/mnt/sdcard/musl"),
         );
         match rc1 {
             Ok(raw) => crate::println!(
                 "oscomp-la-diag: {} busybox true -> raw={} class={}",
-                cand, raw,
-                if raw == 0 { alloc::string::String::from("PASS") }
-                else if raw < 0 { alloc::format!("signal={}", -raw) }
-                else { alloc::format!("exit={}", raw) },
+                cand,
+                raw,
+                if raw == 0 {
+                    alloc::string::String::from("PASS")
+                } else if raw < 0 {
+                    alloc::format!("signal={}", -raw)
+                } else {
+                    alloc::format!("exit={}", raw)
+                },
             ),
             Err(_) => crate::println!("oscomp-la-diag: {} busybox true -> ERROR", cand),
         }
 
         // Probe: shell -c true (argv[0]=busybox, argv[1]=sh if busybox binary)
         let rc2 = run_rootfs_program_with_cwd(
-            cand, &["busybox", "sh", "-c", "true"],
-            &["PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin", "HOME=/"],
+            cand,
+            &["busybox", "sh", "-c", "true"],
+            &[
+                "PATH=.:/mnt/sdcard/musl:/mnt/sdcard/glibc:/bin:/sbin",
+                "HOME=/",
+            ],
             Some("/mnt/sdcard/musl"),
         );
         match rc2 {
             Ok(raw) => crate::println!(
                 "oscomp-la-diag: {} busybox sh -c true -> raw={} class={}",
-                cand, raw,
-                if raw == 0 { alloc::string::String::from("PASS") }
-                else if raw < 0 { alloc::format!("signal={}", -raw) }
-                else { alloc::format!("exit={}", raw) },
+                cand,
+                raw,
+                if raw == 0 {
+                    alloc::string::String::from("PASS")
+                } else if raw < 0 {
+                    alloc::format!("signal={}", -raw)
+                } else {
+                    alloc::format!("exit={}", raw)
+                },
             ),
             Err(_) => crate::println!("oscomp-la-diag: {} busybox sh -c true -> ERROR", cand),
         }
@@ -3063,7 +3880,8 @@ fn oscomp_la_diag(_shell_path: &str) {
         let present = crate::fs::stat(&path).is_ok();
         crate::println!(
             "oscomp-la-applet-diag: /mnt/sdcard/musl/{} present={}",
-            applet, present,
+            applet,
+            present,
         );
     }
 
@@ -3071,11 +3889,17 @@ fn oscomp_la_diag(_shell_path: &str) {
     // Trace-enabled probes for busybox sleep (syscall-level diag).
     oscomp_la_run_sleep_trace_probe(
         "busybox sleep 0",
-        diag_busybox, &["busybox", "sleep", "0"], diag_env, Some(diag_cwd),
+        diag_busybox,
+        &["busybox", "sleep", "0"],
+        diag_env,
+        Some(diag_cwd),
     );
     oscomp_la_run_sleep_trace_probe(
         "busybox sleep 1",
-        diag_busybox, &["busybox", "sleep", "1"], diag_env, Some(diag_cwd),
+        diag_busybox,
+        &["busybox", "sleep", "1"],
+        diag_env,
+        Some(diag_cwd),
     );
 
     // Non-trace probes (keep the existing diag format).
@@ -3084,17 +3908,27 @@ fn oscomp_la_diag(_shell_path: &str) {
         ("sh -c true", &["busybox", "sh", "-c", "true"]),
         ("sh -c sleep 0", &["busybox", "sh", "-c", "sleep 0"]),
         ("sh -c sleep 1", &["busybox", "sh", "-c", "sleep 1"]),
-        ("sh -c echo diag_ok", &["busybox", "sh", "-c", "echo diag_ok"]),
+        ("sh -c echo diag_ok", &[
+            "busybox",
+            "sh",
+            "-c",
+            "echo diag_ok",
+        ]),
     ];
 
     for (label, argv) in applet_probes {
         match run_rootfs_program_with_cwd(diag_busybox, argv, diag_env, Some(diag_cwd)) {
             Ok(raw) => crate::println!(
                 "oscomp-la-applet-diag: {} -> raw={} class={}",
-                label, raw,
-                if raw == 0 { alloc::string::String::from("PASS") }
-                else if raw < 0 { alloc::format!("signal={}", -raw) }
-                else { alloc::format!("exit={}", raw) },
+                label,
+                raw,
+                if raw == 0 {
+                    alloc::string::String::from("PASS")
+                } else if raw < 0 {
+                    alloc::format!("signal={}", -raw)
+                } else {
+                    alloc::format!("exit={}", raw)
+                },
             ),
             Err(_) => crate::println!("oscomp-la-applet-diag: {} -> ERROR", label),
         }
@@ -3122,14 +3956,14 @@ fn oscomp_la_basic_probe() {
     ];
 
     let probes: &[(&str, &str, &[&str])] = &[
-        ("glibc/brk",    "/mnt/sdcard/glibc/basic/brk",    glibc_env),
+        ("glibc/brk", "/mnt/sdcard/glibc/basic/brk", glibc_env),
         ("glibc/getpid", "/mnt/sdcard/glibc/basic/getpid", glibc_env),
-        ("glibc/write",  "/mnt/sdcard/glibc/basic/write",  glibc_env),
-        ("glibc/exit",   "/mnt/sdcard/glibc/basic/exit",   glibc_env),
-        ("musl/brk",     "/mnt/sdcard/musl/basic/brk",     musl_env),
-        ("musl/getpid",  "/mnt/sdcard/musl/basic/getpid",  musl_env),
-        ("musl/write",   "/mnt/sdcard/musl/basic/write",   musl_env),
-        ("musl/exit",    "/mnt/sdcard/musl/basic/exit",    musl_env),
+        ("glibc/write", "/mnt/sdcard/glibc/basic/write", glibc_env),
+        ("glibc/exit", "/mnt/sdcard/glibc/basic/exit", glibc_env),
+        ("musl/brk", "/mnt/sdcard/musl/basic/brk", musl_env),
+        ("musl/getpid", "/mnt/sdcard/musl/basic/getpid", musl_env),
+        ("musl/write", "/mnt/sdcard/musl/basic/write", musl_env),
+        ("musl/exit", "/mnt/sdcard/musl/basic/exit", musl_env),
     ];
 
     for (label, path, env) in probes {
@@ -3139,23 +3973,27 @@ fn oscomp_la_basic_probe() {
             "/mnt/sdcard/musl/basic"
         };
 
-        crate::println!(
-            "oscomp-la-basic-probe: run path={} cwd={}",
-            path, cwd,
-        );
+        crate::println!("oscomp-la-basic-probe: run path={} cwd={}", path, cwd,);
 
-        match run_rootfs_program_with_cwd(path, &[label.split('/').nth(1).unwrap_or("?")], env, Some(cwd)) {
+        match run_rootfs_program_with_cwd(
+            path,
+            &[label.split('/').nth(1).unwrap_or("?")],
+            env,
+            Some(cwd),
+        ) {
             Ok(raw) => crate::println!(
                 "oscomp-la-basic-probe: done path={} raw={} class={}",
-                path, raw,
-                if raw == 0 { alloc::string::String::from("PASS") }
-                else if raw < 0 { alloc::format!("signal={}", -raw) }
-                else { alloc::format!("exit={}", raw) },
-            ),
-            Err(_) => crate::println!(
-                "oscomp-la-basic-probe: done path={} ERROR",
                 path,
+                raw,
+                if raw == 0 {
+                    alloc::string::String::from("PASS")
+                } else if raw < 0 {
+                    alloc::format!("signal={}", -raw)
+                } else {
+                    alloc::format!("exit={}", raw)
+                },
             ),
+            Err(_) => crate::println!("oscomp-la-basic-probe: done path={} ERROR", path,),
         }
     }
 
@@ -3173,11 +4011,38 @@ fn oscomp_la_run_basic_direct(kind: &str, root: &str) -> isize {
     // Cases known to exist in sdcard basic directories.
     // Full list — all cases that RISC-V passes.
     let cases: &[&str] = &[
-        "brk", "chdir", "clone", "close", "dup2", "dup", "execve", "exit",
-        "fork", "fstat", "getcwd", "getdents", "getpid", "getppid",
-        "gettimeofday", "mkdir_", "mmap", "mount", "munmap", "openat",
-        "open", "pipe", "read", "sleep", "times", "umount", "uname",
-        "unlink", "wait", "waitpid", "write", "yield",
+        "brk",
+        "chdir",
+        "clone",
+        "close",
+        "dup2",
+        "dup",
+        "execve",
+        "exit",
+        "fork",
+        "fstat",
+        "getcwd",
+        "getdents",
+        "getpid",
+        "getppid",
+        "gettimeofday",
+        "mkdir_",
+        "mmap",
+        "mount",
+        "munmap",
+        "openat",
+        "open",
+        "pipe",
+        "read",
+        "sleep",
+        "times",
+        "umount",
+        "uname",
+        "unlink",
+        "wait",
+        "waitpid",
+        "write",
+        "yield",
     ];
 
     let path_env: &str;
@@ -3197,19 +4062,16 @@ fn oscomp_la_run_basic_direct(kind: &str, root: &str) -> isize {
         if crate::fs::stat(&path).is_err() {
             crate::println!(
                 "oscomp-la-basic-direct: missing case={} path={}",
-                case, path,
+                case,
+                path,
             );
             continue;
         }
 
         crate::println!("Testing {} :", case);
 
-        match run_rootfs_program_with_cwd(
-            &path,
-            &[case],
-            &[path_env, ld_env, "HOME=/"],
-            Some(root),
-        ) {
+        match run_rootfs_program_with_cwd(&path, &[case], &[path_env, ld_env, "HOME=/"], Some(root))
+        {
             Ok(0) => {}
             Ok(raw) => {
                 let class = if raw < 0 {
@@ -3219,15 +4081,15 @@ fn oscomp_la_run_basic_direct(kind: &str, root: &str) -> isize {
                 };
                 crate::println!(
                     "oscomp-la-basic-direct: FAIL case={} path={} raw={} class={}",
-                    case, path, raw, class,
+                    case,
+                    path,
+                    raw,
+                    class,
                 );
                 all_passed = false;
             }
             Err(_) => {
-                crate::println!(
-                    "oscomp-la-basic-direct: ERROR case={} path={}",
-                    case, path,
-                );
+                crate::println!("oscomp-la-basic-direct: ERROR case={} path={}", case, path,);
                 all_passed = false;
             }
         }
@@ -3399,10 +4261,7 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
                     installed += 1;
                 }
             }
-        } else if entry.file_type == EXT4_FT_DIR
-            && entry.name != "."
-            && entry.name != ".."
-        {
+        } else if entry.file_type == EXT4_FT_DIR && entry.name != "." && entry.name != ".." {
             let sub_ext4 = if ext4_dir == "/" {
                 alloc::format!("/{}", entry.name)
             } else {
@@ -3416,9 +4275,13 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
             }
         }
     }
-    crate::println!("sdcard: expanded {} -> {} : {} files", ext4_dir, vfs_dir, installed);
+    crate::println!(
+        "sdcard: expanded {} -> {} : {} files",
+        ext4_dir,
+        vfs_dir,
+        installed
+    );
 }
-
 
 fn verify_sdcard_basic_binaries() {
     const BASIC_TESTS: &[&str] = &[
@@ -3513,17 +4376,14 @@ fn run_program_image_with_cwd(
         VmAreaFlags::user_rw(),
         VmAreaKind::Anonymous,
     )];
-    let exec = crate::exec::exec_elf(
-        image,
-        crate::exec::ExecConfig {
-            argv,
-            envp,
-            stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
-            heap_start: VirtAddr::new(USER_HEAP_START),
-            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
-            extra_areas: &extra_areas,
-        },
-    )?;
+    let exec = crate::exec::exec_elf(image, crate::exec::ExecConfig {
+        argv,
+        envp,
+        stack: VirtRange::from_bounds(RUNTIME_STACK, RUNTIME_STACK_TOP),
+        heap_start: VirtAddr::new(USER_HEAP_START),
+        heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+        extra_areas: &extra_areas,
+    })?;
     // Set parent so getppid returns a valid PID.
     // During contest we may run in a kernel thread; fallback to PID 1 (init).
     let ppid = crate::task::current_user_thread()
@@ -3540,7 +4400,8 @@ fn run_program_image_with_cwd(
     if oscomp_la_sleep_trace_active() {
         crate::println!(
             "oscomp-la-status-trace: child-exit pid={} raw={}",
-            child_pid.get(), result,
+            child_pid.get(),
+            result,
         );
     }
     task.wait_for_detach();
@@ -3824,7 +4685,13 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             LAST_TRACED_SYSCALL_NR.store(number, Ordering::Relaxed);
             crate::println!(
                 "oscomp-la-sleep-syscall: enter nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-                number, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
+                number,
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+                arguments[5],
             );
         } else {
             OSCOMP_LA_SLEEP_TRACE.store(false, Ordering::Relaxed);
@@ -3835,8 +4702,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     if OSCOMP_TRACE_PTHREAD_CREATE {
         let budget = OSCOMP_PTHREAD_TRACE_BUDGET.load(Ordering::Relaxed);
         if budget > 0
-            && matches!(number,
-              220 | 435 | 293 | 132 |   // clone/clone3/rseq/sigaltstack
+            && matches!(
+                number,
+                220 | 435 | 293 | 132 |   // clone/clone3/rseq/sigaltstack
               96 | 99 |                 // set_tid_address/set_robust_list
               135 |                     // rt_sigprocmask
               222 | 226 | 215 |         // mmap/mprotect/munmap
@@ -3845,24 +4713,44 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
               123 | 122 |               // sched_get/setaffinity
               119 | 120 | 121 | 118 |   // sched_setscheduler/getscheduler/getparam/setparam
               125 | 126 | 127 |         // sched_get_priority_max/min, sched_rr_get_interval
-              228 | 230 | 229           // mlock/mlockall/munlock
+              228 | 230 | 229 // mlock/mlockall/munlock
             )
         {
             OSCOMP_PTHREAD_TRACE_BUDGET.store(budget - 1, Ordering::Relaxed);
             let pid = current_process().id().get();
             crate::println!(
                 "pthread-trace: enter pid={} nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
-                pid, number, arguments[0], arguments[1], arguments[2],
-                arguments[3], arguments[4], arguments[5],
+                pid,
+                number,
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+                arguments[5],
             );
         }
     }
 
     // ── P11B: pthread trace — save nr for exit trace ──
     if OSCOMP_TRACE_PTHREAD_CREATE
-        && matches!(number,
-            220 | 435 | 293 | 132 | 96 | 99 | 135 |
-            222 | 226 | 215 | 98 | 261 | 123 | 122 | 228 | 230
+        && matches!(
+            number,
+            220 | 435
+                | 293
+                | 132
+                | 96
+                | 99
+                | 135
+                | 222
+                | 226
+                | 215
+                | 98
+                | 261
+                | 123
+                | 122
+                | 228
+                | 230
         )
     {
         LAST_TRACED_SYSCALL_NR.store(number | 0x1_0000, Ordering::Relaxed);
@@ -3871,11 +4759,22 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     let _interrupt_guard = SyscallInterruptGuard::enable_until_trap_return();
 
     match number {
+        SYS_EVENTFD2 => set_syscall_result(frame, sys_eventfd2(arguments[0], arguments[1])),
+        SYS_EPOLL_CREATE1 => set_syscall_result(frame, sys_epoll_create1(arguments[0])),
+        SYS_EPOLL_CTL => set_syscall_result(
+            frame,
+            sys_epoll_ctl(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
+        SYS_EPOLL_PWAIT => set_syscall_result(
+            frame,
+            sys_epoll_pwait(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_GETCWD => set_syscall_result(frame, sys_getcwd(arguments[0], arguments[1])),
         SYS_DUP => set_syscall_result(frame, sys_dup(arguments[0])),
         SYS_DUP3 => set_syscall_result(frame, sys_dup3(arguments[0], arguments[1], arguments[2])),
         SYS_FCNTL => set_syscall_result(frame, sys_fcntl(arguments[0], arguments[1], arguments[2])),
         SYS_IOCTL => set_syscall_result(frame, sys_ioctl(arguments[0], arguments[1], arguments[2])),
+        SYS_FLOCK => set_syscall_result(frame, sys_flock(arguments[0], arguments[1])),
         SYS_PIPE2 => set_syscall_result(frame, sys_pipe2(arguments[0], arguments[1])),
         SYS_GETPID => set_syscall_result(frame, current_process().id().get() as isize),
         SYS_GETTID => set_syscall_result(
@@ -3908,9 +4807,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             set_syscall_result(frame, sys_set_robust_list(arguments[0], arguments[1]))
         }
 
-        SYS_GET_ROBUST_LIST => {
-            set_syscall_result(frame, sys_get_robust_list(arguments[0], arguments[1], arguments[2]))
-        }
+        SYS_GET_ROBUST_LIST => set_syscall_result(
+            frame,
+            sys_get_robust_list(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_SETSID => set_syscall_result(frame, current_process().setsid()),
         SYS_SETPGID => set_syscall_result(frame, sys_setpgid(arguments[0], arguments[1])),
         SYS_GETPGID => set_syscall_result(frame, sys_getpgid(arguments[0])),
@@ -3923,18 +4823,22 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_rt_sigprocmask(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
-        SYS_RT_SIGTIMEDWAIT => {
-            set_syscall_result(frame, sys_rt_sigtimedwait(arguments))
-        }
+        SYS_RT_SIGTIMEDWAIT => set_syscall_result(frame, sys_rt_sigtimedwait(arguments)),
         SYS_RT_SIGRETURN => {
             if let Err(error) = sys_rt_sigreturn(frame) {
                 set_syscall_result(frame, error);
             }
         }
-        SYS_WAIT4 => set_syscall_result(frame, sys_wait4(arguments[0], arguments[1], arguments[2], arguments[3])),
+        SYS_WAIT4 => set_syscall_result(
+            frame,
+            sys_wait4(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_CLONE => set_syscall_result(frame, sys_clone(frame, arguments)),
         SYS_CLONE3 => set_syscall_result(frame, sys_clone3(frame, arguments[0], arguments[1])),
-        SYS_RSEQ => set_syscall_result(frame, sys_rseq(arguments[0], arguments[1], arguments[2], arguments[3])),
+        SYS_RSEQ => set_syscall_result(
+            frame,
+            sys_rseq(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_SIGALTSTACK => set_syscall_result(frame, sys_sigaltstack(arguments[0], arguments[1])),
         SYS_EXECVE => {
             let result = sys_execve(frame, arguments);
@@ -3944,19 +4848,19 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_CLOCK_GETTIME => {
             set_syscall_result(frame, sys_clock_gettime(arguments[0], arguments[1]))
         }
-        SYS_CLOCK_GETRES => {
-            set_syscall_result(frame, sys_clock_getres(arguments[0], arguments[1]))
-        }
-        SYS_CLOCK_NANOSLEEP => {
-            set_syscall_result(frame, sys_clock_nanosleep(
-                arguments[0], arguments[1], arguments[2], arguments[3],
-            ))
-        }
+        SYS_CLOCK_GETRES => set_syscall_result(frame, sys_clock_getres(arguments[0], arguments[1])),
+        SYS_CLOCK_NANOSLEEP => set_syscall_result(
+            frame,
+            sys_clock_nanosleep(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_GETTIMEOFDAY => set_syscall_result(frame, sys_gettimeofday(arguments[0])),
         SYS_TIMES => set_syscall_result(frame, sys_times(arguments[0])),
         SYS_UNAME => set_syscall_result(frame, sys_uname(arguments[0])),
         SYS_SYSINFO => set_syscall_result(frame, sys_sysinfo(arguments[0])),
-        SYS_GETRANDOM => set_syscall_result(frame, sys_getrandom(arguments[0], arguments[1], arguments[2])),
+        SYS_GETRANDOM => set_syscall_result(
+            frame,
+            sys_getrandom(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_MKDIRAT => {
             set_syscall_result(frame, sys_mkdirat(arguments[0], arguments[1], arguments[2]))
         }
@@ -4026,6 +4930,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let result = sys_pread64(arguments[0], arguments[1], arguments[2], arguments[3]);
             set_syscall_result(frame, result);
         }
+        SYS_SENDFILE => {
+            let result = sys_sendfile(arguments[0], arguments[1], arguments[2], arguments[3]);
+            set_syscall_result(frame, result);
+        }
         SYS_PWRITE64 => {
             let result = sys_pwrite64(arguments[0], arguments[1], arguments[2], arguments[3]);
             set_syscall_result(frame, result);
@@ -4060,6 +4968,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_mprotect(arguments[0], arguments[1], arguments[2]),
         ),
+        SYS_MADVISE => {
+            set_syscall_result(frame, sys_madvise(arguments[0], arguments[1], arguments[2]))
+        }
         SYS_PKEY_MPROTECT => set_syscall_result(
             frame,
             sys_pkey_mprotect(arguments[0], arguments[1], arguments[2], arguments[3]),
@@ -4082,35 +4993,75 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             );
         }
         SYS_MKNODAT => {
-            set_syscall_result(frame, sys_mknodat(arguments[0], arguments[1], arguments[2], arguments[3]));
+            set_syscall_result(
+                frame,
+                sys_mknodat(arguments[0], arguments[1], arguments[2], arguments[3]),
+            );
         }
-        SYS_UTIMENSAT => set_syscall_result(frame, sys_utimensat(arguments[0], arguments[1], arguments[2])),
+        SYS_UTIMENSAT => set_syscall_result(
+            frame,
+            sys_utimensat(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_STATFS => set_syscall_result(frame, sys_statfs_path(arguments[0], arguments[1])),
         SYS_FSTATFS => set_syscall_result(frame, sys_statfs_fd(arguments[0], arguments[1])),
-        SYS_SYSLOG => set_syscall_result(frame, sys_syslog(arguments[0], arguments[1], arguments[2])),
-        SYS_SCHED_GETAFFINITY => set_syscall_result(frame, sys_sched_getaffinity(arguments[0], arguments[1], arguments[2])),
-        SYS_SCHED_SETAFFINITY => set_syscall_result(frame, sys_sched_setaffinity(arguments[0], arguments[1], arguments[2])),
-        SYS_SCHED_SETSCHEDULER => set_syscall_result(frame, sys_sched_setscheduler(arguments[0], arguments[1], arguments[2])),
+        SYS_SYSLOG => {
+            set_syscall_result(frame, sys_syslog(arguments[0], arguments[1], arguments[2]))
+        }
+        SYS_SCHED_GETAFFINITY => set_syscall_result(
+            frame,
+            sys_sched_getaffinity(arguments[0], arguments[1], arguments[2]),
+        ),
+        SYS_SCHED_SETAFFINITY => set_syscall_result(
+            frame,
+            sys_sched_setaffinity(arguments[0], arguments[1], arguments[2]),
+        ),
+        SYS_SCHED_SETSCHEDULER => set_syscall_result(
+            frame,
+            sys_sched_setscheduler(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_SCHED_GETSCHEDULER => set_syscall_result(frame, sys_sched_getscheduler(arguments[0])),
-        SYS_SCHED_GETPARAM => set_syscall_result(frame, sys_sched_getparam(arguments[0], arguments[1])),
-        SYS_SCHED_SETPARAM => set_syscall_result(frame, sys_sched_setparam(arguments[0], arguments[1])),
-        SYS_SCHED_GET_PRIORITY_MAX => set_syscall_result(frame, sys_sched_get_priority(arguments[0], true)),
-        SYS_SCHED_GET_PRIORITY_MIN => set_syscall_result(frame, sys_sched_get_priority(arguments[0], false)),
-        SYS_SCHED_RR_GET_INTERVAL => set_syscall_result(frame, sys_sched_rr_get_interval(arguments[0], arguments[1])),
+        SYS_SCHED_GETPARAM => {
+            set_syscall_result(frame, sys_sched_getparam(arguments[0], arguments[1]))
+        }
+        SYS_SCHED_SETPARAM => {
+            set_syscall_result(frame, sys_sched_setparam(arguments[0], arguments[1]))
+        }
+        SYS_SCHED_GET_PRIORITY_MAX => {
+            set_syscall_result(frame, sys_sched_get_priority(arguments[0], true))
+        }
+        SYS_SCHED_GET_PRIORITY_MIN => {
+            set_syscall_result(frame, sys_sched_get_priority(arguments[0], false))
+        }
+        SYS_SCHED_RR_GET_INTERVAL => {
+            set_syscall_result(frame, sys_sched_rr_get_interval(arguments[0], arguments[1]))
+        }
         SYS_MLOCKALL => set_syscall_result(frame, sys_mlockall(arguments[0])),
         SYS_MUNLOCKALL => set_syscall_result(frame, 0),
         SYS_MLOCK => set_syscall_result(frame, sys_mlock(arguments[0], arguments[1])),
         SYS_MUNLOCK => set_syscall_result(frame, sys_mlock(arguments[0], arguments[1])),
-        SYS_RENAMEAT2 => {
-            set_syscall_result(frame,
-                sys_renameat2(arguments[0], arguments[1], arguments[2], arguments[3], arguments[4]))
-        }
+        SYS_RENAMEAT2 => set_syscall_result(
+            frame,
+            sys_renameat2(
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+            ),
+        ),
         SYS_PRCTL => set_syscall_result(frame, sys_prctl(arguments[0], arguments[1], arguments[2])),
-        SYS_SETITIMER => set_syscall_result(frame, sys_setitimer(arguments[0], arguments[1], arguments[2])),
+        SYS_SETITIMER => set_syscall_result(
+            frame,
+            sys_setitimer(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_GETITIMER => set_syscall_result(frame, sys_getitimer(arguments[0], arguments[1])),
         SYS_GETRUSAGE => set_syscall_result(frame, sys_getrusage(arguments[0], arguments[1])),
-        SYS_RT_SIGPENDING => set_syscall_result(frame, sys_rt_sigpending(arguments[0], arguments[1])),
-        SYS_RT_SIGSUSPEND => set_syscall_result(frame, sys_rt_sigsuspend(arguments[0], arguments[1])),
+        SYS_RT_SIGPENDING => {
+            set_syscall_result(frame, sys_rt_sigpending(arguments[0], arguments[1]))
+        }
+        SYS_RT_SIGSUSPEND => {
+            set_syscall_result(frame, sys_rt_sigsuspend(arguments[0], arguments[1]))
+        }
         SYS_SCHED_YIELD => {
             let thread = crate::task::current_user_thread()
                 .expect("M9-B sched_yield arrived without a current user Thread");
@@ -4132,12 +5083,30 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             }
             #[cfg(target_arch = "loongarch64")]
             oscomp_la_status_trace("sys_exit", arguments[0] as isize);
+            crate::println!(
+                "process-exit: pid={} tid={} group={} status={}",
+                current_process().id().get(),
+                crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+                number == SYS_EXIT_GROUP,
+                arguments[0] as isize,
+            );
             return_to_kernel(frame, arguments[0] as isize);
         }
         SYS_SOCKET => {
             set_syscall_result(
                 frame,
                 crate::net::socket::sys_socket(arguments[0], arguments[1], arguments[2]),
+            );
+        }
+        SYS_SOCKETPAIR => {
+            set_syscall_result(
+                frame,
+                crate::net::socket::sys_socketpair(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                ),
             );
         }
         SYS_BIND => {
@@ -4158,10 +5127,33 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
                 crate::net::socket::sys_accept(arguments[0], arguments[1], arguments[2]),
             );
         }
+        SYS_ACCEPT4 => {
+            set_syscall_result(
+                frame,
+                crate::net::socket::sys_accept4(
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                ),
+            );
+        }
         SYS_CONNECT => {
             set_syscall_result(
                 frame,
                 crate::net::socket::sys_connect(arguments[0], arguments[1], arguments[2]),
+            );
+        }
+        SYS_GETSOCKNAME => {
+            set_syscall_result(
+                frame,
+                crate::net::socket::sys_getsockname(arguments[0], arguments[1], arguments[2]),
+            );
+        }
+        SYS_GETPEERNAME => {
+            set_syscall_result(
+                frame,
+                crate::net::socket::sys_getpeername(arguments[0], arguments[1], arguments[2]),
             );
         }
         SYS_SENDTO => {
@@ -4190,6 +5182,18 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
                 ),
             );
         }
+        SYS_SENDMSG => {
+            set_syscall_result(
+                frame,
+                crate::net::socket::sys_sendmsg(arguments[0], arguments[1], arguments[2]),
+            );
+        }
+        SYS_RECVMSG => {
+            set_syscall_result(
+                frame,
+                crate::net::socket::sys_recvmsg(arguments[0], arguments[1], arguments[2]),
+            );
+        }
         SYS_SHUTDOWN => {
             set_syscall_result(
                 frame,
@@ -4200,8 +5204,11 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             set_syscall_result(
                 frame,
                 sys_setsockopt(
-                    arguments[0], arguments[1], arguments[2],
-                    arguments[3], arguments[4],
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
                 ),
             );
         }
@@ -4209,12 +5216,30 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             set_syscall_result(
                 frame,
                 sys_getsockopt(
-                    arguments[0], arguments[1], arguments[2],
-                    arguments[3], arguments[4],
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
                 ),
             );
         }
-        _ => set_syscall_result(frame, -ENOSYS),
+        _ => {
+            static UNKNOWN_SYSCALL_PRINTS: AtomicUsize = AtomicUsize::new(0);
+            if UNKNOWN_SYSCALL_PRINTS.fetch_add(1, Ordering::Relaxed) < 128 {
+                crate::println!(
+                    "unknown-syscall: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
+                    number,
+                    arguments[0],
+                    arguments[1],
+                    arguments[2],
+                    arguments[3],
+                    arguments[4],
+                    arguments[5],
+                );
+            }
+            set_syscall_result(frame, -ENOSYS)
+        }
     }
     deliver_pending_signal(frame);
 }
@@ -4300,9 +5325,18 @@ pub fn handle_fault(
                 static FAULT_PRINT_COUNT: AtomicUsize = AtomicUsize::new(0);
                 let print_idx = FAULT_PRINT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if print_idx < 8 {
+                    let process = current_process();
+                    let tid =
+                        crate::task::current_user_thread().map_or(0, |thread| thread.id().get());
                     crate::println!(
-                        "sigsegv: class={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x}",
-                        class, bpc, baddr, access, bsp,
+                        "sigsegv: pid={} tid={} class={} pc={:#018x} badaddr={:#018x} access={:?} sp={:#018x}",
+                        process.id().get(),
+                        tid,
+                        class,
+                        bpc,
+                        baddr,
+                        access,
+                        bsp,
                     );
                 } else if print_idx == 8 {
                     crate::println!("sigsegv: ... further faults suppressed");
@@ -4316,7 +5350,11 @@ pub fn handle_fault(
                 EXIT_STATUS.store(-EFAULT, Ordering::Release);
             }
             // External programs: use SIGSEGV so wait4 produces signal status.
-            let exit_code = if ACTIVE.load(Ordering::Acquire) { -EFAULT } else { -11 }; // SIGSEGV
+            let exit_code = if ACTIVE.load(Ordering::Acquire) {
+                -EFAULT
+            } else {
+                -11
+            }; // SIGSEGV
             #[cfg(target_arch = "loongarch64")]
             oscomp_la_status_trace("fault-sigsegv", exit_code);
             return_to_kernel(frame, exit_code);
@@ -4325,10 +5363,18 @@ pub fn handle_fault(
     }
 }
 
-fn classify_segv(pc: usize, badaddr: usize, sp: usize, _frame: &crate::arch::trap::TrapFrame) -> &'static str {
+fn classify_segv(
+    pc: usize,
+    badaddr: usize,
+    sp: usize,
+    _frame: &crate::arch::trap::TrapFrame,
+) -> &'static str {
     // Known-bad LA static busybox: andi rX,r0,imm placeholder.
-    if pc == 0x12018ae50 || pc == 0x12018bd2c || pc == 0x12018b840
-        || pc == 0x12018b4c8 || pc == 0x1201acc9c
+    if pc == 0x12018ae50
+        || pc == 0x12018bd2c
+        || pc == 0x12018b840
+        || pc == 0x12018b4c8
+        || pc == 0x1201acc9c
     {
         return "known-bad-busybox";
     }
@@ -4364,10 +5410,7 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
             );
             let n = OSCOMP_LA_FPD_FIXUPS.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 16 {
-                crate::println!(
-                    "oscomp-la-fpd: fixup count={} era={:#x}",
-                    n, frame.era,
-                );
+                crate::println!("oscomp-la-fpd: fixup count={} era={:#x}", n, frame.era,);
             }
             crate::arch::cpu::enable_fpu();
             // Return without advancing PC — the instruction will retry.
@@ -4383,7 +5426,9 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         let sp = frame.stack_pointer();
         crate::println!(
             "oscomp-la-exception-trace: code={} era={:#x} sp={:#x}",
-            _code, era, sp,
+            _code,
+            era,
+            sp,
         );
     }
 
@@ -4452,7 +5497,7 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
     const MAP_ACCEPTED: usize = MAP_PRIVATE | MAP_SHARED | MAP_ANONYMOUS
         | MAP_FIXED | 0x800 | 0x1000  // MAP_DENYWRITE | MAP_EXECUTABLE
         | 0x4000 | 0x8000 | 0x20000   // MAP_NORESERVE | MAP_POPULATE | MAP_STACK
-        | 0x100000;                   // MAP_FIXED_NOREPLACE
+        | 0x100000; // MAP_FIXED_NOREPLACE
 
     let map_type = flags & MAP_TYPE;
     let is_file_backed = file != usize::MAX && (map_type == MAP_PRIVATE || map_type == MAP_SHARED);
@@ -4477,27 +5522,39 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
     // MAP_FIXED: unmap the target range first, then let the allocator
     // place the mapping.  (For true MAP_FIXED we should map at the exact
     // address; this is a best-effort approximation.)
-    if is_fixed && address != 0 {
+    let fixed_range = if is_fixed && address != 0 {
         let fixed_start = VirtAddr::new(address);
-        if let Some(fixed_range) = fixed_start
+        let fixed_range = match fixed_start
             .checked_add(rounded)
             .and_then(|end| VirtRange::new(fixed_start, end))
         {
-            let _ = current_user_mm().unmap_range(fixed_range);
-        }
+            Some(range) => range,
+            None => return -ENOMEM,
+        };
+        let _ = current_user_mm().unmap_range(fixed_range);
         if mmap_file_ok_trace() {
             crate::println!(
                 "mmap-anon: FIXED addr={:#x} len={:#x} prot={:?}",
-                address, rounded, vm_flags,
+                address,
+                rounded,
+                vm_flags,
             );
         }
-    }
+        Some(fixed_range)
+    } else {
+        None
+    };
 
-    match current_user_mm().map_anonymous(
-        VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
-        rounded,
-        vm_flags,
-    ) {
+    let mapping = if let Some(range) = fixed_range {
+        current_user_mm().map_anonymous_exact(range, vm_flags)
+    } else {
+        current_user_mm().map_anonymous(
+            VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
+            rounded,
+            vm_flags,
+        )
+    };
+    match mapping {
         Ok(start) => {
             if ACTIVE.load(Ordering::Acquire) {
                 MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -4506,18 +5563,26 @@ fn sys_mmap(arguments: [usize; 6]) -> isize {
             if mmap_file_ok_trace() {
                 crate::println!(
                     "mmap-anon: ok addr_req={:#x} -> {:#x} len={:#x} prot={:?}",
-                    address, start.get(), rounded, vm_flags,
+                    address,
+                    start.get(),
+                    rounded,
+                    vm_flags,
                 );
             }
             start.get() as isize
         }
-        Err(_) => {
-            if is_fixed {
-                crate::println!(
-                    "mmap-anon: FAIL FIXED addr={:#x} len={:#x} prot={:?}",
-                    address, rounded, vm_flags,
-                );
-            }
+        Err(error) => {
+            let (vmas, capacity) = current_user_mm().vma_usage();
+            crate::println!(
+                "mmap-anon: FAIL fixed={} addr={:#x} len={:#x} prot={:?} vmas={}/{} err={:?}",
+                is_fixed,
+                address,
+                rounded,
+                vm_flags,
+                vmas,
+                capacity,
+                error,
+            );
             -ENOMEM
         }
     }
@@ -4529,10 +5594,10 @@ fn sys_file_private_mmap(
     length: usize,
     rounded: usize,
     vm_flags: VmAreaFlags,
-    _address: usize,
+    address: usize,
     is_fixed: bool,
 ) -> isize {
-    const MAX_FILE_MMAP: usize = 16 * 1024 * 1024;
+    const MAX_FILE_MMAP: usize = 512 * 1024 * 1024;
     if offset & (PAGE_SIZE - 1) != 0 || rounded > MAX_FILE_MMAP {
         return -EINVAL;
     }
@@ -4549,7 +5614,11 @@ fn sys_file_private_mmap(
     if mode != myos_vfs::FileMode::S_IFREG && mode != myos_vfs::FileMode::S_IFBLK {
         return -(myos_vfs::Errno::Eacces.to_isize());
     }
-    let file_size = if stat.size <= 0 { 0 } else { stat.size as usize };
+    let file_size = if stat.size <= 0 {
+        0
+    } else {
+        stat.size as usize
+    };
     let readable = file_size.saturating_sub(offset).min(length);
 
     let temporary_flags = VmAreaFlags::user_rw();
@@ -4558,21 +5627,31 @@ fn sys_file_private_mmap(
     // place the new mapping.  (A full implementation would map at the
     // exact address; for now this avoids EINVAL when ld-linux uses
     // MAP_FIXED to place PT_LOAD segments.)
-    if is_fixed {
-        let fixed_start = VirtAddr::new(_address);
-        if let Some(fixed_range) = fixed_start
+    let fixed_range = if is_fixed {
+        let fixed_start = VirtAddr::new(address);
+        let fixed_range = match fixed_start
             .checked_add(rounded)
             .and_then(|end| VirtRange::new(fixed_start, end))
         {
-            let _ = current_user_mm().unmap_range(fixed_range);
-        }
-    }
+            Some(range) => range,
+            None => return -ENOMEM,
+        };
+        let _ = current_user_mm().unmap_range(fixed_range);
+        Some(fixed_range)
+    } else {
+        None
+    };
 
-    let start = match current_user_mm().map_anonymous(
-        VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
-        rounded,
-        temporary_flags,
-    ) {
+    let mapping = if let Some(range) = fixed_range {
+        current_user_mm().map_anonymous_exact(range, temporary_flags)
+    } else {
+        current_user_mm().map_anonymous(
+            VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
+            rounded,
+            temporary_flags,
+        )
+    };
+    let start = match mapping {
         Ok(start) => start,
         Err(_) => return -ENOMEM,
     };
@@ -4597,14 +5676,23 @@ fn sys_file_private_mmap(
     }
     // Zero-fill tail padding (BSS / partial page beyond file size).
     if rounded > readable {
-        let _ = zero_user_mapping(start.checked_add(readable).unwrap_or(start), rounded - readable);
+        let _ = zero_user_mapping(
+            start.checked_add(readable).unwrap_or(start),
+            rounded - readable,
+        );
     }
     if let Err(e) = current_user_mm().protect_range(range, vm_flags.access_only()) {
         if mmap_file_fail_trace() {
             let path = file.path().unwrap_or("?");
             crate::println!(
                 "mmap-file: FAIL fd={} path={} off={:#x} len={:#x} range=[{:#x},{:#x}) err={:?}",
-                fd, path, offset, length, range.start().get(), range.end().get(), e,
+                fd,
+                path,
+                offset,
+                length,
+                range.start().get(),
+                range.end().get(),
+                e,
             );
         }
         let _ = current_user_mm().unmap_range(range);
@@ -4614,12 +5702,20 @@ fn sys_file_private_mmap(
         MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
     }
     let path = file.path().unwrap_or("?");
-    let is_lib = path.contains("/lib/") || path.contains("/lib64/") || path.contains("ld-linux") || path.contains("ld-musl");
+    let is_lib = path.contains("/lib/")
+        || path.contains("/lib64/")
+        || path.contains("ld-linux")
+        || path.contains("ld-musl");
     // Always print mmap for lib paths; rate-limit everything else.
     if is_lib || mmap_file_ok_trace() {
         crate::println!(
             "mmap-file: ok fd={} path={} off={:#x} len={:#x} -> {:#x} prot={:?}",
-            fd, path, offset, length, start.get(), vm_flags,
+            fd,
+            path,
+            offset,
+            length,
+            start.get(),
+            vm_flags,
         );
     }
     start.get() as isize
@@ -4630,9 +5726,10 @@ fn zero_user_mapping(mut addr: VirtAddr, mut remaining: usize) -> Result<(), ()>
     while remaining > 0 {
         let chunk = core::cmp::min(PAGE_SIZE, remaining);
         let phys = mm.populate_page(addr).map_err(|_| ())?;
-        let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(phys)
-            .map_err(|_| ())?;
-        unsafe { core::ptr::write_bytes(ptr, 0, chunk); }
+        let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(phys).map_err(|_| ())?;
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, chunk);
+        }
         addr = addr.checked_add(chunk).ok_or(())?;
         remaining -= chunk;
     }
@@ -4644,10 +5741,14 @@ fn copy_file_into_private_mapping(
     start: VirtAddr,
     length: usize,
 ) -> Result<(), ()> {
+    const FILE_MMAP_IO_CHUNK: usize = 256 * 1024;
     let mut copied = 0;
-    let mut buffer = [0_u8; MAX_USER_COPY];
+    let buffer_size = length.min(FILE_MMAP_IO_CHUNK);
+    let mut buffer = Vec::new();
+    buffer.try_reserve(buffer_size).map_err(|_| ())?;
+    buffer.resize(buffer_size, 0);
     while copied < length {
-        let chunk = (length - copied).min(MAX_USER_COPY);
+        let chunk = (length - copied).min(buffer.len());
         let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
         let read = file.read(&mut output).map_err(|_| ())?;
         if read == 0 {
@@ -4710,7 +5811,10 @@ fn sys_pkey_mprotect(address: usize, length: usize, protection: usize, pkey: usi
     if mmap_file_fail_trace() {
         crate::println!(
             "pkey_mprotect: FAIL pkey={} addr={:#x} len={:#x} prot={:#x}",
-            pkey, address, length, protection,
+            pkey,
+            address,
+            length,
+            protection,
         );
     }
     -EINVAL
@@ -4742,9 +5846,7 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
     };
     // PROT_NONE (prot=0): access-only flags will be empty (no R/W/X bits).
     let flags = if protection == 0 {
-        // PROT_NONE: effectively no access. Use USER flag only so VMA
-        // is recognized as a user mapping; access bits are all cleared.
-        VmAreaFlags::USER
+        VmAreaFlags::empty()
     } else {
         match protection_flags(protection) {
             Some(flags) => flags.access_only(),
@@ -4771,8 +5873,13 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
             if mprotect_fail_trace() {
                 crate::println!(
                     "mprotect: FAIL ret={} addr={:#x} len={:#x} prot={:#x} range=[{:#x},{:#x}) err={:?}",
-                    errno, address, length, protection,
-                    range.start().get(), range.end().get(), e,
+                    errno,
+                    address,
+                    length,
+                    protection,
+                    range.start().get(),
+                    range.end().get(),
+                    e,
                 );
             }
             errno
@@ -4783,16 +5890,46 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
     if ret < 0 {
         crate::println!(
             "mprotect: FAIL ret={} addr={:#x} len={:#x} prot={:#x} range=[{:#x},{:#x})",
-            ret, address, length, protection,
-            range.start().get(), range.end().get(),
+            ret,
+            address,
+            length,
+            protection,
+            range.start().get(),
+            range.end().get(),
         );
     } else if mprotect_ok_trace() {
         crate::println!(
             "mprotect: ok addr={:#x} len={:#x} prot={:#x}",
-            address, length, protection,
+            address,
+            length,
+            protection,
         );
     }
     ret
+}
+
+fn sys_madvise(address: usize, length: usize, advice: usize) -> isize {
+    const MADV_NORMAL: usize = 0;
+    const MADV_RANDOM: usize = 1;
+    const MADV_SEQUENTIAL: usize = 2;
+    const MADV_WILLNEED: usize = 3;
+    const MADV_DONTNEED: usize = 4;
+    if !matches!(
+        advice,
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED
+    ) {
+        return -EINVAL;
+    }
+    if length == 0 {
+        return 0;
+    }
+    if address & (PAGE_SIZE - 1) != 0
+        || address.checked_add(length).is_none()
+        || !crate::arch::memory::layout::USER_RANGE.contains(VirtAddr::new(address))
+    {
+        return -EINVAL;
+    }
+    0
 }
 
 fn syscall_range(address: usize, mut length: usize) -> Option<VirtRange> {
@@ -4808,7 +5945,7 @@ fn syscall_range(address: usize, mut length: usize) -> Option<VirtRange> {
 }
 
 fn protection_flags(protection: usize) -> Option<VmAreaFlags> {
-    if protection == 0 || protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
+    if protection & !(PROT_READ | PROT_WRITE | PROT_EXEC) != 0 {
         return None;
     }
 
@@ -4821,9 +5958,6 @@ fn protection_flags(protection: usize) -> Option<VmAreaFlags> {
     }
     if protection & PROT_EXEC != 0 {
         flags = flags.union(VmAreaFlags::EXECUTE);
-    }
-    if flags.is_writable() && flags.is_executable() {
-        return None;
     }
     Some(flags)
 }
@@ -4980,8 +6114,100 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
     total as isize
 }
 
+fn sys_sendfile(out_fd: usize, in_fd: usize, offset_address: usize, count: usize) -> isize {
+    let input = match current_process_file(in_fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+    let output = match current_process_file(out_fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+
+    let old_position = input.position();
+    let mut explicit_offset = 0_u64;
+    if offset_address != 0 {
+        explicit_offset = match copy_plain_from_user::<u64>(offset_address) {
+            Ok(value) => value,
+            Err(errno) => return errno,
+        };
+        if input
+            .seek(explicit_offset as i64, myos_vfs::SeekWhence::Set)
+            .is_err()
+        {
+            return -EINVAL;
+        }
+    }
+
+    let mut total = 0_usize;
+    let mut remaining = count;
+    while remaining != 0 {
+        let chunk = remaining.min(MAX_USER_COPY);
+        let mut buffer = [0_u8; MAX_USER_COPY];
+        let mut read_buf = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
+        let read = match input.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(errno) => {
+                if total != 0 {
+                    break;
+                }
+                if offset_address != 0 {
+                    let _ = input.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+                }
+                return errno.to_isize();
+            }
+        };
+
+        let mut written_total = 0_usize;
+        while written_total < read {
+            let written = match output.write(&myos_vfs::IoBuffer::new(
+                &read_buf.filled_bytes()[written_total..read],
+            )) {
+                Ok(0) => break,
+                Ok(written) => written,
+                Err(errno) => {
+                    if total != 0 {
+                        remaining = 0;
+                        break;
+                    }
+                    if offset_address != 0 {
+                        let _ = input.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+                    }
+                    return errno.to_isize();
+                }
+            };
+            written_total += written;
+            total += written;
+            remaining = remaining.saturating_sub(written);
+        }
+
+        if written_total < read || read < chunk {
+            break;
+        }
+    }
+
+    if offset_address != 0 {
+        explicit_offset = explicit_offset.saturating_add(total as u64);
+        let _ = copy_plain_to_user(offset_address, &explicit_offset);
+        let _ = input.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+    }
+
+    total as isize
+}
+
 fn sys_close(fd: usize) -> isize {
-    match current_process().files().close(fd) {
+    let process = current_process();
+    if let Ok(file) = process.files().get(fd) {
+        crate::println!(
+            "fd-close: pid={} fd={} file={:#x} refs={}",
+            process.id().get(),
+            fd,
+            Arc::as_ptr(&file) as usize,
+            Arc::strong_count(&file),
+        );
+    }
+    match process.files().close(fd) {
         Ok(()) => 0,
         Err(errno) => errno.to_isize(),
     }
@@ -5206,8 +6432,8 @@ fn sys_get_robust_list(pid: usize, head_ptr: usize, len_ptr: usize) -> isize {
     if pid != 0 && pid != current_process().id().get() {
         return -(crate::syscall::errno::ESRCH);
     }
-    let thread = crate::task::current_user_thread()
-        .expect("get_robust_list without current user Thread");
+    let thread =
+        crate::task::current_user_thread().expect("get_robust_list without current user Thread");
     let head = thread.robust_list_head();
     if head_ptr != 0 && copy_to_user(head_ptr, &head.to_ne_bytes()).is_err() {
         return -EFAULT;
@@ -5292,14 +6518,18 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     let current_thread =
         crate::task::current_user_thread().expect("clone arrived without a current user Thread");
 
-    let child = if wants_vm_share {
-        // Thread: share the parent's address space and file table.
+    let child = if wants_thread {
+        // A real thread shares the parent's address space and file table.
         match parent.fork_child_thread() {
             Ok(child) => child,
             Err(_) => return -ENOMEM,
         }
     } else {
-        // Process: copy address space and file table.
+        // glibc implements posix_spawn with CLONE_VM | CLONE_VFORK but expects
+        // the parent to remain suspended until exec/exit. Until the kernel has
+        // a full vfork completion hand-off, give every non-thread child a
+        // private eager copy so an immediately returning parent cannot unmap
+        // the child's temporary spawn stack.
         let child_mm = match parent.mm().fork_clone_eager() {
             Ok(mm) => mm,
             Err(_) => return -ENOMEM,
@@ -5309,6 +6539,16 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
             Err(_) => return -ENOMEM,
         }
     };
+
+    if !wants_thread {
+        crate::println!(
+            "clone-process: parent={} child={} flags={:#x} child_stack={:#x}",
+            parent.id().get(),
+            child.id().get(),
+            flags,
+            arguments[1],
+        );
+    }
 
     let child_thread =
         match child.create_initial_thread(current_thread.entry(), current_thread.user_stack()) {
@@ -5378,7 +6618,11 @@ fn sys_clone3(
         return -EFAULT;
     }
     let field = |offset: usize| -> u64 {
-        u64::from_ne_bytes(raw[offset..offset + 8].try_into().expect("clone3 field slice"))
+        u64::from_ne_bytes(
+            raw[offset..offset + 8]
+                .try_into()
+                .expect("clone3 field slice"),
+        )
     };
 
     let flags = field(0);
@@ -5393,8 +6637,24 @@ fn sys_clone3(
     let set_tid_size = field(72);
     let cgroup = field(80);
 
+    if OSCOMP_TRACE_PTHREAD_CREATE {
+        crate::println!(
+            "clone3-decode: flags={:#x} pidfd={:#x} child_tid={:#x} parent_tid={:#x} exit_signal={:#x} stack={:#x} stack_size={:#x} tls={:#x} set_tid={:#x} set_tid_size={:#x} cgroup={:#x}",
+            flags,
+            pidfd,
+            child_tid,
+            parent_tid,
+            exit_signal,
+            stack,
+            stack_size,
+            tls,
+            set_tid,
+            set_tid_size,
+            cgroup,
+        );
+    }
+
     if flags & CLONE_PIDFD != 0
-        || pidfd != 0
         || exit_signal > 64
         || set_tid != 0
         || set_tid_size != 0
@@ -5421,20 +6681,20 @@ fn sys_clone3(
         }
     };
     let legacy_flags = (flags as usize) | exit_signal as usize;
-    sys_clone(
-        frame,
-        [
-            legacy_flags,
-            child_stack,
-            parent_tid as usize,
-            tls as usize,
-            child_tid as usize,
-            0,
-        ],
-    )
+    sys_clone(frame, [
+        legacy_flags,
+        child_stack,
+        parent_tid as usize,
+        tls as usize,
+        child_tid as usize,
+        0,
+    ])
 }
 
 fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
+    let thread = crate::task::current_user_thread()
+        .expect("execve arrived without a current user Thread");
+    let exec_stack = thread.user_stack();
     let raw_path = match copy_user_c_string(arguments[0]) {
         Ok(path) => path,
         Err(errno) => return errno,
@@ -5443,6 +6703,12 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         Ok(path) => path,
         Err(errno) => return errno,
     };
+    crate::println!(
+        "execve-attempt: pid={} raw={} resolved={}",
+        current_process().id().get(),
+        raw_path,
+        path,
+    );
     let argv = match copy_user_string_array(arguments[1], MAX_EXEC_ARGS, Some(&raw_path)) {
         Ok(values) => values,
         Err(errno) => return errno,
@@ -5473,7 +6739,8 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             if exec_trace_allow() {
                 crate::println!(
                     "execve-fail: phase=target-open path={} errno={}",
-                    exec_path, errno,
+                    exec_path,
+                    errno,
                 );
             }
             return errno;
@@ -5524,7 +6791,9 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
                 if exec_trace_allow() {
                     crate::println!(
                         "execve-fail: phase=shebang-interp path={} interp={} errno={}",
-                        exec_path, interpreter_path, errno,
+                        exec_path,
+                        interpreter_path,
+                        errno,
                     );
                 }
                 return errno;
@@ -5543,10 +6812,7 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         }
         // Construct: /bin/sh <original_path> <original_argv[1..]>
         let mut fallback_argv = Vec::new();
-        if fallback_argv
-            .try_reserve(exec_argv.len() + 1)
-            .is_err()
-        {
+        if fallback_argv.try_reserve(exec_argv.len() + 1).is_err() {
             return -ENOMEM;
         }
         fallback_argv.push(alloc::string::String::from("/bin/sh"));
@@ -5561,7 +6827,8 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
                 if exec_trace_allow() {
                     crate::println!(
                         "execve-fail: phase=sh-fallback path={} interp=/bin/sh errno={}",
-                        exec_path, errno,
+                        exec_path,
+                        errno,
                     );
                 }
                 return errno;
@@ -5579,17 +6846,14 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         VmAreaFlags::user_rw(),
         VmAreaKind::Anonymous,
     )];
-    let prepared = match crate::exec::prepare_elf(
-        &image,
-        crate::exec::ExecConfig {
-            argv: &argv_refs,
-            envp: &envp_refs,
-            stack: VirtRange::from_bounds(USER_STACK, USER_STACK_TOP),
-            heap_start: VirtAddr::new(USER_HEAP_START),
-            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
-            extra_areas: &extra_areas,
-        },
-    ) {
+    let prepared = match crate::exec::prepare_elf(&image, crate::exec::ExecConfig {
+        argv: &argv_refs,
+        envp: &envp_refs,
+        stack: exec_stack,
+        heap_start: VirtAddr::new(USER_HEAP_START),
+        heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+        extra_areas: &extra_areas,
+    }) {
         Ok(prepared) => {
             // Trace successful dynamic execs (first 32 only).
             if prepared.interp_base.is_some() && exec_trace_success_allow() {
@@ -5606,77 +6870,82 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             if exec_trace_allow() {
                 crate::println!(
                     "execve: path={} failed errno=ENOEXEC reason={}",
-                    exec_path, e.reason(),
+                    exec_path,
+                    e.reason(),
                 );
             }
-            return myos_vfs::Errno::Enoexec.to_isize()
+            return myos_vfs::Errno::Enoexec.to_isize();
         }
         Err(ref e @ crate::exec::ExecError::Elf(crate::elf::ElfError::Unsupported)) => {
             if exec_trace_allow() {
                 crate::println!(
                     "execve: path={} failed errno=ENOEXEC reason={}",
-                    exec_path, e.reason(),
+                    exec_path,
+                    e.reason(),
                 );
             }
-            return myos_vfs::Errno::Enoexec.to_isize()
+            return myos_vfs::Errno::Enoexec.to_isize();
         }
         Err(ref e @ crate::exec::ExecError::Elf(crate::elf::ElfError::InvalidMachine)) => {
             if exec_trace_allow() {
                 crate::println!(
                     "execve: path={} failed errno=ENOEXEC reason={}",
-                    exec_path, e.reason(),
+                    exec_path,
+                    e.reason(),
                 );
             }
-            return myos_vfs::Errno::Enoexec.to_isize()
+            return myos_vfs::Errno::Enoexec.to_isize();
         }
         Err(ref e @ crate::exec::ExecError::DynamicInterpreterUnsupported) => {
             // ENOEXEC lets shell fallback; EINVAL would be wrong here.
             if exec_trace_allow() {
                 crate::println!(
                     "execve: path={} failed errno=ENOEXEC reason={}",
-                    exec_path, e.reason(),
+                    exec_path,
+                    e.reason(),
                 );
             }
-            return myos_vfs::Errno::Enoexec.to_isize()
+            return myos_vfs::Errno::Enoexec.to_isize();
         }
         Err(ref e @ crate::exec::ExecError::Vfs(eno)) => {
             let errno: isize = eno.to_isize();
             if exec_trace_allow() {
                 crate::println!(
                     "execve: path={} failed errno={} reason={}",
-                    exec_path, errno, e.reason(),
+                    exec_path,
+                    errno,
+                    e.reason(),
                 );
             }
-            return errno
+            return errno;
         }
-        Err(ref e @ crate::exec::ExecError::MetadataOutOfMemory) |
-        Err(ref e @ crate::exec::ExecError::UserMm(_)) |
-        Err(ref e @ crate::exec::ExecError::AddressOverflow) => {
+        Err(ref e @ crate::exec::ExecError::MetadataOutOfMemory)
+        | Err(ref e @ crate::exec::ExecError::UserMm(_))
+        | Err(ref e @ crate::exec::ExecError::AddressOverflow) => {
             if exec_trace_allow() {
                 crate::println!(
                     "execve: path={} failed errno=ENOMEM reason={}",
-                    exec_path, e.reason(),
+                    exec_path,
+                    e.reason(),
                 );
             }
-            return -ENOMEM
+            return -ENOMEM;
         }
         Err(ref e) => {
-            if exec_trace_allow() {
-                crate::println!(
-                    "execve: path={} failed errno=EINVAL reason={}",
-                    exec_path, e.reason(),
-                );
-            }
-            return -EINVAL
+            crate::println!(
+                "execve: path={} failed errno=EINVAL reason={}",
+                exec_path,
+                e.reason(),
+            );
+            return -EINVAL;
         }
     };
 
     let process = current_process();
-    let thread =
-        crate::task::current_user_thread().expect("execve arrived without a current user Thread");
     if process.files().close_on_exec().is_err() {
         return -ENOMEM;
     }
+    process.signals().reset_actions_for_exec();
     let old_mm = process.replace_mm(prepared.mm);
     let new_mm = process.mm_arc();
     crate::task::replace_current_user_mm(Arc::clone(&old_mm), Arc::clone(&new_mm));
@@ -5684,6 +6953,10 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         .exec_replace_context(prepared.entry, prepared.stack, prepared.stack_pointer)
         .is_err()
     {
+        crate::println!(
+            "execve: path={} failed errno=EINVAL reason=context-replace",
+            exec_path,
+        );
         return -EINVAL;
     }
     // Always reset TLS for the new process.  The previous process may
@@ -5698,14 +6971,10 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
     thread.set_tls_pointer(init_tls);
     set_frame_tls(frame, init_tls);
-    match Arc::try_unwrap(old_mm) {
-        Ok(mut old_mm) => {
-            if old_mm.destroy().is_err() {
-                return -EINVAL;
-            }
-        }
-        Err(_) => return -EINVAL,
-    }
+    // A multithreaded process can still have sibling tasks retiring from the
+    // old address space.  They pin it with Arc references; the final owner
+    // performs teardown after every CPU has switched away.
+    drop(old_mm);
     set_frame_entry(frame, prepared.entry.get());
     set_frame_stack_pointer(frame, prepared.stack_pointer.get());
     0
@@ -5750,7 +7019,7 @@ fn parse_shebang(image: &[u8]) -> Result<Option<(String, Option<String>)>, isize
 }
 
 fn load_exec_image(path: &str) -> Result<Vec<u8>, isize> {
-    const MAX_EXEC_IMAGE: usize = 16 * 1024 * 1024;
+    const MAX_EXEC_IMAGE: usize = 128 * 1024 * 1024;
 
     match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
         Ok(file) => {
@@ -5924,10 +7193,7 @@ fn sys_kill(pid: usize, signal: usize) -> isize {
         -(crate::syscall::errno::EPERM)
     } else if pid == 0 {
         // process group kill — fallback to self for compat
-        match crate::signal::send_signal(
-            current_process().id(),
-            signal as u32,
-        ) {
+        match crate::signal::send_signal(current_process().id(), signal as u32) {
             Ok(()) => 0,
             Err(errno) => errno.to_isize(),
         }
@@ -5955,7 +7221,9 @@ fn sys_rt_sigaction(arguments: [usize; 6]) -> isize {
     // signal=0 is invalid, SIGKILL/SIGSTOP cannot have their action changed.
     if crate::signal::signal_bit(signal).is_none()
         || signal == crate::signal::SIGKILL
-        || signal == 19 /* SIGSTOP */ {
+        || signal == 19
+    /* SIGSTOP */
+    {
         return -EINVAL;
     }
     if let Err(errno) = oscomp_validate_sigset_size(arguments[3]) {
@@ -5985,7 +7253,12 @@ fn sys_rt_sigaction(arguments: [usize; 6]) -> isize {
     0
 }
 
-fn sys_rt_sigprocmask(how: usize, set_address: usize, oldset_address: usize, sigsetsize: usize) -> isize {
+fn sys_rt_sigprocmask(
+    how: usize,
+    set_address: usize,
+    oldset_address: usize,
+    sigsetsize: usize,
+) -> isize {
     if let Err(errno) = oscomp_validate_sigset_size(sigsetsize) {
         return errno;
     }
@@ -6028,8 +7301,10 @@ fn sys_rt_sigtimedwait(arguments: [usize; 6]) -> isize {
         crate::task::current_user_thread().expect("rt_sigtimedwait without current Thread");
     let process = thread.process();
 
-    // Check if any signal in the waited set is pending and unblocked
-    if let Some(signal) = process.signals().take_matching_unblocked(waited_mask, thread.blocked_signals()) {
+    // sigtimedwait consumes a pending signal from the requested set. Callers
+    // normally block that signal first, so the thread mask must not exclude it
+    // from the synchronous wait.
+    if let Some(signal) = process.signals().take_matching_unblocked(waited_mask, 0) {
         // Write siginfo to userspace if info pointer is non-null
         let info_address = arguments[1];
         if info_address != 0 {
@@ -6082,8 +7357,7 @@ fn sys_rt_sigpending(set_address: usize, sigsetsize: usize) -> isize {
         return -EFAULT;
     }
     let process = current_process();
-    let thread = crate::task::current_user_thread()
-        .expect("rt_sigpending without current Thread");
+    let thread = crate::task::current_user_thread().expect("rt_sigpending without current Thread");
     // Return pending signals that are not blocked.
     let pending = process.signals().pending() & !thread.blocked_signals();
     if copy_to_user(set_address, &pending.to_ne_bytes()).is_err() {
@@ -6104,8 +7378,7 @@ fn sys_rt_sigsuspend(mask_address: usize, sigsetsize: usize) -> isize {
         return -EFAULT;
     }
     let temp_mask = u64::from_ne_bytes(mask_bytes) & !crate::signal::unblockable_mask();
-    let thread = crate::task::current_user_thread()
-        .expect("rt_sigsuspend without current Thread");
+    let thread = crate::task::current_user_thread().expect("rt_sigsuspend without current Thread");
     let old_mask = thread.blocked_signals();
     thread.set_blocked_signals(temp_mask);
 
@@ -6151,10 +7424,7 @@ const SO_RCVTIMEO: usize = 20;
 const TCP_NODELAY: usize = 1;
 const IPPROTO_TCP: usize = 6;
 
-fn sys_setsockopt(
-    fd: usize, level: usize, optname: usize,
-    optval: usize, optlen: usize,
-) -> isize {
+fn sys_setsockopt(fd: usize, level: usize, optname: usize, optval: usize, optlen: usize) -> isize {
     const SOL_SOCKET: usize = 1;
     const IPPROTO_TCP: usize = 6;
 
@@ -6194,8 +7464,11 @@ fn sys_setsockopt(
 }
 
 fn sys_getsockopt(
-    fd: usize, level: usize, optname: usize,
-    optval: usize, optlen_addr: usize,
+    fd: usize,
+    level: usize,
+    optname: usize,
+    optval: usize,
+    optlen_addr: usize,
 ) -> isize {
     const SOL_SOCKET: usize = 1;
     const IPPROTO_TCP: usize = 6;
@@ -6228,7 +7501,12 @@ fn sys_getsockopt(
                 30 /* SO_ACCEPTCONN */ => 0,
                 _ => return -(crate::syscall::errno::ENOPROTOOPT),
             };
-            if copy_to_user(optval, &value.to_ne_bytes()[..core::cmp::min(user_optlen as usize, 4)]).is_err() {
+            if copy_to_user(
+                optval,
+                &value.to_ne_bytes()[..core::cmp::min(user_optlen as usize, 4)],
+            )
+            .is_err()
+            {
                 return -EFAULT;
             }
             user_optlen = core::cmp::min(user_optlen, 4);
@@ -6273,6 +7551,7 @@ fn deliver_pending_signal(frame: &mut crate::arch::trap::TrapFrame) {
 
     let action = process.signals().action(signal).unwrap_or_default();
     match action.handler {
+        SIG_DFL if signal == crate::signal::SIGCHLD => {}
         SIG_DFL => {
             TERMINATED.store(true, Ordering::Release);
             EXIT_STATUS.store(-(signal as isize), Ordering::Release);
@@ -6282,12 +7561,6 @@ fn deliver_pending_signal(frame: &mut crate::arch::trap::TrapFrame) {
         }
         SIG_IGN => {}
         handler => {
-            if action.restorer == 0 {
-                TERMINATED.store(true, Ordering::Release);
-                EXIT_STATUS.store(-EINVAL, Ordering::Release);
-                return_to_kernel(frame, -EINVAL);
-                return;
-            }
             if install_signal_frame(frame, signal, action, handler).is_err() {
                 TERMINATED.store(true, Ordering::Release);
                 EXIT_STATUS.store(-EFAULT, Ordering::Release);
@@ -6303,6 +7576,7 @@ fn install_signal_frame(
     action: crate::signal::KernelSigAction,
     handler: usize,
 ) -> Result<(), ()> {
+    const SA_RESTORER: usize = 0x0400_0000;
     let thread =
         crate::task::current_user_thread().expect("signal frame install without current Thread");
     let old_mask = thread.blocked_signals();
@@ -6326,7 +7600,12 @@ fn install_signal_frame(
         return Err(());
     }
     thread.set_blocked_signals(new_mask);
-    set_signal_handler_frame(frame, signal_sp, signal as usize, handler, action.restorer);
+    let restorer = if action.flags & SA_RESTORER != 0 && action.restorer != 0 {
+        action.restorer
+    } else {
+        crate::exec::USER_SIGNAL_TRAMPOLINE
+    };
+    set_signal_handler_frame(frame, signal_sp, signal as usize, handler, restorer);
     Ok(())
 }
 
@@ -6342,12 +7621,28 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
         return -EINVAL;
     }
 
-    let requested = if pid == 0 || pid == usize::MAX { -1 } else { pid as isize };
+    let requested = if pid == 0 || pid == usize::MAX {
+        -1
+    } else {
+        pid as isize
+    };
     let process = current_process();
+    crate::println!(
+        "process-wait: pid={} requested={} options={:#x}",
+        process.id().get(),
+        requested,
+        options,
+    );
     loop {
         match process.wait_zombie_child(requested) {
             Ok(Some((child, raw_status))) => {
                 let child_pid = child.id().get();
+                crate::println!(
+                    "process-wait: pid={} reaped={} status={}",
+                    process.id().get(),
+                    child_pid,
+                    raw_status,
+                );
                 if status_address != 0 {
                     // Linux wait status encoding for external programs.
                     // Gate tests (verifier=true) expect raw exit codes.
@@ -6424,6 +7719,168 @@ struct KernelRlimit64 {
     max: u64,
 }
 
+struct EventFd {
+    counter: AtomicU64,
+    semaphore: bool,
+}
+
+impl myos_vfs::FileOperations for EventFd {
+    fn read(
+        &self,
+        _file: &myos_vfs::File,
+        buffer: &mut myos_vfs::MutableIoBuffer<'_>,
+    ) -> Result<usize, myos_vfs::Errno> {
+        if buffer.remaining() < core::mem::size_of::<u64>() {
+            return Err(myos_vfs::Errno::Einval);
+        }
+        loop {
+            let current = self.counter.load(Ordering::Acquire);
+            if current == 0 {
+                return Err(myos_vfs::Errno::Eagain);
+            }
+            let returned = if self.semaphore { 1 } else { current };
+            let next = if self.semaphore { current - 1 } else { 0 };
+            if self
+                .counter
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                buffer.push(&returned.to_ne_bytes());
+                return Ok(core::mem::size_of::<u64>());
+            }
+        }
+    }
+
+    fn write(
+        &self,
+        _file: &myos_vfs::File,
+        buffer: &myos_vfs::IoBuffer<'_>,
+    ) -> Result<usize, myos_vfs::Errno> {
+        if buffer.len() != core::mem::size_of::<u64>() {
+            return Err(myos_vfs::Errno::Einval);
+        }
+        let value = u64::from_ne_bytes(
+            buffer
+                .as_bytes()
+                .try_into()
+                .expect("eventfd write has an eight-byte buffer"),
+        );
+        if value == u64::MAX {
+            return Err(myos_vfs::Errno::Einval);
+        }
+        loop {
+            let current = self.counter.load(Ordering::Acquire);
+            let next = current.checked_add(value).ok_or(myos_vfs::Errno::Eagain)?;
+            if self
+                .counter
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(core::mem::size_of::<u64>());
+            }
+        }
+    }
+
+    fn poll(
+        &self,
+        _file: &myos_vfs::File,
+        requested: myos_vfs::PollEvents,
+    ) -> myos_vfs::PollEvents {
+        let mut ready = myos_vfs::PollEvents::OUT;
+        if self.counter.load(Ordering::Acquire) != 0 {
+            ready = ready.union(myos_vfs::PollEvents::IN);
+        }
+        ready.intersect(requested)
+    }
+}
+
+fn sys_eventfd2(initial_value: usize, flags: usize) -> isize {
+    const EFD_SEMAPHORE: usize = 1;
+    const EFD_NONBLOCK: usize = 0x800;
+    const EFD_CLOEXEC: usize = 0x80000;
+    const EFD_ALLOWED: usize = EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC;
+    if flags & !EFD_ALLOWED != 0 || initial_value > u32::MAX as usize {
+        return -EINVAL;
+    }
+    let mut open_flags = myos_vfs::OpenFlags::O_RDWR;
+    if flags & EFD_NONBLOCK != 0 {
+        open_flags = open_flags.union(myos_vfs::OpenFlags::O_NONBLOCK);
+    }
+    let file = myos_vfs::File::new(
+        open_flags,
+        Arc::new(EventFd {
+            counter: AtomicU64::new(initial_value as u64),
+            semaphore: flags & EFD_SEMAPHORE != 0,
+        }),
+    );
+    match current_process()
+        .files()
+        .allocate(file, flags & EFD_CLOEXEC != 0)
+    {
+        Ok(fd) => fd as isize,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
+struct EpollFile;
+
+impl myos_vfs::FileOperations for EpollFile {}
+
+fn sys_epoll_create1(flags: usize) -> isize {
+    const EPOLL_CLOEXEC: usize = 0x80000;
+    if flags & !EPOLL_CLOEXEC != 0 {
+        return -EINVAL;
+    }
+    let file = myos_vfs::File::new(myos_vfs::OpenFlags::O_RDWR, Arc::new(EpollFile));
+    match current_process()
+        .files()
+        .allocate(file, flags & EPOLL_CLOEXEC != 0)
+    {
+        Ok(fd) => fd as isize,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
+fn sys_epoll_ctl(epfd: usize, operation: usize, fd: usize, event_address: usize) -> isize {
+    const EPOLL_CTL_ADD: usize = 1;
+    const EPOLL_CTL_DEL: usize = 2;
+    const EPOLL_CTL_MOD: usize = 3;
+    if !matches!(operation, EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD) {
+        return -EINVAL;
+    }
+    if current_process_file(epfd).is_err() || current_process_file(fd).is_err() {
+        return -EBADF;
+    }
+    if operation != EPOLL_CTL_DEL {
+        let mut event = [0_u8; 12];
+        if event_address == 0 || copy_from_user(event_address, &mut event).is_err() {
+            return -EFAULT;
+        }
+    }
+    0
+}
+
+fn sys_epoll_pwait(
+    epfd: usize,
+    events_address: usize,
+    max_events: usize,
+    timeout_ms: usize,
+) -> isize {
+    if current_process_file(epfd).is_err() {
+        return -EBADF;
+    }
+    if max_events == 0 || max_events > isize::MAX as usize / 12 {
+        return -EINVAL;
+    }
+    if events_address == 0 {
+        return -EFAULT;
+    }
+    if timeout_ms != 0 && timeout_ms != usize::MAX {
+        crate::task::yield_now();
+    }
+    0
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct KernelPollFd {
@@ -6479,7 +7936,7 @@ fn sys_clock_gettime(clock_id: usize, timespec_address: usize) -> isize {
     if clock_id > 7 {
         return -EINVAL;
     }
-    let ns = current_time_ns();
+    let ns = clock_time_ns(clock_id);
     let ts = KernelTimespec {
         sec: (ns / 1_000_000_000) as isize,
         nsec: (ns % 1_000_000_000) as isize,
@@ -6494,10 +7951,7 @@ fn sys_clock_getres(clock_id: usize, timespec_address: usize) -> isize {
     if timespec_address == 0 {
         return 0;
     }
-    let ts = KernelTimespec {
-        sec: 0,
-        nsec: 1,
-    };
+    let ts = KernelTimespec { sec: 0, nsec: 1 };
     copy_plain_to_user(timespec_address, &ts)
 }
 
@@ -6538,9 +7992,9 @@ fn sys_clock_nanosleep(
     }
 
     if flags & TIMER_ABSTIME != 0 {
-        let target_ns = (duration.as_secs() as u128) * 1_000_000_000_u128
-            + u128::from(duration.subsec_nanos());
-        let now_ns = current_time_ns();
+        let target_ns =
+            (duration.as_secs() as u128) * 1_000_000_000_u128 + u128::from(duration.subsec_nanos());
+        let now_ns = clock_time_ns(clock_id);
         if target_ns > now_ns {
             let delta_ns = target_ns - now_ns;
             let sleep_ns = core::cmp::min(delta_ns, u128::from(u64::MAX));
@@ -6557,7 +8011,7 @@ fn sys_gettimeofday(timeval_address: usize) -> isize {
     if timeval_address == 0 {
         return 0;
     }
-    let ns = current_time_ns();
+    let ns = clock_time_ns(0);
     let tv = KernelTimeval {
         sec: (ns / 1_000_000_000) as isize,
         usec: ((ns % 1_000_000_000) / 1_000) as isize,
@@ -6585,6 +8039,16 @@ fn sys_times(tms_address: usize) -> isize {
 fn current_time_ns() -> u128 {
     let cycles = crate::time::now().cycles();
     (u128::from(cycles) * 1_000_000_000_u128) / u128::from(crate::time::clock_frequency_hz())
+}
+
+fn clock_time_ns(clock_id: usize) -> u128 {
+    const FALLBACK_REALTIME_SECONDS: u128 = 1_767_225_600; // 2026-01-01 UTC
+    let monotonic = current_time_ns();
+    if matches!(clock_id, 0 | 5) {
+        FALLBACK_REALTIME_SECONDS * 1_000_000_000 + monotonic
+    } else {
+        monotonic
+    }
 }
 
 fn sys_prlimit64(pid: usize, resource: usize, new_limit: usize, old_limit: usize) -> isize {
@@ -6721,8 +8185,8 @@ fn sys_futex(
 ) -> isize {
     let op = futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
 
-    if futex_op & FUTEX_CLOCK_REALTIME != 0 {
-        return -ENOSYS;
+    if futex_op & FUTEX_CLOCK_REALTIME != 0 && op != 9 {
+        return -EINVAL;
     }
 
     match op {
@@ -6811,16 +8275,14 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
         Ok(value) => value,
         Err(_) => return,
     };
-    let futex_offset = match copy_plain_from_user::<isize>(
-        head.saturating_add(core::mem::size_of::<usize>()),
-    ) {
-        Ok(value) => value,
-        Err(_) => return,
-    };
-    let pending = copy_plain_from_user::<usize>(
-        head.saturating_add(2 * core::mem::size_of::<usize>()),
-    )
-    .unwrap_or(0);
+    let futex_offset =
+        match copy_plain_from_user::<isize>(head.saturating_add(core::mem::size_of::<usize>())) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+    let pending =
+        copy_plain_from_user::<usize>(head.saturating_add(2 * core::mem::size_of::<usize>()))
+            .unwrap_or(0);
 
     let mark_owner_dead = |node: usize| {
         if node == 0 || node == head {
@@ -6896,29 +8358,38 @@ fn sys_mknodat(dirfd: usize, path_address: usize, mode: usize, _dev: usize) -> i
     }
 }
 
-fn sys_utimensat(_dirfd: usize, _path: usize, times: usize) -> isize {
-    const UTIME_NOW:  isize = (1_isize << 30) - 1; // 1073741823
+fn sys_utimensat(dirfd: usize, path_address: usize, times: usize, flags: usize) -> isize {
+    const UTIME_NOW: isize = (1_isize << 30) - 1; // 1073741823
     const UTIME_OMIT: isize = (1_isize << 30) - 2; // 1073741822
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
 
-    // times == 0 -> set to "now" (success, no real persistence)
-    if times == 0 {
-        return 0;
+    if flags & !AT_SYMLINK_NOFOLLOW != 0 {
+        return -EINVAL;
     }
 
-    // Validate both timespecs
-    let ts = match copy_plain_from_user::<[KernelTimespec; 2]>(times) {
-        Ok(v) => v,
+    if times != 0 {
+        let ts = match copy_plain_from_user::<[KernelTimespec; 2]>(times) {
+            Ok(v) => v,
+            Err(errno) => return errno,
+        };
+        for t in &ts {
+            if t.nsec == UTIME_NOW || t.nsec == UTIME_OMIT {
+                continue;
+            }
+            if t.nsec < 0 || t.nsec >= 1_000_000_000 {
+                return -EINVAL;
+            }
+        }
+    }
+
+    let path = match resolve_user_path(dirfd, path_address) {
+        Ok(path) => path,
         Err(errno) => return errno,
     };
-    for t in &ts {
-        if t.nsec == UTIME_NOW || t.nsec == UTIME_OMIT {
-            continue;
-        }
-        if t.nsec < 0 || t.nsec >= 1_000_000_000 {
-            return -EINVAL;
-        }
+    match crate::fs::stat(&path) {
+        Ok(_) => 0,
+        Err(errno) => errno.to_isize(),
     }
-    0
 }
 
 fn fill_statfs_buffer(f_type: u64) -> [u8; 112] {
@@ -6926,16 +8397,16 @@ fn fill_statfs_buffer(f_type: u64) -> [u8; 112] {
     // f_type(8) f_bsize(8) f_blocks(8) f_bfree(8) f_bavail(8) f_files(8)
     // f_ffree(8) f_fsid(8) f_namelen(8) f_frsize(8) f_flags(8) f_spare[4](32)
     let mut data = [0_u8; 112];
-    data[0..8].copy_from_slice(&f_type.to_ne_bytes());          // f_type
-    data[8..16].copy_from_slice(&4096_u64.to_ne_bytes());       // f_bsize
-    data[16..24].copy_from_slice(&1000000_u64.to_ne_bytes());   // f_blocks
-    data[24..32].copy_from_slice(&900000_u64.to_ne_bytes());    // f_bfree
-    data[32..40].copy_from_slice(&900000_u64.to_ne_bytes());    // f_bavail
-    data[40..48].copy_from_slice(&1000000_u64.to_ne_bytes());   // f_files
-    data[48..56].copy_from_slice(&999000_u64.to_ne_bytes());    // f_ffree
+    data[0..8].copy_from_slice(&f_type.to_ne_bytes()); // f_type
+    data[8..16].copy_from_slice(&4096_u64.to_ne_bytes()); // f_bsize
+    data[16..24].copy_from_slice(&1000000_u64.to_ne_bytes()); // f_blocks
+    data[24..32].copy_from_slice(&900000_u64.to_ne_bytes()); // f_bfree
+    data[32..40].copy_from_slice(&900000_u64.to_ne_bytes()); // f_bavail
+    data[40..48].copy_from_slice(&1000000_u64.to_ne_bytes()); // f_files
+    data[48..56].copy_from_slice(&999000_u64.to_ne_bytes()); // f_ffree
     // f_fsid[0..1] stays zero (56..72)
-    data[64..72].copy_from_slice(&255_u64.to_ne_bytes());       // f_namelen
-    data[72..80].copy_from_slice(&4096_u64.to_ne_bytes());      // f_frsize
+    data[64..72].copy_from_slice(&255_u64.to_ne_bytes()); // f_namelen
+    data[72..80].copy_from_slice(&4096_u64.to_ne_bytes()); // f_frsize
     data
 }
 
@@ -6995,7 +8466,7 @@ fn sys_syslog(action: usize, _buf: usize, _len: usize) -> isize {
     match action {
         0 | 1 | 5 => 0,
         2 | 3 | 4 | 9 => 0, // 0 bytes read
-        10 => 0,             // size of kernel log buffer = 0
+        10 => 0,            // size of kernel log buffer = 0
         _ => -(crate::syscall::errno::EINVAL),
     }
 }
@@ -7017,7 +8488,11 @@ fn sys_sched_getaffinity(_pid: usize, cpusetsize: usize, mask: usize) -> isize {
     }
     // pid=0 means current thread; non-zero pids may be checked against process list.
     let cpu_count = crate::smp::scheduler_active_cpu_count().min(64);
-    let bits = if cpu_count >= 64 { !0_u64 } else { (1_u64 << cpu_count) - 1 };
+    let bits = if cpu_count >= 64 {
+        !0_u64
+    } else {
+        (1_u64 << cpu_count) - 1
+    };
     let raw = bits.to_ne_bytes();
     let copy_len = core::cmp::min(cpusetsize, core::mem::size_of::<u64>());
     if copy_to_user(mask, &raw[..copy_len]).is_err() {
@@ -7090,7 +8565,11 @@ fn sys_sched_get_priority(policy: usize, maximum: bool) -> isize {
     match policy {
         SCHED_OTHER => 0,
         SCHED_FIFO | SCHED_RR => {
-            if maximum { 99 } else { 1 }
+            if maximum {
+                99
+            } else {
+                1
+            }
         }
         _ => -EINVAL,
     }
@@ -7149,8 +8628,10 @@ fn sys_sched_setscheduler(_pid: usize, policy: usize, param_address: usize) -> i
 }
 
 fn sys_renameat2(
-    olddirfd: usize, oldpath: usize,
-    newdirfd: usize, newpath: usize,
+    olddirfd: usize,
+    oldpath: usize,
+    newdirfd: usize,
+    newpath: usize,
     flags: usize,
 ) -> isize {
     const RENAME_NOREPLACE: usize = 1;
@@ -7388,9 +8869,7 @@ fn sys_chdir(path_address: usize) -> isize {
 }
 
 fn sys_getdents64(fd: usize, address: usize, length: usize) -> isize {
-    if length > MAX_USER_COPY {
-        return -EINVAL;
-    }
+    let length = length.min(MAX_USER_COPY);
     let file = match current_process_file(fd) {
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
@@ -7844,8 +9323,8 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
             Err(errno) => errno.to_isize(),
         },
         F_SETFL => {
-            // Accept O_NONBLOCK, O_APPEND. O_ASYNC/O_DIRECT/O_NOATIME are
-            // accepted but ignored (file table may not persist them yet).
+            // Linux permits changing these status flags on an open file.
+            // O_ASYNC/O_DIRECT/O_NOATIME remain accepted compatibility no-ops.
             let allowed = myos_vfs::OpenFlags::O_NONBLOCK.bits()
                 | myos_vfs::OpenFlags::O_APPEND.bits()
                 | 0x2000_u32  // O_ASYNC
@@ -7854,11 +9333,11 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
             if argument & !(allowed as usize) != 0 {
                 return -EINVAL;
             }
-            // Validate fd exists.
-            let _ = match process.files().get(fd) {
-                Ok(_) => {}
+            let file = match process.files().get(fd) {
+                Ok(file) => file,
                 Err(errno) => return errno.to_isize(),
             };
+            file.set_status_flags(myos_vfs::OpenFlags::from_bits(argument as u32));
             0
         }
         F_GETOWN => 0,
@@ -7867,14 +9346,59 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
     }
 }
 
+fn sys_flock(fd: usize, operation: usize) -> isize {
+    const LOCK_SH: usize = 1;
+    const LOCK_EX: usize = 2;
+    const LOCK_NB: usize = 4;
+    const LOCK_UN: usize = 8;
+    let base = operation & !LOCK_NB;
+    if !matches!(base, LOCK_SH | LOCK_EX | LOCK_UN) || operation & !(base | LOCK_NB) != 0 {
+        return -EINVAL;
+    }
+    match current_process_file(fd) {
+        Ok(_) => 0,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
 fn sys_ioctl(fd: usize, command: usize, argument: usize) -> isize {
+    const FIONBIO: usize = 0x5421;
     let file = match current_process_file(fd) {
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
+    if command == FIONBIO {
+        let enabled = match copy_plain_from_user::<i32>(argument) {
+            Ok(value) => value != 0,
+            Err(errno) => return errno,
+        };
+        let mut flags = file.flags().bits();
+        if enabled {
+            flags |= myos_vfs::OpenFlags::O_NONBLOCK.bits();
+        } else {
+            flags &= !myos_vfs::OpenFlags::O_NONBLOCK.bits();
+        }
+        file.set_status_flags(myos_vfs::OpenFlags::from_bits(flags));
+        return match file.ioctl(command, argument) {
+            Ok(value) => value as isize,
+            Err(myos_vfs::Errno::Enotty) => 0,
+            Err(errno) => errno.to_isize(),
+        };
+    }
     match file.ioctl(command, argument) {
         Ok(value) => value as isize,
-        Err(errno) => errno.to_isize(),
+        Err(errno) => {
+            crate::println!(
+                "ioctl-fail: pid={} tid={} fd={} cmd={:#x} arg={:#x} errno={}",
+                current_process().id().get(),
+                crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+                fd,
+                command,
+                argument,
+                errno.to_isize(),
+            );
+            errno.to_isize()
+        }
     }
 }
 
@@ -8310,10 +9834,7 @@ fn set_syscall_result(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
         if pthread_nr & 0x1_0000 != 0 {
             let nr = pthread_nr & !0x1_0000;
             let pid = current_process().id().get();
-            crate::println!(
-                "pthread-trace: exit pid={} nr={} ret={}",
-                pid, nr, result,
-            );
+            crate::println!("pthread-trace: exit pid={} nr={} ret={}", pid, nr, result,);
         }
     }
     crate::syscall::abi::set_result(frame, result);
@@ -8347,6 +9868,9 @@ fn return_to_kernel(frame: &mut crate::arch::trap::TrapFrame, result: isize) {
 
     frame.gpr[3] = kernel_stack;
     frame.gpr[4] = result as usize;
+    // Trap return is switching back to PLV0, so r21 must stop carrying the
+    // user task's value and once again identify the CPU running this stack.
+    frame.gpr[21] = crate::smp::current_cpu_id().get();
     frame.era = user_return_address();
     frame.prmd &= !(PRMD_PPLV_MASK | PRMD_PIE);
 }

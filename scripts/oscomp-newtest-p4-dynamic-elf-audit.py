@@ -40,8 +40,14 @@ add('/lib/ld-linux-riscv64-lp64d.so.1' in main_rs,
     "sdcard installs RISC-V glibc ld-linux path")
 add('/lib/ld-linux-loongarch64-lp64d.so.1' in main_rs,
     "sdcard installs LoongArch glibc ld-linux path")
-add('symlink("/lib", "/lib64")' in main_rs,
-    "sdcard creates /lib64 → /lib symlink")
+add(
+    'symlink("/lib", "/lib64")' in main_rs
+    or (
+        "/lib64/ld-linux-loongarch-lp64d.so.1" in main_rs
+        and "real directory" in main_rs
+    ),
+    "sdcard provides /lib64 loader compatibility",
+)
 
 # PreparedExec has new fields
 add("interp_base: Option<VirtAddr>" in exec_rs,

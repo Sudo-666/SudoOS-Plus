@@ -372,6 +372,32 @@ impl<T: Transport + Send + 'static> BlockDevice for VirtioBlockDevice<T> {
         result
     }
 
+    fn read_blocks(&self, block: u64, output: &mut [u8]) -> Result<(), BlockError> {
+        if output.is_empty() || output.len() % SECTOR_SIZE != 0 {
+            return Err(BlockError::BadBlockSize);
+        }
+        let sectors =
+            u64::try_from(output.len() / SECTOR_SIZE).map_err(|_| BlockError::AddressOverflow)?;
+        if block
+            .checked_add(sectors)
+            .is_none_or(|end| end > self.block_count)
+        {
+            return Err(BlockError::OutOfRange);
+        }
+        let block = usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
+        let (allocation, buffer) = dma_buffer(output.len())?;
+        let result = self
+            .driver
+            .lock()
+            .read_blocks(block, buffer)
+            .map_err(|_| BlockError::InvalidArgument);
+        if result.is_ok() {
+            output.copy_from_slice(buffer);
+        }
+        page_alloc::free(allocation).map_err(|_| BlockError::InvalidArgument)?;
+        result
+    }
+
     fn write_block(&self, block: u64, input: &[u8]) -> Result<(), BlockError> {
         if self.read_only {
             return Err(BlockError::DeviceReadOnly);
@@ -396,7 +422,22 @@ impl<T: Transport + Send + 'static> BlockDevice for VirtioBlockDevice<T> {
 }
 
 fn dma_sector_buffer() -> Result<(PageAllocation, &'static mut [u8]), BlockError> {
-    let allocation = page_alloc::allocate(0, PageAllocationOptions::dma32_zeroed())
+    dma_buffer(SECTOR_SIZE)
+}
+
+fn dma_buffer(length: usize) -> Result<(PageAllocation, &'static mut [u8]), BlockError> {
+    if length == 0 {
+        return Err(BlockError::InvalidArgument);
+    }
+    let pages = length
+        .checked_add(PAGE_SIZE - 1)
+        .ok_or(BlockError::AddressOverflow)?
+        / PAGE_SIZE;
+    let rounded_pages = pages
+        .checked_next_power_of_two()
+        .ok_or(BlockError::AddressOverflow)?;
+    let order = rounded_pages.trailing_zeros() as usize;
+    let allocation = page_alloc::allocate(order, PageAllocationOptions::dma32_zeroed())
         .map_err(|_| BlockError::MetadataOutOfMemory)?;
     let pointer =
         match crate::arch::memory::phys_access::ram_mut_ptr::<u8>(allocation.range().start()) {
@@ -406,10 +447,9 @@ fn dma_sector_buffer() -> Result<(PageAllocation, &'static mut [u8]), BlockError
                 return Err(BlockError::InvalidArgument);
             }
         };
-    // SAFETY: the fresh DMA32 allocation owns at least one page, SECTOR_SIZE is
-    // smaller than a page, and the allocation is kept alive until the caller
-    // copies data and frees it after the virtio operation completes.
-    let buffer = unsafe { core::slice::from_raw_parts_mut(pointer, SECTOR_SIZE) };
+    // SAFETY: the rounded DMA32 allocation covers `length` contiguous bytes
+    // and remains owned until the virtio request and copy complete.
+    let buffer = unsafe { core::slice::from_raw_parts_mut(pointer, length) };
     Ok((allocation, buffer))
 }
 
@@ -567,10 +607,7 @@ fn probe_mmio_region(region: MmioRegion) -> Result<Option<Arc<dyn BlockDevice>>,
             ));
             crate::rng::register_hardware_source(alloc::boxed::Box::new(
                 move |buf: &mut [u8]| -> usize {
-                    rng_device
-                        .lock()
-                        .request_entropy(buf)
-                        .unwrap_or(0)
+                    rng_device.lock().request_entropy(buf).unwrap_or(0)
                 },
             ));
             crate::println!("  rng device     : registered");
@@ -582,18 +619,20 @@ fn probe_mmio_region(region: MmioRegion) -> Result<Option<Arc<dyn BlockDevice>>,
                 MmioTransport,
                 { crate::net::virtio_net::NET_QUEUE_SIZE },
             >::new(transport)
-                .map_err(|_| VirtioProbeError::DriverFailed)?;
+            .map_err(|_| VirtioProbeError::DriverFailed)?;
             let net_dev = crate::net::virtio_net::from_raw(raw, Some(mapping));
             let mac = net_dev.mac_address();
-            let name = alloc::format!(
-                "eth{}",
-                crate::net::registered_interfaces().len()
-            );
+            let name = alloc::format!("eth{}", crate::net::registered_interfaces().len());
             crate::net::register_interface(&name, net_dev)
                 .map_err(|_| VirtioProbeError::DriverFailed)?;
             crate::println!(
                 "  net device     : {name} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                mac[0],
+                mac[1],
+                mac[2],
+                mac[3],
+                mac[4],
+                mac[5],
             );
             Ok(None)
         }
@@ -642,41 +681,40 @@ fn probe_pci_host(host: PciHostBridge, first_index: usize) -> Result<usize, Virt
             crate::println!("  pci {device_function}: virtio {device_type:?}");
             allocate_bars(&mut root, device_function, &mut allocator)?;
             match device_type {
-                DeviceType::Block => {
-                    match probe_pci_block(&mut root, device_function) {
-                        Ok(device) => {
-                            let name = virtio_block_name(first_index + found);
-                            match block::register_device(&name, Arc::clone(&device)) {
-                                Ok(()) => {
-                                    crate::println!("  block registry : /dev/{name}");
-                                    register_compat_partition_alias(&name, &device);
-                                    found += 1;
-                                }
-                                Err(error) => {
-                                    crate::println!("  block registry : failed ({error:?})");
-                                }
+                DeviceType::Block => match probe_pci_block(&mut root, device_function) {
+                    Ok(device) => {
+                        let name = virtio_block_name(first_index + found);
+                        match block::register_device(&name, Arc::clone(&device)) {
+                            Ok(()) => {
+                                crate::println!("  block registry : /dev/{name}");
+                                register_compat_partition_alias(&name, &device);
+                                found += 1;
+                            }
+                            Err(error) => {
+                                crate::println!("  block registry : failed ({error:?})");
                             }
                         }
-                        Err(error) => {
-                            crate::println!("  pci {device_function}: ignored ({})", error.as_str());
-                        }
                     }
-                }
+                    Err(error) => {
+                        crate::println!("  pci {device_function}: ignored ({})", error.as_str());
+                    }
+                },
                 DeviceType::EntropySource => {
                     if probe_pci_rng(&mut root, device_function).is_ok() {
                         crate::println!("  rng device     : registered");
                     }
                 }
-                DeviceType::Network => {
-                    match probe_pci_net(&mut root, device_function) {
-                        Ok(name) => {
-                            crate::println!("  net device     : {name} registered");
-                        }
-                        Err(error) => {
-                            crate::println!("  pci {device_function}: net probe failed ({})", error.as_str());
-                        }
+                DeviceType::Network => match probe_pci_net(&mut root, device_function) {
+                    Ok(name) => {
+                        crate::println!("  net device     : {name} registered");
                     }
-                }
+                    Err(error) => {
+                        crate::println!(
+                            "  pci {device_function}: net probe failed ({})",
+                            error.as_str()
+                        );
+                    }
+                },
                 _ => {}
             }
         }
@@ -721,14 +759,9 @@ fn probe_pci_rng(
         driver,
         crate::lockdep::LockClass::new("virtio.rng", crate::lockdep::LockRank::Vfs, 22),
     ));
-    crate::rng::register_hardware_source(alloc::boxed::Box::new(
-        move |buf: &mut [u8]| -> usize {
-            rng_device
-                .lock()
-                .request_entropy(buf)
-                .unwrap_or(0)
-        },
-    ));
+    crate::rng::register_hardware_source(alloc::boxed::Box::new(move |buf: &mut [u8]| -> usize {
+        rng_device.lock().request_entropy(buf).unwrap_or(0)
+    }));
     Ok(())
 }
 
@@ -743,18 +776,19 @@ fn probe_pci_net(
         PciTransport,
         { crate::net::virtio_net::NET_QUEUE_SIZE },
     >::new(transport)
-        .map_err(|_| VirtioProbeError::DriverFailed)?;
+    .map_err(|_| VirtioProbeError::DriverFailed)?;
     let net_dev = crate::net::virtio_net::from_raw(raw, None);
     let mac = net_dev.mac_address();
-    let name = alloc::format!(
-        "eth{}",
-        crate::net::registered_interfaces().len()
-    );
-    crate::net::register_interface(&name, net_dev)
-        .map_err(|_| VirtioProbeError::DriverFailed)?;
+    let name = alloc::format!("eth{}", crate::net::registered_interfaces().len());
+    crate::net::register_interface(&name, net_dev).map_err(|_| VirtioProbeError::DriverFailed)?;
     crate::println!(
         "  net device     : {name} MAC={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5],
     );
     Ok(name)
 }

@@ -130,9 +130,7 @@ impl Device {
     /// 从设备私有数据中取出类型擦除的状态。
     pub fn take_private<T: 'static>(&self) -> Option<Box<T>> {
         let mut guard = self.private_data.lock();
-        guard
-            .take()
-            .and_then(|boxed| boxed.downcast::<T>().ok())
+        guard.take().and_then(|boxed| boxed.downcast::<T>().ok())
     }
 }
 
@@ -238,11 +236,7 @@ pub fn register_device(device: Arc<Device>) -> Result<(), DriverError> {
     }
     drop(buses);
 
-    crate::println!(
-        "  device registry : {} ({})",
-        name,
-        device_type.name(),
-    );
+    crate::println!("  device registry : {} ({})", name, device_type.name(),);
     Ok(())
 }
 
@@ -266,11 +260,7 @@ pub fn register_driver(driver: Arc<dyn Driver>) -> Result<(), DriverError> {
             match driver.probe(device) {
                 Ok(()) => {
                     *device.driver.lock() = Some(Arc::clone(&driver));
-                    crate::println!(
-                        "  driver bind    : {} -> {}",
-                        name,
-                        device.name,
-                    );
+                    crate::println!("  driver bind    : {} -> {}", name, device.name,);
                 }
                 Err(_err) => {
                     // probe 失败 — 设备可能不属于此驱动
@@ -288,9 +278,7 @@ pub fn register_bus(bus: Arc<dyn Bus>) -> Result<(), DriverError> {
     let name = bus.name();
 
     let mut buses = BUSES.lock();
-    buses
-        .try_reserve(1)
-        .map_err(|_| DriverError::OutOfMemory)?;
+    buses.try_reserve(1).map_err(|_| DriverError::OutOfMemory)?;
     buses.push(Arc::clone(&bus));
     drop(buses);
 

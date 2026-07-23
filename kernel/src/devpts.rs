@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use myos_vfs::{
-    Errno, File, FileOperations, FileMode, IoBuffer, MutableIoBuffer, OpenFlags, PollEvents, Stat,
+    Errno, File, FileMode, FileOperations, IoBuffer, MutableIoBuffer, OpenFlags, PollEvents, Stat,
 };
 
 use crate::irq_lock::IrqSpinLock;
@@ -123,10 +123,11 @@ impl FileOperations for PtyMaster {
                 return Err(Errno::Eagain);
             }
             drop(output);
-            let _ = crate::task::block_current_on_if_from_user_trap(
-                &self.shared.output_wait,
-                || self.shared.output.lock().is_empty() && !self.shared.slave_closed.load(Ordering::Acquire),
-            );
+            let _ =
+                crate::task::block_current_on_if_from_user_trap(&self.shared.output_wait, || {
+                    self.shared.output.lock().is_empty()
+                        && !self.shared.slave_closed.load(Ordering::Acquire)
+                });
         }
     }
 
@@ -203,10 +204,11 @@ impl FileOperations for PtySlave {
                 return Err(Errno::Eagain);
             }
             drop(input);
-            let _ = crate::task::block_current_on_if_from_user_trap(
-                &self.shared.input_wait,
-                || self.shared.input.lock().is_empty() && !self.shared.master_closed.load(Ordering::Acquire),
-            );
+            let _ =
+                crate::task::block_current_on_if_from_user_trap(&self.shared.input_wait, || {
+                    self.shared.input.lock().is_empty()
+                        && !self.shared.master_closed.load(Ordering::Acquire)
+                });
         }
     }
 
@@ -272,7 +274,9 @@ fn safe_wake(wq: &WaitQueue) {
 /// 创建一个新的 PTY 对。
 ///
 /// 返回 (master_file, slave_file, pts_index)。
-pub fn create_pty_pair(flags: OpenFlags) -> Result<(myos_vfs::ArcFile, myos_vfs::ArcFile, usize), Errno> {
+pub fn create_pty_pair(
+    flags: OpenFlags,
+) -> Result<(myos_vfs::ArcFile, myos_vfs::ArcFile, usize), Errno> {
     let index = NEXT_PTS_INDEX.fetch_add(1, Ordering::Relaxed);
     let shared = Arc::new(PtyShared {
         input: IrqSpinLock::new_with_class(PtyRingBuffer::new(), PTY_LOCK),
@@ -297,10 +301,7 @@ pub fn create_pty_pair(flags: OpenFlags) -> Result<(myos_vfs::ArcFile, myos_vfs:
             shared: Arc::clone(&shared),
         }),
     );
-    let slave = File::new(
-        slave_flags,
-        Arc::new(PtySlave { shared, index }),
-    );
+    let slave = File::new(slave_flags, Arc::new(PtySlave { shared, index }));
 
     Ok((master, slave, index))
 }
@@ -323,10 +324,7 @@ pub fn verify() {
     );
     let mut bytes = [0_u8; 8];
     let mut output = MutableIoBuffer::new(&mut bytes);
-    assert_eq!(
-        slave.read(&mut output).expect("pty slave read failed"),
-        6,
-    );
+    assert_eq!(slave.read(&mut output).expect("pty slave read failed"), 6,);
     assert_eq!(output.filled_bytes(), b"pty-ok");
 
     // 写入 slave → 从 master 读取

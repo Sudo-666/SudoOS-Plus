@@ -44,7 +44,11 @@ pub fn send_signal(pid: ProcessId, signal: u32) -> Result<(), myos_vfs::Errno> {
         );
     }
     let process = crate::process::lookup_process(pid).ok_or(myos_vfs::Errno::Esrch)?;
-    process.signals().add_pending(signal)
+    let result = process.signals().add_pending(signal);
+    if result.is_ok() {
+        crate::net::socket::wake_all_waiters();
+    }
+    result
 }
 
 #[allow(dead_code)]

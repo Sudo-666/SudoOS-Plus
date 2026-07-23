@@ -632,13 +632,10 @@ mod tests {
 
         let request = mm.plan_post_install_tlb(VirtAddr::new(0x4123)).unwrap();
         assert_eq!(request.generation(), 1);
-        assert_eq!(
-            request.flush(),
-            TlbFlush::Page {
-                scope: TlbScope::AddressSpace(AddressSpaceId::new(7)),
-                address: VirtAddr::new(0x4000),
-            }
-        );
+        assert_eq!(request.flush(), TlbFlush::Page {
+            scope: TlbScope::AddressSpace(AddressSpaceId::new(7)),
+            address: VirtAddr::new(0x4000),
+        });
         assert!(request.targets().contains(0).unwrap());
     }
 

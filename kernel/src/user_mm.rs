@@ -1,10 +1,10 @@
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use myos_mm::{
     AddressSpaceError, AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, FaultSource,
-    PAGE_SIZE, PageAllocation, PageFault, PerMmTlbRequest, PhysAddr, TlbFlush, TlbScope,
+    PAGE_SIZE, PageAllocation, PageFault, PerMmTlbRequest, PhysAddr, PhysFrame, TlbFlush, TlbScope,
     UserAddressSpace, UserFaultPlan, UserMmError, VirtAddr, VirtPage, VirtRange, VmArea,
     VmAreaError, VmAreaFlags,
 };
@@ -13,7 +13,10 @@ use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
-const VMA_CAPACITY: usize = 96;
+// Native toolchains keep many shared objects, metadata files, thread stacks,
+// and guard mappings live at once.  A clean rustc invocation exceeds the old
+// 96-entry contest baseline before it can allocate its signal alt stack.
+const VMA_CAPACITY: usize = 256;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
@@ -83,7 +86,7 @@ struct MappedPageSource {
 }
 
 struct UserMmState {
-    core: UserAddressSpace<VMA_CAPACITY>,
+    core: Box<UserAddressSpace<VMA_CAPACITY>>,
     page_table: Option<RuntimePageTable>,
     pages: Vec<MappedPage>,
 }
@@ -135,10 +138,18 @@ pub enum UserFaultResolution {
 }
 
 impl UserMm {
+    pub fn vma_usage(&self) -> (usize, usize) {
+        let state = self.state.lock();
+        (state.core.layout().area_count(), VMA_CAPACITY)
+    }
+
     pub fn new(areas: &[VmArea]) -> Result<Self, UserMmRuntimeError> {
         let asid = reserve_asid_for_mm()?;
         let result: Result<Self, UserMmRuntimeError> = (|| {
-            let mut core = UserAddressSpace::new(crate::arch::memory::layout::USER_RANGE, asid);
+            let mut core = Box::new(UserAddressSpace::new(
+                crate::arch::memory::layout::USER_RANGE,
+                asid,
+            ));
 
             // Reject invalid VMA topology before allocating a hardware root so
             // metadata failure cannot leak page-table ownership.
@@ -481,6 +492,18 @@ impl UserMm {
         Ok(area.range().start())
     }
 
+    pub fn map_anonymous_exact(
+        &self,
+        range: VirtRange,
+        flags: VmAreaFlags,
+    ) -> Result<VirtAddr, UserMmRuntimeError> {
+        let mut state = self.state.lock();
+        state
+            .core
+            .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))?;
+        Ok(range.start())
+    }
+
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();
@@ -525,7 +548,7 @@ impl UserMm {
                 let old_area = old_layout
                     .find_area(mapping.page.start_address())
                     .expect("mapped user page has no old VMA");
-                changed_pages.push((mapping.page, old_area));
+                changed_pages.push((mapping.page, old_area, mapping.backing.start()));
             }
 
             let request = if changed_pages.is_empty() {
@@ -538,10 +561,7 @@ impl UserMm {
             };
 
             // Try the full VMA-splitting protect first.
-            let layout_result = state
-                .core
-                .layout_mut()
-                .protect_range(range, access);
+            let layout_result = state.core.layout_mut().protect_range(range, access);
 
             // PTE-only fallback: when VMA capacity is exhausted but the
             // range is fully covered by existing VMAs, update only the
@@ -549,15 +569,13 @@ impl UserMm {
             // Covers both RELRO (PROT_READ) and text-segment mmap
             // finalization (R-X or R-- from temporary RW).
             let is_downgrade = !access.contains(VmAreaFlags::WRITE);
-            let pte_fallback = layout_result.is_err()
-                && is_downgrade
-                && !changed_pages.is_empty();
+            let pte_fallback = layout_result.is_err() && is_downgrade && !changed_pages.is_empty();
 
             if pte_fallback {
                 // Don't update the VMA layout — just protect existing PTEs.
                 let mut pte_result = Ok(());
                 if let Some(page_table) = state.page_table.as_mut() {
-                    for (page, old_area) in &changed_pages {
+                    for (page, old_area, frame) in &changed_pages {
                         // Build a temporary read-only VMA to derive mapping options.
                         let ro_start = page.start_address().get();
                         let ro_end = ro_start
@@ -566,11 +584,13 @@ impl UserMm {
                         let ro_range = VirtRange::from_bounds(ro_start, ro_end);
                         let ro_area = VmArea::new(
                             ro_range,
-                            old_area.flags().with_access(VmAreaFlags::READ),
+                            old_area.flags().with_access(access),
                             old_area.kind(),
                         );
-                        if let Err(e) = page_table.protect_page(*page, ro_area.mapping_options()) {
-                            pte_result = Err(e);
+                        if let Err(error) =
+                            apply_page_protection(page_table, *page, *frame, ro_area)
+                        {
+                            pte_result = Err(error);
                             break;
                         }
                     }
@@ -578,8 +598,8 @@ impl UserMm {
                 if let Err(e) = pte_result {
                     // Rollback: restore original PTE flags.
                     if let Some(page_table) = state.page_table.as_mut() {
-                        for (page, old_area) in &changed_pages {
-                            let _ = page_table.protect_page(*page, old_area.mapping_options());
+                        for (page, old_area, frame) in &changed_pages {
+                            let _ = apply_page_protection(page_table, *page, *frame, *old_area);
                         }
                     }
                     return Err(UserMmRuntimeError::Core(UserMmError::AddressSpace(
@@ -589,25 +609,31 @@ impl UserMm {
                 // PTE-only fallback succeeded — skip VMA layout update.
                 request
             } else {
-                // Normal path: layout protect succeeded, now update PTEs.
-                state
-                    .core
-                    .layout_mut()
-                    .protect_range(range, access)
-                    .map_err(UserMmError::from)?;
+                // The first call already committed the VMA split on success.
+                // Calling it a second time can split an already-updated layout
+                // and makes rollback operate on a different topology.
+                if let Err(error) = layout_result {
+                    *state.core.layout_mut() = old_layout;
+                    return Err(UserMmError::from(error).into());
+                }
 
+                let mut updated_pages = Vec::new();
+                updated_pages
+                    .try_reserve(changed_pages.len())
+                    .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
                 let result: Result<(), RuntimePageTableError> = (|| {
-                    for (page, _) in &changed_pages {
+                    for (page, _, frame) in &changed_pages {
                         let area = state
                             .core
                             .layout()
                             .find_area(page.start_address())
                             .expect("mprotect removed a mapped page's VMA");
-                        state
+                        let page_table = state
                             .page_table
                             .as_mut()
-                            .ok_or(RuntimePageTableError::NotMapped)?
-                            .protect_page(*page, area.mapping_options())?;
+                            .ok_or(RuntimePageTableError::NotMapped)?;
+                        apply_page_protection(page_table, *page, *frame, area)?;
+                        updated_pages.push(*page);
                     }
                     Ok(())
                 })();
@@ -617,12 +643,22 @@ impl UserMm {
                         .page_table
                         .as_mut()
                         .expect("mprotect rollback lost the user page table");
-                    for (page, old_area) in &changed_pages {
-                        page_table
-                            .protect_page(*page, old_area.mapping_options())
-                            .expect("mprotect rollback could not restore a leaf PTE");
+                    for page in &updated_pages {
+                        if let Some((_, old_area, frame)) = changed_pages
+                            .iter()
+                            .find(|(changed_page, _, _)| changed_page == page)
+                        {
+                            let _ = apply_page_protection(page_table, *page, *frame, *old_area);
+                        }
                     }
                     *state.core.layout_mut() = old_layout;
+                    crate::println!(
+                        "sudoos-diag: mprotect PTE update failed range=[{:#x},{:#x}) updated={} error={:?}",
+                        range.start().get(),
+                        range.end().get(),
+                        updated_pages.len(),
+                        error,
+                    );
                     return Err(error.into());
                 }
                 request
@@ -857,24 +893,74 @@ impl UserMm {
             .try_reserve(table_capacity)
             .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
+        let mut already_unmapped = 0_usize;
         while let Some(mapping) = state.pages.pop() {
             let page_table = state
                 .page_table
                 .as_mut()
                 .ok_or(UserMmRuntimeError::NotMapped)?;
-            let frame = page_table.unmap_page(mapping.page)?;
-            assert_eq!(
-                frame,
-                mapping.backing.start(),
-                "M8-B3 user leaf returned a different physical frame",
-            );
+            match page_table.translate(mapping.page.start_address())? {
+                Some(physical) => {
+                    assert_eq!(
+                        physical,
+                        mapping.backing.start().start_address(),
+                        "M8-B3 user leaf returned a different physical address",
+                    );
+                    let frame = page_table.unmap_page(mapping.page)?;
+                    assert_eq!(
+                        frame,
+                        mapping.backing.start(),
+                        "M8-B3 user leaf returned a different physical frame",
+                    );
+                }
+                None => {
+                    // MAP_FIXED/munmap may retire the leaf before the final
+                    // owner reaches process teardown. The backing remains
+                    // uniquely owned by this record and still must be freed.
+                    already_unmapped += 1;
+                }
+            }
             page_table.reclaim_empty_tables(mapping.page, &mut retired)?;
-            crate::page_alloc::free(mapping.backing)?;
+            let backing_start = mapping.backing.start().start_address().get();
+            let backing_order = mapping.backing.order();
+            if let Err(error) = crate::page_alloc::free(mapping.backing) {
+                crate::println!(
+                    "user-mm: backing free failed page={:#x} phys={:#x} order={} error={:?}",
+                    mapping.page.start_address().get(),
+                    backing_start,
+                    backing_order,
+                    error,
+                );
+                return Err(error.into());
+            }
             LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
         }
 
+        if already_unmapped != 0 {
+            crate::println!(
+                "user-mm: reclaimed {} backing pages whose leaves were already unmapped",
+                already_unmapped,
+            );
+        }
+
+        state
+            .page_table
+            .as_mut()
+            .ok_or(UserMmRuntimeError::NotMapped)?
+            .retire_all_private_tables(&mut retired)?;
+
         for table in retired.drain(..) {
-            crate::page_alloc::free(table)?;
+            let start = table.start().start_address().get();
+            let order = table.order();
+            if let Err(error) = crate::page_alloc::free(table) {
+                crate::println!(
+                    "user-mm: table free failed phys={:#x} order={} error={:?}",
+                    start,
+                    order,
+                    error,
+                );
+                return Err(error.into());
+            }
         }
 
         let page_table = state
@@ -901,7 +987,9 @@ impl Drop for UserMm {
             state.page_table.is_some()
         };
         if needs_teardown {
-            let _ = self.destroy();
+            if let Err(error) = self.destroy() {
+                panic!("M8-B3 UserMm teardown failed during drop: {error:?}");
+            }
         }
         let state = self.state.lock();
         assert!(
@@ -1066,6 +1154,31 @@ fn finish_retirement(retirement: RetirementBatch) -> Result<(), UserMmRuntimeErr
         crate::page_alloc::free(table)?;
     }
     Ok(())
+}
+
+fn apply_page_protection(
+    page_table: &mut RuntimePageTable,
+    page: VirtPage,
+    frame: PhysFrame,
+    area: VmArea,
+) -> Result<(), RuntimePageTableError> {
+    if area.flags().access_only() == VmAreaFlags::empty() {
+        return match page_table.unmap_page(page) {
+            Ok(mapped) => {
+                debug_assert_eq!(mapped, frame);
+                Ok(())
+            }
+            Err(RuntimePageTableError::NotMapped) => Ok(()),
+            Err(error) => Err(error),
+        };
+    }
+
+    let options = area.mapping_options();
+    match page_table.protect_page(page, options) {
+        Ok(()) => Ok(()),
+        Err(RuntimePageTableError::NotMapped) => page_table.map_page(page, frame, options),
+        Err(error) => Err(error),
+    }
 }
 
 fn shootdown_user_request(request: myos_mm::PerMmTlbRequest) {

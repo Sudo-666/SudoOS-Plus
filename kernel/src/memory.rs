@@ -684,9 +684,11 @@ pub fn verify_loongarch_high_mapping() {
 pub fn prepare_riscv_direct_map(state: &mut EarlyMemoryState, ram: &BootMemoryMap) {
     use myos_mm::{PAGE_SIZE, PhysFrame, VirtPage};
 
+    const MEGA_PAGE_SIZE: usize = 2 * 1024 * 1024;
     let image = crate::linker::kernel_image_layout();
 
     let mut mapped_pages = 0_usize;
+    let mut mapped_mega_pages = 0_usize;
 
     let (allocator, page_table) = state.parts_mut();
 
@@ -703,33 +705,60 @@ pub fn prepare_riscv_direct_map(state: &mut EarlyMemoryState, ram: &BootMemoryMa
                     );
                 });
 
-            let page =
-                VirtPage::from_start_address(virtual_address).expect("direct-map VA is unaligned");
+            let chunk_end = physical.checked_add(MEGA_PAGE_SIZE);
+            let overlaps_image = chunk_end.is_none_or(|end| {
+                image.segments().iter().any(|segment| {
+                    segment.physical().start() < end && physical < segment.physical().end()
+                })
+            });
+            let use_mega_page = physical.get() & (MEGA_PAGE_SIZE - 1) == 0
+                && virtual_address.get() & (MEGA_PAGE_SIZE - 1) == 0
+                && chunk_end.is_some_and(|end| end <= range.end())
+                && !overlaps_image;
 
-            let frame = PhysFrame::from_start_address(physical).expect("RAM frame is unaligned");
+            if use_mega_page {
+                page_table
+                    .map_mega_page(
+                        allocator,
+                        virtual_address,
+                        physical,
+                        myos_mm::MappingOptions::kernel_data(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "unable to map direct-map 2 MiB page {:#x}: {error:?}",
+                            physical.get(),
+                        );
+                    });
+                physical = chunk_end.expect("validated 2 MiB chunk disappeared");
+                mapped_pages += MEGA_PAGE_SIZE / PAGE_SIZE;
+                mapped_mega_pages += 1;
+            } else {
+                let page = VirtPage::from_start_address(virtual_address)
+                    .expect("direct-map VA is unaligned");
+                let frame =
+                    PhysFrame::from_start_address(physical).expect("RAM frame is unaligned");
+                let options = direct_map_options(physical, &image);
 
-            let options = direct_map_options(physical, &image);
-
-            page_table
-                .map_page(allocator, page, frame, options)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "unable to map direct-map page \
-                         {:#x}: {error:?}",
-                        physical.get(),
-                    );
-                });
-
-            physical = physical
-                .checked_add(PAGE_SIZE)
-                .expect("RAM iterator overflow");
-
-            mapped_pages += 1;
+                page_table
+                    .map_page(allocator, page, frame, options)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "unable to map direct-map page {:#x}: {error:?}",
+                            physical.get(),
+                        );
+                    });
+                physical = physical
+                    .checked_add(PAGE_SIZE)
+                    .expect("RAM iterator overflow");
+                mapped_pages += 1;
+            }
         }
     }
 
     crate::println!("RISC-V direct map:");
     crate::println!("  mapped pages : {}", mapped_pages,);
+    crate::println!("  2 MiB leaves : {}", mapped_mega_pages,);
     crate::println!("  table pages  : {}", page_table.allocated_table_pages(),);
 }
 
@@ -785,8 +814,6 @@ impl EarlyMemoryState {
     }
 }
 
-
- 
 #[cfg(target_arch = "riscv64")]
 fn riscv_boot_puts(message: &str) {
     for byte in message.as_bytes() {
@@ -799,8 +826,8 @@ pub fn initialize_page_allocator(
     early_memory: EarlyMemoryState,
 ) -> KernelMemoryState {
     let managed = managed_physical_span(layout.ram());
-    let required_bytes = BuddyAllocator::required_metadata_bytes(managed)
-        .expect("invalid managed physical range");
+    let required_bytes =
+        BuddyAllocator::required_metadata_bytes(managed).expect("invalid managed physical range");
     let metadata_pages = required_bytes
         .checked_add(myos_mm::PAGE_SIZE - 1)
         .expect("page metadata size overflow")
@@ -849,9 +876,11 @@ pub fn initialize_page_allocator(
      * are released below.
      */
     for range in layout.ram().iter() {
-        page_allocator.mark_present_range(range).unwrap_or_else(|error| {
-            panic!("unable to mark RAM present: {error:?}");
-        });
+        page_allocator
+            .mark_present_range(range)
+            .unwrap_or_else(|error| {
+                panic!("unable to mark RAM present: {error:?}");
+            });
     }
 
     let expected_free_pages = early_allocator
@@ -879,16 +908,16 @@ pub fn initialize_page_allocator(
     );
 
     #[cfg(target_arch = "riscv64")]
-{
-    riscv_boot_puts("  total free   : verified\n");
-    // SAFETY: still in single-CPU boot handoff. Runtime IRQ paths and secondary CPUs
-    // are not active yet, so publishing the prepared buddy allocator directly matches
-    // Linux-style bootmem -> buddy handoff semantics.
-    unsafe { crate::page_alloc::install_boot(page_allocator) }.unwrap_or_else(|error| {
-        panic!("unable to install global page allocator: {error:?}");
-    });
-    riscv_boot_puts("  early handoff: complete\n");
-}
+    {
+        riscv_boot_puts("  total free   : verified\n");
+        // SAFETY: still in single-CPU boot handoff. Runtime IRQ paths and secondary CPUs
+        // are not active yet, so publishing the prepared buddy allocator directly matches
+        // Linux-style bootmem -> buddy handoff semantics.
+        unsafe { crate::page_alloc::install_boot(page_allocator) }.unwrap_or_else(|error| {
+            panic!("unable to install global page allocator: {error:?}");
+        });
+        riscv_boot_puts("  early handoff: complete\n");
+    }
 
     #[cfg(not(target_arch = "riscv64"))]
     {
@@ -904,7 +933,10 @@ pub fn initialize_page_allocator(
             "  Normal free  : {} pages",
             page_allocator.zone_free_pages(ZoneKind::Normal),
         );
-        crate::println!("  total free   : {} pages", page_allocator.total_free_pages());
+        crate::println!(
+            "  total free   : {} pages",
+            page_allocator.total_free_pages()
+        );
         crate::println!("  early handoff: complete");
         crate::page_alloc::install(page_allocator).unwrap_or_else(|error| {
             panic!("unable to install global page allocator: {error:?}");
@@ -916,9 +948,7 @@ pub fn initialize_page_allocator(
         boot_page_table,
         _metadata_range: metadata_range,
     }
-} 
-
-
+}
 
 #[cfg(target_arch = "riscv64")]
 #[inline(always)]
@@ -1004,7 +1034,6 @@ fn riscv_boot_print_page_allocator_handoff(total_free_pages: usize) {
 // final-page-table/low-map invariants while making the RISC-V handoff finite,
 // observable, and equivalent to coalescing the same physical pages into buddy.
 
-  
 const MAX_ORDER_NR_PAGES: usize = 1_usize << (myos_mm::MAX_ORDER - 1);
 
 fn release_early_ranges_to_buddy_chunked(
@@ -1017,7 +1046,10 @@ fn release_early_ranges_to_buddy_chunked(
     }
 }
 
-fn release_early_range_to_buddy_chunked(page_allocator: &mut BuddyAllocator, range: PhysRange) -> Result<(), myos_mm::BuddyError> {
+fn release_early_range_to_buddy_chunked(
+    page_allocator: &mut BuddyAllocator,
+    range: PhysRange,
+) -> Result<(), myos_mm::BuddyError> {
     let max_chunk_bytes = MAX_ORDER_NR_PAGES * myos_mm::PAGE_SIZE;
     let mut start = range.start();
     while start < range.end() {
@@ -1064,12 +1096,9 @@ fn rebase_riscv_boot_stack_to_kernel_alias() {
     }
 
     let physical = myos_mm::PhysAddr::new(sp);
-    let high = crate::arch::memory::layout::phys_to_direct(physical)
-        .unwrap_or_else(|| {
-            panic!(
-                "RISC-V boot stack {sp:#018x} is neither high-half nor direct-mappable"
-            );
-        });
+    let high = crate::arch::memory::layout::phys_to_direct(physical).unwrap_or_else(|| {
+        panic!("RISC-V boot stack {sp:#018x} is neither high-half nor direct-mappable");
+    });
 
     let high_sp = high.get();
 
@@ -1103,4 +1132,3 @@ fn riscv_current_stack_pointer() -> usize {
 
     sp
 }
-

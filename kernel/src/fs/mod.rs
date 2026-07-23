@@ -35,6 +35,18 @@ struct Node {
 enum NodeState {
     Directory(Vec<(String, Arc<Node>)>),
     Regular(Vec<u8>),
+    Ext4Directory {
+        fs: Arc<crate::ext4::Ext4FileSystem>,
+        ino: u32,
+        children: Vec<(String, Arc<Node>)>,
+        whiteouts: Vec<String>,
+    },
+    Ext4Regular {
+        fs: Arc<crate::ext4::Ext4FileSystem>,
+        ino: u32,
+        size: u64,
+        overlay: Option<Vec<u8>>,
+    },
     Symlink(String),
     Device(DeviceKind),
     BlockDevice {
@@ -43,6 +55,24 @@ enum NodeState {
         cache: Arc<crate::block::BufferCache>,
     },
     ProcFile(Arc<dyn crate::procfs::ProcFileGenerator>),
+}
+
+fn directory_children(state: &NodeState) -> Option<&Vec<(String, Arc<Node>)>> {
+    match state {
+        NodeState::Directory(children) | NodeState::Ext4Directory { children, .. } => {
+            Some(children)
+        }
+        _ => None,
+    }
+}
+
+fn directory_children_mut(state: &mut NodeState) -> Option<&mut Vec<(String, Arc<Node>)>> {
+    match state {
+        NodeState::Directory(children) | NodeState::Ext4Directory { children, .. } => {
+            Some(children)
+        }
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -86,20 +116,19 @@ pub fn initialize() {
         .expect("unable to install /dev/random");
     insert_child(&dev, "urandom", device(DeviceKind::Urandom))
         .expect("unable to install /dev/urandom");
-    insert_child(&dev, "ptmx", device(DeviceKind::Ptmx))
-        .expect("unable to install /dev/ptmx");
-    insert_child(&dev, "rtc", device(DeviceKind::Rtc))
-        .expect("unable to install /dev/rtc");
+    insert_child(&dev, "ptmx", device(DeviceKind::Ptmx)).expect("unable to install /dev/ptmx");
+    insert_child(&dev, "rtc", device(DeviceKind::Rtc)).expect("unable to install /dev/rtc");
     let pts = directory(FileMode::DIR_DEFAULT);
-    insert_child(&dev, "pts", pts)
-        .expect("unable to install /dev/pts");
+    insert_child(&dev, "pts", pts).expect("unable to install /dev/pts");
     install_registered_block_devices(&dev).expect("unable to install block devices");
     *ROOT.lock() = Some(root);
     initialize_mount_table().expect("unable to initialize mount table");
 
     crate::println!("vfs:");
     crate::println!("  root fs       : tmpfs");
-    crate::println!("  devfs         : /dev/null /dev/zero /dev/console /dev/random /dev/urandom /dev/rtc /dev/ptmx /dev/pts + block devices");
+    crate::println!(
+        "  devfs         : /dev/null /dev/zero /dev/console /dev/random /dev/urandom /dev/rtc /dev/ptmx /dev/pts + block devices"
+    );
     crate::println!("  fd table      : per-process");
 }
 
@@ -290,6 +319,19 @@ pub fn symlink(target: &str, link_path: &str) -> Result<(), Errno> {
     insert_child(&parent, name, symlink_node(target))
 }
 
+pub fn replace_with_symlink(target: &str, link_path: &str) -> Result<(), Errno> {
+    if target.is_empty() || target.len() > 4096 || target.as_bytes().contains(&0) {
+        return Err(Errno::Einval);
+    }
+    let _tree = TREE.lock();
+    let (parent_path, name) = split_parent(link_path)?;
+    let parent = lookup(parent_path)?;
+    if lookup_child(&parent, name)?.is_some() {
+        let _ = remove_child_unchecked(&parent, name)?;
+    }
+    insert_child(&parent, name, symlink_node(target))
+}
+
 pub fn link(old_path: &str, new_path: &str, follow_source: bool) -> Result<(), Errno> {
     let _tree = TREE.lock();
     let source = if follow_source {
@@ -444,6 +486,33 @@ pub fn mount_ext4_subtree(
     }
     install_ext4_path_snapshot(&target_node, device, source_path)?;
     insert_mount(source, target, MountFsType::Ext4, flags)
+}
+
+/// Mount an ext4 tree lazily and keep all guest writes in memory. The block
+/// device remains the immutable source of truth, which matches QEMU snapshot
+/// runs while avoiding an eager multi-gigabyte rootfs copy at boot.
+pub fn mount_ext4_overlay(source: &str, target: &str) -> Result<(), Errno> {
+    let _tree = TREE.lock();
+    let target_node = lookup(target)?;
+    if target_node.mode.file_type() != myos_vfs::FileType::Directory {
+        return Err(Errno::Enotdir);
+    }
+    let device_name = normalize_block_source(source)?;
+    let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
+    verify_ext4_superblock(&device)?;
+    let fs = Arc::new(crate::ext4::Ext4FileSystem::open(device).map_err(ext4_errno)?);
+    let root = fs.root_info().map_err(ext4_errno)?;
+    if root.kind != crate::ext4::Ext4NodeKind::Directory {
+        return Err(Errno::Enotdir);
+    }
+    target_node.read_only.store(false, Ordering::Release);
+    *target_node.state.lock() = NodeState::Ext4Directory {
+        fs,
+        ino: root.ino,
+        children: Vec::new(),
+        whiteouts: Vec::new(),
+    };
+    Ok(())
 }
 
 pub fn install_ext4_path(source: &str, target_path: &str, source_path: &str) -> Result<(), Errno> {
@@ -730,16 +799,7 @@ fn lookup_follow(path: &str, follow_final: bool, depth: usize) -> Result<Arc<Nod
     let mut current = root()?;
     let mut current_path = String::from("/");
     for (index, component) in parts.iter().enumerate() {
-        let next = {
-            let state = current.state.lock();
-            match &*state {
-                NodeState::Directory(children) => children
-                    .iter()
-                    .find(|(name, _)| name == *component)
-                    .map(|(_, child)| Arc::clone(child)),
-                _ => return Err(Errno::Enotdir),
-            }
-        };
+        let next = lookup_child(&current, component)?;
         let next = next.ok_or(Errno::Enoent)?;
         let is_final = index + 1 == parts.len();
         if next.mode.file_type() == myos_vfs::FileType::Symlink && (!is_final || follow_final) {
@@ -773,6 +833,80 @@ fn create_regular(path: &str) -> Result<Arc<Node>, Errno> {
     let node = regular();
     insert_child(&parent, name, Arc::clone(&node))?;
     Ok(node)
+}
+
+fn ext4_node(
+    fs: Arc<crate::ext4::Ext4FileSystem>,
+    info: crate::ext4::Ext4NodeInfo,
+) -> Result<Arc<Node>, Errno> {
+    let state = match info.kind {
+        crate::ext4::Ext4NodeKind::Directory => NodeState::Ext4Directory {
+            fs,
+            ino: info.ino,
+            children: Vec::new(),
+            whiteouts: Vec::new(),
+        },
+        crate::ext4::Ext4NodeKind::Regular => NodeState::Ext4Regular {
+            fs,
+            ino: info.ino,
+            size: info.size,
+            overlay: None,
+        },
+        crate::ext4::Ext4NodeKind::Symlink => {
+            let target = fs.read_symlink_inode(info.ino).map_err(ext4_errno)?;
+            NodeState::Symlink(target)
+        }
+    };
+    Ok(Arc::new(Node {
+        ino: u64::from(info.ino),
+        parent_ino: AtomicU64::new(0),
+        nlink: AtomicU64::new(1),
+        mode: FileMode::from_bits(info.mode),
+        read_only: AtomicBool::new(false),
+        state: IrqSpinLock::new_with_class(state, NODE_LOCK),
+    }))
+}
+
+fn populate_ext4_directory(node: &Arc<Node>) -> Result<(), Errno> {
+    let backing = {
+        let state = node.state.lock();
+        match &*state {
+            NodeState::Ext4Directory { fs, ino, .. } => Some((Arc::clone(fs), *ino)),
+            NodeState::Directory(_) => None,
+            _ => return Err(Errno::Enotdir),
+        }
+    };
+    let Some((fs, ino)) = backing else {
+        return Ok(());
+    };
+    let entries = fs.list_directory_info(ino).map_err(ext4_errno)?;
+    for (name, info) in entries {
+        let skip = {
+            let state = node.state.lock();
+            let NodeState::Ext4Directory {
+                children,
+                whiteouts,
+                ..
+            } = &*state
+            else {
+                return Err(Errno::Enotdir);
+            };
+            whiteouts.iter().any(|hidden| hidden == &name)
+                || children.iter().any(|(child_name, _)| child_name == &name)
+        };
+        if skip {
+            continue;
+        }
+        let child = ext4_node(Arc::clone(&fs), info)?;
+        child.parent_ino.store(node.ino, Ordering::Release);
+        let mut state = node.state.lock();
+        let NodeState::Ext4Directory { children, .. } = &mut *state else {
+            return Err(Errno::Enotdir);
+        };
+        children.try_reserve(1).map_err(|_| Errno::Enomem)?;
+        children.push((name, child));
+    }
+    Ok(())
 }
 
 fn initramfs_absolute_path(path: &str) -> Result<String, Errno> {
@@ -867,6 +1001,35 @@ fn initramfs_errno(error: crate::initramfs::InitramfsError) -> Errno {
     }
 }
 
+fn regular_overlay_mut(state: &mut NodeState) -> Result<&mut Vec<u8>, Errno> {
+    if let NodeState::Ext4Regular {
+        fs,
+        ino,
+        size,
+        overlay,
+    } = state
+        && overlay.is_none()
+    {
+        let length = usize::try_from(*size).map_err(|_| Errno::Eoverflow)?;
+        let mut data = Vec::new();
+        data.try_reserve(length).map_err(|_| Errno::Enomem)?;
+        data.resize(length, 0);
+        let read = fs.read_inode_at(*ino, 0, &mut data).map_err(ext4_errno)?;
+        if read != length {
+            return Err(Errno::Eio);
+        }
+        *overlay = Some(data);
+    }
+    match state {
+        NodeState::Regular(data) => Ok(data),
+        NodeState::Ext4Regular {
+            overlay: Some(data),
+            ..
+        } => Ok(data),
+        _ => Err(Errno::Einval),
+    }
+}
+
 fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     if is_node_read_only(node) {
         return Err(Errno::Erofs);
@@ -874,7 +1037,8 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     let length = usize::try_from(length).map_err(|_| Errno::Eoverflow)?;
     let mut state = node.state.lock();
     match &mut *state {
-        NodeState::Regular(data) => {
+        NodeState::Regular(_) | NodeState::Ext4Regular { .. } => {
+            let data = regular_overlay_mut(&mut *state)?;
             if length > data.len() {
                 data.try_reserve(length - data.len())
                     .map_err(|_| Errno::Enomem)?;
@@ -882,7 +1046,7 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
             data.resize(length, 0);
             Ok(())
         }
-        NodeState::Directory(_) => Err(Errno::Eisdir),
+        NodeState::Directory(_) | NodeState::Ext4Directory { .. } => Err(Errno::Eisdir),
         NodeState::Symlink(_) => Err(Errno::Einval),
         NodeState::Device(_) => Ok(()),
         NodeState::BlockDevice { .. } => Err(Errno::Einval),
@@ -901,10 +1065,10 @@ fn ensure_mount_target_free(target: &str) -> Result<(), Errno> {
 }
 
 fn directory_is_empty(node: &Arc<Node>) -> Result<bool, Errno> {
-    match &*node.state.lock() {
-        NodeState::Directory(children) => Ok(children.is_empty()),
-        _ => Err(Errno::Enotdir),
-    }
+    populate_ext4_directory(node)?;
+    directory_children(&node.state.lock())
+        .map(|children| children.is_empty())
+        .ok_or(Errno::Enotdir)
 }
 
 fn clear_ext4_snapshot(target: &Arc<Node>) -> Result<(), Errno> {
@@ -1015,6 +1179,7 @@ fn ext4_errno(error: crate::ext4::Ext4Error) -> Errno {
         crate::ext4::Ext4Error::FileTooLarge => Errno::Eoverflow,
         crate::ext4::Ext4Error::InvalidFeatureSet => Errno::Enosys,
         crate::ext4::Ext4Error::InvalidSuperblock => Errno::Einval,
+        crate::ext4::Ext4Error::NotFound => Errno::Enoent,
         crate::ext4::Ext4Error::OutOfMemory => Errno::Enomem,
         crate::ext4::Ext4Error::Unsupported => Errno::Enosys,
     }
@@ -1143,9 +1308,10 @@ fn allocate_inode() -> u64 {
 fn insert_child(parent: &Arc<Node>, name: &str, child: Arc<Node>) -> Result<(), Errno> {
     validate_component(name)?;
     let mut state = parent.state.lock();
-    let NodeState::Directory(children) = &mut *state else {
-        return Err(Errno::Enotdir);
-    };
+    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+        whiteouts.retain(|hidden| hidden != name);
+    }
+    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     if children.iter().any(|(child_name, _)| child_name == name) {
         return Err(Errno::Eexist);
     }
@@ -1168,9 +1334,10 @@ fn insert_child_prepared(
 ) -> Result<(), Errno> {
     validate_component(&name)?;
     let mut state = parent.state.lock();
-    let NodeState::Directory(children) = &mut *state else {
-        return Err(Errno::Enotdir);
-    };
+    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+        whiteouts.retain(|hidden| hidden != &name);
+    }
+    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     if let Some(index) = children
         .iter()
         .position(|(child_name, _)| child_name == &name)
@@ -1190,9 +1357,7 @@ fn insert_child_prepared(
 fn reserve_child_slot(parent: &Arc<Node>, name: &str, replace_existing: bool) -> Result<(), Errno> {
     validate_component(name)?;
     let mut state = parent.state.lock();
-    let NodeState::Directory(children) = &mut *state else {
-        return Err(Errno::Enotdir);
-    };
+    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     if children.iter().any(|(child_name, _)| child_name == name) {
         return if replace_existing {
             Ok(())
@@ -1205,14 +1370,35 @@ fn reserve_child_slot(parent: &Arc<Node>, name: &str, replace_existing: bool) ->
 
 fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Errno> {
     validate_component(name)?;
-    let state = parent.state.lock();
-    let NodeState::Directory(children) = &*state else {
-        return Err(Errno::Enotdir);
+    let backing = {
+        let state = parent.state.lock();
+        let children = directory_children(&state).ok_or(Errno::Enotdir)?;
+        if let Some((_, child)) = children.iter().find(|(child_name, _)| child_name == name) {
+            return Ok(Some(Arc::clone(child)));
+        }
+        match &*state {
+            NodeState::Ext4Directory {
+                fs, ino, whiteouts, ..
+            } if !whiteouts.iter().any(|hidden| hidden == name) => Some((Arc::clone(fs), *ino)),
+            _ => None,
+        }
     };
-    Ok(children
-        .iter()
-        .find(|(child_name, _)| child_name == name)
-        .map(|(_, child)| Arc::clone(child)))
+    let Some((fs, ino)) = backing else {
+        return Ok(None);
+    };
+    let info = match fs.lookup_child_info(ino, name) {
+        Ok(info) => info,
+        Err(crate::ext4::Ext4Error::NotFound) => return Ok(None),
+        Err(error) => return Err(ext4_errno(error)),
+    };
+    let child = ext4_node(fs, info)?;
+    child.parent_ino.store(parent.ino, Ordering::Release);
+    let stored_name = clone_component(name)?;
+    let mut state = parent.state.lock();
+    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
+    children.try_reserve(1).map_err(|_| Errno::Enomem)?;
+    children.push((stored_name, Arc::clone(&child)));
+    Ok(Some(child))
 }
 
 fn remove_child(parent: &Arc<Node>, name: &str, remove_dir: bool) -> Result<Arc<Node>, Errno> {
@@ -1238,9 +1424,13 @@ fn remove_child(parent: &Arc<Node>, name: &str, remove_dir: bool) -> Result<Arc<
 fn remove_child_unchecked(parent: &Arc<Node>, name: &str) -> Result<Arc<Node>, Errno> {
     validate_component(name)?;
     let mut state = parent.state.lock();
-    let NodeState::Directory(children) = &mut *state else {
-        return Err(Errno::Enotdir);
-    };
+    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+        if !whiteouts.iter().any(|hidden| hidden == name) {
+            whiteouts.try_reserve(1).map_err(|_| Errno::Enomem)?;
+            whiteouts.push(clone_component(name)?);
+        }
+    }
+    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     let index = children
         .iter()
         .position(|(child_name, _)| child_name == name)
@@ -1252,9 +1442,14 @@ fn rename_inside_parent(parent: &Arc<Node>, old_name: &str, new_name: String) ->
     validate_component(old_name)?;
     validate_component(&new_name)?;
     let mut state = parent.state.lock();
-    let NodeState::Directory(children) = &mut *state else {
-        return Err(Errno::Enotdir);
-    };
+    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+        if !whiteouts.iter().any(|hidden| hidden == old_name) {
+            whiteouts.try_reserve(1).map_err(|_| Errno::Enomem)?;
+            whiteouts.push(clone_component(old_name)?);
+        }
+        whiteouts.retain(|hidden| hidden != &new_name);
+    }
+    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     if old_name == new_name {
         return Ok(());
     }
@@ -1291,10 +1486,9 @@ fn validate_rename_target(source: &Arc<Node>, target: Option<&Arc<Node>>) -> Res
 }
 
 fn ensure_empty_directory(node: &Arc<Node>) -> Result<(), Errno> {
+    populate_ext4_directory(node)?;
     let state = node.state.lock();
-    let NodeState::Directory(children) = &*state else {
-        return Err(Errno::Enotdir);
-    };
+    let children = directory_children(&state).ok_or(Errno::Enotdir)?;
     if children.is_empty() {
         Ok(())
     } else {
@@ -1419,34 +1613,68 @@ struct RegularFile {
 impl FileOperations for RegularFile {
     fn read(&self, file: &File, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         file.with_position(|position| {
-            let state = self.node.state.lock();
-            match &*state {
-                NodeState::Regular(data) => {
-                    let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
-                    if start >= data.len() {
-                        return Ok(0);
+            let backing = {
+                let state = self.node.state.lock();
+                match &*state {
+                    NodeState::Regular(data) => {
+                        let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
+                        if start >= data.len() {
+                            return Ok(0);
+                        }
+                        let count = buf.push(&data[start..]);
+                        *position = (*position)
+                            .checked_add(count as u64)
+                            .ok_or(Errno::Eoverflow)?;
+                        return Ok(count);
                     }
-                    let count = buf.push(&data[start..]);
-                    *position = (*position)
-                        .checked_add(count as u64)
-                        .ok_or(Errno::Eoverflow)?;
-                    Ok(count)
-                }
-                NodeState::ProcFile(generator) => {
-                    // 每次 read 生成内容（简化实现：忽略位置，完整返回）
-                    let data = generator.generate()?;
-                    if *position >= data.len() as u64 {
-                        return Ok(0);
+                    NodeState::Ext4Regular {
+                        overlay: Some(data),
+                        ..
+                    } => {
+                        let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
+                        if start >= data.len() {
+                            return Ok(0);
+                        }
+                        let count = buf.push(&data[start..]);
+                        *position = (*position)
+                            .checked_add(count as u64)
+                            .ok_or(Errno::Eoverflow)?;
+                        return Ok(count);
                     }
-                    let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
-                    let count = buf.push(&data[start..]);
-                    *position = (*position)
-                        .checked_add(count as u64)
-                        .ok_or(Errno::Eoverflow)?;
-                    Ok(count)
+                    NodeState::Ext4Regular {
+                        fs,
+                        ino,
+                        size,
+                        overlay: None,
+                    } => (Arc::clone(fs), *ino, *size),
+                    NodeState::ProcFile(generator) => {
+                        // 每次 read 生成内容（简化实现：忽略位置，完整返回）
+                        let data = generator.generate()?;
+                        if *position >= data.len() as u64 {
+                            return Ok(0);
+                        }
+                        let start = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
+                        let count = buf.push(&data[start..]);
+                        *position = (*position)
+                            .checked_add(count as u64)
+                            .ok_or(Errno::Eoverflow)?;
+                        return Ok(count);
+                    }
+                    _ => return Err(Errno::Einval),
                 }
-                _ => Err(Errno::Einval),
+            };
+            let (fs, ino, size) = backing;
+            if *position >= size {
+                return Ok(0);
             }
+            let count = usize::try_from((size - *position).min(buf.remaining() as u64))
+                .map_err(|_| Errno::Eoverflow)?;
+            let read = fs
+                .read_inode_at(ino, *position, &mut buf.unfilled_mut()[..count])
+                .map_err(ext4_errno)?;
+            buf.advance(read)?;
+            *position = position.checked_add(read as u64).ok_or(Errno::Eoverflow)?;
+            Ok(read)
         })
     }
 
@@ -1460,9 +1688,7 @@ impl FileOperations for RegularFile {
         }
         file.with_position(|position| {
             let mut state = self.node.state.lock();
-            let NodeState::Regular(data) = &mut *state else {
-                return Err(Errno::Einval);
-            };
+            let data = regular_overlay_mut(&mut *state)?;
             if file.flags().contains(OpenFlags::O_APPEND) {
                 *position = data.len() as u64;
             }
@@ -1484,6 +1710,15 @@ impl FileOperations for RegularFile {
             let state = self.node.state.lock();
             match &*state {
                 NodeState::Regular(data) => data.len() as u64,
+                NodeState::Ext4Regular {
+                    size,
+                    overlay: None,
+                    ..
+                } => *size,
+                NodeState::Ext4Regular {
+                    overlay: Some(data),
+                    ..
+                } => data.len() as u64,
                 NodeState::ProcFile(generator) => {
                     generator.generate().map(|d| d.len() as u64).unwrap_or(0)
                 }
@@ -1523,12 +1758,11 @@ impl FileOperations for DirectoryFile {
     }
 
     fn readdir(&self, file: &File, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
+        populate_ext4_directory(&self.node)?;
         file.with_position(|position| {
             let mut index = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
             let state = self.node.state.lock();
-            let NodeState::Directory(children) = &*state else {
-                return Err(Errno::Enotdir);
-            };
+            let children = directory_children(&state).ok_or(Errno::Enotdir)?;
             let start_len = buf.len();
             while index < children.len() + 2 {
                 let (ino, file_type, name) = match index {
@@ -1543,15 +1777,12 @@ impl FileOperations for DirectoryFile {
                         (child.ino, child.mode.file_type(), name.as_str())
                     }
                 };
-                let emitted = emit_dirent64(
-                    buf,
-                    DirEntry {
-                        ino,
-                        offset: (index + 1) as i64,
-                        file_type,
-                        name,
-                    },
-                )?;
+                let emitted = emit_dirent64(buf, DirEntry {
+                    ino,
+                    offset: (index + 1) as i64,
+                    file_type,
+                    name,
+                })?;
                 if !emitted {
                     break;
                 }
@@ -1616,10 +1847,11 @@ impl FileOperations for DeviceFile {
 
     fn write(&self, _file: &File, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
         match self.kind {
-            DeviceKind::Null | DeviceKind::Zero | DeviceKind::Random | DeviceKind::Urandom
-            | DeviceKind::Rtc => {
-                Ok(buf.len())
-            }
+            DeviceKind::Null
+            | DeviceKind::Zero
+            | DeviceKind::Random
+            | DeviceKind::Urandom
+            | DeviceKind::Rtc => Ok(buf.len()),
             DeviceKind::Console => Ok(crate::tty::write_console(buf.as_bytes())),
             // Ptmx handled before DeviceFile creation
             _ => Ok(buf.len()),
@@ -1656,7 +1888,10 @@ impl FileOperations for DeviceFile {
                 }
                 ready.intersect(requested)
             }
-            DeviceKind::Null | DeviceKind::Zero | DeviceKind::Random | DeviceKind::Urandom
+            DeviceKind::Null
+            | DeviceKind::Zero
+            | DeviceKind::Random
+            | DeviceKind::Urandom
             | DeviceKind::Rtc => {
                 let mut ready = PollEvents::empty();
                 if file.flags().access_mode().is_readable() {
@@ -1784,12 +2019,20 @@ fn stat_for_node(node: &Arc<Node>) -> Result<Stat, Errno> {
     stat.size = match &*state {
         NodeState::Directory(children) => children.len() as i64,
         NodeState::Regular(data) => data.len() as i64,
+        NodeState::Ext4Directory { children, .. } => children.len() as i64,
+        NodeState::Ext4Regular {
+            size,
+            overlay: None,
+            ..
+        } => i64::try_from(*size).map_err(|_| Errno::Eoverflow)?,
+        NodeState::Ext4Regular {
+            overlay: Some(data),
+            ..
+        } => data.len() as i64,
         NodeState::Symlink(target) => target.len() as i64,
         NodeState::Device(_) => 0,
         NodeState::BlockDevice { device, .. } => device.size_bytes().unwrap_or(0) as i64,
-        NodeState::ProcFile(generator) => {
-            generator.generate().map(|d| d.len() as i64).unwrap_or(0)
-        }
+        NodeState::ProcFile(generator) => generator.generate().map(|d| d.len() as i64).unwrap_or(0),
     };
     stat.nlink = node.nlink.load(Ordering::Acquire) as u32;
     stat.blocks = (stat.size.saturating_add(511)) / 512;

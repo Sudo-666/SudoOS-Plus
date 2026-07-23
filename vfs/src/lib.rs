@@ -4,7 +4,10 @@
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc};
-use core::array;
+use core::{
+    array,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 use myos_sync::SpinLock;
 
@@ -14,6 +17,7 @@ pub enum Errno {
     Eperm = 1,
     Enoent = 2,
     Esrch = 3,
+    Eintr = 4,
     Eio = 5,
     Ebadf = 9,
     Echild = 10,
@@ -149,6 +153,7 @@ impl FileMode {
     pub const S_IFMT: u32 = 0o170000;
     pub const S_IFREG: u32 = 0o100000;
     pub const S_IFDIR: u32 = 0o040000;
+    pub const S_IFIFO: u32 = 0o010000;
     pub const S_IFCHR: u32 = 0o020000;
     pub const S_IFBLK: u32 = 0o060000;
     pub const S_IFLNK: u32 = 0o120000;
@@ -349,6 +354,18 @@ impl<'a> MutableIoBuffer<'a> {
         count
     }
 
+    pub fn unfilled_mut(&mut self) -> &mut [u8] {
+        &mut self.data[self.filled..]
+    }
+
+    pub fn advance(&mut self, count: usize) -> Result<(), Errno> {
+        if count > self.remaining() {
+            return Err(Errno::Einval);
+        }
+        self.filled += count;
+        Ok(())
+    }
+
     pub const fn len(&self) -> usize {
         self.filled
     }
@@ -454,6 +471,8 @@ pub trait FileOperations: Send + Sync + 'static {
     }
 
     fn release(&self, _file: &File) {}
+
+    fn process_exit(&self, _file: &File) {}
 }
 
 struct FileState {
@@ -461,7 +480,7 @@ struct FileState {
 }
 
 pub struct File {
-    flags: OpenFlags,
+    flags: AtomicU32,
     path: Option<String>,
     ops: Arc<dyn FileOperations>,
     state: SpinLock<FileState>,
@@ -472,7 +491,7 @@ pub type ArcFile = Arc<File>;
 impl File {
     pub fn new(flags: OpenFlags, ops: Arc<dyn FileOperations>) -> ArcFile {
         Arc::new(Self {
-            flags,
+            flags: AtomicU32::new(flags.bits()),
             path: None,
             ops,
             state: SpinLock::new(FileState { position: 0 }),
@@ -481,15 +500,32 @@ impl File {
 
     pub fn new_with_path(flags: OpenFlags, path: String, ops: Arc<dyn FileOperations>) -> ArcFile {
         Arc::new(Self {
-            flags,
+            flags: AtomicU32::new(flags.bits()),
             path: Some(path),
             ops,
             state: SpinLock::new(FileState { position: 0 }),
         })
     }
 
-    pub const fn flags(&self) -> OpenFlags {
-        self.flags
+    pub fn flags(&self) -> OpenFlags {
+        OpenFlags::from_bits(self.flags.load(Ordering::Acquire))
+    }
+
+    pub fn set_status_flags(&self, flags: OpenFlags) {
+        let mask = OpenFlags::O_APPEND.bits() | OpenFlags::O_NONBLOCK.bits();
+        let mut current = self.flags.load(Ordering::Acquire);
+        loop {
+            let updated = (current & !mask) | (flags.bits() & mask);
+            match self.flags.compare_exchange_weak(
+                current,
+                updated,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn path(&self) -> Option<&str> {
@@ -497,14 +533,14 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
-        if !self.flags.access_mode().is_readable() {
+        if !self.flags().access_mode().is_readable() {
             return Err(Errno::Ebadf);
         }
         self.ops.read(self, buf)
     }
 
     pub fn write(&self, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
-        if !self.flags.access_mode().is_writable() {
+        if !self.flags().access_mode().is_writable() {
             return Err(Errno::Ebadf);
         }
         self.ops.write(self, buf)
@@ -519,7 +555,7 @@ impl File {
     }
 
     pub fn truncate(&self, length: u64) -> Result<(), Errno> {
-        if !self.flags.access_mode().is_writable() {
+        if !self.flags().access_mode().is_writable() {
             return Err(Errno::Ebadf);
         }
         self.ops.truncate(self, length)
@@ -539,6 +575,10 @@ impl File {
 
     pub fn sync(&self) -> Result<(), Errno> {
         self.ops.sync(self)
+    }
+
+    pub fn process_exit(&self) {
+        self.ops.process_exit(self);
     }
 
     pub fn position(&self) -> u64 {
@@ -742,6 +782,14 @@ impl<const MAX_FDS: usize> FileTable<MAX_FDS> {
         }
     }
 
+    pub fn take_all(&mut self, output: &mut alloc::vec::Vec<ArcFile>) {
+        for slot in &mut self.slots {
+            if let Some(descriptor) = slot.take() {
+                output.push(descriptor.file);
+            }
+        }
+    }
+
     pub fn fork_clone(&self) -> Self {
         Self {
             slots: array::from_fn(|index| {
@@ -893,15 +941,12 @@ mod tests {
         let mut bytes = [0_u8; 64];
         let mut buffer = MutableIoBuffer::new(&mut bytes);
         assert!(
-            emit_dirent64(
-                &mut buffer,
-                DirEntry {
-                    ino: 7,
-                    offset: 1,
-                    file_type: FileType::Regular,
-                    name: "name",
-                },
-            )
+            emit_dirent64(&mut buffer, DirEntry {
+                ino: 7,
+                offset: 1,
+                file_type: FileType::Regular,
+                name: "name",
+            },)
             .unwrap()
         );
         assert_eq!(buffer.filled_bytes()[0..8], 7_u64.to_ne_bytes());
@@ -915,15 +960,12 @@ mod tests {
         let mut tiny = [0_u8; 8];
         let mut tiny_buffer = MutableIoBuffer::new(&mut tiny);
         assert_eq!(
-            emit_dirent64(
-                &mut tiny_buffer,
-                DirEntry {
-                    ino: 1,
-                    offset: 1,
-                    file_type: FileType::Directory,
-                    name: ".",
-                },
-            ),
+            emit_dirent64(&mut tiny_buffer, DirEntry {
+                ino: 1,
+                offset: 1,
+                file_type: FileType::Directory,
+                name: ".",
+            },),
             Err(Errno::Einval),
         );
     }

@@ -77,7 +77,6 @@ pub fn install(allocator: BuddyAllocator) -> Result<(), GlobalPageAllocatorError
     Ok(())
 }
 
-
 /// Install the global page allocator during the single-CPU boot handoff.
 ///
 /// # Safety
