@@ -630,43 +630,37 @@ mod tests {
         });
 
         socket.connect(host_address, guest_port).unwrap();
-        assert_eq!(
-            socket.wait_for_event().unwrap(),
-            VsockEvent {
-                source: host_address,
-                destination: VsockAddr {
-                    cid: guest_cid,
-                    port: guest_port,
-                },
-                event_type: VsockEventType::Connected,
-                buffer_status: VsockBufferStatus {
-                    buffer_allocation: 50,
-                    forward_count: 0,
-                },
-            }
-        );
+        assert_eq!(socket.wait_for_event().unwrap(), VsockEvent {
+            source: host_address,
+            destination: VsockAddr {
+                cid: guest_cid,
+                port: guest_port,
+            },
+            event_type: VsockEventType::Connected,
+            buffer_status: VsockBufferStatus {
+                buffer_allocation: 50,
+                forward_count: 0,
+            },
+        });
         println!("Guest sending");
         socket
             .send(host_address, guest_port, "Hello from guest".as_bytes())
             .unwrap();
         println!("Guest waiting to receive.");
-        assert_eq!(
-            socket.wait_for_event().unwrap(),
-            VsockEvent {
-                source: host_address,
-                destination: VsockAddr {
-                    cid: guest_cid,
-                    port: guest_port,
-                },
-                event_type: VsockEventType::Received {
-                    length: hello_from_host.len()
-                },
-                buffer_status: VsockBufferStatus {
-                    buffer_allocation: 50,
-                    forward_count: hello_from_guest.len() as u32,
-                },
-            }
-        );
+        assert_eq!(socket.wait_for_event().unwrap(), VsockEvent {
+            source: host_address,
+            destination: VsockAddr {
+                cid: guest_cid,
+                port: guest_port,
+            },
+            event_type: VsockEventType::Received {
+                length: hello_from_host.len()
+            },
+            buffer_status: VsockBufferStatus {
+                buffer_allocation: 50,
+                forward_count: hello_from_guest.len() as u32,
+            },
+        });
         println!("Guest getting received data.");
         let mut buffer = [0u8; 64];
         assert_eq!(
@@ -815,21 +809,18 @@ mod tests {
 
         // Expect an incoming connection.
         println!("Guest expecting incoming connection.");
-        assert_eq!(
-            socket.wait_for_event().unwrap(),
-            VsockEvent {
-                source: host_address,
-                destination: VsockAddr {
-                    cid: guest_cid,
-                    port: guest_port,
-                },
-                event_type: VsockEventType::ConnectionRequest,
-                buffer_status: VsockBufferStatus {
-                    buffer_allocation: 50,
-                    forward_count: 0,
-                },
-            }
-        );
+        assert_eq!(socket.wait_for_event().unwrap(), VsockEvent {
+            source: host_address,
+            destination: VsockAddr {
+                cid: guest_cid,
+                port: guest_port,
+            },
+            event_type: VsockEventType::ConnectionRequest,
+            buffer_status: VsockBufferStatus {
+                buffer_allocation: 50,
+                forward_count: 0,
+            },
+        });
 
         handle.join().unwrap();
     }

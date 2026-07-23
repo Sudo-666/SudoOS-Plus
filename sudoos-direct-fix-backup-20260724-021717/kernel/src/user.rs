@@ -264,8 +264,6 @@ static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(8000);
 // ── P9-H14: LoongArch FPD fixup counter ──
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_FPD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(target_arch = "loongarch64")]
-static OSCOMP_LA_REAL_EXCEPTION_LOGS: AtomicUsize = AtomicUsize::new(0); // SUDOOS_FINAL_DIRECT_FIX_V1
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
@@ -5421,20 +5419,17 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         // Kernel-mode FPD is a bug — fall through to the assertion below.
     }
 
-    // SUDOOS_FINAL_DIRECT_FIX_V1: bounded telemetry from the real LoongArch trap frame.
+    // ── P9-H13: trace LA user exception ──
     #[cfg(target_arch = "loongarch64")]
-    {
-        let index = OSCOMP_LA_REAL_EXCEPTION_LOGS.fetch_add(1, Ordering::Relaxed);
-        if index < 32 {
-            crate::println!(
-                "oscomp-la-user-exception: index={} code={} era={:#x} sp={:#x} last_syscall={}",
-                index,
-                _code,
-                frame.era,
-                frame.stack_pointer(),
-                LAST_TRACED_SYSCALL_NR.load(Ordering::Relaxed),
-            );
-        }
+    if oscomp_la_sleep_trace_active() {
+        let era = frame.era;
+        let sp = frame.stack_pointer();
+        crate::println!(
+            "oscomp-la-exception-trace: code={} era={:#x} sp={:#x}",
+            _code,
+            era,
+            sp,
+        );
     }
 
     if ACTIVE.load(Ordering::Acquire) {
@@ -6697,8 +6692,8 @@ fn sys_clone3(
 }
 
 fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
-    let thread =
-        crate::task::current_user_thread().expect("execve arrived without a current user Thread");
+    let thread = crate::task::current_user_thread()
+        .expect("execve arrived without a current user Thread");
     let exec_stack = thread.user_stack();
     let raw_path = match copy_user_c_string(arguments[0]) {
         Ok(path) => path,
@@ -8164,18 +8159,12 @@ static FUTEX_QUEUES: crate::irq_lock::IrqSpinLock<
     alloc::collections::BTreeMap::new(),
     crate::lockdep::LockClass::new("futex.queues", crate::lockdep::LockRank::WaitQueue, 5),
 );
-// SUDOOS_FINAL_DIRECT_FIX_V1: futex keys used during thread teardown must come from the
-// exiting thread's actual MM, not from scheduler-current state.
-fn futex_key_for_mm(mm: &crate::user_mm::UserMm, uaddr: usize) -> (usize, usize) {
-    (mm.asid().id().get() as usize, uaddr)
-}
-
 fn futex_key(uaddr: usize) -> (usize, usize) {
-    let mm = current_user_mm();
-    futex_key_for_mm(mm.as_ref(), uaddr)
+    (current_user_mm().asid().id().get() as usize, uaddr)
 }
 
-fn get_futex_queue_by_key(key: (usize, usize)) -> alloc::sync::Arc<FutexQueue> {
+fn get_futex_queue(uaddr: usize) -> alloc::sync::Arc<FutexQueue> {
+    let key = futex_key(uaddr);
     let mut queues = FUTEX_QUEUES.lock();
     if let Some(q) = queues.get(&key) {
         alloc::sync::Arc::clone(q)
@@ -8184,17 +8173,6 @@ fn get_futex_queue_by_key(key: (usize, usize)) -> alloc::sync::Arc<FutexQueue> {
         queues.insert(key, alloc::sync::Arc::clone(&q));
         q
     }
-}
-
-fn get_futex_queue_for_mm(
-    mm: &crate::user_mm::UserMm,
-    uaddr: usize,
-) -> alloc::sync::Arc<FutexQueue> {
-    get_futex_queue_by_key(futex_key_for_mm(mm, uaddr))
-}
-
-fn get_futex_queue(uaddr: usize) -> alloc::sync::Arc<FutexQueue> {
-    get_futex_queue_by_key(futex_key(uaddr))
 }
 
 fn sys_futex(
@@ -8277,16 +8255,9 @@ pub(crate) fn clear_child_tid_on_exit(thread: &crate::process::Thread) {
     if ctid == 0 {
         return;
     }
-
-    // SUDOOS_FINAL_DIRECT_FIX_V1: current_user_thread() may already be detached here.
-    // Use the exiting Thread's real Process/MM for both uaccess and futex wake.
-    let mm = thread.process().mm();
     let zero: u32 = 0;
-    let _ = mm.copy_to_user(ctid, &zero.to_ne_bytes());
-
-    let queue = get_futex_queue_for_mm(mm, ctid);
-    queue.wake_sequence.fetch_add(1, Ordering::AcqRel);
-    let _ = queue.waiters.wake_one();
+    let _ = copy_to_user(ctid, &zero.to_ne_bytes());
+    let _ = sys_futex(ctid, FUTEX_WAKE, 1, 0, 0, 0);
 }
 
 pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {

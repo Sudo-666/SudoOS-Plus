@@ -533,10 +533,9 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
                     // SAFETY: The buffers being added to the queue are non-empty and are not
                     // accessed before the corresponding call to `pop_used`.
                     tokens[head] = unsafe {
-                        self.tx_queue.add(
-                            &[&stream_id_bytes, buffer],
-                            &mut [statuses[head].as_mut_bytes()],
-                        )?
+                        self.tx_queue.add(&[&stream_id_bytes, buffer], &mut [
+                            statuses[head].as_mut_bytes()
+                        ])?
                     };
                     if self.tx_queue.should_notify() {
                         self.transport.notify(TX_QUEUE_IDX);
@@ -620,11 +619,12 @@ impl<H: Hal, T: Transport> VirtIOSound<H, T> {
         // SAFETY: The buffers passed into `pop_used` are the same buffers from a previous call
         // to `add` that returned `token`.
         unsafe {
-            self.tx_queue.pop_used(
-                token,
-                &[&self.token_buf[&token]],
-                &mut [self.token_rsp.get_mut(&token).unwrap().as_mut_bytes()],
-            )?;
+            self.tx_queue
+                .pop_used(token, &[&self.token_buf[&token]], &mut [self
+                    .token_rsp
+                    .get_mut(&token)
+                    .unwrap()
+                    .as_mut_bytes()])?;
         }
 
         self.token_buf.remove(&token);

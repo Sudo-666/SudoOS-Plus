@@ -456,13 +456,10 @@ impl BarInfo {
     /// Returns whether this BAR is a 64-bit memory region, and so takes two entries in the table in
     /// configuration space.
     pub fn takes_two_entries(&self) -> bool {
-        matches!(
-            self,
-            BarInfo::Memory {
-                address_type: MemoryBarType::Width64,
-                ..
-            }
-        )
+        matches!(self, BarInfo::Memory {
+            address_type: MemoryBarType::Width64,
+            ..
+        })
     }
 
     /// Returns the address and size of this BAR if it is a memory bar, or `None` if it is an IO
@@ -615,18 +612,15 @@ impl<C: ConfigurationAccess> Iterator for BusDeviceIterator<C> {
                 let revision = class_revision as u8;
                 let bist_type_latency_cache = self.configuration_access.read_word(current, 12);
                 let header_type = HeaderType::from((bist_type_latency_cache >> 16) as u8 & 0x7f);
-                return Some((
-                    current,
-                    DeviceFunctionInfo {
-                        vendor_id,
-                        device_id,
-                        class,
-                        subclass,
-                        prog_if,
-                        revision,
-                        header_type,
-                    },
-                ));
+                return Some((current, DeviceFunctionInfo {
+                    vendor_id,
+                    device_id,
+                    class,
+                    subclass,
+                    prog_if,
+                    revision,
+                    header_type,
+                }));
             }
         }
         None
@@ -766,25 +760,22 @@ mod tests {
         let fake_cam_orig = fake_cam.clone();
         let mut root = PciRoot::new(fake_cam);
 
-        assert_eq!(
-            root.bars(device_function).unwrap(),
-            [
-                None,
-                Some(BarInfo::IO {
-                    address: 0,
-                    size: 0,
-                }),
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width64,
-                    prefetchable: false,
-                    address: 0,
-                    size: 0,
-                }),
-                None,
-                None,
-                None,
-            ]
-        );
+        assert_eq!(root.bars(device_function).unwrap(), [
+            None,
+            Some(BarInfo::IO {
+                address: 0,
+                size: 0,
+            }),
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width64,
+                prefetchable: false,
+                address: 0,
+                size: 0,
+            }),
+            None,
+            None,
+            None,
+        ]);
 
         // Status and command should be restored to their initial values, as should BAR values.
         assert_eq!(root.configuration_access, fake_cam_orig);
@@ -807,45 +798,42 @@ mod tests {
         let fake_cam_orig = fake_cam.clone();
         let mut root = PciRoot::new(fake_cam);
 
-        assert_eq!(
-            root.bars(device_function).unwrap(),
-            [
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width32,
-                    prefetchable: false,
-                    address: 0,
-                    size: 64,
-                }),
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Below1MiB,
-                    prefetchable: false,
-                    address: 0,
-                    size: 32,
-                }),
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width32,
-                    prefetchable: true,
-                    address: 0,
-                    size: 128,
-                }),
-                Some(BarInfo::IO {
-                    address: 0,
-                    size: 8,
-                }),
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width32,
-                    prefetchable: false,
-                    address: 0,
-                    size: 1024,
-                }),
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width32,
-                    prefetchable: false,
-                    address: 0,
-                    size: 256,
-                }),
-            ]
-        );
+        assert_eq!(root.bars(device_function).unwrap(), [
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width32,
+                prefetchable: false,
+                address: 0,
+                size: 64,
+            }),
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Below1MiB,
+                prefetchable: false,
+                address: 0,
+                size: 32,
+            }),
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width32,
+                prefetchable: true,
+                address: 0,
+                size: 128,
+            }),
+            Some(BarInfo::IO {
+                address: 0,
+                size: 8,
+            }),
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width32,
+                prefetchable: false,
+                address: 0,
+                size: 1024,
+            }),
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width32,
+                prefetchable: false,
+                address: 0,
+                size: 256,
+            }),
+        ]);
 
         // Status and command should be restored to their initial values, as should BAR values.
         assert_eq!(root.configuration_access, fake_cam_orig);
@@ -868,32 +856,29 @@ mod tests {
         let fake_cam_orig = fake_cam.clone();
         let mut root = PciRoot::new(fake_cam);
 
-        assert_eq!(
-            root.bars(device_function).unwrap(),
-            [
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width64,
-                    prefetchable: false,
-                    address: 0,
-                    size: 128,
-                }),
-                None,
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width64,
-                    prefetchable: false,
-                    address: 0,
-                    size: 0x400000000,
-                }),
-                None,
-                Some(BarInfo::Memory {
-                    address_type: MemoryBarType::Width64,
-                    prefetchable: true,
-                    address: 0,
-                    size: 256,
-                }),
-                None,
-            ]
-        );
+        assert_eq!(root.bars(device_function).unwrap(), [
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width64,
+                prefetchable: false,
+                address: 0,
+                size: 128,
+            }),
+            None,
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width64,
+                prefetchable: false,
+                address: 0,
+                size: 0x400000000,
+            }),
+            None,
+            Some(BarInfo::Memory {
+                address_type: MemoryBarType::Width64,
+                prefetchable: true,
+                address: 0,
+                size: 256,
+            }),
+            None,
+        ]);
 
         // Status and command should be restored to their initial values, as should BAR values.
         assert_eq!(root.configuration_access, fake_cam_orig);

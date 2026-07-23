@@ -343,8 +343,9 @@ fn copy_to_user(address: usize, bytes: &[u8]) -> Result<(), Errno> {
 }
 
 fn write_output(bytes: &[u8]) {
-    // SUDOOS_FINAL_DIRECT_FIX_V1: the bytes still come from the real guest process.
-    crate::console::write_bytes(bytes);
+    for byte in bytes {
+        crate::arch::early_console::write_byte(*byte);
+    }
 }
 
 fn wake_readers() {
