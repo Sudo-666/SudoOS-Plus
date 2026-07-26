@@ -2346,43 +2346,33 @@ fn exit_current() -> ! {
     crate::context::assert_interrupts_enabled();
 
     let _interrupt_guard = crate::context::IrqSaveGuard::new();
-    let reported_cpu = crate::smp::current_cpu_id();
     let running_sp = crate::arch::task::current_stack_pointer();
+    // P0: always determine the actual CPU from the exiting task's kernel
+    // stack instead of trusting `current_cpu_id()`.  On RISC-V the `tp`
+    // register can become stale when a task is preempted between building
+    // the sscratch anchor and executing `sret` after migration — the anchor
+    // caches the source CPU's tp, and the next user→kernel transition
+    // loads that stale value.
     let actual_cpu = {
         let slot = SCHEDULER.lock();
         let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        let reported_task = scheduler.current(reported_cpu);
-        if scheduler.task(reported_task).stack_contains(running_sp) {
-            reported_cpu
-        } else {
-            let mut owner = None;
-            for index in 0..scheduler.discovered_cpus {
-                let candidate = CpuId::new(index).expect("scheduler CPU index is invalid");
-                let task = scheduler.current(candidate);
-                if scheduler.task(task).stack_contains(running_sp) {
-                    assert!(owner.is_none(), "kernel stack is current on multiple CPUs");
-                    owner = Some(candidate);
-                }
+        let mut owner = None;
+        for index in 0..scheduler.discovered_cpus {
+            let candidate = CpuId::new(index).expect("scheduler CPU index is invalid");
+            let task = scheduler.current(candidate);
+            if scheduler.task(task).stack_contains(running_sp) {
+                assert!(owner.is_none(), "kernel stack is current on multiple CPUs");
+                owner = Some(candidate);
             }
-            let actual_cpu = owner.unwrap_or_else(|| {
-                panic!(
-                    "exiting task stack has no scheduler owner: reported_cpu={} task={:?} sp={running_sp:#x}",
-                    reported_cpu.get(),
-                    reported_task,
-                )
-            });
-            actual_cpu
         }
+        owner.unwrap_or_else(|| {
+            panic!(
+                "exiting task stack has no scheduler owner: sp={running_sp:#x}",
+            )
+        })
     };
-    if actual_cpu != reported_cpu {
-        crate::arch::smp::set_current_cpu_id(actual_cpu.get());
-        crate::println!(
-            "scheduler: repaired stale CPU identity on exit reported={} actual={} sp={:#x}",
-            reported_cpu.get(),
-            actual_cpu.get(),
-            running_sp,
-        );
-    }
+    // Always repair tp — it may have been corrupted by a stale anchor.
+    crate::arch::smp::set_current_cpu_id(actual_cpu.get());
     let (previous, next) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
