@@ -42,7 +42,7 @@
 .equ TEMP_KERNEL_LARGE_PAGES, 32
 
 /* Official final configuration exposes 8 GiB at PA 0x80000000. */
-.equ TEMP_DIRECT_MAP_GIB_PAGES, 8
+.equ TEMP_DIRECT_MAP_GIB_PAGES, 24
 
 _start:
     /*
