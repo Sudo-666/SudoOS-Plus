@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{Ordering, fence},
 };
 
-pub const MAX_CPUS: usize = 8;
+pub const MAX_CPUS: usize = 16;
 const BOOT_STACK_SIZE: usize = 64 * 1024;
 const HARDWARE_CPU_ID_LIMIT: usize = 1 << 10;
 
