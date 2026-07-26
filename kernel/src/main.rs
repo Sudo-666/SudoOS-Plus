@@ -792,6 +792,18 @@ fn oscomp_materialize_ext4_dir_flat(ext4_dir: &str, vfs_dir: &str, max_files: us
             oscomp_sdcard_ensure_parent_dirs(&vfs_child);
             let _ = fs::mkdir(&vfs_child, 0o755);
             already_available += 1;
+            // P1: recurse into subdirectories so deeply nested toolchain
+            // sysroots (e.g. rustlib/riscv64gc-unknown-linux-gnu/lib/)
+            // are fully materialised before rustc looks for libstd-*.rlib.
+            // Skip source/docs/CI directories to avoid expanding the
+            // entire rustlib/src/ and cargo registry source trees.
+            let skip = matches!(
+                entry.name.as_str(),
+                "src" | "examples" | "tests" | "benches" | "ci" | "docker" | ".github"
+            );
+            if !skip {
+                oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files);
+            }
             continue;
         }
 
