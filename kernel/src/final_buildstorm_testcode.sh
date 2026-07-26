@@ -18,7 +18,8 @@ mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
 
 export PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
-export HOME=/root RUSTUP_HOME=/root/.rustup CARGO_HOME=/root/.cargo
+export HOME=/root RUSTUP_HOME=/root/.rustup
+export CARGO_HOME=${CARGO_HOME:-/root/.cargo}
 export RUSTUP_TOOLCHAIN=nightly-2026-05-28
 export CARGO_NET_OFFLINE=true
 
