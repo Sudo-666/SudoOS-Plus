@@ -2246,6 +2246,14 @@ fn verify_final_buildstorm_thread() {
     for (path, mode) in &[("/dev", 0o755), ("/proc", 0o755), ("/sys", 0o755)] {
         let _ = crate::fs::mkdir(path, *mode);
     }
+    // P1: Cargo needs writable cache but the ext4 overlay is read-only.
+    // If /tmp was symlinked to ext4 above, replace it with tmpfs.
+    if crate::fs::stat("/tmp").map_or(false, |s| {
+        s.mode & myos_vfs::FileMode::S_IFMT == myos_vfs::FileMode::S_IFLNK
+    }) {
+        let _ = crate::fs::unlink("/tmp", false);
+        let _ = crate::fs::mkdir("/tmp", 0o1777);
+    }
 
     let script = "/tmp/buildstorm_testcode.official.sh";
     if let Err(error) =
@@ -2265,6 +2273,7 @@ fn verify_final_buildstorm_thread() {
         "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
         "HOME=/root",
         "TERM=dumb",
+        "CARGO_HOME=/tmp/cargo-cache",
     ];
     crate::println!("sudoos-diag: final-buildstorm: diagnostic minibuild begin");
     let diagnostic = "rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; echo BUILDSTORM_DIAG_NEW_RC=$?; cd /tmp/minibuild-diag || exit 97; cargo build; echo BUILDSTORM_DIAG_BUILD_RC=$?; /tmp/minibuild-diag/target/debug/minibuild; echo BUILDSTORM_DIAG_RUN_RC=$?";
