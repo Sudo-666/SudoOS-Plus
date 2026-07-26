@@ -195,6 +195,12 @@ fn kernel_main(boot: BootInfo) -> ! {
             );
         });
     println!("BOOT00b fdt-mapped");
+    // Force a read to fill the TLB and verify the direct map covers this PA.
+    let fdt_magic: u32 = unsafe { core::ptr::read_volatile(fdt_pointer as *const u32) };
+    println!(
+        "BOOT00b1 fdt-magic={:#010x} (expected 0xd00dfeed)",
+        u32::from_be(fdt_magic),
+    );
 
     let (
         memory_layout,
