@@ -183,13 +183,8 @@ fn kernel_main(boot: BootInfo) -> ! {
         .device_tree()
         .expect("a device tree is required at this stage")
         .get();
+    println!("BOOT00a fdt-addr={:#x}", fdt_address);
 
-    /*
-     * SAFETY:
-     *
-     * FDT 地址来自受信任的架构启动协议。
-     * 当前尚未启用正式分页。
-     */
     let fdt_physical = myos_mm::PhysAddr::new(fdt_address);
 
     let fdt_pointer =
@@ -199,6 +194,7 @@ fn kernel_main(boot: BootInfo) -> ! {
              {fdt_address:#x}: {error:?}",
             );
         });
+    println!("BOOT00b fdt-mapped");
 
     let (
         memory_layout,
@@ -208,13 +204,13 @@ fn kernel_main(boot: BootInfo) -> ! {
         initrd_range,
         explicit_oscomp_mode,
     ) = {
-        // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
                 "failed to validate FDT at \
              {fdt_address:#x}: {error}",
             );
         });
+        println!("BOOT00c blob-ok");
 
         let tree = DeviceTree::from_blob(&blob).unwrap_or_else(|error| {
             panic!(
@@ -222,17 +218,21 @@ fn kernel_main(boot: BootInfo) -> ! {
                          {fdt_address:#x}: {error}",
             );
         });
+        println!("BOOT00d dt-ok");
 
         inspect_device_tree(&boot, &blob, &tree);
+        println!("BOOT00e inspect-done");
         let virtio_regions = collect_virtio_mmio_regions(&tree);
         let pci_hosts = collect_pci_host_bridges(&tree);
         smp::initialize(&tree, boot_hardware_cpu_id(&boot));
+        println!("BOOT00f smp-ok");
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
         let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs());
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
+        println!("BOOT00g initrd-ok");
         let memory_layout = memory::build_boot_memory_layout(fdt_address, &blob, &tree)
             .unwrap_or_else(|error| {
                 panic!(
@@ -240,6 +240,7 @@ fn kernel_main(boot: BootInfo) -> ! {
                      {error:?}",
                 );
             });
+        println!("BOOT00h mem-ok");
 
         (
             memory_layout,
