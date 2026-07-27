@@ -924,9 +924,9 @@ impl Scheduler {
         (previous_pointer, next_pointer)
     }
 
-    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> bool {
+    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> (bool, Option<Arc<Completion>>) {
         let Some(pending) = self.cpus[cpu.get()].pending.take() else {
-            return false;
+            return (false, None);
         };
 
         assert_eq!(
@@ -1007,24 +1007,23 @@ impl Scheduler {
                         .expect("live user-thread counter underflowed");
                 }
 
-                let task = self.tasks[pending.previous.0]
+                let mut task = self.tasks[pending.previous.0]
                     .take()
                     .expect("exited task disappeared before reclamation");
                 assert_eq!(task.id, pending.previous);
                 assert_eq!(task.state, TaskState::Exited);
-                // M15-A: grow the deferred reclamation queue instead of
-                // panicking during SMP verifier/user-exit bursts. Linux-like
-                // task reclamation must tolerate transient exit bursts until
-                // the reaper catches up.
+                // Signal join completion IMMEDIATELY so that
+                // run_rootfs_program_with_cwd → wait_for_detach() can
+                // return without waiting for the reaper to drain the
+                // retired queue.  Only read the join Arc here; the
+                // reaper still handles resource destruction later.
+                let join = task.user_join.take();
                 if self.retired_tasks.len() == self.retired_tasks.capacity() {
                     self.retired_tasks
                         .try_reserve(MAX_TASKS)
                         .expect("unable to grow retired task queue");
                 }
                 self.retired_tasks.push(task);
-                // Publish the flush/barrier lifetime before making the task
-                // visible to the reaper.  The scheduler lock prevents a consumer
-                // from detaching the task between these two publications.
                 RETIRED_OUTSTANDING
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_add(1)
@@ -1039,11 +1038,11 @@ impl Scheduler {
                     pending < MAX_TASKS,
                     "retired backlog exceeded queue capacity"
                 );
-                return true;
+                return (true, join);
             }
         }
 
-        false
+        (false, None)
     }
 
     fn take_retired_task(&mut self) -> Option<Task> {
@@ -2393,19 +2392,23 @@ fn exit_current() -> ! {
 fn finish_switch() {
     let cpu = crate::smp::current_cpu_id();
     let running_sp = crate::arch::task::current_stack_pointer();
-    let (retired_task_added, current_is_idle) = {
+    let (retired_task_added, current_is_idle, retired_join) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        let retired_task_added = scheduler.complete_switch(cpu, running_sp);
+        let (retired, join) = scheduler.complete_switch(cpu, running_sp);
         let current = scheduler.current(cpu);
         let current_is_idle = scheduler.task(current).kind.is_idle();
-        (retired_task_added, current_is_idle)
+        (retired, current_is_idle, join)
     };
 
-    // The switch tail still owns the IRQ-save guard, but no longer owns the
-    // scheduler lock. Restore policy ticks here to preserve Timer < Scheduler.
     if !current_is_idle {
         crate::time::leave_idle();
+    }
+    // Signal join completion BEFORE waking the reaper.  This lets
+    // run_rootfs_program_with_cwd → wait_for_detach() return immediately
+    // without waiting for the reaper to drain the retired queue.
+    if let Some(join) = retired_join {
+        join.complete_all();
     }
     if retired_task_added {
         crate::println!("P0: finish_switch cpu={} retired_task_added", cpu.get());
