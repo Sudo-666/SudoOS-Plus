@@ -797,15 +797,8 @@ fn oscomp_materialize_ext4_dir_flat(
 
         if entry.file_type == EXT4_FT_DIR {
             oscomp_sdcard_ensure_parent_dirs(&vfs_child);
-            // Use full ext4 snapshot for directories so that children
-            // (e.g. .rlib files) are visible to rustc.  Plain mkdir
-            // creates an empty VFS directory that blocks lazy lookup.
-            if fs::stat(&vfs_child).is_err() {
-                oscomp_sdcard_install_ext4_path(&ext4_child, &vfs_child);
-            }
-            if fs::stat(&vfs_child).is_ok() {
-                already_available += 1;
-            }
+            let _ = fs::mkdir(&vfs_child, 0o755);
+            already_available += 1;
             continue;
         }
 
@@ -845,22 +838,9 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
     for component in parent.split('/').filter(|component| !component.is_empty()) {
         let next_vfs = alloc::format!("{}/{}", vfs_dir, component);
         if crate::fs::stat(&next_vfs).is_err() {
-            crate::println!(
-                "sdcard: materialize missing={} expand={}->{}",
-                component, ext4_dir, vfs_dir,
-            );
-            // Expand the parent directory from ext4.  This installs the
-            // immediate children so that the VFS ext4-lazy lookup path can
-            // continue one level deeper.  We do NOT recursively snapshot
-            // the entire subtree — the VFS Ext4Directory mechanism will
-            // lazily populate each level on demand via lookup_child.
             oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 0);
         }
         if crate::fs::stat(&next_vfs).is_err() {
-            crate::println!(
-                "sdcard: materialize FAIL after expand {}->{}",
-                ext4_dir, vfs_dir,
-            );
             return false;
         }
 
@@ -873,6 +853,9 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         vfs_dir = next_vfs;
     }
 
+    // Install the final directory's children (e.g. .rlib files)
+    // so that the target file is visible to the caller's VFS lookup.
+    oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 16384, 0);
     true
 }
 
