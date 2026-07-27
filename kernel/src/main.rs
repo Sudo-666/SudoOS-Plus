@@ -801,12 +801,9 @@ fn oscomp_materialize_ext4_dir_flat(
         let vfs_child = alloc::format!("{}/{}", vfs_dir.trim_end_matches('/'), entry.name);
 
         if entry.file_type == EXT4_FT_DIR {
-            if recurse_levels > 0 {
-                oscomp_sdcard_ensure_parent_dirs(&vfs_child);
-                let _ = fs::mkdir(&vfs_child, 0o755);
-                already_available += 1;
-                oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files, recurse_levels - 1);
-            }
+            oscomp_sdcard_ensure_parent_dirs(&vfs_child);
+            let _ = fs::mkdir(&vfs_child, 0o755);
+            already_available += 1;
             continue;
         }
 
@@ -854,7 +851,12 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
                 "sdcard: materialize missing={} expand={}->{}",
                 component, ext4_dir, vfs_dir,
             );
-            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 1);
+            // Expand the parent directory from ext4.  This installs the
+            // immediate children so that the VFS ext4-lazy lookup path can
+            // continue one level deeper.  We do NOT recursively snapshot
+            // the entire subtree — the VFS Ext4Directory mechanism will
+            // lazily populate each level on demand via lookup_child.
+            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 0);
         }
         if crate::fs::stat(&next_vfs).is_err() {
             crate::println!(
@@ -873,12 +875,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         vfs_dir = next_vfs;
     }
 
-    crate::println!(
-        "sdcard: materialize final expand={}->{}",
-        ext4_dir, vfs_dir,
-    );
-    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 1);
-    count > 0
+    true
 }
 
 /// P1-A: install ELF dynamic linker (ld-linux / ld-musl) from their real
