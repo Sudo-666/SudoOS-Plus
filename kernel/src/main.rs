@@ -852,7 +852,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
     for component in parent.split('/').filter(|component| !component.is_empty()) {
         let next_vfs = alloc::format!("{}/{}", vfs_dir, component);
         if crate::fs::stat(&next_vfs).is_err() {
-            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 2);
+            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 1);
         }
         if crate::fs::stat(&next_vfs).is_err() {
             return false;
@@ -867,7 +867,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         vfs_dir = next_vfs;
     }
 
-    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 2);
+    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 1);
     count > 0
 }
 
