@@ -1,0 +1,448 @@
+qemu-system-loongarch64 -kernel kernel-la -m 36G -nographic -smp 12 -drive file=sdcard-la.img,if=none,format=raw,id=x0 -device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc 
+
+MyOS
+  architecture : loongarch64
+  firmware args: 0x0000000000000001 0x0000000000000000 0x0000000000000200
+  boot cpu      : unavailable
+  device tree   : 0x0000000000100000
+  command line  : 0x0000000000000000
+  system table  : 0x0000000000000200
+
+entered Rust kernel successfully
+kernel_main: initialization started
+BOOT00 entry
+LoongArch DMW:
+  current PC      : 0x90000000004adef4
+  physical alias  : 0x00000000004adef4
+  uncached alias  : 0x80000000004adef4
+  DMW0            : 0x8000000000000001
+  DMW1            : 0x9000000000000011
+  high execution  : verified
+BOOT00a fdt-addr=0x100000
+BOOT00b fdt-mapped
+BOOT00b1 fdt-magic=0xd00dfeed (expected 0xd00dfeed)
+BOOT00c blob-ok
+BOOT00d dt-ok
+fdt:
+  address       : 0x0000000000100000
+  total size    : 1048576 bytes
+  model         : unavailable
+  compatible    : linux,dummy-loongson3
+  cpu count     : 12
+  timer frequency: architecture-defined
+  bootargs      : unavailable
+  initrd        : unavailable
+  memory:
+    [0x0000000080000000, 0x0000000970000000)  36608 MiB
+  virtio-mmio:
+    unavailable
+  pci-host:
+    pcie: ecam=[0x0000000020000000, 0x0000000028000000) mem32=[0x0000000040000000, 0x0000000080000000) bus=0..127
+BOOT00e inspect-done
+BOOT00f smp-ok
+BOOT00g initrd-ok
+BOOT00h mem-ok
+BOOT01 fdt-valid
+BOOT02 memory-map
+BOOT08 smp-discovery count=12
+physical memory:
+  free [0x0000000080000000, 0x0000000970000000)  37486592 KiB
+  total usable: 36608 MiB
+virtual memory policy:
+  user [0x0000000000000000, 0x0001000000000000)
+  uncached-direct-map  [0x8000000000000000, 0x8001000000000000)
+  cached-direct-map    [0x9000000000000000, 0x9001000000000000)
+  vmalloc              [0xffff800000000000, 0xffffc00000000000)
+  modules              [0xffffc00000000000, 0xffffc10000000000)
+  fixmap               [0xfffffffe00000000, 0xffffffff00000000)
+  kernel link address: 0x9000000000400000
+paging policy:
+  levels            : 4
+  entries per table : 512
+  virtual bits      : 48
+  write xor execute : enforced
+early frame allocator:
+  single frame : 0x000000096ffff000
+  four frames  : [0x000000096fffb000, 0x000000096ffff000)
+  total frames : 9371648
+boot page tables:
+  root frame      : 0x000000096fffc000
+  allocated pages : 4
+  remaining frames: 9371644
+BOOT03 early-page-table
+software page-table test:
+  virtual : 0xfffffffe00000000
+  physical: 0x0000000000100000
+  tables  : 7 pages
+kernel image mapping:
+  text             phys [0x0000000000400000, 0x00000000004d7000) -> virt 0x9000000000400000
+  rodata           phys [0x00000000004d7000, 0x0000000000742000) -> virt 0x90000000004d7000
+  data/bss/boot-stacks phys [0x0000000000742000, 0x0000000000820000) -> virt 0x9000000000742000
+BOOT04 final-page-table
+physical page allocator:
+  managed span : [0x0000000080000000, 0x0000000970000000)
+  page metadata: [0x0000000962979000, 0x000000096fff9000) 219648 KiB
+  DMA32 present: 524288 pages
+  DMA32 free   : 524288 pages
+  Normal free  : 8792441 pages
+  total free   : 9316729 pages
+  early handoff: complete
+BOOT05 buddy-ready
+kernel heap:
+  small objects : slab
+  large objects : buddy
+  global allocator: installed
+BOOT06 heap-ready
+trap subsystem:
+  vector installed : yes
+  interrupts       : disabled
+  frame guard      : enabled
+BOOT07 bsp-trap-ready
+irq subsystem:
+  local interrupts: disabled
+  local sources   : masked
+  dispatch policy : fail-fast on unhandled irq
+time subsystem:
+  clocksource      : ready
+  frequency        : 100000000 Hz
+  current counter  : 70450473
+  monotonic ns     : 704504730
+  clockevent       : one-shot
+  scheduler tick   : not armed
+timer runtime:
+  bases            : per-CPU
+  capacity         : 128 timers/CPU
+  callback context : hardirq, timer lock released
+  cancel contract  : synchronous
+kernel vm:
+  vmalloc arena  : [0xffff800000000000, 0xffffc00000000000)
+  reservations   : 128
+  guard pages    : enabled
+  runtime pgtbl  : active hardware root
+  root physical  : 0x000000096fffc000
+  refill entry   : 0x0000000000400000
+  address bits   : VA=48 PA=48
+virtio:
+  mmio regions   : 0
+  pci hosts      : 1
+  pci pcie: ecam=0x0000000020000000 mem32=0x0000000040000000..0x0000000080000000 bus=0..127
+  pci 00:01.0: virtio Block
+  block device   : 29360128 sectors, readonly=false
+  block registry : /dev/vda
+  block registry : /dev/vda2 -> /dev/vda
+  pci 00:02.0: virtio Network
+  net device     : eth0 MAC=52:54:00:12:34:56
+  net device     : eth0 registered
+  mmio probe     : no devices described
+  block devices  : 1
+BOOT12 virtio-ready
+device model:
+  buses/device/driver : Linux-style probe model
+rng:
+  hardware       : unavailable
+  algorithm      : ChaCha20 DRBG
+  devices        : /dev/random /dev/urandom
+net:
+  interfaces     : 1
+  eth0           : MAC 52:54:00:12:34:56 MTU 1500
+  stack          : smoltcp (TCP/UDP/IPv4/IPv6)
+rtc:
+  hardware       : unavailable
+  device         : /dev/rtc
+page fault subsystem:
+  kernel faults  : fail-fast
+  user faults    : pending task/address-space
+  demand paging  : policy ready
+vfs:
+  root fs       : tmpfs
+  devfs         : /dev/null /dev/zero /dev/console /dev/random /dev/urandom /dev/rtc /dev/ptmx /dev/pts + block devices
+  fd table      : per-process
+procfs:
+  mount          : /proc (proc)
+  files          : version cpuinfo meminfo uptime mounts self
+sysfs:
+  mount          : /sys (sysfs)
+  dirs           : kernel devices class
+initramfs:
+  external      : unavailable
+sdcard: vendor LA busybox accepted size=2368120 entry=0x1200e5864 phnum=7
+sdcard: installed runtime loader aliases
+sdcard: installed 3 runtime library aliases
+sdcard: alias /lib64/ld-linux-loongarch-lp64d.so.1 size=1385368 mode=0o100755 read=64 magic=7f454c46
+sdcard: alias /lib/libc.so.6 size=13770312 mode=0o100755 read=64 magic=7f454c46
+sdcard: alias /lib/libm.so.6 size=2628968 mode=0o100755 read=64 magic=7f454c46
+sdcard: expanded /glibc -> /mnt/sdcard/glibc : 4 newly installed, 3 already available
+sdcard: expanded /glibc/lib -> /mnt/sdcard/glibc/lib : 3 newly installed, 0 already available
+sdcard: expand failed /glibc/basic -> /mnt/sdcard/glibc/basic
+sdcard: expand failed /glibc/lua -> /mnt/sdcard/glibc/lua
+sdcard: expand failed /glibc/ltp -> /mnt/sdcard/glibc/ltp
+sdcard: expand failed /glibc/lmbench -> /mnt/sdcard/glibc/lmbench
+sdcard: expanded /musl -> /mnt/sdcard/musl : 11 newly installed, 4 already available
+sdcard: expanded /musl/lib -> /mnt/sdcard/musl/lib : 1 newly installed, 0 already available
+sdcard: expand failed /musl/basic -> /mnt/sdcard/musl/basic
+sdcard: expand failed /musl/lua -> /mnt/sdcard/musl/lua
+sdcard: expand failed /musl/ltp -> /mnt/sdcard/musl/ltp
+sdcard: expand failed /musl/lmbench -> /mnt/sdcard/musl/lmbench
+sdcard:
+  mount         : /dev/vda (ext4)
+  mounted tree  : /mnt/sdcard (lazy file install)
+  root entries  : 23
+  scanned dirs   : 96
+  test scripts  : 5
+  test script   : /mnt/sdcard/glibc/buildstorm_testcode.sh
+  test script   : /mnt/sdcard/glibc/cagent_testcode.sh
+  test script   : /mnt/sdcard/musl/copy-file-range_testcode.sh
+  test script   : /mnt/sdcard/musl/interrupts_testcode.sh
+  test script   : /mnt/sdcard/musl/splice_testcode.sh
+BOOT13 rootfs-ready
+tty:
+  console line discipline: canonical
+  ioctl hooks            : termios/pgrp/winsize
+kernel scheduler:
+  policy          : preemptive per-CPU FIFO round-robin
+  kernel stack    : 64 KiB plus guard pages
+  bootstrap CPUs  : 1
+  configured CPUs : 12
+  timeslice       : 4 timer ticks
+  wait queues     : blocking wakeup enabled
+  task reaper     : dedicated kernel thread
+  migration       : runnable tasks may move across CPUs
+BOOT09 ap-start-request cpu=1
+BOOT09 ap-start-request cpu=2
+BOOT09 ap-start-request cpu=3
+BOOT09 ap-start-request cpu=4
+BOOT09 ap-start-request cpu=5
+BOOT09 ap-start-request cpu=6
+BOOT09 ap-start-request cpu=7
+BOOT09 ap-start-request cpu=8
+BOOT09 ap-start-request cpu=9
+BOOT09 ap-start-request cpu=10
+BOOT09 ap-start-request cpu=11
+BOOT10 ap-online cpu=1
+BOOT10 ap-online cpu=2
+BOOT10 ap-online cpu=3
+BOOT10 ap-online cpu=4
+BOOT10 ap-online cpu=5
+BOOT10 ap-online cpu=6
+BOOT10 ap-online cpu=7
+BOOT10 ap-online cpu=8
+BOOT10 ap-online cpu=9
+BOOT10 ap-online cpu=10
+BOOT10 ap-online cpu=11
+SMP subsystem:
+  discovered CPUs : 12
+  online CPUs     : 12
+  active CPUs     : 12
+  IPI-ready CPUs  : 12
+  boot CPU        : 0 (hardware 0)
+  secondary CPUs  : verified
+  lifecycle       : explicit state machine
+  per-CPU stacks  : verified
+  per-CPU traps   : verified
+  per-CPU timers  : armed
+kernel scheduler CPUs:
+  registered CPUs : 12
+  active CPUs     : 12
+  active mask     : 0xfff
+  lifecycle source: smp::CpuState
+BOOT11 all-ap-online
+workqueue runtime:
+  topology         : 2 bounded workers per CPU
+  capacity         : 128 work items/CPU
+  callback context : sleepable system thread
+  delayed work     : timer publishes, worker executes
+  cancel contract  : synchronous task-context teardown
+hello user
+process-exit: pid=1 tid=1 group=false status=0
+process-cleanup: tid=1 close-files begin
+process-cleanup: tid=1 close-files done
+process-cleanup: tid=1 robust done
+process-cleanup: tid=1 ctid done
+unknown-syscall: nr=2047 a0=0x0 a1=0x0 a2=0x0 a3=0x0 a4=0x0 a5=0x0
+process-exit: pid=2 tid=2 group=false status=0
+process-cleanup: tid=2 close-files begin
+process-cleanup: tid=2 close-files done
+process-cleanup: tid=2 robust done
+process-cleanup: tid=2 ctid done
+process-exit: pid=3 tid=3 group=false status=0
+process-cleanup: tid=3 close-files begin
+process-cleanup: tid=3 close-files done
+process-cleanup: tid=3 robust done
+process-cleanup: tid=3 ctid done
+process-cleanup: tid=4 close-files begin
+process-cleanup: tid=4 close-files done
+process-cleanup: tid=4 robust done
+process-cleanup: tid=4 ctid done
+hello user
+process-exit: pid=5 tid=5 group=false status=0
+process-cleanup: tid=5 close-files begin
+process-cleanup: tid=5 close-files done
+process-cleanup: tid=5 robust done
+process-cleanup: tid=5 ctid done
+mmap-anon: ok addr_req=0x0 -> 0x1000000 len=0x1000 prot=VmAreaFlags(43)
+mprotect: ok addr=0x1000000 len=0x1000 prot=0x1
+process-exit: pid=6 tid=6 group=false status=0
+process-cleanup: tid=6 close-files begin
+process-cleanup: tid=6 close-files done
+process-cleanup: tid=6 robust done
+process-cleanup: tid=6 ctid done
+mmap-anon: ok addr_req=0x0 -> 0x1000000 len=0x1000 prot=VmAreaFlags(43)
+mprotect: ok addr=0x1000000 len=0x1000 prot=0x1
+process-cleanup: tid=7 close-files begin
+process-cleanup: tid=7 close-files done
+process-cleanup: tid=7 robust done
+process-cleanup: tid=7 ctid done
+mmap-anon: ok addr_req=0x0 -> 0x1000000 len=0x1000 prot=VmAreaFlags(43)
+process-cleanup: tid=8 close-files begin
+process-cleanup: tid=8 close-files done
+process-cleanup: tid=8 robust done
+process-cleanup: tid=8 ctid done
+process-exit: pid=9 tid=9 group=true status=0
+process-cleanup: tid=9 close-files begin
+process-cleanup: tid=9 close-files done
+process-cleanup: tid=9 robust done
+process-cleanup: tid=9 ctid done
+fd-close: pid=10 fd=3 file=0x9000000962978a10 refs=2
+process-exit: pid=10 tid=10 group=false status=0
+process-cleanup: tid=10 close-files begin
+process-cleanup: tid=10 close-files done
+process-cleanup: tid=10 robust done
+process-cleanup: tid=10 ctid done
+clone-process: parent=11 child=12 flags=0x11 child_stack=0x0
+process-wait: pid=11 requested=12 options=0x0
+process-exit: pid=12 tid=12 group=false status=42
+process-cleanup: tid=12 close-files begin
+process-cleanup: tid=12 close-files done
+process-cleanup: tid=12 robust done
+process-cleanup: tid=12 ctid done
+process-wait: pid=11 reaped=12 status=42
+pipe-create: pipe=0x90000009558d6038
+fd-close: pid=11 fd=4 file=0x9000000962978a90 refs=2
+pipe-release: kind=writer pipe=0x90000009558d6038
+fd-close: pid=11 fd=3 file=0x9000000962978a10 refs=2
+pipe-release: kind=reader pipe=0x90000009558d6038
+execve-attempt: pid=11 raw=/.m12 resolved=/.m12
+process-exit: pid=11 tid=11 group=false status=0
+process-cleanup: tid=11 close-files begin
+process-cleanup: tid=11 close-files done
+process-cleanup: tid=11 robust done
+process-cleanup: tid=11 ctid done
+minimal user mode test:
+  U-mode/PLV3 entry : verified
+  user trap stack   : verified
+  write/exit ABI    : verified
+  checked user copy : verified
+  unknown syscall   : -ENOSYS verified
+  invalid user ptr  : -EFAULT verified
+  RX write fault    : isolated from kernel
+  session recycle   : verified (5 runs)
+  mapping reclaim   : verified
+M8-B3 private-root gate:
+  private user root : verified
+  kernel high half  : shared
+  ASID root switch  : verified
+  active CPU publish: verified
+  kernel root return: verified
+  page/root reclaim : verified
+  demand fault path : verified
+M8-B4 demand paging/VM gate:
+  anonymous demand  : verified
+  bounded stack grow: verified
+  brk growth/shrink : verified
+  mmap/munmap       : verified
+  mprotect          : verified
+  TLB-before-free   : verified
+  user fault retry  : verified
+M9-A Process/Thread + ABI gate:
+  Process owns MM   : verified
+  Thread owns proc  : verified
+  cycle-free reap   : verified
+  Linux generic ABI : verified
+M9-B scheduler/MM gate:
+  schedulable user task : verified
+  per-CPU loaded MM     : verified
+  timer-preemptible user: verified
+  deferred task reap    : verified
+M10 ELF/initramfs gate:
+  newc initramfs        : verified
+  ELF64 PT_LOAD         : verified
+  Linux initial stack   : verified
+  kernel execve path    : verified
+M11 user VFS gate:
+  openat/write/read     : verified
+  lseek/close via fd    : verified
+M12/M13 user ABI gate:
+  clone/wait4          : verified
+  execve current image : verified
+  pipe2/read/write      : verified
+  signal frame/return   : verified
+  pid/session syscalls  : verified
+  clock/uname/getrandom : verified
+sudoos-diag: oscomp mode selected: final-all (final image discovery)
+BOOT14 user-entry
+sudoos-diag: entering final-2026 all runner
+sudoos-diag: entering final-2026 CAgent runner
+sdcard: expanded /glibc/lib -> /mnt/sdcard/glibc/lib : 0 files
+sdcard: expanded /glibc -> /mnt/sdcard/glibc : 0 files
+sdcard: expanded /glibc/lib -> /mnt/sdcard/glibc/lib : 0 files
+sudoos-diag: final-cagent: installed system loader
+sudoos-diag: final-cagent: installed system libc
+sudoos-diag: final-cagent: installed official bash
+sudoos-diag: final-cagent: installed official libtinfo
+sudoos-diag: final-cagent: installed official date
+sdcard scripts: discovered 1
+sdcard scripts: using shell /mnt/sdcard/glibc/bash
+oscomp: arch=loongarch64 final-cagent
+#### OS COMP TEST GROUP START /tmp/cagent_testcode.official.sh ####
+exec: interp=/mnt/sdcard/system-glibc/ld-linux-loongarch-lp64d.so.1 kind=PositionIndependent entry=0x20017364 bias=0x20000000
+exec-reloc: skip main (has PT_INTERP) rela=496
+exec-reloc: applied=0 skipped=1 jmprel=0 pltrel=0
+oscomp-la-user-exception: index=0 code=16 era=0x200177d4 sp=0xfff7b0 last_syscall=0
+process-cleanup: tid=13 close-files begin
+process-cleanup: tid=13 close-files done
+process-cleanup: tid=13 robust done
+process-cleanup: tid=13 ctid done
+/tmp/cagent_testcode.official.sh : FAIL (signal=14)
+#### OS COMP TEST GROUP END /tmp/cagent_testcode.official.sh ####
+#### OS COMP SUMMARY ####
+arch=loongarch64
+total=1
+completed=1
+pass=0
+fail=1
+skipped=0
+timeout=0
+signal11=0
+signal14=1
+score=0
+score: 0
+#### OS COMP SUMMARY END ####
+sudoos-diag: entering final-2026 BuildStorm runner
+oscomp: arch=loongarch64 final-buildstorm
+sudoos-diag: final-buildstorm: lazy ext4 overlay ready
+sudoos-diag: final-buildstorm: diagnostic minibuild begin
+exec: interp=/lib64/ld-linux-loongarch-lp64d.so.1 kind=PositionIndependent entry=0x20017364 bias=0x20000000
+exec-reloc: skip main (has PT_INTERP) rela=480
+exec-reloc: applied=0 skipped=1 jmprel=0 pltrel=0
+oscomp-la-user-exception: index=1 code=16 era=0x200177d4 sp=0xfff750 last_syscall=0
+process-cleanup: tid=14 close-files begin
+process-cleanup: tid=14 close-files done
+process-cleanup: tid=14 robust done
+process-cleanup: tid=14 ctid done
+sudoos-diag: final-buildstorm: diagnostic exit=-14
+exec: interp=/lib64/ld-linux-loongarch-lp64d.so.1 kind=PositionIndependent entry=0x20017364 bias=0x20000000
+exec-reloc: skip main (has PT_INTERP) rela=480
+exec-reloc: applied=0 skipped=1 jmprel=0 pltrel=0
+oscomp-la-user-exception: index=2 code=16 era=0x200177d4 sp=0xfff830 last_syscall=0
+process-cleanup: tid=15 close-files begin
+process-cleanup: tid=15 close-files done
+process-cleanup: tid=15 robust done
+process-cleanup: tid=15 ctid done
+sudoos-diag: final-buildstorm: script exit=-14
+kernel_main: initialization completed
+SMOKE_TEST: PASS
+contest: runner returned after summary; forcing platform shutdown
+oscomp: platform shutdown
+oscomp: loongarch qemu acpi shutdown
+oscomp: loongarch acpi sleep write addr=0x80000000100e001c value=0x34
+oscomp: l

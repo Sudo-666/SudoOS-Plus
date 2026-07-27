@@ -802,8 +802,15 @@ fn oscomp_materialize_ext4_dir_flat(
 
         if entry.file_type == EXT4_FT_DIR {
             oscomp_sdcard_ensure_parent_dirs(&vfs_child);
-            let _ = fs::mkdir(&vfs_child, 0o755);
-            already_available += 1;
+            // Use full ext4 snapshot for directories so that children
+            // (e.g. .rlib files) are visible to rustc.  Plain mkdir
+            // creates an empty VFS directory that blocks lazy lookup.
+            if fs::stat(&vfs_child).is_err() {
+                oscomp_sdcard_install_ext4_path(&ext4_child, &vfs_child);
+            }
+            if fs::stat(&vfs_child).is_ok() {
+                already_available += 1;
+            }
             continue;
         }
 
