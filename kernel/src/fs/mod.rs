@@ -1392,10 +1392,6 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
         Err(error) => return Err(ext4_errno(error)),
     };
     let child = ext4_node(fs, info)?;
-    crate::println!(
-        "sdcard: lookup ext4 name={} ino={} kind={:?} size={}",
-        name, info.ino, info.kind, info.size,
-    );
     child.parent_ino.store(parent.ino, Ordering::Release);
     let stored_name = clone_component(name)?;
     let mut state = parent.state.lock();
