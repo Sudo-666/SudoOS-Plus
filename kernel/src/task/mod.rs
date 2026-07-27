@@ -2366,10 +2366,7 @@ fn exit_current() -> ! {
     };
     // Always repair tp — it may have been corrupted by a stale anchor.
     crate::arch::smp::set_current_cpu_id(actual_cpu.get());
-    crate::println!("P0: exit_current task={:?} cpu={}", {
-        let s = SCHEDULER.lock();
-        s.as_ref().unwrap().current(actual_cpu)
-    }, actual_cpu.get());
+    // P0 diag disabled to avoid lockdep
     let (previous, next) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
@@ -2399,7 +2396,6 @@ fn finish_switch() {
         crate::time::leave_idle();
     }
     if retired_task_added {
-        crate::println!("P0: finish_switch cpu={} retired_task_added", cpu.get());
         TASK_REAPER_QUEUE.wake_one();
     }
 }
@@ -2441,7 +2437,6 @@ fn complete_retired_task_reclamation() {
 fn task_reaper_main() {
     loop {
         TASK_REAPER_QUEUE.wait_until(|| retired_task_backlog() != 0);
-        crate::println!("P0: reaper woke backlog={}", RETIRED_BACKLOG.load(Ordering::Acquire));
         drain_retired_queue();
     }
 }
@@ -2621,19 +2616,10 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
     // Linux closes an exiting process's descriptors before publishing the
     // zombie. In particular, pipe readers must observe EOF without waiting
     // for the parent to reap the child.
-    crate::println!(
-        "process-cleanup: tid={} close-files begin",
-        thread.id().get()
-    );
+    // Process cleanup logs disabled to avoid lockdep violations.
     let _ = thread.process_arc().files().close_all();
-    crate::println!(
-        "process-cleanup: tid={} close-files done",
-        thread.id().get()
-    );
     crate::user::cleanup_robust_list_on_exit(&thread);
-    crate::println!("process-cleanup: tid={} robust done", thread.id().get());
     crate::user::clear_child_tid_on_exit(&thread);
-    crate::println!("process-cleanup: tid={} ctid done", thread.id().get());
     thread
         .exit(result)
         .expect("M9-B user Thread failed to publish exit state");
