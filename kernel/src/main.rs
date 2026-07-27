@@ -801,14 +801,12 @@ fn oscomp_materialize_ext4_dir_flat(
         let vfs_child = alloc::format!("{}/{}", vfs_dir.trim_end_matches('/'), entry.name);
 
         if entry.file_type == EXT4_FT_DIR {
-            oscomp_sdcard_ensure_parent_dirs(&vfs_child);
-            let _ = fs::mkdir(&vfs_child, 0o755);
-            already_available += 1;
-            // Expand one more level so that rustlib/riscv64gc-.../
-            // has lib/ populated with .rlib files visible to rustc.
             if recurse_levels > 0 {
-    oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files, recurse_levels - 1);
-}
+                oscomp_sdcard_ensure_parent_dirs(&vfs_child);
+                let _ = fs::mkdir(&vfs_child, 0o755);
+                already_available += 1;
+                oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files, recurse_levels - 1);
+            }
             continue;
         }
 
