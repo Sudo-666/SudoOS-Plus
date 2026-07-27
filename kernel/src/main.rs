@@ -776,11 +776,6 @@ fn oscomp_materialize_ext4_dir_flat(
         // Install it as a regular file instead of creating a false directory.
         oscomp_sdcard_install_ext4_path(ext4_dir, vfs_dir);
         if fs::stat(vfs_dir).is_ok() {
-            crate::println!(
-                "sdcard: installed {} -> {} (regular file)",
-                ext4_dir,
-                vfs_dir
-            );
             return 1;
         }
         crate::println!("sdcard: expand failed {} -> {}", ext4_dir, vfs_dir);
@@ -825,13 +820,9 @@ fn oscomp_materialize_ext4_dir_flat(
         }
     }
 
-    crate::println!(
-        "sdcard: expanded {} -> {} : {} newly installed, {} already available",
-        ext4_dir,
-        vfs_dir,
-        newly_installed,
-        already_available,
-    );
+    // Diagnostic — disabled to avoid lockdep violation (console.write inside VFS ops).
+    // crate::println!("sdcard: expanded {} -> {} : {} newly installed, {} already available",
+    //     ext4_dir, vfs_dir, newly_installed, already_available);
     newly_installed + already_available
 }
 
