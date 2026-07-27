@@ -2373,6 +2373,10 @@ fn exit_current() -> ! {
     };
     // Always repair tp — it may have been corrupted by a stale anchor.
     crate::arch::smp::set_current_cpu_id(actual_cpu.get());
+    crate::println!("P0: exit_current task={:?} cpu={}", {
+        let s = SCHEDULER.lock();
+        s.as_ref().unwrap().current(actual_cpu)
+    }, actual_cpu.get());
     let (previous, next) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
@@ -2404,6 +2408,7 @@ fn finish_switch() {
         crate::time::leave_idle();
     }
     if retired_task_added {
+        crate::println!("P0: finish_switch cpu={} retired_task_added", cpu.get());
         TASK_REAPER_QUEUE.wake_one();
     }
 }
@@ -2445,6 +2450,7 @@ fn complete_retired_task_reclamation() {
 fn task_reaper_main() {
     loop {
         TASK_REAPER_QUEUE.wait_until(|| retired_task_backlog() != 0);
+        crate::println!("P0: reaper woke backlog={}", RETIRED_BACKLOG.load(Ordering::Acquire));
         drain_retired_queue();
     }
 }
