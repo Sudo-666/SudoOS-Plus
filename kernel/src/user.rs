@@ -8344,6 +8344,8 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
         read_usize(head.saturating_add(2 * core::mem::size_of::<usize>()))
             .unwrap_or(0);
 
+    let mut pending_wakes: usize = 0;
+    let mut wake_addrs = [0_usize; MAX_ROBUST_NODES];
     let mark_owner_dead = |node: usize| {
         if node == 0 || node == head {
             return;
@@ -8369,9 +8371,10 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
             .copy_to_user(futex_address, &dead.to_ne_bytes())
             .is_ok()
         {
-            let queue = get_futex_queue_for_mm(mm, futex_address);
-            queue.wake_sequence.fetch_add(1, Ordering::AcqRel);
-            let _ = queue.waiters.wake_one();
+            if pending_wakes < MAX_ROBUST_NODES {
+                wake_addrs[pending_wakes] = futex_address;
+                pending_wakes += 1;
+            }
         }
     };
 
@@ -8389,6 +8392,14 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
 
     if pending != 0 {
         mark_owner_dead(pending);
+    }
+    // P2: drop user_mm reference before futex wake to avoid lock order
+    // violation (Vm/#2 held → Scheduler/#1 acquired via wake_one).
+    drop(mm);
+    for i in 0..pending_wakes {
+        let queue = get_futex_queue(wake_addrs[i]);
+        queue.wake_sequence.fetch_add(1, Ordering::AcqRel);
+        let _ = queue.waiters.wake_one();
     }
 }
 
