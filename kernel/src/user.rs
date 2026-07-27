@@ -8346,7 +8346,7 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
 
     let mut pending_wakes: usize = 0;
     let mut wake_addrs = [0_usize; MAX_ROBUST_NODES];
-    let mark_owner_dead = |node: usize| {
+    let mut mark_owner_dead = |node: usize| {
         if node == 0 || node == head {
             return;
         }
