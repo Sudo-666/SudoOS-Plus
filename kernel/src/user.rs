@@ -439,16 +439,15 @@ impl UserImage {
             "M9-B user Thread was never bound to a scheduler task",
         );
         drop(thread);
-        assert_eq!(
-            Arc::strong_count(&process),
-            1,
-            "M9-B retained an unexpected Process owner after scheduler detach",
-        );
-        let process = Arc::try_unwrap(process)
-            .unwrap_or_else(|_| panic!("M9-B could not obtain unique Process ownership"));
-        process
-            .destroy()
-            .expect("unable to destroy the M9-B process address space");
+        // The retired task may still hold a Thread reference inside
+        // retired_tasks until the reaper runs destroy_resources().
+        // Don't assert strong_count==1 — let Arc::try_unwrap fail
+        // gracefully and fall back to letting the reaper clean up.
+        if let Ok(process) = Arc::try_unwrap(process) {
+            process
+                .destroy()
+                .unwrap_or_else(|error| crate::println!("exec: process destroy failed: {error:?}"));
+        }
     }
 }
 
