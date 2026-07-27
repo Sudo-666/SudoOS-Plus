@@ -203,10 +203,7 @@ impl FileOperations for PipeReader {
     }
 
     fn release(&self, _file: &File) {
-        crate::println!(
-            "pipe-release: kind=reader pipe={:#x}",
-            Arc::as_ptr(&self.pipe) as usize,
-        );
+        // crate::println!("pipe-release: kind=reader pipe={:#x}", ...);
         self.pipe.close_reader();
     }
 
@@ -236,10 +233,7 @@ impl FileOperations for PipeWriter {
     }
 
     fn release(&self, _file: &File) {
-        crate::println!(
-            "pipe-release: kind=writer pipe={:#x}",
-            Arc::as_ptr(&self.pipe) as usize,
-        );
+        // crate::println!("pipe-release: kind=writer pipe={:#x}", ...);
         self.pipe.close_writer();
     }
 
