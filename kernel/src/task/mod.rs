@@ -1012,12 +1012,19 @@ impl Scheduler {
                     .expect("exited task disappeared before reclamation");
                 assert_eq!(task.id, pending.previous);
                 assert_eq!(task.state, TaskState::Exited);
+                // M15-A: grow the deferred reclamation queue instead of
+                // panicking during SMP verifier/user-exit bursts. Linux-like
+                // task reclamation must tolerate transient exit bursts until
+                // the reaper catches up.
                 if self.retired_tasks.len() == self.retired_tasks.capacity() {
                     self.retired_tasks
                         .try_reserve(MAX_TASKS)
                         .expect("unable to grow retired task queue");
                 }
                 self.retired_tasks.push(task);
+                // Publish the flush/barrier lifetime before making the task
+                // visible to the reaper.  The scheduler lock prevents a consumer
+                // from detaching the task between these two publications.
                 RETIRED_OUTSTANDING
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_add(1)
@@ -2366,7 +2373,6 @@ fn exit_current() -> ! {
     };
     // Always repair tp — it may have been corrupted by a stale anchor.
     crate::arch::smp::set_current_cpu_id(actual_cpu.get());
-    // P0 diag disabled to avoid lockdep
     let (previous, next) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
@@ -2392,6 +2398,8 @@ fn finish_switch() {
         (retired_task_added, current_is_idle)
     };
 
+    // The switch tail still owns the IRQ-save guard, but no longer owns the
+    // scheduler lock. Restore policy ticks here to preserve Timer < Scheduler.
     if !current_is_idle {
         crate::time::leave_idle();
     }
@@ -2616,10 +2624,19 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
     // Linux closes an exiting process's descriptors before publishing the
     // zombie. In particular, pipe readers must observe EOF without waiting
     // for the parent to reap the child.
-    // Process cleanup logs disabled to avoid lockdep violations.
+    crate::println!(
+        "process-cleanup: tid={} close-files begin",
+        thread.id().get()
+    );
     let _ = thread.process_arc().files().close_all();
+    crate::println!(
+        "process-cleanup: tid={} close-files done",
+        thread.id().get()
+    );
     crate::user::cleanup_robust_list_on_exit(&thread);
+    crate::println!("process-cleanup: tid={} robust done", thread.id().get());
     crate::user::clear_child_tid_on_exit(&thread);
+    crate::println!("process-cleanup: tid={} ctid done", thread.id().get());
     thread
         .exit(result)
         .expect("M9-B user Thread failed to publish exit state");

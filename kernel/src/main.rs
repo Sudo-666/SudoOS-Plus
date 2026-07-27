@@ -183,8 +183,13 @@ fn kernel_main(boot: BootInfo) -> ! {
         .device_tree()
         .expect("a device tree is required at this stage")
         .get();
-    println!("BOOT00a fdt-addr={:#x}", fdt_address);
 
+    /*
+     * SAFETY:
+     *
+     * FDT 地址来自受信任的架构启动协议。
+     * 当前尚未启用正式分页。
+     */
     let fdt_physical = myos_mm::PhysAddr::new(fdt_address);
 
     let fdt_pointer =
@@ -194,13 +199,6 @@ fn kernel_main(boot: BootInfo) -> ! {
              {fdt_address:#x}: {error:?}",
             );
         });
-    println!("BOOT00b fdt-mapped");
-    // Force a read to fill the TLB and verify the direct map covers this PA.
-    let fdt_magic: u32 = unsafe { core::ptr::read_volatile(fdt_pointer as *const u32) };
-    println!(
-        "BOOT00b1 fdt-magic={:#010x} (expected 0xd00dfeed)",
-        u32::from_be(fdt_magic),
-    );
 
     let (
         memory_layout,
@@ -210,13 +208,13 @@ fn kernel_main(boot: BootInfo) -> ! {
         initrd_range,
         explicit_oscomp_mode,
     ) = {
+        // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
             panic!(
                 "failed to validate FDT at \
              {fdt_address:#x}: {error}",
             );
         });
-        println!("BOOT00c blob-ok");
 
         let tree = DeviceTree::from_blob(&blob).unwrap_or_else(|error| {
             panic!(
@@ -224,21 +222,17 @@ fn kernel_main(boot: BootInfo) -> ! {
                          {fdt_address:#x}: {error}",
             );
         });
-        println!("BOOT00d dt-ok");
 
         inspect_device_tree(&boot, &blob, &tree);
-        println!("BOOT00e inspect-done");
         let virtio_regions = collect_virtio_mmio_regions(&tree);
         let pci_hosts = collect_pci_host_bridges(&tree);
         smp::initialize(&tree, boot_hardware_cpu_id(&boot));
-        println!("BOOT00f smp-ok");
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
         let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs());
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
-        println!("BOOT00g initrd-ok");
         let memory_layout = memory::build_boot_memory_layout(fdt_address, &blob, &tree)
             .unwrap_or_else(|error| {
                 panic!(
@@ -246,7 +240,6 @@ fn kernel_main(boot: BootInfo) -> ! {
                      {error:?}",
                 );
             });
-        println!("BOOT00h mem-ok");
 
         (
             memory_layout,
@@ -700,18 +693,18 @@ fn mount_sdcard_if_present() {
     // find ./busybox, ./lua, ./lmbench_all, ./iperf3 etc.
     // Must happen *after* /mnt/sdcard skeleton exists but *before*
     // any script runs.
-    oscomp_materialize_ext4_dir_flat("/glibc", "/mnt/sdcard/glibc", 512);
-    oscomp_materialize_ext4_dir_flat("/glibc/lib", "/mnt/sdcard/glibc/lib", 256);
-    oscomp_materialize_ext4_dir_flat("/glibc/basic", "/mnt/sdcard/glibc/basic", 256);
-    oscomp_materialize_ext4_dir_flat("/glibc/lua", "/mnt/sdcard/glibc/lua", 128);
-    oscomp_materialize_ext4_dir_flat("/glibc/ltp", "/mnt/sdcard/glibc/ltp", 256);
-    oscomp_materialize_ext4_dir_flat("/glibc/lmbench", "/mnt/sdcard/glibc/lmbench", 128);
-    oscomp_materialize_ext4_dir_flat("/musl", "/mnt/sdcard/musl", 512);
-    oscomp_materialize_ext4_dir_flat("/musl/lib", "/mnt/sdcard/musl/lib", 256);
-    oscomp_materialize_ext4_dir_flat("/musl/basic", "/mnt/sdcard/musl/basic", 256);
-    oscomp_materialize_ext4_dir_flat("/musl/lua", "/mnt/sdcard/musl/lua", 128);
-    oscomp_materialize_ext4_dir_flat("/musl/ltp", "/mnt/sdcard/musl/ltp", 256);
-    oscomp_materialize_ext4_dir_flat("/musl/lmbench", "/mnt/sdcard/musl/lmbench", 128);
+    oscomp_materialize_ext4_dir_flat("/glibc", "/mnt/sdcard/glibc", 512, 0);
+    oscomp_materialize_ext4_dir_flat("/glibc/lib", "/mnt/sdcard/glibc/lib", 256, 0);
+    oscomp_materialize_ext4_dir_flat("/glibc/basic", "/mnt/sdcard/glibc/basic", 256, 0);
+    oscomp_materialize_ext4_dir_flat("/glibc/lua", "/mnt/sdcard/glibc/lua", 128, 0);
+    oscomp_materialize_ext4_dir_flat("/glibc/ltp", "/mnt/sdcard/glibc/ltp", 256, 0);
+    oscomp_materialize_ext4_dir_flat("/glibc/lmbench", "/mnt/sdcard/glibc/lmbench", 128, 0);
+    oscomp_materialize_ext4_dir_flat("/musl", "/mnt/sdcard/musl", 512, 0);
+    oscomp_materialize_ext4_dir_flat("/musl/lib", "/mnt/sdcard/musl/lib", 256, 0);
+    oscomp_materialize_ext4_dir_flat("/musl/basic", "/mnt/sdcard/musl/basic", 256, 0);
+    oscomp_materialize_ext4_dir_flat("/musl/lua", "/mnt/sdcard/musl/lua", 128, 0);
+    oscomp_materialize_ext4_dir_flat("/musl/ltp", "/mnt/sdcard/musl/ltp", 256, 0);
+    oscomp_materialize_ext4_dir_flat("/musl/lmbench", "/mnt/sdcard/musl/lmbench", 128, 0);
 
     println!("sdcard:");
     println!("  mount         : /dev/vda (ext4)");
@@ -762,6 +755,7 @@ fn oscomp_materialize_ext4_dir_flat(
     ext4_dir: &str,
     vfs_dir: &str,
     max_files: usize,
+    recurse_levels: usize,
 ) -> usize {
     let Some(device) = crate::block::open_device("vda") else {
         crate::println!("sdcard: expand {} — no device", ext4_dir);
@@ -775,6 +769,11 @@ fn oscomp_materialize_ext4_dir_flat(
         // Install it as a regular file instead of creating a false directory.
         oscomp_sdcard_install_ext4_path(ext4_dir, vfs_dir);
         if fs::stat(vfs_dir).is_ok() {
+            crate::println!(
+                "sdcard: installed {} -> {} (regular file)",
+                ext4_dir,
+                vfs_dir
+            );
             return 1;
         }
         crate::println!("sdcard: expand failed {} -> {}", ext4_dir, vfs_dir);
@@ -798,17 +797,11 @@ fn oscomp_materialize_ext4_dir_flat(
             oscomp_sdcard_ensure_parent_dirs(&vfs_child);
             let _ = fs::mkdir(&vfs_child, 0o755);
             already_available += 1;
-            // Always recurse — the VFS lookup_child lazy mechanism only
-            // works for paths that were first accessed through Ext4Directory
-            // nodes.  Deep toolchain sysroots reachable only via
-            // ensure_sdcard_dir_materialized must be fully expanded.
-            let skip = matches!(
-                entry.name.as_str(),
-                "src" | "examples" | "tests" | "benches" | "ci" | "docker" | ".github" | "doc" | "man" | "locale"
-            );
-            if !skip {
-                oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files);
-            }
+            // Expand one more level so that rustlib/riscv64gc-.../
+            // has lib/ populated with .rlib files visible to rustc.
+            if recurse_levels > 0 {
+    oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files, recurse_levels - 1);
+}
             continue;
         }
 
@@ -823,9 +816,13 @@ fn oscomp_materialize_ext4_dir_flat(
         }
     }
 
-    // Diagnostic — disabled to avoid lockdep violation (console.write inside VFS ops).
-    // crate::println!("sdcard: expanded {} -> {} : {} newly installed, {} already available",
-    //     ext4_dir, vfs_dir, newly_installed, already_available);
+    crate::println!(
+        "sdcard: expanded {} -> {} : {} newly installed, {} already available",
+        ext4_dir,
+        vfs_dir,
+        newly_installed,
+        already_available,
+    );
     newly_installed + already_available
 }
 
@@ -848,7 +845,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
     for component in parent.split('/').filter(|component| !component.is_empty()) {
         let next_vfs = alloc::format!("{}/{}", vfs_dir, component);
         if crate::fs::stat(&next_vfs).is_err() {
-            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096);
+            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 2);
         }
         if crate::fs::stat(&next_vfs).is_err() {
             return false;
@@ -863,10 +860,8 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         vfs_dir = next_vfs;
     }
 
-    // Install the final directory's children (e.g. .rlib files)
-    // so that the target file is visible to the caller's VFS lookup.
-    oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 16384);
-    true
+    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 2);
+    count > 0
 }
 
 /// P1-A: install ELF dynamic linker (ld-linux / ld-musl) from their real
