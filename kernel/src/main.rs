@@ -700,18 +700,18 @@ fn mount_sdcard_if_present() {
     // find ./busybox, ./lua, ./lmbench_all, ./iperf3 etc.
     // Must happen *after* /mnt/sdcard skeleton exists but *before*
     // any script runs.
-    oscomp_materialize_ext4_dir_flat("/glibc", "/mnt/sdcard/glibc", 512, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/lib", "/mnt/sdcard/glibc/lib", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/basic", "/mnt/sdcard/glibc/basic", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/lua", "/mnt/sdcard/glibc/lua", 128, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/ltp", "/mnt/sdcard/glibc/ltp", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/lmbench", "/mnt/sdcard/glibc/lmbench", 128, 0);
-    oscomp_materialize_ext4_dir_flat("/musl", "/mnt/sdcard/musl", 512, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/lib", "/mnt/sdcard/musl/lib", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/basic", "/mnt/sdcard/musl/basic", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/lua", "/mnt/sdcard/musl/lua", 128, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/ltp", "/mnt/sdcard/musl/ltp", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/lmbench", "/mnt/sdcard/musl/lmbench", 128, 0);
+    oscomp_materialize_ext4_dir_flat("/glibc", "/mnt/sdcard/glibc", 512);
+    oscomp_materialize_ext4_dir_flat("/glibc/lib", "/mnt/sdcard/glibc/lib", 256);
+    oscomp_materialize_ext4_dir_flat("/glibc/basic", "/mnt/sdcard/glibc/basic", 256);
+    oscomp_materialize_ext4_dir_flat("/glibc/lua", "/mnt/sdcard/glibc/lua", 128);
+    oscomp_materialize_ext4_dir_flat("/glibc/ltp", "/mnt/sdcard/glibc/ltp", 256);
+    oscomp_materialize_ext4_dir_flat("/glibc/lmbench", "/mnt/sdcard/glibc/lmbench", 128);
+    oscomp_materialize_ext4_dir_flat("/musl", "/mnt/sdcard/musl", 512);
+    oscomp_materialize_ext4_dir_flat("/musl/lib", "/mnt/sdcard/musl/lib", 256);
+    oscomp_materialize_ext4_dir_flat("/musl/basic", "/mnt/sdcard/musl/basic", 256);
+    oscomp_materialize_ext4_dir_flat("/musl/lua", "/mnt/sdcard/musl/lua", 128);
+    oscomp_materialize_ext4_dir_flat("/musl/ltp", "/mnt/sdcard/musl/ltp", 256);
+    oscomp_materialize_ext4_dir_flat("/musl/lmbench", "/mnt/sdcard/musl/lmbench", 128);
 
     println!("sdcard:");
     println!("  mount         : /dev/vda (ext4)");
@@ -762,7 +762,6 @@ fn oscomp_materialize_ext4_dir_flat(
     ext4_dir: &str,
     vfs_dir: &str,
     max_files: usize,
-    recurse_levels: usize,
 ) -> usize {
     let Some(device) = crate::block::open_device("vda") else {
         crate::println!("sdcard: expand {} — no device", ext4_dir);
@@ -799,6 +798,17 @@ fn oscomp_materialize_ext4_dir_flat(
             oscomp_sdcard_ensure_parent_dirs(&vfs_child);
             let _ = fs::mkdir(&vfs_child, 0o755);
             already_available += 1;
+            // Always recurse — the VFS lookup_child lazy mechanism only
+            // works for paths that were first accessed through Ext4Directory
+            // nodes.  Deep toolchain sysroots reachable only via
+            // ensure_sdcard_dir_materialized must be fully expanded.
+            let skip = matches!(
+                entry.name.as_str(),
+                "src" | "examples" | "tests" | "benches" | "ci" | "docker" | ".github" | "doc" | "man" | "locale"
+            );
+            if !skip {
+                oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files);
+            }
             continue;
         }
 
@@ -838,7 +848,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
     for component in parent.split('/').filter(|component| !component.is_empty()) {
         let next_vfs = alloc::format!("{}/{}", vfs_dir, component);
         if crate::fs::stat(&next_vfs).is_err() {
-            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 0);
+            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096);
         }
         if crate::fs::stat(&next_vfs).is_err() {
             return false;
@@ -855,7 +865,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
 
     // Install the final directory's children (e.g. .rlib files)
     // so that the target file is visible to the caller's VFS lookup.
-    oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 16384, 0);
+    oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 16384);
     true
 }
 
