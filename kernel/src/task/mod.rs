@@ -924,9 +924,9 @@ impl Scheduler {
         (previous_pointer, next_pointer)
     }
 
-    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> (bool, Option<Arc<Completion>>) {
+    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> bool {
         let Some(pending) = self.cpus[cpu.get()].pending.take() else {
-            return (false, None);
+            return false;
         };
 
         assert_eq!(
@@ -1007,17 +1007,11 @@ impl Scheduler {
                         .expect("live user-thread counter underflowed");
                 }
 
-                let mut task = self.tasks[pending.previous.0]
+                let task = self.tasks[pending.previous.0]
                     .take()
                     .expect("exited task disappeared before reclamation");
                 assert_eq!(task.id, pending.previous);
                 assert_eq!(task.state, TaskState::Exited);
-                // Signal join completion IMMEDIATELY so that
-                // run_rootfs_program_with_cwd → wait_for_detach() can
-                // return without waiting for the reaper to drain the
-                // retired queue.  Only read the join Arc here; the
-                // reaper still handles resource destruction later.
-                let join = task.user_join.take();
                 if self.retired_tasks.len() == self.retired_tasks.capacity() {
                     self.retired_tasks
                         .try_reserve(MAX_TASKS)
@@ -1038,11 +1032,11 @@ impl Scheduler {
                     pending < MAX_TASKS,
                     "retired backlog exceeded queue capacity"
                 );
-                return (true, join);
+                return true;
             }
         }
 
-        (false, None)
+        false
     }
 
     fn take_retired_task(&mut self) -> Option<Task> {
@@ -2392,23 +2386,17 @@ fn exit_current() -> ! {
 fn finish_switch() {
     let cpu = crate::smp::current_cpu_id();
     let running_sp = crate::arch::task::current_stack_pointer();
-    let (retired_task_added, current_is_idle, retired_join) = {
+    let (retired_task_added, current_is_idle) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        let (retired, join) = scheduler.complete_switch(cpu, running_sp);
+        let retired_task_added = scheduler.complete_switch(cpu, running_sp);
         let current = scheduler.current(cpu);
         let current_is_idle = scheduler.task(current).kind.is_idle();
-        (retired, current_is_idle, join)
+        (retired_task_added, current_is_idle)
     };
 
     if !current_is_idle {
         crate::time::leave_idle();
-    }
-    // Signal join completion BEFORE waking the reaper.  This lets
-    // run_rootfs_program_with_cwd → wait_for_detach() return immediately
-    // without waiting for the reaper to drain the retired queue.
-    if let Some(join) = retired_join {
-        join.complete_all();
     }
     if retired_task_added {
         crate::println!("P0: finish_switch cpu={} retired_task_added", cpu.get());
