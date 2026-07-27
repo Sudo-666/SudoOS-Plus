@@ -6214,15 +6214,6 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_address: usize, count: usize
 
 fn sys_close(fd: usize) -> isize {
     let process = current_process();
-    if let Ok(file) = process.files().get(fd) {
-        crate::println!(
-            "fd-close: pid={} fd={} file={:#x} refs={}",
-            process.id().get(),
-            fd,
-            Arc::as_ptr(&file) as usize,
-            Arc::strong_count(&file),
-        );
-    }
     match process.files().close(fd) {
         Ok(()) => 0,
         Err(errno) => errno.to_isize(),
