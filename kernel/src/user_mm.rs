@@ -16,7 +16,9 @@ use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 // Native toolchains keep many shared objects, metadata files, thread stacks,
 // and guard mappings live at once.  A clean rustc invocation exceeds the old
 // 96-entry contest baseline before it can allocate its signal alt stack.
-const VMA_CAPACITY: usize = 256;
+// G5: linker mmap'd 50+ .rlib/.rmeta files simultaneously (2+ VMA each);
+// 256 was too low — bump to 512 for BuildStorm full linking.
+const VMA_CAPACITY: usize = 512;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
