@@ -2865,6 +2865,7 @@ fn verify_final_cagent_thread() {
     let _ = crate::fs::unlink("/mnt/sdcard/glibc/touch", false);
     let _ = crate::fs::symlink("/bin/touch", "/mnt/sdcard/glibc/touch");
 
+    // CAGENT_OFFICIAL_MARKERS_ONLY_V1
     let script = "/tmp/cagent_testcode.official.sh";
     if let Err(error) = crate::fs::install_bytes(script, include_bytes!("final_cagent_testcode.sh"))
     {
@@ -2917,7 +2918,6 @@ fn verify_final_cagent_thread() {
     crate::println!("sdcard scripts: discovered 1");
     crate::println!("sdcard scripts: using shell {}", shell_path);
     crate::println!("oscomp: arch={} final-cagent", crate::arch::ARCH_NAME);
-    crate::println!("#### OS COMP TEST GROUP START {} ####", script);
 
     let environment = [
         "PATH=/tmp/cagent-bin:.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
@@ -2938,7 +2938,7 @@ fn verify_final_cagent_thread() {
 
     match raw {
         Ok(0) => {
-            crate::println!("{} : PASS", script);
+            crate::println!("sudoos-diag: final-cagent: official script exit=0");
             OSCOMP_PASS.store(1, Ordering::Release);
         }
         Ok(code) => {
@@ -2950,28 +2950,28 @@ fn verify_final_cagent_thread() {
                 if signal == 14 {
                     OSCOMP_SIGNAL14.store(1, Ordering::Release);
                 }
-                crate::println!("{} : FAIL (signal={})", script, signal);
+                crate::println!(
+                    "sudoos-diag: final-cagent: official script signal={}",
+                    signal,
+                );
             } else {
-                crate::println!("{} : FAIL (exit={})", script, code);
+                crate::println!(
+                    "sudoos-diag: final-cagent: official script exit={}",
+                    code,
+                );
             }
             OSCOMP_FAIL.store(1, Ordering::Release);
         }
         Err(error) => {
-            crate::println!("{} : FAIL (exec={:?})", script, error);
+            crate::println!(
+                "sudoos-diag: final-cagent: official script exec failed: {:?}",
+                error,
+            );
             OSCOMP_FAIL.store(1, Ordering::Release);
         }
     }
 
     OSCOMP_COMPLETED.store(1, Ordering::Release);
-    crate::println!("#### OS COMP TEST GROUP END {} ####", script);
-    oscomp_print_summary(
-        1,
-        OSCOMP_PASS.load(Ordering::Acquire),
-        OSCOMP_FAIL.load(Ordering::Acquire),
-        0,
-        OSCOMP_SIGNAL11.load(Ordering::Acquire),
-        OSCOMP_SIGNAL14.load(Ordering::Acquire),
-    );
     OSCOMP_FINALIZED.store(true, Ordering::Release);
     OSCOMP_ACTIVE.store(false, Ordering::Release);
 }

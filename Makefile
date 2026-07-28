@@ -244,7 +244,16 @@ final-cagent-rv: kernel-rv
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/cagent-rv-$(FINAL_RUN_ID).log \
 		--success-pattern "#### OS COMP TEST GROUP END cagent ####" \
-		--success-pattern "#### OS COMP SUMMARY END ####" \
+		--success-regex '^testcase cagent factorial pass [0-9]+$$' \
+		--success-regex '^testcase cagent date pass [0-9]+$$' \
+		--success-regex '^testcase cagent network pass [0-9]+$$' \
+		--success-regex '^testcase cagent cpu pass [0-9]+$$' \
+		--success-regex '^testcase cagent kernel pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-create pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-readwrite pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-directory pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-search pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-usage pass [0-9]+$$' \
 		$(FINAL_CAGENT_REJECT_GUARD) \
 		--failure-regex '^panicked at .*' --timeout $(FINAL_CAGENT_TIMEOUT) -- qemu-system-riscv64 \
 		-machine virt \
@@ -269,7 +278,16 @@ final-cagent-la: kernel-la
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/cagent-la-$(FINAL_RUN_ID).log \
 		--success-pattern "#### OS COMP TEST GROUP END cagent ####" \
-		--success-pattern "#### OS COMP SUMMARY END ####" \
+		--success-regex '^testcase cagent factorial pass [0-9]+$$' \
+		--success-regex '^testcase cagent date pass [0-9]+$$' \
+		--success-regex '^testcase cagent network pass [0-9]+$$' \
+		--success-regex '^testcase cagent cpu pass [0-9]+$$' \
+		--success-regex '^testcase cagent kernel pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-create pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-readwrite pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-directory pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-search pass [0-9]+$$' \
+		--success-regex '^testcase cagent fs-usage pass [0-9]+$$' \
 		$(FINAL_CAGENT_REJECT_GUARD) \
 		--failure-regex '^panicked at .*' --timeout $(FINAL_CAGENT_TIMEOUT) -- qemu-system-loongarch64 \
 		-kernel kernel-la \
