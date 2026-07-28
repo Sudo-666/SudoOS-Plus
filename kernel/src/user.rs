@@ -14,10 +14,11 @@ const USER_DATA: usize = USER_CODE + PAGE_SIZE;
 const USER_DEMAND: usize = 0x0000_0000_0050_0000;
 const USER_HEAP_START: usize = 0x0000_0000_0060_0000;
 // G5: 1 MiB heap was too small for ld — linker xmalloc/sbrk exhausted
-// during minibuild final link ("Cannot allocate memory").  Bump to 506 MiB.
-const USER_HEAP_LIMIT: usize = 0x0000_0000_2000_0000;
-const USER_STACK: usize = 0x0000_0000_2100_0000;
-const USER_MMAP_START: usize = 0x0000_0000_3000_0000;
+// during minibuild final link ("Cannot allocate memory").  Expand to 10 MiB
+// while keeping heap < RUNTIME_STACK < RUNTIME_STACK_TOP (=USER_MMAP_START).
+const USER_HEAP_LIMIT: usize = 0x0000_0000_00FF_0000;
+const USER_STACK: usize = 0x0000_0000_0080_0000;
+const USER_MMAP_START: usize = 0x0000_0000_0100_0000;
 const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
 const RUNTIME_STACK: usize = USER_HEAP_LIMIT;
 const RUNTIME_STACK_TOP: usize = USER_MMAP_START;
