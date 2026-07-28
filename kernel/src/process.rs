@@ -17,7 +17,7 @@ use crate::lockdep::{LockClass, LockRank};
 use crate::task::{Completion, TaskId, WaitQueue};
 use crate::user_mm::{UserMm, UserMmRuntimeError};
 
-pub const PROCESS_MAX_FDS: usize = 128;
+pub const PROCESS_MAX_FDS: usize = 1024;
 
 const THREAD_READY: u8 = 0;
 const THREAD_RUNNABLE: u8 = 1;
