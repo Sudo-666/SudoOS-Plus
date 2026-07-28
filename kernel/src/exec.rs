@@ -574,6 +574,10 @@ fn apply_static_pie_relocations(
             applied += 1;
         } else if is_abs64 && symbol != 0 {
             // R_LARCH_64 with explicit symbol: S + A.
+            crate::println!(
+                "exec-reloc: LA R_ABS64 sym={} off={:#x} symtab={}",
+                symbol, raw_offset, symtab_base.is_some(),
+            );
             if let Some(sym_file_off) = symtab_base {
                 let sym_off = (symbol as usize).checked_mul(24).ok_or(ExecError::AddressOverflow)?;
                 let sym_entry = image.get(sym_file_off + sym_off..sym_file_off + sym_off + 24)
@@ -594,10 +598,11 @@ fn apply_static_pie_relocations(
                 loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
                 applied += 1;
             } else {
+                crate::println!("exec-reloc: LA R_ABS64 no symtab");
                 skipped += 1;
             }
         } else {
-            if skipped < 4 && cfg!(target_arch = "loongarch64") {
+            if skipped < 4 {
                 crate::println!(
                     "exec-reloc: LA skip type={} sym={} off={:#x}",
                     relocation_type, symbol, raw_offset,
