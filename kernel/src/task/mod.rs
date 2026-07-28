@@ -3138,79 +3138,39 @@ pub fn boot_idle_loop() -> ! {
 
 #[cfg(debug_assertions)]
 static WORKER_PROGRESS: [AtomicUsize; MAX_CPUS] = [
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
 ];
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
-	AtomicUsize::new(0),
 #[cfg(debug_assertions)]
 static WORKER_STACKS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
 ];
 #[cfg(debug_assertions)]
 static WORKER_CPUS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
 ];
 #[cfg(debug_assertions)]
 static EXPECTED_CPUS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
+    AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX),
 ];
 #[cfg(debug_assertions)]
 static WORKER_READY_MASK: AtomicUsize = AtomicUsize::new(0);
@@ -3310,7 +3270,6 @@ fn worker_7() {
 
 #[cfg(debug_assertions)]
 const WORKER_ENTRIES: [KernelThreadEntry; MAX_CPUS] = [
-    worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7,
     worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7,
 ];
 
