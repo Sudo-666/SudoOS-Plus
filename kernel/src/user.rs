@@ -2563,7 +2563,7 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
             }
         }
         crate::println!("sudoos-diag: final-buildstorm: diagnostic minibuild begin");
-        let diagnostic = "rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; new_rc=$?; echo BUILDSTORM_DIAG_NEW_RC=$new_rc; test $new_rc -eq 0 || exit $new_rc; cd /tmp/minibuild-diag || exit 97; cargo build; build_rc=$?; echo BUILDSTORM_DIAG_BUILD_RC=$build_rc; test $build_rc -eq 0 || exit $build_rc; /tmp/minibuild-diag/target/debug/minibuild-diag; run_rc=$?; echo BUILDSTORM_DIAG_RUN_RC=$run_rc; exit $run_rc";
+        let diagnostic = "echo DIAG_PHASE=start; rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; new_rc=$?; echo BUILDSTORM_DIAG_NEW_RC=$new_rc; test $new_rc -eq 0 || { echo DIAG_FAIL=new; exit $new_rc; }; cd /tmp/minibuild-diag || { echo DIAG_FAIL=cd; exit 97; }; echo DIAG_PHASE=cargo-build; cargo build; build_rc=$?; echo BUILDSTORM_DIAG_BUILD_RC=$build_rc; echo DIAG_PHASE=cargo-build-done; test $build_rc -eq 0 || { echo DIAG_FAIL=build; exit $build_rc; }; echo DIAG_PHASE=run; /tmp/minibuild-diag/target/debug/minibuild-diag; run_rc=$?; echo BUILDSTORM_DIAG_RUN_RC=$run_rc; echo DIAG_PHASE=done; exit $run_rc";
         EXEC_TRACE_COUNT.store(0, Ordering::Release);
         OSCOMP_LIFECYCLE_TRACE_BUDGET.store(2048, Ordering::Release);
         OSCOMP_LIFECYCLE_TRACE.store(true, Ordering::Release);
