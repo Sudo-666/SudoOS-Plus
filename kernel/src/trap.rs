@@ -142,6 +142,13 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
         ECODE_PAGE_PRIVILEGE => {
             handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Read, true)
         }
+        // G7: EXCCODE_SXD (16) — LoongArch fires this instead of PIS when the
+        // TLB entry exists but the page's storage attribute (MAT) is incompatible
+        // with the store instruction.  Handle like a write page fault so the
+        // kernel can re-map the page with correct attributes.
+        16 if frame.previous_mode_was_user() => {
+            handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Write, false)
+        }
         ECODE_INTERRUPT => {
             crate::irq::enter();
             let pending = frame.pending_interrupts();

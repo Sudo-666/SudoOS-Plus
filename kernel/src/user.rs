@@ -4698,11 +4698,22 @@ fn run_program_image_with_cwd(
     owner: &str,
     cwd: Option<&str>,
 ) -> Result<isize, crate::exec::ExecError> {
-    let extra_areas = [VmArea::new(
-        VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
-        VmAreaFlags::user_rw(),
-        VmAreaKind::Anonymous,
-    )];
+    // G7: LA ld-linux accesses low anonymous pages during early init; pre-create a
+    // writable VMA covering the typical mmap base so page faults are satisfied.
+    // A single page at USER_MMAP_START was enough to eliminate the SXD exception
+    // but ld-linux still hung — expand to a generous anonymous window.
+    let extra_areas = [
+        VmArea::new(
+            VirtRange::from_bounds(USER_DEMAND, USER_DEMAND + PAGE_SIZE),
+            VmAreaFlags::user_rw(),
+            VmAreaKind::Anonymous,
+        ),
+        VmArea::new(
+            VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_START + 0x100000),
+            VmAreaFlags::user_rw(),
+            VmAreaKind::Anonymous,
+        ),
+    ];
     let exec = crate::exec::exec_elf(image, crate::exec::ExecConfig {
         argv,
         envp,
@@ -5782,10 +5793,13 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         let index = OSCOMP_LA_REAL_EXCEPTION_LOGS.fetch_add(1, Ordering::Relaxed);
         if index < 32 {
             crate::println!(
-                "oscomp-la-user-exception: index={} code={} era={:#x} sp={:#x} last_syscall={}",
+                "oscomp-la-user-exception: index={} code={} subcode={} era={:#x} badv={:#x} badi={:#x} sp={:#x} last_syscall={}",
                 index,
                 _code,
+                (frame.estat >> 22) & 0x1ff,
                 frame.era,
+                frame.badv,
+                frame.badi,
                 frame.stack_pointer(),
                 LAST_TRACED_SYSCALL_NR.load(Ordering::Relaxed),
             );
