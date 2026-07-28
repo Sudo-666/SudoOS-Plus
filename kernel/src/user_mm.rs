@@ -889,6 +889,7 @@ impl UserMm {
         // marker. A CLONE_VM/pthread process may legally execute this same mm
         // on multiple CPUs at once. Hardware root/ASID checks above and the
         // current-CPU membership check below are the required local invariant.
+        assert!(active.count() >= 1, "M8-B3 published an unexpected CPU mask");
         let current_is_active = active.contains(cpu).map_err(UserMmError::from)?;
         assert!(
             current_is_active,
