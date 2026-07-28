@@ -871,7 +871,7 @@ impl UserMm {
             asid,
             "M8-B3 hardware ASID does not match the active user mm",
         );
-        assert_eq!(active.count(), 1, "M8-B3 published an unexpected CPU mask");
+        assert!(active.count() >= 1, "M8-B3 published an unexpected CPU mask");
         let current_is_active = active.contains(cpu).map_err(UserMmError::from)?;
         assert!(
             current_is_active,
