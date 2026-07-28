@@ -486,10 +486,12 @@ fn apply_static_pie_relocations(
                 pltrel_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
             }
             35 => {
-                relr_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+                relr_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?;
+                crate::println!("exec-reloc: DT_RELRSZ={:#x}", relr_size);
             }
             36 => {
-                relr_vaddr = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+                relr_vaddr = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?;
+                crate::println!("exec-reloc: DT_RELR={:#x}", relr_vaddr);
             }
             _ => {}
         }
@@ -530,8 +532,10 @@ fn apply_static_pie_relocations(
         if sym_vaddr != 0 {
             let sym_runtime = sym_vaddr.checked_add(elf.load_bias)
                 .ok_or(ExecError::AddressOverflow)?;
+            crate::println!("exec-reloc: LA SYMTAB vaddr={:#x}", sym_vaddr);
             Some(virtual_to_file_offset(elf, VirtAddr::new(sym_runtime), 24 * 256)?)
         } else {
+            crate::println!("exec-reloc: LA no SYMTAB");
             None
         }
     };
@@ -593,6 +597,12 @@ fn apply_static_pie_relocations(
                 skipped += 1;
             }
         } else {
+            if skipped < 4 && cfg!(target_arch = "loongarch64") {
+                crate::println!(
+                    "exec-reloc: LA skip type={} sym={} off={:#x}",
+                    relocation_type, symbol, raw_offset,
+                );
+            }
             skipped += 1;
         }
     }
