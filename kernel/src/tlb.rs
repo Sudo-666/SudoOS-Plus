@@ -389,7 +389,10 @@ pub fn shootdown_user_local(request: PerMmTlbRequest) {
     let current = crate::smp::current_cpu_id();
     let current_bit = cpu_bit(current);
     if requested & !current_bit != 0 {
-        shootdown_user(request);
+        // Interrupts are disabled; fall back to local flush only.
+        // The other CPU(s) will flush on their own next TLB event.
+        flush_local(request.flush());
+        COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
