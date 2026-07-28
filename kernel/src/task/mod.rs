@@ -29,7 +29,7 @@ use crate::{
 };
 use stack::KernelStack;
 
-const MAX_TASKS: usize = 512;
+const MAX_TASKS: usize = 128;
 const DEFAULT_TIME_SLICE_TICKS: u32 = 4;
 const MAX_CPUS: usize = crate::smp::MAX_CPUS;
 #[cfg(debug_assertions)]
