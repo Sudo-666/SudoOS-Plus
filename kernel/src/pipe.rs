@@ -221,7 +221,10 @@ impl FileOperations for PipeReader {
     }
 
     fn process_exit(&self, _file: &File) {
-        self.pipe.exit_reader();
+        // A process exit removes only that process's descriptor reference.
+        // fork/dup may leave the same Arc<File> alive elsewhere, so forcing
+        // the whole pipe endpoint closed here would publish a false EOF.
+        // The final Arc<File> drop calls release() and closes the endpoint.
     }
 
     fn poll(&self, _file: &File, requested: PollEvents) -> PollEvents {
@@ -251,7 +254,8 @@ impl FileOperations for PipeWriter {
     }
 
     fn process_exit(&self, _file: &File) {
-        self.pipe.exit_writer();
+        // See PipeReader::process_exit. EOF belongs to open-file-description
+        // lifetime, not to one process removing its inherited descriptor.
     }
 
     fn poll(&self, _file: &File, requested: PollEvents) -> PollEvents {
@@ -300,6 +304,27 @@ pub fn verify() {
     drop(writer);
     let mut eof = MutableIoBuffer::new(&mut bytes[..1]);
     assert_eq!(reader.read(&mut eof).expect("pipe EOF failed"), 0);
+
+    // fork/dup share an Arc<File>. One process exiting must not set the
+    // endpoint count to zero while another process still owns that Arc.
+    let (jobserver_reader, jobserver_writer) =
+        create_pipe(OpenFlags::O_NONBLOCK).expect("jobserver pipe creation failed");
+    jobserver_writer.process_exit();
+    let mut token = [0_u8; 1];
+    let mut token_output = MutableIoBuffer::new(&mut token);
+    assert_eq!(
+        jobserver_reader.read(&mut token_output),
+        Err(Errno::Eagain),
+        "jobserver inherited writer survived process-exit hook",
+    );
+    drop(jobserver_writer);
+    let mut jobserver_eof = MutableIoBuffer::new(&mut token);
+    assert_eq!(
+        jobserver_reader
+            .read(&mut jobserver_eof)
+            .expect("jobserver final EOF failed"),
+        0,
+    );
     assert!(
         reader
             .poll(PollEvents::IN.union(PollEvents::HUP))

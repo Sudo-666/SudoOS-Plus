@@ -22,6 +22,7 @@ pub mod number {
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
     pub const FACCESSAT: usize = 48;
+    pub const FCHMODAT: usize = 53;
     pub const CHDIR: usize = 49;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -69,6 +70,7 @@ pub mod number {
     pub const GETPGID: usize = 155;
     pub const GETSID: usize = 156;
     pub const UNAME: usize = 160;
+    pub const UMASK: usize = 166;
     pub const GETTIMEOFDAY: usize = 169;
     pub const GETPID: usize = 172;
     pub const GETPPID: usize = 173;
