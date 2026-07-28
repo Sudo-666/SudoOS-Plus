@@ -648,12 +648,11 @@ fn apply_static_pie_relocations(
                                 let physical = mm.populate_page(VirtAddr::new(dst))?;
                                 let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
                                     .map_err(|_| ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
-                                let raw = unsafe { core::ptr::read_volatile(ptr as *const u64) };
-                                let old_val = u64::from_le(raw.to_le_bytes());
+                                let old_val = unsafe { core::ptr::read_volatile(ptr as *const u64) };
                                 let new_val = old_val
                                     .checked_add(elf.load_bias as u64)
                                     .ok_or(ExecError::AddressOverflow)?;
-                                unsafe { core::ptr::write_volatile(ptr as *mut u64, u64::from_le(new_val.to_le_bytes())) };
+                                unsafe { core::ptr::write_volatile(ptr as *mut u64, new_val) };
                                 relr_applied += 1;
                             }
                         }
