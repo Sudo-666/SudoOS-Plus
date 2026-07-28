@@ -458,6 +458,8 @@ fn apply_static_pie_relocations(
     let mut rel_size = 0_usize;
     let mut jmprel = 0_usize;
     let mut pltrel_size = 0_usize;
+    let mut relr_vaddr = 0_usize;
+    let mut relr_size = 0_usize;
 
     for entry in entries.chunks_exact(16) {
         let tag = read_u64(entry, 0)?;
@@ -483,6 +485,12 @@ fn apply_static_pie_relocations(
             DT_PLTRELSZ => {
                 pltrel_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
             }
+            35 => {
+                relr_size = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
+            36 => {
+                relr_vaddr = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?
+            }
             _ => {}
         }
     }
@@ -506,6 +514,30 @@ fn apply_static_pie_relocations(
         .get(rela_offset..rela_offset + rela_size)
         .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
 
+    // G7: LoongArch DT_SYMTAB for R_LARCH_64 symbol resolution.
+    #[cfg(target_arch = "loongarch64")]
+    let symtab_base: Option<usize> = {
+        let mut sym_vaddr = 0_usize;
+        for entry in entries.chunks_exact(16) {
+            let tag = read_u64(entry, 0)?;
+            let value = read_u64(entry, 8)?;
+            match tag {
+                6 => sym_vaddr = usize::try_from(value).map_err(|_| ExecError::AddressOverflow)?,
+                DT_NULL => break,
+                _ => {}
+            }
+        }
+        if sym_vaddr != 0 {
+            let sym_runtime = sym_vaddr.checked_add(elf.load_bias)
+                .ok_or(ExecError::AddressOverflow)?;
+            Some(virtual_to_file_offset(elf, VirtAddr::new(sym_runtime), 24 * 256)?)
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_arch = "loongarch64"))]
+    let symtab_base: Option<usize> = None;
+
     let mut applied: usize = 0;
     let mut skipped: usize = 0;
     for entry in rela_bytes.chunks_exact(rela_ent) {
@@ -514,11 +546,8 @@ fn apply_static_pie_relocations(
         let addend = read_i64(entry, 16)?;
         let relocation_type = (info & 0xffff_ffff) as u32;
         let symbol = info >> 32;
-        // R_LARCH_64 (type 2, symbol=0): absolute 64-bit relocation.
-        // Writes the addend as an absolute address.  Used by static
-        // PIE binaries for GOT entries pointing to global data.
         #[cfg(target_arch = "loongarch64")]
-        let is_abs64 = relocation_type == R_ABS64 && symbol == 0;
+        let is_abs64 = relocation_type == R_ABS64;
         #[cfg(not(target_arch = "loongarch64"))]
         let is_abs64 = false;
 
@@ -528,10 +557,8 @@ fn apply_static_pie_relocations(
                 .checked_add(elf.load_bias)
                 .ok_or(ExecError::AddressOverflow)?;
             let value = if is_abs64 {
-                // R_LARCH_64 with symbol=0: value = addend (absolute address).
                 addend as u64
             } else {
-                // R_RELATIVE: value = load_bias + addend.
                 u64::try_from(
                     (elf.load_bias as i128)
                         .checked_add(addend as i128)
@@ -541,6 +568,30 @@ fn apply_static_pie_relocations(
             };
             loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
             applied += 1;
+        } else if is_abs64 && symbol != 0 {
+            // R_LARCH_64 with explicit symbol: S + A.
+            if let Some(sym_file_off) = symtab_base {
+                let sym_off = (symbol as usize).checked_mul(24).ok_or(ExecError::AddressOverflow)?;
+                let sym_entry = image.get(sym_file_off + sym_off..sym_file_off + sym_off + 24)
+                    .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader))?;
+                let st_value = u64::from_le_bytes([
+                    sym_entry[8], sym_entry[9], sym_entry[10], sym_entry[11],
+                    sym_entry[12], sym_entry[13], sym_entry[14], sym_entry[15],
+                ]);
+                let s = (st_value as i128).checked_add(elf.load_bias as i128)
+                    .ok_or(ExecError::AddressOverflow)?;
+                let value = u64::try_from(s.checked_add(addend as i128)
+                    .ok_or(ExecError::AddressOverflow)?)
+                    .map_err(|_| ExecError::AddressOverflow)?;
+                let destination = usize::try_from(raw_offset)
+                    .map_err(|_| ExecError::AddressOverflow)?
+                    .checked_add(elf.load_bias)
+                    .ok_or(ExecError::AddressOverflow)?;
+                loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         } else {
             skipped += 1;
         }
@@ -553,6 +604,49 @@ fn apply_static_pie_relocations(
             jmprel,
             pltrel_size,
         );
+    }
+
+    // G7: DT_RELR compact relative relocations (LoongArch ld-linux).
+    let mut relr_applied: usize = 0;
+    if relr_size != 0 {
+        let relr_addr = relr_vaddr
+            .checked_add(elf.load_bias)
+            .ok_or(ExecError::AddressOverflow)?;
+        if let Ok(relr_offset) = virtual_to_file_offset(elf, VirtAddr::new(relr_addr), relr_size)
+        {
+            if let Some(relr_bytes) = image.get(relr_offset..relr_offset + relr_size) {
+                let mut base: usize = 0;
+                for chunk in relr_bytes.chunks_exact(8) {
+                    let entry = u64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3],
+                        chunk[4], chunk[5], chunk[6], chunk[7],
+                    ]);
+                    if entry & 1 != 0 {
+                        base = (entry as usize) & !1;
+                    } else {
+                        for i in 0..63 {
+                            if entry & (1u64 << i) != 0 {
+                                let addr = base.saturating_add(i * 8);
+                                let dst = addr
+                                    .checked_add(elf.load_bias)
+                                    .ok_or(ExecError::AddressOverflow)?;
+                                let physical = mm.populate_page(VirtAddr::new(dst))?;
+                                let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
+                                    .map_err(|_| ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
+                                let raw = unsafe { core::ptr::read_volatile(ptr as *const u64) };
+                                let old_val = u64::from_le(raw.to_le_bytes());
+                                let new_val = old_val
+                                    .checked_add(elf.load_bias as u64)
+                                    .ok_or(ExecError::AddressOverflow)?;
+                                unsafe { core::ptr::write_volatile(ptr as *mut u64, u64::from_le(new_val.to_le_bytes())) };
+                                relr_applied += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        crate::println!("exec-reloc: relr applied={}", relr_applied);
     }
 
     Ok(())
