@@ -41,70 +41,75 @@
 
 ---
 
-# RISC-V BuildStorm 诊断分析 (rv-diag.log)
+# RISC-V 测试与修复
 
-> 运行模式: `sudoos.oscomp=final-buildstorm-diag`  
-> 配置: RISC-V64, QEMU virt, 2 CPUs, 2G RAM, OpenSBI v1.8
+## CAgent: ✅ 10/10 PASS（日志: cagent-rv.log）
 
-## Gate 对照 (plan.md G0-G5)
-
-| Gate | 状态 | 说明 |
+| 测试 | 耗时 | 奖励 |
 |---|---|---|
-| G0 基线 | ✅ | 内核启动、双核 SMP |
-| G1 环境一致性 | ✅ | 诊断/生产分离，preflight 通过 |
-| G2 退出/回收 | ✅ | 生命周期摘要正常 |
-| G3 CAgent | ❓ | 此日志仅跑 BuildStorm 诊断模式 |
-| G4 工具链 | ⚠️ | rustc/cargo 可运行，rustfmt 缺失 (回退到 `/root/.cargo`) |
-| **G5 minibuild** | ❌ | **链接阶段 OOM** |
+| factorial | 14000 | ✅ < 15000 |
+| date | 12000 | ✅ |
+| network | 12000 | ✅ |
+| kernel | 12000 | ✅ |
+| cpu | 13000 | ✅ |
+| fs-search | 12000 | ✅ |
+| fs-create | 12000 | ✅ |
+| fs-readwrite | 12000 | ✅ |
+| fs-usage | 12000 | ✅ |
+| fs-directory | 14000 | ✅ |
 
-## 🔴 阻断问题：Linker OOM
+- 全部在 50% 超时线以下，时间奖励全部到手
+- lifecycle: `spawned=120 retired=124 backlog=0 outstanding=0` 无泄漏
+
+## BuildStorm: 🔴→✅ 已修复（日志: buildstorm-rv-diag-v6.log）
+
+### 根因
+
+[user.rs](kernel/src/user.rs): brk 堆仅有 **1 MiB**（`USER_HEAP_LIMIT=0x700000`，`HEAP_START=0x600000`）。
+
+`ld` 链接器通过 `sbrk(0)` / `brk()` 分配内部数据结构（哈希表、重定位表、段数据等），1 MiB 在链接 Rust 二进制时瞬间耗尽，导致：
 
 ```
-error: linking with `cc` failed: exit status: 1
 /usr/bin/ld: final link failed: Cannot allocate memory
 BUILDSTORM_DIAG_BUILD_RC=101
-DIAG_FAIL=build
 ```
 
-- `cargo build` 编译 (.rlib) 成功，但 `ld` 最终链接阶段失败
-- 根因：链接器需要大量虚拟地址空间来 mmap 所有 `.rlib`/`.rmeta` + 生成最终二进制，当前内核内存管理无法满足
-- 这可能与 `MAX_TASKS=128` 进程数限制、或用户空间地址映射数量上限有关
+### 修复
 
-## 🟡 缺失 Syscalls
+`USER_HEAP_LIMIT`: **0x700000 → 0xFF0000**（1 MiB → 10 MiB heap）
 
-| nr | 频率 | 推测 (riscv64) | 影响范围 |
+注意事项：
+- `USER_STACK`（0x800000）和 `USER_MMAP_START`（0x1000000）**保持不变**，确保自测汇编中的硬编码地址不破坏
+- `RUNTIME_STACK = USER_HEAP_LIMIT` 和 `RUNTIME_STACK_TOP = USER_MMAP_START` 保持 `start < end`
+- `VMA_CAPACITY` 保持 **256**（增至 384/512 会触发 vmalloc page fault）
+
+### 验证结果
+
+```
+BUILDSTORM_DIAG_NEW_RC=0    ✅ cargo new 成功
+DIAG_PHASE=cargo-build
+  Compiling minibuild-diag   ✅ 编译成功
+BUILDSTORM_DIAG_BUILD_RC=0  ✅ 链接成功（之前 101）
+DIAG_PHASE=run
+BUILDSTORM_DIAG_RUN_RC=0    ✅ Hello, world! 运行成功
+DIAG_PHASE=done
+sudoos-diag: final-buildstorm: diagnostic exit=0
+SMOKE_TEST: PASS
+```
+
+## 缺失 Syscalls（低优先级，均有 glibc fallback）
+
+| nr | 名称 | 频率 | 影响 |
 |---|---|---|---|
-| **258** | 极高 (~50+次) | 线程/futex 辅助调用 | 每个 rustc/cargo 子进程 |
-| **223** | 中等 (~5次) | 路径/文件操作 | 编译和链接阶段 |
-| **439** | 低 (2次) | `faccessat2` | cargo 访问权限检查 |
-| **166** | 低 (2次) | socket 相关 | 链接阶段 |
-| **53** | 低 (1次) | socket 相关 | 进程退出阶段 |
-| **2047** | 低 (1次) | RISC-V 特定调用 | 早期初始化 |
+| 258 | `riscv_hwprobe` | 极高 | RISC-V 硬件探测，ld-linux 调用，-ENOSYS 可回退 |
+| 223 | 待确认 | 中等 | 编译/链接阶段 |
+| 439 | `faccessat2` | 低 | cargo 访问权限检查 |
+| 2047 | 待确认 | 低 | 早期初始化调用 |
+| 166 | socket 相关 | 低 | 链接/退出阶段 |
+| 53 | socket 相关 | 低 | 进程退出阶段 |
 
-## 🟡 Disk I/O Error
+## 🟡 已知次要问题
 
-```
-warning: failed to save last-use data
-Error code 3850: disk I/O error
-```
-
-cargo 写入缓存使用数据到 `CARGO_HOME` 时 ext4 overlay 写入失败，不影响编译但导致缓存管理异常。
-
-## 🟢 正常运行项
-
-- ✅ 内核完整启动：OpenSBI → 双核 SMP → MMU → buddy → slab → 调度器
-- ✅ ext4 延迟 overlay: lazy expand 正常工作
-- ✅ Write preflight: `/root/.cargo`、`/work`、`/tmp` 均真实可写
-- ✅ rustc/cargo exec: 动态链接可正常加载
-- ✅ `cargo new`: 项目创建成功
-- ✅ rustc 编译: `.rlib`/`.rmeta` 阶段完成，大量 mmap 正常
-- ✅ 进程退出/回收: lifecycle 闭环正常（cleanup 追踪完整）
-- ✅ SMOKE_TEST: PASS
-- ⚠️ `/tmp/cargo-cache/bin/rustfmt` 不存在（自动回退到 `/root/.cargo/bin/rustfmt` 后成功）
-
-## 🔵 修复优先级
-
-1. **Linker OOM** — 最关键阻断点（进程虚拟地址空间限制 / VMA 数量 / 物理内存管理）
-2. **syscall 258 / 223 / 439** — 高频缺失，优先实现
-3. **Disk I/O error 3850** — 排查 ext4 overlay 写入失败
-4. **syscall 166 / 53** — socket 调用补充
+- **Disk I/O error 3850**: cargo 写入缓存到 ext4 overlay 时偶发失败
+- **ioctl TCGETS/TIOCGWINSZ**: 无害终端探测，可安全返回 -ENOTTY
+- **rustfmt 缺失**: `/tmp/cargo-cache/bin/rustfmt` 不存在，自动回退到 `/root/.cargo/bin/rustfmt`
