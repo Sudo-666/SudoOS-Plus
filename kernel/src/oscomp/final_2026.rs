@@ -18,6 +18,16 @@ pub fn run_buildstorm() -> bool {
     crate::user::verify_final_buildstorm()
 }
 
+pub fn run_buildstorm_diag() -> bool {
+    crate::println!("sudoos-diag: entering final-2026 BuildStorm diagnostic runner");
+    crate::user::verify_final_buildstorm_diag()
+}
+
+pub fn run_lifecycle_stress() -> bool {
+    crate::println!("sudoos-diag: entering task lifecycle stress runner");
+    crate::user::verify_task_lifecycle_stress()
+}
+
 pub fn run_all() -> bool {
     crate::println!("sudoos-diag: entering final-2026 all runner");
     let cagent_ran = run_cagent();

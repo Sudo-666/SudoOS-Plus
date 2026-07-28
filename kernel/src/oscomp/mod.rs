@@ -6,6 +6,8 @@ pub enum RunMode {
     Preliminary,
     FinalCagent,
     FinalBuildstorm,
+    FinalBuildstormDiag,
+    LifecycleStress,
     FinalAll,
 }
 
@@ -15,6 +17,8 @@ impl RunMode {
             Self::Preliminary => "preliminary",
             Self::FinalCagent => "final-cagent",
             Self::FinalBuildstorm => "final-buildstorm",
+            Self::FinalBuildstormDiag => "final-buildstorm-diag",
+            Self::LifecycleStress => "lifecycle-stress",
             Self::FinalAll => "final-all",
         }
     }
@@ -25,6 +29,8 @@ fn parse_mode(value: &str) -> Option<RunMode> {
         "preliminary" => Some(RunMode::Preliminary),
         "final-cagent" => Some(RunMode::FinalCagent),
         "final-buildstorm" => Some(RunMode::FinalBuildstorm),
+        "final-buildstorm-diag" => Some(RunMode::FinalBuildstormDiag),
+        "lifecycle-stress" => Some(RunMode::LifecycleStress),
         "final-all" => Some(RunMode::FinalAll),
         _ => None,
     }
@@ -66,6 +72,8 @@ pub fn run(mode: RunMode) -> bool {
         RunMode::Preliminary => preliminary::run(),
         RunMode::FinalCagent => final_2026::run_cagent(),
         RunMode::FinalBuildstorm => final_2026::run_buildstorm(),
+        RunMode::FinalBuildstormDiag => final_2026::run_buildstorm_diag(),
+        RunMode::LifecycleStress => final_2026::run_lifecycle_stress(),
         RunMode::FinalAll => final_2026::run_all(),
     }
 }

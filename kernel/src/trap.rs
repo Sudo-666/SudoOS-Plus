@@ -78,6 +78,9 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             ),
         }
         crate::irq::exit();
+        if frame.previous_mode_was_user() {
+            let _ = crate::user::handle_forced_exit(frame);
+        }
         return;
     }
 
@@ -156,6 +159,9 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
                 crate::irq::handle_timer_interrupt();
             }
             crate::irq::exit();
+            if frame.previous_mode_was_user() {
+                let _ = crate::user::handle_forced_exit(frame);
+            }
         }
         code if frame.previous_mode_was_user() => crate::user::handle_exception(frame, code),
         code => panic!(

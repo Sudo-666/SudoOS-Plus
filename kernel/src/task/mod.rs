@@ -146,11 +146,13 @@ struct Task {
     stack: Option<KernelStack>,
     entry: Option<KernelThreadEntry>,
     user_thread: Option<Arc<crate::process::Thread>>,
-    user_join: Option<Arc<Completion>>,
+    exit_visible: Option<Arc<Completion>>,
+    process_cleanup: Option<ProcessCleanup>,
     affinity: Option<CpuId>,
     queued_on: Option<CpuId>,
     has_run: bool,
     wait_channel: Option<usize>,
+    wait_queue_address: Option<usize>,
     wait_prev: Option<TaskId>,
     wait_next: Option<TaskId>,
     wake_after_switch: bool,
@@ -192,11 +194,13 @@ impl Task {
             stack: None,
             entry: None,
             user_thread: None,
-            user_join: None,
+            exit_visible: None,
+            process_cleanup: None,
             affinity: Some(CpuId::BOOT),
             queued_on: None,
             has_run: true,
             wait_channel: None,
+            wait_queue_address: None,
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
@@ -212,11 +216,13 @@ impl Task {
             stack: Some(stack),
             entry: None,
             user_thread: None,
-            user_join: None,
+            exit_visible: None,
+            process_cleanup: None,
             affinity: Some(cpu),
             queued_on: None,
             has_run: false,
             wait_channel: None,
+            wait_queue_address: None,
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
@@ -242,11 +248,13 @@ impl Task {
             stack: Some(stack),
             entry: Some(entry),
             user_thread: None,
-            user_join: None,
+            exit_visible: None,
+            process_cleanup: None,
             affinity,
             queued_on: None,
             has_run: false,
             wait_channel: None,
+            wait_queue_address: None,
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
@@ -256,7 +264,8 @@ impl Task {
     fn user_thread(
         id: TaskId,
         thread: Arc<crate::process::Thread>,
-        join: Arc<Completion>,
+        exit_visible: Arc<Completion>,
+        process_cleanup: Option<ProcessCleanup>,
         stack: KernelStack,
         affinity: Option<CpuId>,
     ) -> Self {
@@ -271,11 +280,13 @@ impl Task {
             stack: Some(stack),
             entry: None,
             user_thread: Some(thread),
-            user_join: Some(join),
+            exit_visible: Some(exit_visible),
+            process_cleanup,
             affinity,
             queued_on: None,
             has_run: false,
             wait_channel: None,
+            wait_queue_address: None,
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
@@ -307,6 +318,11 @@ impl Task {
             self.id,
         );
         assert!(
+            self.wait_queue_address.is_none(),
+            "destroying task retained a wait-queue address: {:?}",
+            self.id,
+        );
+        assert!(
             !self.wake_after_switch,
             "destroying task with a pending wake claim: {:?}",
             self.id,
@@ -321,9 +337,24 @@ impl Task {
                 .destroy()
                 .unwrap_or_else(|error| panic!("unable to release kernel stack: {error:?}"));
         }
-        drop(self.user_thread.take());
-        if let Some(join) = self.user_join.take() {
-            join.complete_all();
+        assert!(
+            self.exit_visible.is_none(),
+            "exit-visible completion reached final task reclamation",
+        );
+        if let Some(cleanup) = self.process_cleanup.take() {
+            // The synchronous owner stops waiting at ExitVisible. It drops its
+            // Thread/Process references and publishes that hand-off here; the
+            // reaper can then preserve the original stack -> Thread -> Process
+            // destruction order without delaying the caller's return.
+            cleanup.caller_released.wait();
+            drop(self.user_thread.take());
+            let process = Arc::try_unwrap(cleanup.process)
+                .unwrap_or_else(|_| panic!("reaper retained unexpected Process owners"));
+            process
+                .destroy()
+                .unwrap_or_else(|error| panic!("reaper process destroy failed: {error:?}"));
+        } else {
+            drop(self.user_thread.take());
         }
     }
 }
@@ -340,6 +371,20 @@ struct PendingSwitch {
     previous: TaskId,
     next: TaskId,
     disposition: SwitchDisposition,
+}
+
+struct ExitVisible {
+    completion: Arc<Completion>,
+}
+
+struct ProcessCleanup {
+    process: Arc<crate::process::Process>,
+    caller_released: Arc<Completion>,
+}
+
+struct CompletedSwitch {
+    retired_task_added: bool,
+    exit_visible: Option<ExitVisible>,
 }
 
 #[cfg(debug_assertions)]
@@ -531,7 +576,8 @@ impl Scheduler {
     fn spawn_user(
         &mut self,
         thread: Arc<crate::process::Thread>,
-        join: Arc<Completion>,
+        exit_visible: Arc<Completion>,
+        process_cleanup: Option<ProcessCleanup>,
         stack: KernelStack,
         affinity: Option<CpuId>,
         queue_hint: Option<CpuId>,
@@ -546,7 +592,18 @@ impl Scheduler {
         };
 
         let id = self.allocate_task_id();
-        let task = Task::user_thread(id, thread, join, stack, affinity);
+        let task = Task::user_thread(
+            id,
+            thread,
+            exit_visible,
+            process_cleanup,
+            stack,
+            // Pin after the initial load-balanced placement. On RISC-V a
+            // runnable migration in the narrow anchor-rebuild-to-sret window
+            // can preserve the source CPU's kernel `tp` in sscratch and poison
+            // per-CPU state on the next user trap.
+            Some(target),
+        );
         if id.0 == self.tasks.len() {
             self.tasks.push(Some(task));
         } else {
@@ -559,6 +616,7 @@ impl Scheduler {
             .live_user_threads
             .checked_add(1)
             .expect("live user-thread counter overflowed");
+        USER_TASKS_SPAWNED.fetch_add(1, Ordering::Relaxed);
         (id, target)
     }
 
@@ -836,6 +894,7 @@ impl Scheduler {
             "task attempted to join a second wait queue: task={previous:?} channel={:?}",
             previous_task.wait_channel,
         );
+        assert!(previous_task.wait_queue_address.is_none());
         assert!(
             previous_task.wait_prev.is_none() && previous_task.wait_next.is_none(),
             "running task retained stale intrusive wait links: task={previous:?}",
@@ -887,6 +946,7 @@ impl Scheduler {
                 "exiting task retained wait-channel ownership: task={previous:?} channel={:?}",
                 previous_task.wait_channel,
             );
+            assert!(previous_task.wait_queue_address.is_none());
             assert!(
                 !previous_task.wake_after_switch,
                 "exiting task retained a pending wake claim: task={previous:?}",
@@ -924,9 +984,12 @@ impl Scheduler {
         (previous_pointer, next_pointer)
     }
 
-    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> bool {
+    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> CompletedSwitch {
         let Some(pending) = self.cpus[cpu.get()].pending.take() else {
-            return false;
+            return CompletedSwitch {
+                retired_task_added: false,
+                exit_visible: None,
+            };
         };
 
         assert_eq!(
@@ -975,6 +1038,7 @@ impl Scheduler {
                         );
                         task.wake_after_switch = false;
                         task.wait_channel = None;
+                        task.wait_queue_address = None;
                         task.state = TaskState::Runnable;
                     }
                     self.enqueue(pending.previous, cpu);
@@ -1007,11 +1071,21 @@ impl Scheduler {
                         .expect("live user-thread counter underflowed");
                 }
 
-                let task = self.tasks[pending.previous.0]
+                let mut task = self.tasks[pending.previous.0]
                     .take()
                     .expect("exited task disappeared before reclamation");
                 assert_eq!(task.id, pending.previous);
                 assert_eq!(task.state, TaskState::Exited);
+                let exit_visible = if matches!(task.kind, TaskKind::UserThread) {
+                    Some(ExitVisible {
+                        completion: task
+                            .exit_visible
+                            .take()
+                            .expect("exited user task lost its exit-visible completion"),
+                    })
+                } else {
+                    None
+                };
                 // M15-A: grow the deferred reclamation queue instead of
                 // panicking during SMP verifier/user-exit bursts. Linux-like
                 // task reclamation must tolerate transient exit bursts until
@@ -1022,6 +1096,7 @@ impl Scheduler {
                         .expect("unable to grow retired task queue");
                 }
                 self.retired_tasks.push(task);
+                TASKS_RETIRED.fetch_add(1, Ordering::Relaxed);
                 // Publish the flush/barrier lifetime before making the task
                 // visible to the reaper.  The scheduler lock prevents a consumer
                 // from detaching the task between these two publications.
@@ -1039,11 +1114,17 @@ impl Scheduler {
                     pending < MAX_TASKS,
                     "retired backlog exceeded queue capacity"
                 );
-                return true;
+                return CompletedSwitch {
+                    retired_task_added: true,
+                    exit_visible,
+                };
             }
         }
 
-        false
+        CompletedSwitch {
+            retired_task_added: false,
+            exit_visible: None,
+        }
     }
 
     fn take_retired_task(&mut self) -> Option<Task> {
@@ -1198,6 +1279,61 @@ impl Scheduler {
         self.task(self.current(cpu)).user_thread.as_ref().cloned()
     }
 
+    fn request_process_thread_exit(
+        &mut self,
+        process: crate::process::ProcessId,
+        except: crate::process::ThreadId,
+        status: isize,
+    ) -> usize {
+        let mut wake = Vec::new();
+        let mut target_mask = 0_usize;
+
+        for index in 0..self.tasks.len() {
+            let Some(task) = self.tasks[index].as_ref() else {
+                continue;
+            };
+            let Some(thread) = task.user_thread.as_ref() else {
+                continue;
+            };
+            if thread.process().id() != process || thread.id() == except {
+                continue;
+            }
+
+            thread.request_forced_exit(status);
+            match task.state {
+                TaskState::Blocked => {
+                    if let Some(address) = task.wait_queue_address {
+                        wake.push((task.id, address));
+                    }
+                }
+                TaskState::SwitchingOut(cpu) if !task.wake_after_switch => {
+                    if let Some(address) = task.wait_queue_address {
+                        wake.push((task.id, address));
+                    }
+                    target_mask |= 1_usize << cpu.get();
+                }
+                TaskState::Running(cpu) => target_mask |= 1_usize << cpu.get(),
+                TaskState::Runnable => {
+                    if let Some(cpu) = task.queued_on {
+                        target_mask |= 1_usize << cpu.get();
+                    }
+                }
+                TaskState::SwitchingOut(cpu) => target_mask |= 1_usize << cpu.get(),
+                TaskState::Idle(_) | TaskState::Exited => {}
+            }
+        }
+
+        for (task, address) in wake {
+            // SAFETY: a linked waiter keeps the WaitQueue alive until it is
+            // unlinked. The scheduler lock serializes this lookup with normal
+            // wakeup and switch-tail queue removal.
+            let queue = unsafe { &*(address as *const WaitQueue) };
+            let (_, targets) = self.wake_waiters(queue, 1, Some(task));
+            target_mask |= targets;
+        }
+        target_mask
+    }
+
     #[cfg(debug_assertions)]
     fn current_stack_contains(&self, cpu: CpuId, address: usize) -> bool {
         self.task(self.current(cpu)).stack_contains(address)
@@ -1227,6 +1363,7 @@ impl Scheduler {
             let task = self.task(id);
             assert!(matches!(task.state, TaskState::SwitchingOut(_)));
             assert!(task.wait_channel.is_none());
+            assert!(task.wait_queue_address.is_none());
             assert!(task.wait_prev.is_none() && task.wait_next.is_none());
         }
 
@@ -1246,6 +1383,7 @@ impl Scheduler {
         {
             let task = self.task_mut(id);
             task.wait_channel = Some(channel);
+            task.wait_queue_address = Some(queue as *const WaitQueue as usize);
             task.wait_prev = previous_tail;
             task.wait_next = None;
         }
@@ -1348,6 +1486,7 @@ impl Scheduler {
                         assert!(!task.wake_after_switch);
                         assert!(task.wait_prev.is_none() && task.wait_next.is_none());
                         task.wait_channel = None;
+                        task.wait_queue_address = None;
                         task.state = TaskState::Runnable;
                     }
                     self.enqueue(id, target_cpu);
@@ -1521,8 +1660,11 @@ impl Scheduler {
         assert!(
             self.retired_tasks
                 .iter()
-                .all(|task| !matches!(task.kind, TaskKind::UserThread)),
-            "M9-B retained a user task in the reaper queue",
+                .filter(|task| matches!(task.kind, TaskKind::UserThread))
+                .all(|task| {
+                    task.state == TaskState::Exited && task.exit_visible.is_none()
+                }),
+            "M9-B retained a non-retired user task in the reaper queue",
         );
         for (index, cpu) in self.cpus.iter().take(self.discovered_cpus).enumerate() {
             assert!(
@@ -1555,8 +1697,163 @@ static RETIRED_BACKLOG: AtomicUsize = AtomicUsize::new(0);
 // Number of retired tasks whose resources are not fully destroyed yet.  This
 // includes both queued tasks and tasks currently owned by a reaper worker.
 static RETIRED_OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
+static USER_TASKS_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static USER_TASKS_EXIT_VISIBLE: AtomicU64 = AtomicU64::new(0);
+static TASKS_RETIRED: AtomicU64 = AtomicU64::new(0);
+static TASKS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+static EXIT_VISIBLE_WAIT_BEGIN: AtomicU64 = AtomicU64::new(0);
+static EXIT_VISIBLE_WAIT_END: AtomicU64 = AtomicU64::new(0);
 static IDLE_ENTERS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static IDLE_EXITS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TaskLifecycleSnapshot {
+    pub tasks_spawned: u64,
+    pub tasks_exit_visible: u64,
+    pub tasks_retired: u64,
+    pub tasks_reclaimed: u64,
+    pub join_wait_begin: u64,
+    pub join_wait_end: u64,
+    pub retired_backlog: usize,
+    pub retired_outstanding: usize,
+    pub live_user_threads: usize,
+    pub live_kernel_threads: usize,
+    pub live_processes: usize,
+    pub live_threads: usize,
+}
+
+pub(crate) fn task_lifecycle_snapshot() -> TaskLifecycleSnapshot {
+    let (live_user_threads, live_kernel_threads) = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot
+            .as_ref()
+            .expect("kernel scheduler is not initialized");
+        (scheduler.live_user_threads, scheduler.live_kernel_threads)
+    };
+    TaskLifecycleSnapshot {
+        tasks_spawned: USER_TASKS_SPAWNED.load(Ordering::Acquire),
+        tasks_exit_visible: USER_TASKS_EXIT_VISIBLE.load(Ordering::Acquire),
+        tasks_retired: TASKS_RETIRED.load(Ordering::Acquire),
+        tasks_reclaimed: TASKS_RECLAIMED.load(Ordering::Acquire),
+        join_wait_begin: EXIT_VISIBLE_WAIT_BEGIN.load(Ordering::Acquire),
+        join_wait_end: EXIT_VISIBLE_WAIT_END.load(Ordering::Acquire),
+        retired_backlog: RETIRED_BACKLOG.load(Ordering::Acquire),
+        retired_outstanding: RETIRED_OUTSTANDING.load(Ordering::Acquire),
+        live_user_threads,
+        live_kernel_threads,
+        live_processes: crate::process::live_process_count(),
+        live_threads: crate::process::live_thread_count(),
+    }
+}
+
+pub(crate) fn print_task_lifecycle_summary() {
+    let snapshot = task_lifecycle_snapshot();
+    crate::println!(
+        "task-lifecycle-summary spawned={} visible={} retired={} reclaimed={} join_begin={} join_end={} backlog={} outstanding={} live_user={} live_kernel={} live_processes={} live_threads={}",
+        snapshot.tasks_spawned,
+        snapshot.tasks_exit_visible,
+        snapshot.tasks_retired,
+        snapshot.tasks_reclaimed,
+        snapshot.join_wait_begin,
+        snapshot.join_wait_end,
+        snapshot.retired_backlog,
+        snapshot.retired_outstanding,
+        snapshot.live_user_threads,
+        snapshot.live_kernel_threads,
+        snapshot.live_processes,
+        snapshot.live_threads,
+    );
+}
+
+pub(crate) fn print_lifecycle_stress_progress(label: &str, iteration: usize) {
+    let cpu = crate::smp::current_cpu_id();
+    let (boot_sp, current, current_sp) = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        let current = scheduler.current(cpu);
+        (
+            scheduler.task(TaskId(0)).context.saved_stack_pointer(),
+            current,
+            scheduler.task(current).context.saved_stack_pointer(),
+        )
+    };
+    crate::println!(
+        "G2_PROGRESS {} iteration={} cpu={} current={:?} boot_saved_sp={:#x} current_saved_sp={:#x} free_pages={}",
+        label,
+        iteration,
+        cpu.get(),
+        current,
+        boot_sp,
+        current_sp,
+        crate::page_alloc::total_free_pages().unwrap_or(0),
+    );
+}
+
+pub(crate) fn print_task_debug_dump() {
+    let (tasks, cpus) = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot
+            .as_ref()
+            .expect("kernel scheduler is not initialized");
+        let tasks = scheduler
+            .tasks
+            .iter()
+            .flatten()
+            .map(|task| {
+                (
+                    task.id,
+                    task.kind,
+                    task.state,
+                    task.wait_channel,
+                    task.queued_on,
+                    task.user_thread.as_ref().map(|thread| {
+                        (thread.process().id().get(), thread.id().get())
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cpus = scheduler
+            .cpus
+            .iter()
+            .take(scheduler.discovered_cpus)
+            .enumerate()
+            .map(|(index, cpu)| {
+                (
+                    index,
+                    cpu.current,
+                    cpu.run_queue.len(),
+                    cpu.need_resched,
+                    cpu.pending,
+                )
+            })
+            .collect::<Vec<_>>();
+        (tasks, cpus)
+    };
+    crate::println!("sudoos-diag: task-debug-dump begin");
+    for (id, kind, state, wait_channel, queued_on, user) in tasks {
+        crate::println!(
+            "sudoos-diag: task id={:?} kind={:?} state={:?} wait={:?} queued={:?} user={:?}",
+            id,
+            kind,
+            state,
+            wait_channel,
+            queued_on,
+            user,
+        );
+    }
+    for (cpu, current, runnable, need_resched, pending) in cpus {
+        crate::println!(
+            "sudoos-diag: cpu={} current={:?} runnable={} need_resched={} pending={:?}",
+            cpu,
+            current,
+            runnable,
+            need_resched,
+            pending,
+        );
+    }
+    print_task_lifecycle_summary();
+    crate::println!("sudoos-diag: task-debug-dump end");
+}
 
 pub fn initialize() {
     let discovered = crate::smp::discovered_cpu_count();
@@ -1634,6 +1931,20 @@ pub fn request_reschedule_local() {
     if let Some(scheduler) = slot.as_mut() {
         scheduler.request_reschedule(cpu);
     }
+}
+
+pub(crate) fn request_process_thread_exit(
+    process: crate::process::ProcessId,
+    except: crate::process::ThreadId,
+    status: isize,
+) {
+    let targets = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("scheduler is not initialized")
+            .request_process_thread_exit(process, except, status)
+    };
+    send_wakeup_ipis(targets);
 }
 
 fn request_reschedule_on(cpu: CpuId) {
@@ -1896,7 +2207,8 @@ pub fn enter_secondary_idle() -> ! {
 
 pub(crate) struct UserTaskHandle {
     id: TaskId,
-    detached: Arc<Completion>,
+    exit_visible: Arc<Completion>,
+    caller_released: Option<Arc<Completion>>,
 }
 
 impl UserTaskHandle {
@@ -1904,8 +2216,29 @@ impl UserTaskHandle {
         self.id
     }
 
-    pub(crate) fn wait_for_detach(&self) {
-        self.detached.wait();
+    pub(crate) fn wait_for_exit_visible(&self) {
+        EXIT_VISIBLE_WAIT_BEGIN.fetch_add(1, Ordering::Relaxed);
+        self.exit_visible.wait();
+        EXIT_VISIBLE_WAIT_END.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn release_process_owners(
+        mut self,
+        thread: Arc<crate::process::Thread>,
+        process: Arc<crate::process::Process>,
+    ) {
+        let caller_released = self
+            .caller_released
+            .take()
+            .expect("user task has no synchronous process-cleanup hand-off");
+        assert_eq!(
+            thread.process().id(),
+            process.id(),
+            "process-cleanup hand-off mixed Thread and Process owners",
+        );
+        drop(thread);
+        drop(process);
+        caller_released.complete_all();
     }
 }
 
@@ -1917,17 +2250,33 @@ pub(crate) fn spawn_user_thread_on(
     crate::context::assert_interrupts_enabled();
     let stack = KernelStack::allocate()
         .unwrap_or_else(|error| panic!("unable to allocate user-thread kernel stack: {error:?}"));
-    let detached = Arc::new(Completion::new());
+    let exit_visible = Arc::new(Completion::new());
+    let caller_released = Arc::new(Completion::new());
+    let process_cleanup = ProcessCleanup {
+        process: thread.process_arc(),
+        caller_released: Arc::clone(&caller_released),
+    };
     let (id, target) = {
         let mut slot = SCHEDULER.lock();
         slot.as_mut()
             .expect("kernel scheduler is not initialized")
-            .spawn_user(thread, Arc::clone(&detached), stack, affinity, affinity)
+            .spawn_user(
+                thread,
+                Arc::clone(&exit_visible),
+                Some(process_cleanup),
+                stack,
+                affinity,
+                affinity,
+            )
     };
     if target != crate::smp::current_cpu_id() {
         crate::smp::send_ipi(target);
     }
-    UserTaskHandle { id, detached }
+    UserTaskHandle {
+        id,
+        exit_visible,
+        caller_released: Some(caller_released),
+    }
 }
 
 pub(crate) fn spawn_user_thread_from_user_trap(
@@ -1935,7 +2284,7 @@ pub(crate) fn spawn_user_thread_from_user_trap(
 ) -> UserTaskHandle {
     let stack = KernelStack::allocate()
         .unwrap_or_else(|error| panic!("unable to allocate cloned user-thread stack: {error:?}"));
-    let detached = Arc::new(Completion::new());
+    let exit_visible = Arc::new(Completion::new());
     let _interrupt_guard = crate::context::IrqSaveGuard::new();
     let current = crate::smp::current_cpu_id();
     let (id, target) = {
@@ -1944,16 +2293,21 @@ pub(crate) fn spawn_user_thread_from_user_trap(
             .expect("kernel scheduler is not initialized")
             .spawn_user(
                 thread,
-                Arc::clone(&detached),
+                Arc::clone(&exit_visible),
+                None,
                 stack,
-                Some(current),
-                Some(current),
+                None,
+                None,
             )
     };
     if target != current {
         crate::smp::send_ipi(target);
     }
-    UserTaskHandle { id, detached }
+    UserTaskHandle {
+        id,
+        exit_visible,
+        caller_released: None,
+    }
 }
 
 pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
@@ -2389,13 +2743,13 @@ fn exit_current() -> ! {
 fn finish_switch() {
     let cpu = crate::smp::current_cpu_id();
     let running_sp = crate::arch::task::current_stack_pointer();
-    let (retired_task_added, current_is_idle) = {
+    let (completed, current_is_idle) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        let retired_task_added = scheduler.complete_switch(cpu, running_sp);
+        let completed = scheduler.complete_switch(cpu, running_sp);
         let current = scheduler.current(cpu);
         let current_is_idle = scheduler.task(current).kind.is_idle();
-        (retired_task_added, current_is_idle)
+        (completed, current_is_idle)
     };
 
     // The switch tail still owns the IRQ-save guard, but no longer owns the
@@ -2403,7 +2757,14 @@ fn finish_switch() {
     if !current_is_idle {
         crate::time::leave_idle();
     }
-    if retired_task_added {
+    if let Some(exit_visible) = completed.exit_visible {
+        // The hardware switch has committed and the scheduler lock is no
+        // longer held. The retired Task deliberately retains Thread/Process
+        // ownership until the reaper has destroyed the old kernel stack.
+        USER_TASKS_EXIT_VISIBLE.fetch_add(1, Ordering::Release);
+        exit_visible.completion.complete_all();
+    }
+    if completed.retired_task_added {
         TASK_REAPER_QUEUE.wake_one();
     }
 }
@@ -2425,6 +2786,7 @@ fn drain_retired_queue() {
         // with no scheduler/cross-CPU spin lock held.  Timer IRQs and TLB/IPI
         // completion paths are therefore free to make forward progress.
         task.destroy_resources();
+        TASKS_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         complete_retired_task_reclamation();
     }
 }
@@ -2559,9 +2921,46 @@ fn retired_task_backlog() -> usize {
     RETIRED_BACKLOG.load(Ordering::Acquire)
 }
 
-#[cfg(debug_assertions)]
 fn retired_task_outstanding() -> usize {
     RETIRED_OUTSTANDING.load(Ordering::Acquire)
+}
+
+pub(crate) fn synchronize_user_task_reclamation() {
+    crate::context::might_sleep();
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+
+    // The public OS competition runners are launched synchronously from the
+    // boot idle task.  A just-exited verifier can still be queued for deferred
+    // reclamation when control returns to that idle context, and idle tasks
+    // must never join a WaitQueue.  Drain queued work directly first; if a
+    // reaper on another CPU owns the last item, idle with interrupts enabled
+    // until its completion wake becomes observable.
+    let caller_is_idle = {
+        let cpu = crate::smp::current_cpu_id();
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        scheduler.task(scheduler.current(cpu)).kind.is_idle()
+    };
+    if caller_is_idle {
+        while retired_task_outstanding() != 0 {
+            drain_retired_queue();
+            if retired_task_outstanding() == 0 {
+                break;
+            }
+            TASK_REAPER_QUEUE.wake_one();
+            if current_cpu_has_work() {
+                yield_now();
+            } else {
+                idle_until_interrupt();
+            }
+        }
+    } else {
+        if retired_task_outstanding() != 0 {
+            TASK_REAPER_QUEUE.wake_one();
+        }
+        TASK_REAPER_DRAINED.wait_until(|| retired_task_outstanding() == 0);
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -2621,22 +3020,14 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
         // lock held; the user trap frame has already been consumed.
         unsafe { crate::arch::interrupt::enable() };
     }
-    // Linux closes an exiting process's descriptors before publishing the
-    // zombie. In particular, pipe readers must observe EOF without waiting
-    // for the parent to reap the child.
-    crate::println!(
-        "process-cleanup: tid={} close-files begin",
-        thread.id().get()
-    );
-    let _ = thread.process_arc().files().close_all();
-    crate::println!(
-        "process-cleanup: tid={} close-files done",
-        thread.id().get()
-    );
     crate::user::cleanup_robust_list_on_exit(&thread);
-    crate::println!("process-cleanup: tid={} robust done", thread.id().get());
+    if crate::user::oscomp_lifecycle_trace_active() {
+        crate::println!("process-cleanup: tid={} robust done", thread.id().get());
+    }
     crate::user::clear_child_tid_on_exit(&thread);
-    crate::println!("process-cleanup: tid={} ctid done", thread.id().get());
+    if crate::user::oscomp_lifecycle_trace_active() {
+        crate::println!("process-cleanup: tid={} ctid done", thread.id().get());
+    }
     thread
         .exit(result)
         .expect("M9-B user Thread failed to publish exit state");
@@ -2704,8 +3095,16 @@ fn idle_until_interrupt() {
         return;
     }
 
-    crate::time::enter_idle();
     let cpu = crate::smp::current_cpu_id();
+    // The permanent task reaper is pinned to the boot CPU. Keep CPU0's
+    // scheduler clockevent active while it is idle so the level-triggered
+    // `need_resched` publication always has a bounded fallback even if a
+    // coalesced reschedule IPI edge is consumed at the WFI boundary. Secondary
+    // CPUs retain full NO_HZ idle behavior (and are the deterministic NO_HZ
+    // verifier targets).
+    if cpu != CpuId::BOOT {
+        crate::time::enter_idle();
+    }
     #[cfg(debug_assertions)]
     idle_verify::before_arch_wait(cpu);
 

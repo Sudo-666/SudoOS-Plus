@@ -13,6 +13,7 @@ FINAL_RUN_ID ?= $(shell date +%Y%m%d-%H%M%S)
 FINAL_CAGENT_TIMEOUT ?= 300
 FINAL_CAGENT_REJECT_GUARD ?= --failure-regex '^testcase cagent .* reject [0-9]+$$'
 FINAL_BUILDSTORM_TIMEOUT ?= 15000
+FINAL_LIFECYCLE_TIMEOUT ?= 15000
 
 all: oscomp-all
 
@@ -21,6 +22,10 @@ oscomp-all:
 
 oscomp-audit:
 	@python3 scripts/oscomp-audit.py
+
+.PHONY: verify-final-script-sha256
+verify-final-script-sha256:
+	@scripts/verify-final-script-sha256.sh
 
 .PHONY: oscomp-baseline-check
 oscomp-baseline-check:
@@ -283,7 +288,7 @@ final-cagent-la: kernel-la
 		-serial file:$(FINAL_LOG_DIR)/cagent-la-$(FINAL_RUN_ID).log
 
 .PHONY: final-buildstorm-rv
-final-buildstorm-rv: kernel-rv
+final-buildstorm-rv: verify-final-script-sha256 kernel-rv
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-rv-$(FINAL_RUN_ID).log \
 		--success-regex '^BUILDSTORM_COMPILE mode=multi ok=true .*cores=8 .*bytes=[1-9][0-9]{5,} .*' \
@@ -309,7 +314,7 @@ final-buildstorm-rv: kernel-rv
 		-serial file:$(FINAL_LOG_DIR)/buildstorm-rv-$(FINAL_RUN_ID).log
 
 .PHONY: final-buildstorm-la
-final-buildstorm-la: kernel-la
+final-buildstorm-la: verify-final-script-sha256 kernel-la
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-la-$(FINAL_RUN_ID).log \
 		--success-regex '^BUILDSTORM_COMPILE mode=multi ok=true .*cores=8 .*bytes=[1-9][0-9]{5,} .*' \
@@ -331,6 +336,90 @@ final-buildstorm-la: kernel-la
 		-monitor none \
 		-display none \
 		-serial file:$(FINAL_LOG_DIR)/buildstorm-la-$(FINAL_RUN_ID).log
+
+.PHONY: final-buildstorm-rv-diag
+final-buildstorm-rv-diag: kernel-rv
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-rv-diag-$(FINAL_RUN_ID).log \
+		--success-pattern "sudoos-diag: final-buildstorm: diagnostic exit=0" \
+		--failure-regex '^panicked at .*' --timeout $(FINAL_BUILDSTORM_TIMEOUT) -- qemu-system-riscv64 \
+		-machine virt \
+		-kernel kernel-rv \
+		-m $(FINAL_MEM) \
+		-smp $(FINAL_CPUS) \
+		-bios default \
+		-drive file=$(FINAL_IMAGE_RV),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-snapshot \
+		-no-reboot \
+		-device virtio-net-device,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc \
+		-append "sudoos.oscomp=final-buildstorm-diag" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/buildstorm-rv-diag-$(FINAL_RUN_ID).log
+
+.PHONY: final-lifecycle-rv
+final-lifecycle-rv: kernel-rv
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/lifecycle-rv-smp$(FINAL_CPUS)-$(FINAL_RUN_ID).log \
+		--success-pattern "G2_LIFECYCLE_STRESS: PASS" \
+		--failure-regex '^G2_(PHASE|LIFECYCLE_STRESS).*FAIL.*' \
+		--failure-regex '^panicked at .*' --timeout $(FINAL_LIFECYCLE_TIMEOUT) -- qemu-system-riscv64 \
+		-machine virt \
+		-kernel kernel-rv \
+		-m $(FINAL_MEM) \
+		-smp $(FINAL_CPUS) \
+		-bios default \
+		-drive file=$(FINAL_IMAGE_RV),if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-snapshot \
+		-no-reboot \
+		-append "sudoos.oscomp=lifecycle-stress" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/lifecycle-rv-smp$(FINAL_CPUS)-$(FINAL_RUN_ID).log
+
+.PHONY: final-buildstorm-la-diag
+final-buildstorm-la-diag: kernel-la
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-la-diag-$(FINAL_RUN_ID).log \
+		--success-pattern "sudoos-diag: final-buildstorm: diagnostic exit=0" \
+		--failure-regex '^panicked at .*' --timeout $(FINAL_BUILDSTORM_TIMEOUT) -- qemu-system-loongarch64 \
+		-kernel kernel-la \
+		-m $(FINAL_MEM) \
+		-smp $(FINAL_CPUS) \
+		-drive file=$(FINAL_IMAGE_LA),if=none,format=raw,id=x0 \
+		-device virtio-blk-pci,drive=x0 \
+		-snapshot \
+		-no-reboot \
+		-device virtio-net-pci,netdev=net0 \
+		-netdev user,id=net0 \
+		-rtc base=utc \
+		-append "sudoos.oscomp=final-buildstorm-diag" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/buildstorm-la-diag-$(FINAL_RUN_ID).log
+
+.PHONY: final-lifecycle-la
+final-lifecycle-la: kernel-la
+	@mkdir -p $(FINAL_LOG_DIR)
+	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/lifecycle-la-smp$(FINAL_CPUS)-$(FINAL_RUN_ID).log \
+		--success-pattern "G2_LIFECYCLE_STRESS: PASS" \
+		--failure-regex '^G2_(PHASE|LIFECYCLE_STRESS).*FAIL.*' \
+		--failure-regex '^panicked at .*' --timeout $(FINAL_LIFECYCLE_TIMEOUT) -- qemu-system-loongarch64 \
+		-kernel kernel-la \
+		-m $(FINAL_MEM) \
+		-smp $(FINAL_CPUS) \
+		-drive file=$(FINAL_IMAGE_LA),if=none,format=raw,id=x0 \
+		-device virtio-blk-pci,drive=x0 \
+		-snapshot \
+		-no-reboot \
+		-append "sudoos.oscomp=lifecycle-stress" \
+		-monitor none \
+		-display none \
+		-serial file:$(FINAL_LOG_DIR)/lifecycle-la-smp$(FINAL_CPUS)-$(FINAL_RUN_ID).log
 
 .PHONY: final-buildstorm-rv-debug-small final-buildstorm-la-debug-small
 final-buildstorm-rv-debug-small:

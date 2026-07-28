@@ -276,8 +276,12 @@ pub struct Stat {
     pub uid: u32,
     pub gid: u32,
     pub rdev: u64,
+    // asm-generic 64-bit Linux `struct stat` ABI padding. RISC-V and
+    // LoongArch glibc place st_size at byte 48, not immediately after rdev.
+    pub _pad1: u64,
     pub size: i64,
     pub blksize: i32,
+    pub _pad2: i32,
     pub blocks: i64,
     pub atime_sec: i64,
     pub atime_nsec: i64,
@@ -285,6 +289,7 @@ pub struct Stat {
     pub mtime_nsec: i64,
     pub ctime_sec: i64,
     pub ctime_nsec: i64,
+    pub _unused: [i32; 2],
 }
 
 impl Stat {
@@ -297,8 +302,10 @@ impl Stat {
             uid: 0,
             gid: 0,
             rdev: 0,
+            _pad1: 0,
             size: 0,
             blksize: 4096,
+            _pad2: 0,
             blocks: 0,
             atime_sec: 0,
             atime_nsec: 0,
@@ -306,6 +313,7 @@ impl Stat {
             mtime_nsec: 0,
             ctime_sec: 0,
             ctime_nsec: 0,
+            _unused: [0; 2],
         }
     }
 }
@@ -483,6 +491,7 @@ pub struct File {
     flags: AtomicU32,
     path: Option<String>,
     ops: Arc<dyn FileOperations>,
+    operation: SpinLock<()>,
     state: SpinLock<FileState>,
 }
 
@@ -494,6 +503,7 @@ impl File {
             flags: AtomicU32::new(flags.bits()),
             path: None,
             ops,
+            operation: SpinLock::new(()),
             state: SpinLock::new(FileState { position: 0 }),
         })
     }
@@ -503,6 +513,7 @@ impl File {
             flags: AtomicU32::new(flags.bits()),
             path: Some(path),
             ops,
+            operation: SpinLock::new(()),
             state: SpinLock::new(FileState { position: 0 }),
         })
     }
@@ -536,6 +547,7 @@ impl File {
         if !self.flags().access_mode().is_readable() {
             return Err(Errno::Ebadf);
         }
+        let _operation = self.operation.lock();
         self.ops.read(self, buf)
     }
 
@@ -543,11 +555,59 @@ impl File {
         if !self.flags().access_mode().is_writable() {
             return Err(Errno::Ebadf);
         }
+        let _operation = self.operation.lock();
         self.ops.write(self, buf)
     }
 
     pub fn seek(&self, offset: i64, whence: SeekWhence) -> Result<u64, Errno> {
+        let _operation = self.operation.lock();
         self.ops.seek(self, offset, whence)
+    }
+
+    /// Perform one positioned read without changing the open-file position.
+    ///
+    /// The operation lock also serializes ordinary reads, writes, and seeks on
+    /// this open-file description, so another thread cannot observe or disturb
+    /// the temporary position used to implement `pread64`.
+    pub fn read_at(&self, offset: u64, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
+        if !self.flags().access_mode().is_readable() {
+            return Err(Errno::Ebadf);
+        }
+        let _operation = self.operation.lock();
+        let saved = self.position();
+        let offset = i64::try_from(offset).map_err(|_| Errno::Eoverflow)?;
+        self.ops.seek(self, offset, SeekWhence::Set)?;
+        let result = self.ops.read(self, buf);
+        let restore = self.ops.seek(
+            self,
+            i64::try_from(saved).map_err(|_| Errno::Eoverflow)?,
+            SeekWhence::Set,
+        );
+        match (result, restore) {
+            (Ok(read), Ok(_)) => Ok(read),
+            (Err(errno), _) | (Ok(_), Err(errno)) => Err(errno),
+        }
+    }
+
+    /// Perform one positioned write without changing the open-file position.
+    pub fn write_at(&self, offset: u64, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
+        if !self.flags().access_mode().is_writable() {
+            return Err(Errno::Ebadf);
+        }
+        let _operation = self.operation.lock();
+        let saved = self.position();
+        let offset = i64::try_from(offset).map_err(|_| Errno::Eoverflow)?;
+        self.ops.seek(self, offset, SeekWhence::Set)?;
+        let result = self.ops.write(self, buf);
+        let restore = self.ops.seek(
+            self,
+            i64::try_from(saved).map_err(|_| Errno::Eoverflow)?,
+            SeekWhence::Set,
+        );
+        match (result, restore) {
+            (Ok(written), Ok(_)) => Ok(written),
+            (Err(errno), _) | (Ok(_), Err(errno)) => Err(errno),
+        }
     }
 
     pub fn fstat(&self) -> Result<Stat, Errno> {

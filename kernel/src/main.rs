@@ -85,6 +85,35 @@ fn boot_hardware_cpu_id(_boot: &BootInfo) -> usize {
     arch::smp::hardware_cpu_id()
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn direct_boot_oscomp_mode(boot: &BootInfo) -> Option<oscomp::RunMode> {
+    const MAX_COMMAND_LINE_BYTES: usize = 1024;
+
+    let base = boot.command_line()?.get();
+    let mut bytes = [0_u8; MAX_COMMAND_LINE_BYTES];
+    let mut length = 0_usize;
+    while length < bytes.len() {
+        let address = base.checked_add(length)?;
+        let pointer =
+            arch::memory::phys_access::ram_ptr::<u8>(myos_mm::PhysAddr::new(address)).ok()?;
+        // SAFETY: QEMU's direct-boot protocol owns this bounded, NUL-terminated
+        // command-line buffer and keeps it alive for the duration of boot.
+        let byte = unsafe { core::ptr::read_volatile(pointer) };
+        if byte == 0 {
+            let arguments = core::str::from_utf8(&bytes[..length]).ok()?;
+            return oscomp::mode_from_bootargs(Some(arguments));
+        }
+        bytes[length] = byte;
+        length += 1;
+    }
+    None
+}
+
+#[cfg(target_arch = "riscv64")]
+fn direct_boot_oscomp_mode(_boot: &BootInfo) -> Option<oscomp::RunMode> {
+    None
+}
+
 fn print_boot_info(boot: &BootInfo) {
     let raw = boot.raw_args();
 
@@ -229,7 +258,8 @@ fn kernel_main(boot: BootInfo) -> ! {
         smp::initialize(&tree, boot_hardware_cpu_id(&boot));
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
-        let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs());
+        let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs())
+            .or_else(|| direct_boot_oscomp_mode(&boot));
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });

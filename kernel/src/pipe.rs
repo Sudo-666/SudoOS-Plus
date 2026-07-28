@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use myos_vfs::{
     Errno, File, FileOperations, IoBuffer, MutableIoBuffer, OpenFlags, PollEvents, Stat,
@@ -15,6 +16,8 @@ struct Pipe {
     state: IrqSpinLock<PipeState>,
     read_wait: WaitQueue,
     write_wait: WaitQueue,
+    read_epoch: AtomicU64,
+    write_epoch: AtomicU64,
 }
 
 struct PipeState {
@@ -40,6 +43,8 @@ impl Pipe {
             ),
             read_wait: WaitQueue::new(),
             write_wait: WaitQueue::new(),
+            read_epoch: AtomicU64::new(0),
+            write_epoch: AtomicU64::new(0),
         })
     }
 
@@ -56,8 +61,11 @@ impl Pipe {
                 {
                     return Err(Errno::Eagain);
                 }
+                let observed_epoch = self.read_epoch.load(Ordering::Acquire);
                 drop(state);
-                let _ = crate::task::block_current_on_if_from_user_trap(&self.read_wait, || true);
+                let _ = crate::task::block_current_on_if_from_user_trap(&self.read_wait, || {
+                    self.read_epoch.load(Ordering::Acquire) == observed_epoch
+                });
                 continue;
             }
 
@@ -98,8 +106,11 @@ impl Pipe {
                 {
                     return Err(Errno::Eagain);
                 }
+                let observed_epoch = self.write_epoch.load(Ordering::Acquire);
                 drop(state);
-                let _ = crate::task::block_current_on_if_from_user_trap(&self.write_wait, || true);
+                let _ = crate::task::block_current_on_if_from_user_trap(&self.write_wait, || {
+                    self.write_epoch.load(Ordering::Acquire) == observed_epoch
+                });
                 continue;
             }
 
@@ -174,12 +185,14 @@ impl Pipe {
     }
 
     fn wake_readers(&self) {
+        self.read_epoch.fetch_add(1, Ordering::Release);
         if crate::task::scheduler_is_initialized() {
             self.read_wait.wake_all();
         }
     }
 
     fn wake_writers(&self) {
+        self.write_epoch.fetch_add(1, Ordering::Release);
         if crate::task::scheduler_is_initialized() {
             self.write_wait.wake_all();
         }

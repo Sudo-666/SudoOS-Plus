@@ -24,6 +24,7 @@ const THREAD_RUNNABLE: u8 = 1;
 const THREAD_RUNNING: u8 = 2;
 const THREAD_EXITING: u8 = 3;
 const THREAD_EXITED: u8 = 4;
+const NO_FORCED_EXIT: isize = isize::MIN;
 const UNBOUND_SCHEDULER_TASK: usize = usize::MAX;
 const PROCESS_MM_LOCK: LockClass = LockClass::new("process.mm", LockRank::Process, 0);
 const PROCESS_THREAD_GROUP_LOCK: LockClass =
@@ -437,6 +438,7 @@ pub struct Process {
     process_group: AtomicIsize,
     session: AtomicIsize,
     thread_group: IrqSpinLock<ThreadGroup>,
+    thread_exit: WaitQueue,
 }
 
 impl Process {
@@ -457,37 +459,11 @@ impl Process {
                 ThreadGroup::new(),
                 PROCESS_THREAD_GROUP_LOCK,
             ),
+            thread_exit: WaitQueue::new(),
         });
         register_process(&process);
         LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
         process
-    }
-
-    /// Create a Process that shares an existing `Arc<UserMm>` (CLONE_VM).
-    /// The mm is shared, not cloned — both the parent and child threads
-    /// use the same address space.
-    fn create_from_shared_mm(self: &Arc<Self>, mm: Arc<UserMm>) -> Result<Arc<Self>, ProcessError> {
-        let id = ProcessId(allocate_process_id());
-        let process = Arc::new(Self {
-            id,
-            // Store the shared Arc without wrapping in another Arc.
-            mm: IrqSpinLock::new_with_class(mm, PROCESS_MM_LOCK),
-            files: FileTable::new(),
-            signals: SignalState::new(),
-            credentials: self.credentials.clone(),
-            fs: FsContext::bootstrap(),
-            relations: IrqSpinLock::new_with_class(ProcessRelations::new(), PROCESS_RELATION_LOCK),
-            child_wait: WaitQueue::new(),
-            process_group: AtomicIsize::new(self.process_group()),
-            session: AtomicIsize::new(self.session()),
-            thread_group: IrqSpinLock::new_with_class(
-                ThreadGroup::new(),
-                PROCESS_THREAD_GROUP_LOCK,
-            ),
-        });
-        register_process(&process);
-        LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
-        Ok(process)
     }
 
     pub fn fork_child(self: &Arc<Self>, mm: Box<UserMm>) -> Result<Arc<Self>, ProcessError> {
@@ -503,34 +479,6 @@ impl Process {
             .process_group
             .store(self.process_group(), Ordering::Release);
         child.session.store(self.session(), Ordering::Release);
-        child.set_parent(self.id())?;
-        self.add_child(Arc::clone(&child))?;
-        Ok(child)
-    }
-
-    /// Create a child thread that shares the parent's address space (mm),
-    /// file table, and signal handlers. Used for CLONE_VM | CLONE_THREAD.
-    pub fn fork_child_thread(self: &Arc<Self>) -> Result<Arc<Self>, ProcessError> {
-        // Share the parent's mm (CLONE_VM).
-        let shared_mm = self.mm_arc();
-        // Create a new Process wrapper that shares the same UserMm.
-        let child = self.create_from_shared_mm(shared_mm)?;
-        // Share file descriptor contents (CLONE_FILES approximation).
-        {
-            let mut child_files = child.files.table.lock();
-            *child_files = self.files.table.lock().fork_clone();
-        }
-        // Share fs context.
-        child.fs.copy_from(&self.fs)?;
-        // Share signal handlers and blocked mask (CLONE_SIGHAND).
-        child.signals.set_blocked(self.signals.blocked());
-        child.signals.copy_actions_from(&self.signals);
-        // Share process group and session.
-        child
-            .process_group
-            .store(self.process_group(), Ordering::Release);
-        child.session.store(self.session(), Ordering::Release);
-        // Register in the parent's thread group.
         child.set_parent(self.id())?;
         self.add_child(Arc::clone(&child))?;
         Ok(child)
@@ -731,17 +679,74 @@ impl Process {
             schedule_count: AtomicUsize::new(0),
             lifecycle: AtomicU8::new(THREAD_READY),
             exit_status: AtomicIsize::new(0),
+            forced_exit_status: AtomicIsize::new(NO_FORCED_EXIT),
             exited: Completion::new(),
         });
         LIVE_THREADS.fetch_add(1, Ordering::AcqRel);
         Ok(thread)
     }
 
-    /// Consumes the final unique process owner and tears down its address space.
+    /// Creates a non-leader member of this process's thread group.
     ///
-    /// The process lock is released before entering `UserMm::destroy()`, so no
-    /// Process-ranked lock is held while the VM lock, page-table lock, allocator,
-    /// or TLB completion paths execute.
+    /// Keeping every CLONE_THREAD task on the same Process object is what
+    /// provides the Linux CLONE_VM/CLONE_FILES/CLONE_FS/CLONE_SIGHAND sharing
+    /// semantics. In particular, one pthread exiting must not close a copied
+    /// descriptor table and accidentally publish EOF on a process-wide pipe.
+    pub fn create_thread(
+        self: &Arc<Self>,
+        entry: VirtAddr,
+        user_stack: VirtRange,
+    ) -> Result<Arc<Thread>, ProcessError> {
+        let user_range = crate::arch::memory::layout::USER_RANGE;
+        if !user_range.contains(entry)
+            || user_stack.is_empty()
+            || !user_range.contains_range(user_stack)
+        {
+            return Err(ProcessError::InvalidUserContext);
+        }
+
+        let mut group = self.thread_group.lock();
+        if group.leader.is_none() {
+            return Err(ProcessError::ThreadNotReady);
+        }
+        group
+            .members
+            .try_reserve(1)
+            .map_err(|_| ProcessError::MetadataOutOfMemory)?;
+
+        let id = ThreadId(allocate_process_id());
+        group.members.push(id);
+        drop(group);
+
+        let thread = Arc::new(Thread {
+            id,
+            process: Arc::clone(self),
+            user_pc: AtomicUsize::new(entry.get()),
+            user_stack,
+            user_sp: AtomicUsize::new(user_stack.end().get()),
+            trap_frame: IrqSpinLock::new_with_class(None, THREAD_TRAP_FRAME_LOCK),
+            tls: AtomicUsize::new(0),
+            clear_child_tid: AtomicUsize::new(0),
+            robust_list_head: AtomicUsize::new(0),
+            blocked_signals: AtomicU64::new(0),
+            scheduler_task: AtomicUsize::new(UNBOUND_SCHEDULER_TASK),
+            visited_cpus: AtomicUsize::new(0),
+            schedule_count: AtomicUsize::new(0),
+            lifecycle: AtomicU8::new(THREAD_READY),
+            exit_status: AtomicIsize::new(0),
+            forced_exit_status: AtomicIsize::new(NO_FORCED_EXIT),
+            exited: Completion::new(),
+        });
+        LIVE_THREADS.fetch_add(1, Ordering::AcqRel);
+        Ok(thread)
+    }
+
+    /// Consumes the final unique process owner.
+    ///
+    /// Resource teardown is RAII-backed by `Drop`.  This is important for
+    /// orphaned children: a parent may exit without waiting for every zombie,
+    /// and the last child owner must still unregister the process and release
+    /// its address space instead of depending on a successful `wait4`.
     pub fn destroy(self) -> Result<(), UserMmRuntimeError> {
         {
             let group = self.thread_group.lock();
@@ -750,18 +755,14 @@ impl Process {
                 "M9-B attempted to destroy a Process with live thread-group members",
             );
         }
-
-        unregister_process(self.id);
-        let Self { mm, .. } = self;
-        let mm = mm.into_inner();
-        if let Ok(mut mm) = Arc::try_unwrap(mm) {
-            mm.destroy()?;
-        }
-        LIVE_PROCESSES.fetch_sub(1, Ordering::AcqRel);
         Ok(())
     }
 
-    fn detach_thread(&self, id: ThreadId) -> Result<(), ProcessError> {
+    pub fn wait_until_single_thread(&self) {
+        self.thread_exit.wait_until(|| self.thread_count() <= 1);
+    }
+
+    fn detach_thread(&self, id: ThreadId) -> Result<bool, ProcessError> {
         let mut group = self.thread_group.lock();
         let index = group
             .members
@@ -772,7 +773,35 @@ impl Process {
         if group.leader == Some(id) {
             group.leader = None;
         }
-        Ok(())
+        let empty = group.members.is_empty();
+        drop(group);
+        if empty {
+            // Multiple members may enter Thread::exit before either retired
+            // Thread is dropped, so a pre-detach thread_count check can miss
+            // the 2 -> 0 transition. Final detach is the unique process-exit
+            // point and must close inherited pipe/jobserver descriptors before
+            // the parent observes the zombie.
+            let _ = self.files.close_all();
+        }
+        self.thread_exit.wake_all();
+        Ok(empty)
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let group = self.thread_group.lock();
+        assert!(
+            group.members.is_empty() && group.leader.is_none(),
+            "dropping a Process with live thread-group members",
+        );
+        drop(group);
+
+        unregister_process(self.id);
+        LIVE_PROCESSES.fetch_sub(1, Ordering::AcqRel);
+        // `mm` is dropped after this method returns. `UserMm::drop` performs
+        // the fallible page-table teardown and turns an impossible teardown
+        // failure into a kernel panic, matching the previous explicit path.
     }
 }
 
@@ -836,6 +865,7 @@ pub struct Thread {
     schedule_count: AtomicUsize,
     lifecycle: AtomicU8,
     exit_status: AtomicIsize,
+    forced_exit_status: AtomicIsize,
     exited: Completion,
 }
 
@@ -966,13 +996,24 @@ impl Thread {
                 Ordering::Acquire,
             )
             .map_err(|_| ProcessError::ThreadAlreadyExited)?;
-        if self.process.thread_count() <= 1 {
-            let _ = self.process.files().close_all();
-        }
         self.exit_status.store(status, Ordering::Relaxed);
         self.lifecycle.store(THREAD_EXITED, Ordering::Release);
         self.exited.complete_all();
         Ok(())
+    }
+
+    pub(crate) fn request_forced_exit(&self, status: isize) {
+        let _ = self.forced_exit_status.compare_exchange(
+            NO_FORCED_EXIT,
+            status,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn forced_exit_status(&self) -> Option<isize> {
+        let status = self.forced_exit_status.load(Ordering::Acquire);
+        (status != NO_FORCED_EXIT).then_some(status)
     }
 
     pub fn exit_status(&self) -> Option<isize> {
@@ -1084,13 +1125,15 @@ impl Drop for Thread {
             self.trap_frame.lock().is_none(),
             "M9-B Thread dropped with an owned trap frame",
         );
-        self.process
+        let process_became_empty = self
+            .process
             .detach_thread(self.id)
             .expect("M9-B Thread disappeared from its process thread group");
-        if let Some(parent) = self
-            .process
-            .parent_id()
-            .and_then(crate::process::lookup_process)
+        if process_became_empty
+            && let Some(parent) = self
+                .process
+                .parent_id()
+                .and_then(crate::process::lookup_process)
         {
             let status = self
                 .exit_status()
@@ -1144,6 +1187,14 @@ pub fn assert_no_leaks() {
         0,
         "M9-A leaked a Process object",
     );
+}
+
+pub(crate) fn live_process_count() -> usize {
+    LIVE_PROCESSES.load(Ordering::Acquire)
+}
+
+pub(crate) fn live_thread_count() -> usize {
+    LIVE_THREADS.load(Ordering::Acquire)
 }
 
 fn allocate_process_id() -> usize {

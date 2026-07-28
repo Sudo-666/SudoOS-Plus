@@ -176,6 +176,7 @@ const ERANGE: isize = 34;
 
 const MAX_USER_COPY: usize = 4096;
 const MAX_USER_PATH: usize = 256;
+const MAX_EXEC_STRING: usize = 64 * 1024;
 const MAX_EXEC_ARGS: usize = 256;
 const MAX_EXEC_ENVS: usize = 256;
 const USER_MESSAGE: &[u8] = b"hello user\n";
@@ -213,6 +214,9 @@ static TERMINATED: AtomicBool = AtomicBool::new(false);
 /// Set to true when the contest runner finds at least one test script on
 /// the sdcard and runs the full contest loop (including shutdown).
 static SDCARD_CONTEST_RAN: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_STRESS_PASSED: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_STRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE_STRESS_PROGRESS: AtomicUsize = AtomicUsize::new(0);
 
 // ── P9-G7d: contest progress atomics (visible to external watchdog) ──
 static OSCOMP_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -260,6 +264,21 @@ static LAST_TRACED_SYSCALL_NR: AtomicUsize = AtomicUsize::new(0);
 // ── P11B: pthread create trace (default false) ──
 const OSCOMP_TRACE_PTHREAD_CREATE: bool = false;
 static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(8000);
+static OSCOMP_LIFECYCLE_TRACE: AtomicBool = AtomicBool::new(false);
+static OSCOMP_LIFECYCLE_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+fn oscomp_lifecycle_trace_allow() -> bool {
+    OSCOMP_LIFECYCLE_TRACE.load(Ordering::Relaxed)
+        && OSCOMP_LIFECYCLE_TRACE_BUDGET
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |budget| {
+                budget.checked_sub(1)
+            })
+            .is_ok()
+}
+
+pub(crate) fn oscomp_lifecycle_trace_active() -> bool {
+    OSCOMP_LIFECYCLE_TRACE.load(Ordering::Relaxed)
+}
 
 // ── P9-H14: LoongArch FPD fixup counter ──
 #[cfg(target_arch = "loongarch64")]
@@ -427,7 +446,7 @@ impl UserImage {
         );
     }
 
-    fn destroy(self) {
+    fn destroy(self, task: crate::task::UserTaskHandle) {
         let Self { process, thread } = self;
         assert_eq!(
             thread.exit_status(),
@@ -438,16 +457,7 @@ impl UserImage {
             thread.scheduler_task().is_some(),
             "M9-B user Thread was never bound to a scheduler task",
         );
-        drop(thread);
-        // The retired task may still hold a Thread reference inside
-        // retired_tasks until the reaper runs destroy_resources().
-        // Don't assert strong_count==1 — let Arc::try_unwrap fail
-        // gracefully and fall back to letting the reaper clean up.
-        if let Ok(process) = Arc::try_unwrap(process) {
-            process
-                .destroy()
-                .unwrap_or_else(|error| crate::println!("exec: process destroy failed: {error:?}"));
-        }
+        task.release_process_owners(thread, process);
     }
 }
 
@@ -2202,6 +2212,8 @@ pub fn verify_final_cagent() -> bool {
 
     SDCARD_CONTEST_RAN.store(false, Ordering::Release);
     crate::task::run_kernel_thread_sync(verify_final_cagent_thread);
+    crate::task::synchronize_user_task_reclamation();
+    crate::task::print_task_lifecycle_summary();
     SDCARD_CONTEST_RAN.load(Ordering::Acquire)
 }
 
@@ -2211,11 +2223,249 @@ pub fn verify_final_buildstorm() -> bool {
         return false;
     }
     SDCARD_CONTEST_RAN.store(false, Ordering::Release);
-    crate::task::run_kernel_thread_sync(verify_final_buildstorm_thread);
+    crate::task::run_kernel_thread_sync(verify_final_buildstorm_production_thread);
+    crate::task::synchronize_user_task_reclamation();
+    crate::task::print_task_lifecycle_summary();
     SDCARD_CONTEST_RAN.load(Ordering::Acquire)
 }
 
-fn verify_final_buildstorm_thread() {
+pub fn verify_final_buildstorm_diag() -> bool {
+    if crate::block::open_device("vda").is_none() {
+        crate::println!("sudoos-diag: final-buildstorm-diag: no sdcard");
+        return false;
+    }
+    SDCARD_CONTEST_RAN.store(false, Ordering::Release);
+    crate::task::run_kernel_thread_sync(verify_final_buildstorm_diagnostic_thread);
+    crate::task::synchronize_user_task_reclamation();
+    crate::task::print_task_lifecycle_summary();
+    SDCARD_CONTEST_RAN.load(Ordering::Acquire)
+}
+
+pub fn verify_task_lifecycle_stress() -> bool {
+    let busybox = [
+        "/bin/busybox",
+        "/busybox",
+        "/musl/busybox",
+        "/mnt/sdcard/musl/busybox",
+        "/mnt/sdcard/glibc/busybox",
+    ]
+    .into_iter()
+    .find(|path| crate::fs::stat(path).is_ok());
+    if let Some(busybox) = busybox {
+        let _ = crate::fs::mkdir("/bin", 0o755);
+        if crate::fs::stat("/bin/busybox").is_err() {
+            let _ = crate::fs::symlink(busybox, "/bin/busybox");
+        }
+        for applet in &[
+            "sh", "true", "false", "sleep", "kill", "timeout", "cat", "echo", "test",
+        ] {
+            let target = alloc::format!("/bin/{}", applet);
+            if crate::fs::stat(&target).is_err() {
+                let _ = crate::fs::symlink("/bin/busybox", &target);
+            }
+        }
+    }
+    if crate::fs::stat("/bin/sh").is_err() || crate::fs::stat("/bin/true").is_err() {
+        crate::println!("G2_LIFECYCLE_STRESS: FAIL missing /bin/sh or /bin/true");
+        return false;
+    }
+    LIFECYCLE_STRESS_PASSED.store(false, Ordering::Release);
+    crate::task::run_kernel_thread_sync(verify_task_lifecycle_stress_thread);
+    crate::task::synchronize_user_task_reclamation();
+    crate::task::print_task_lifecycle_summary();
+    LIFECYCLE_STRESS_PASSED.load(Ordering::Acquire)
+}
+
+fn lifecycle_stress_invariants(
+    label: &str,
+    baseline: crate::task::TaskLifecycleSnapshot,
+) -> bool {
+    crate::task::synchronize_user_task_reclamation();
+    let current = crate::task::task_lifecycle_snapshot();
+    let spawned = current.tasks_spawned.saturating_sub(baseline.tasks_spawned);
+    let visible = current
+        .tasks_exit_visible
+        .saturating_sub(baseline.tasks_exit_visible);
+    let joins_begin = current.join_wait_begin.saturating_sub(baseline.join_wait_begin);
+    let joins_end = current.join_wait_end.saturating_sub(baseline.join_wait_end);
+    let clean = spawned == visible
+        && joins_begin == joins_end
+        && current.retired_backlog == 0
+        && current.retired_outstanding == 0
+        && current.live_user_threads == baseline.live_user_threads
+        && current.live_processes == baseline.live_processes
+        && current.live_threads == baseline.live_threads;
+    crate::println!(
+        "G2_PHASE {} {} spawned={} visible={} join_begin={} join_end={} backlog={} outstanding={} live_user={} live_processes={} live_threads={} free_pages={}",
+        label,
+        if clean { "PASS" } else { "FAIL" },
+        spawned,
+        visible,
+        joins_begin,
+        joins_end,
+        current.retired_backlog,
+        current.retired_outstanding,
+        current.live_user_threads,
+        current.live_processes,
+        current.live_threads,
+        crate::page_alloc::total_free_pages().unwrap_or(0),
+    );
+    clean
+}
+
+fn lifecycle_stress_shell(label: &str, script: &str) -> bool {
+    let baseline = crate::task::task_lifecycle_snapshot();
+    let result = run_rootfs_program_with_cwd(
+        "/bin/sh",
+        &["sh", "-c", script],
+        &["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/tmp"],
+        Some("/tmp"),
+    );
+    let exited = matches!(result, Ok(0));
+    if !exited {
+        crate::println!("G2_PHASE {} FAIL result={:?}", label, result);
+    }
+    exited && lifecycle_stress_invariants(label, baseline)
+}
+
+fn lifecycle_stress_repeat(label: &str, count: usize, path: &str, argv: &[&str]) -> bool {
+    let baseline = crate::task::task_lifecycle_snapshot();
+    for iteration in 0..count {
+        if iteration.is_multiple_of(500) {
+            crate::task::print_lifecycle_stress_progress(label, iteration);
+        }
+        let result = run_rootfs_program_with_cwd(
+            path,
+            argv,
+            &["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/tmp"],
+            Some("/tmp"),
+        );
+        if !matches!(result, Ok(0)) {
+            crate::println!(
+                "G2_PHASE {} FAIL iteration={} result={:?}",
+                label,
+                iteration,
+                result,
+            );
+            crate::task::synchronize_user_task_reclamation();
+            crate::task::print_task_debug_dump();
+            return false;
+        }
+        LIFECYCLE_STRESS_PROGRESS.fetch_add(1, Ordering::Release);
+    }
+    lifecycle_stress_invariants(label, baseline)
+}
+
+fn lifecycle_stress_watchdog() {
+    let mut previous = LIFECYCLE_STRESS_PROGRESS.load(Ordering::Acquire);
+    let mut stalled_ticks = 0_usize;
+    while LIFECYCLE_STRESS_ACTIVE.load(Ordering::Acquire) {
+        crate::timer::sleep(core::time::Duration::from_secs(15));
+        if !LIFECYCLE_STRESS_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        let current = LIFECYCLE_STRESS_PROGRESS.load(Ordering::Acquire);
+        if current == previous {
+            stalled_ticks += 1;
+        } else {
+            stalled_ticks = 0;
+            previous = current;
+        }
+        if stalled_ticks == 4 {
+            crate::println!(
+                "G2_WATCHDOG no-progress completed={} interval_seconds=60",
+                current,
+            );
+            crate::task::print_task_debug_dump();
+            stalled_ticks = 0;
+        }
+    }
+}
+
+fn verify_task_lifecycle_stress_thread() {
+    let _ = crate::fs::mkdir("/tmp", 0o1777);
+    crate::println!("G2_LIFECYCLE_STRESS: BEGIN");
+    LIFECYCLE_STRESS_PROGRESS.store(0, Ordering::Release);
+    LIFECYCLE_STRESS_ACTIVE.store(true, Ordering::Release);
+    crate::task::spawn_kernel_thread(lifecycle_stress_watchdog);
+
+    let t1 = lifecycle_stress_repeat(
+        "T1-sequential-10000",
+        10_000,
+        "/bin/true",
+        &["true"],
+    );
+    let t2 = t1
+        && lifecycle_stress_repeat(
+            "T2-shell-2000",
+            2_000,
+            "/bin/sh",
+            &["sh", "-c", "exit 0"],
+        );
+    let t3 = t2
+        && lifecycle_stress_repeat(
+            "T3-pipe-2000",
+            2_000,
+            "/bin/sh",
+            &["sh", "-c", "echo x | cat >/dev/null"],
+        );
+    let t4 = t3
+        && lifecycle_stress_repeat(
+            "T4-concurrent-64x200",
+            200,
+            "/bin/sh",
+            &[
+                "sh",
+                "-c",
+                "j=0; while test $j -lt 64; do /bin/true & j=$((j+1)); done; wait",
+            ],
+        );
+    let t5 = t4 && lifecycle_stress_shell(
+        "T5-signals",
+        "set +e; /bin/sleep 30 & p=$!; /bin/kill -TERM $p; wait $p; r=$?; test $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill -KILL $p; wait $p; r=$?; test $r -eq 137 || exit 1; /bin/timeout 1 /bin/sleep 30; r=$?; test $r -eq 124 -o $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill $p; wait $p; r=$?; test $r -eq 143",
+    );
+    // BusyBox's foreground/background wait path exercises clone, child-tid
+    // publication, wait wakeups and group exit without depending on Cargo.
+    let t6 = t5
+        && lifecycle_stress_repeat(
+            "T6-clone-futex-group-exit",
+            2_000,
+            "/bin/sh",
+            &["sh", "-c", "/bin/true & p=$!; wait $p"],
+        );
+
+    if t6 {
+        LIFECYCLE_STRESS_PASSED.store(true, Ordering::Release);
+        crate::println!("G2_LIFECYCLE_STRESS: PASS");
+    } else {
+        crate::println!("G2_LIFECYCLE_STRESS: FAIL");
+    }
+    LIFECYCLE_STRESS_ACTIVE.store(false, Ordering::Release);
+}
+
+fn verify_final_buildstorm_production_thread() {
+    verify_final_buildstorm_thread(false);
+}
+
+fn verify_final_buildstorm_diagnostic_thread() {
+    verify_final_buildstorm_thread(true);
+}
+
+fn final_buildstorm_lifecycle_watchdog() {
+    for elapsed in [120_u64, 240, 360] {
+        crate::timer::sleep(core::time::Duration::from_secs(120));
+        if !OSCOMP_LIFECYCLE_TRACE.load(Ordering::Acquire) {
+            return;
+        }
+        crate::println!(
+            "sudoos-diag: lifecycle watchdog fired after {}s",
+            elapsed,
+        );
+        crate::task::print_task_debug_dump();
+    }
+}
+
+fn verify_final_buildstorm_thread(run_diagnostic: bool) {
     let _ = crate::fs::mkdir("/mnt", 0o755);
     let _ = crate::fs::mkdir("/mnt/sdcard", 0o755);
     if let Err(error) = crate::fs::mount_ext4_overlay("/dev/vda", "/mnt/sdcard") {
@@ -2268,26 +2518,87 @@ fn verify_final_buildstorm_thread() {
     SDCARD_CONTEST_RAN.store(true, Ordering::Release);
     crate::println!("oscomp: arch={} final-buildstorm", crate::arch::ARCH_NAME);
     crate::println!("sudoos-diag: final-buildstorm: lazy ext4 overlay ready");
+    if run_diagnostic {
+        let environment = [
+            "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
+            "HOME=/root",
+            "RUSTUP_HOME=/root/.rustup",
+            "CARGO_HOME=/tmp/cargo-cache",
+            "RUSTUP_TOOLCHAIN=nightly-2026-05-28",
+            "CARGO_NET_OFFLINE=true",
+            "TERM=dumb",
+        ];
+        crate::println!("sudoos-diag: final-buildstorm: write preflight begin");
+        let preflight = concat!(
+            "set -eu; ",
+            "test -d /root/.cargo; test -d /work/tgoskits; ",
+            "test -r /root/.cargo/bin/cargo; test -x /root/.cargo/bin/cargo; ",
+            "echo x > /root/.cargo/.sudoos-write-probe; ",
+            "test \"$(cat /root/.cargo/.sudoos-write-probe)\" = x; ",
+            "rm /root/.cargo/.sudoos-write-probe; ",
+            "echo x > /work/.sudoos-write-probe; ",
+            "test \"$(cat /work/.sudoos-write-probe)\" = x; ",
+            "rm /work/.sudoos-write-probe; ",
+            "echo x > /tmp/.sudoos-write-probe; ",
+            "test \"$(cat /tmp/.sudoos-write-probe)\" = x; ",
+            "rm /tmp/.sudoos-write-probe",
+        );
+        match run_rootfs_program_with_cwd(
+            "/bin/sh",
+            &["sh", "-c", preflight],
+            &environment,
+            Some("/"),
+        ) {
+            Ok(0) => crate::println!("sudoos-diag: final-buildstorm: write preflight ok"),
+            Ok(code) => {
+                crate::println!("sudoos-diag: final-buildstorm: write preflight exit={}", code);
+                return;
+            }
+            Err(error) => {
+                crate::println!(
+                    "sudoos-diag: final-buildstorm: write preflight exec failed: {:?}",
+                    error,
+                );
+                return;
+            }
+        }
+        crate::println!("sudoos-diag: final-buildstorm: diagnostic minibuild begin");
+        let diagnostic = "rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; new_rc=$?; echo BUILDSTORM_DIAG_NEW_RC=$new_rc; test $new_rc -eq 0 || exit $new_rc; cd /tmp/minibuild-diag || exit 97; cargo build; build_rc=$?; echo BUILDSTORM_DIAG_BUILD_RC=$build_rc; test $build_rc -eq 0 || exit $build_rc; /tmp/minibuild-diag/target/debug/minibuild-diag; run_rc=$?; echo BUILDSTORM_DIAG_RUN_RC=$run_rc; exit $run_rc";
+        EXEC_TRACE_COUNT.store(0, Ordering::Release);
+        OSCOMP_LIFECYCLE_TRACE_BUDGET.store(2048, Ordering::Release);
+        OSCOMP_LIFECYCLE_TRACE.store(true, Ordering::Release);
+        crate::task::spawn_system_thread_on(
+            final_buildstorm_lifecycle_watchdog,
+            crate::smp::CpuId::BOOT,
+        );
+        let diagnostic_result = run_rootfs_program_with_cwd(
+            "/bin/sh",
+            &["sh", "-c", diagnostic],
+            &environment,
+            Some("/"),
+        );
+        OSCOMP_LIFECYCLE_TRACE.store(false, Ordering::Release);
+        match diagnostic_result {
+            Ok(code) => {
+                crate::println!("sudoos-diag: final-buildstorm: diagnostic exit={}", code)
+            }
+            Err(error) => crate::println!(
+                "sudoos-diag: final-buildstorm: diagnostic exec failed: {:?}",
+                error,
+            ),
+        }
+        return;
+    }
+
     let environment = [
         "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
         "HOME=/root",
+        "RUSTUP_HOME=/root/.rustup",
+        "CARGO_HOME=/root/.cargo",
+        "RUSTUP_TOOLCHAIN=nightly-2026-05-28",
+        "CARGO_NET_OFFLINE=true",
         "TERM=dumb",
-        "CARGO_HOME=/tmp/cargo-cache",
     ];
-    crate::println!("sudoos-diag: final-buildstorm: diagnostic minibuild begin");
-    let diagnostic = "rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; echo BUILDSTORM_DIAG_NEW_RC=$?; cd /tmp/minibuild-diag || exit 97; cargo build; echo BUILDSTORM_DIAG_BUILD_RC=$?; /tmp/minibuild-diag/target/debug/minibuild; echo BUILDSTORM_DIAG_RUN_RC=$?";
-    match run_rootfs_program_with_cwd(
-        "/bin/sh",
-        &["sh", "-c", diagnostic],
-        &environment,
-        Some("/"),
-    ) {
-        Ok(code) => crate::println!("sudoos-diag: final-buildstorm: diagnostic exit={}", code),
-        Err(error) => crate::println!(
-            "sudoos-diag: final-buildstorm: diagnostic exec failed: {:?}",
-            error,
-        ),
-    }
     match run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/")) {
         Ok(0) => crate::println!("sudoos-diag: final-buildstorm: script exit=0"),
         Ok(code) => crate::println!("sudoos-diag: final-buildstorm: script exit={}", code),
@@ -4417,11 +4728,8 @@ fn run_program_image_with_cwd(
             result,
         );
     }
-    task.wait_for_detach();
-    drop(exec.thread);
-    let process = Arc::try_unwrap(exec.process)
-        .unwrap_or_else(|_| panic!("{owner} run retained unexpected Process owners"));
-    process.destroy()?;
+    task.wait_for_exit_visible();
+    task.release_process_owners(exec.thread, exec.process);
     Ok(result)
 }
 
@@ -4499,7 +4807,7 @@ fn run_session_on(
         "M9-B scheduler task binding diverged from Thread state",
     );
     let result = image.thread.wait_for_exit();
-    task.wait_for_detach();
+    task.wait_for_exit_visible();
 
     if scheduler_probe {
         let target = target.expect("M9-B scheduler probe lost its target CPU");
@@ -4541,7 +4849,8 @@ fn run_session_on(
     };
 
     image.unpublish();
-    image.destroy();
+    image.destroy(task);
+    crate::task::synchronize_user_task_reclamation();
     crate::user_mm::assert_no_leaks();
     crate::process::assert_no_leaks();
 
@@ -4680,6 +4989,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         frame.previous_mode_was_user(),
         "syscall trap did not originate in user mode",
     );
+    if handle_forced_exit(frame) {
+        return;
+    }
 
     let verifier = ACTIVE.load(Ordering::Acquire);
     if verifier {
@@ -5096,13 +5408,24 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             }
             #[cfg(target_arch = "loongarch64")]
             oscomp_la_status_trace("sys_exit", arguments[0] as isize);
-            crate::println!(
-                "process-exit: pid={} tid={} group={} status={}",
-                current_process().id().get(),
-                crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
-                number == SYS_EXIT_GROUP,
-                arguments[0] as isize,
-            );
+            if oscomp_lifecycle_trace_allow() {
+                crate::println!(
+                    "process-exit: pid={} tid={} group={} status={}",
+                    current_process().id().get(),
+                    crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+                    number == SYS_EXIT_GROUP,
+                    arguments[0] as isize,
+                );
+            }
+            if number == SYS_EXIT_GROUP {
+                let thread = crate::task::current_user_thread()
+                    .expect("exit_group arrived without a current user Thread");
+                crate::task::request_process_thread_exit(
+                    thread.process().id(),
+                    thread.id(),
+                    arguments[0] as isize,
+                );
+            }
             return_to_kernel(frame, arguments[0] as isize);
         }
         SYS_SOCKET => {
@@ -5254,7 +5577,19 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             set_syscall_result(frame, -ENOSYS)
         }
     }
-    deliver_pending_signal(frame);
+    if !handle_forced_exit(frame) {
+        deliver_pending_signal(frame);
+    }
+}
+
+pub(crate) fn handle_forced_exit(frame: &mut crate::arch::trap::TrapFrame) -> bool {
+    let Some(status) = crate::task::current_user_thread()
+        .and_then(|thread| thread.forced_exit_status())
+    else {
+        return false;
+    };
+    return_to_kernel(frame, status);
+    true
 }
 
 struct SyscallInterruptGuard {
@@ -5292,6 +5627,9 @@ pub fn handle_fault(
         frame.previous_mode_was_user(),
         "M8-B4 user fault handler received a kernel fault",
     );
+    if handle_forced_exit(frame) {
+        return;
+    }
 
     let verifier = ACTIVE.load(Ordering::Acquire);
     if verifier {
@@ -5411,6 +5749,9 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         frame.previous_mode_was_user(),
         "M8-B3 user exception handler received a kernel exception",
     );
+    if handle_forced_exit(frame) {
+        return;
+    }
 
     // ── P9-H14: handle LoongArch user FPD by enabling the FPU ──
     #[cfg(target_arch = "loongarch64")]
@@ -5679,13 +6020,7 @@ fn sys_file_private_mmap(
         None => return -ENOMEM,
     };
 
-    let old_position = file.position();
-    if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
-        let _ = current_user_mm().unmap_range(range);
-        return -EINVAL;
-    }
-    let result = copy_file_into_private_mapping(&file, start, readable);
-    let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
+    let result = copy_file_into_private_mapping(&file, start, offset, readable);
     if result.is_err() {
         let _ = current_user_mm().unmap_range(range);
         return -EFAULT;
@@ -5740,7 +6075,11 @@ fn sys_file_private_mmap(
 fn zero_user_mapping(mut addr: VirtAddr, mut remaining: usize) -> Result<(), ()> {
     let mm = current_user_mm();
     while remaining > 0 {
-        let chunk = core::cmp::min(PAGE_SIZE, remaining);
+        // `populate_page()` returns a physical address with the same in-page
+        // offset as `addr`. A fixed PAGE_SIZE write from an unaligned tail
+        // would cross into an unrelated physical frame.
+        let in_page = addr.get() & (PAGE_SIZE - 1);
+        let chunk = core::cmp::min(PAGE_SIZE - in_page, remaining);
         let phys = mm.populate_page(addr).map_err(|_| ())?;
         let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(phys).map_err(|_| ())?;
         unsafe {
@@ -5755,6 +6094,7 @@ fn zero_user_mapping(mut addr: VirtAddr, mut remaining: usize) -> Result<(), ()>
 fn copy_file_into_private_mapping(
     file: &myos_vfs::ArcFile,
     start: VirtAddr,
+    file_offset: usize,
     length: usize,
 ) -> Result<(), ()> {
     const FILE_MMAP_IO_CHUNK: usize = 256 * 1024;
@@ -5766,7 +6106,8 @@ fn copy_file_into_private_mapping(
     while copied < length {
         let chunk = (length - copied).min(buffer.len());
         let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
-        let read = file.read(&mut output).map_err(|_| ())?;
+        let offset = file_offset.checked_add(copied).ok_or(())?;
+        let read = file.read_at(offset as u64, &mut output).map_err(|_| ())?;
         if read == 0 {
             break;
         }
@@ -5979,10 +6320,18 @@ fn protection_flags(protection: usize) -> Option<VmAreaFlags> {
 }
 
 fn sys_write(fd: usize, address: usize, length: usize) -> isize {
-    let length = length.min(MAX_USER_COPY);
+    // Linux caps one read/write transfer, but does not silently reduce every
+    // regular-file operation to one page. Linkers rely on receiving complete
+    // multi-page object and archive records in a single successful call.
+    const MAX_RW_TRANSFER: usize = 64 * 1024 * 1024;
+    let length = length.min(MAX_RW_TRANSFER);
 
-    let mut buffer = [0_u8; MAX_USER_COPY];
-    if copy_from_user(address, &mut buffer[..length]).is_err() {
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(length).is_err() {
+        return -ENOMEM;
+    }
+    buffer.resize(length, 0);
+    if copy_from_user(address, &mut buffer).is_err() {
         return -EFAULT;
     }
 
@@ -5990,7 +6339,7 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
-    match file.write(&myos_vfs::IoBuffer::new(&buffer[..length])) {
+    match file.write(&myos_vfs::IoBuffer::new(&buffer)) {
         Ok(written) => {
             oscomp_lmbench_capture_bytes(fd, &buffer[..written]);
             if ACTIVE.load(Ordering::Acquire) {
@@ -6003,17 +6352,22 @@ fn sys_write(fd: usize, address: usize, length: usize) -> isize {
 }
 
 fn sys_read(fd: usize, address: usize, length: usize) -> isize {
-    let length = length.min(MAX_USER_COPY);
+    const MAX_RW_TRANSFER: usize = 64 * 1024 * 1024;
+    let length = length.min(MAX_RW_TRANSFER);
     let file = match current_process_file(fd) {
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
-
-    let mut buffer = [0_u8; MAX_USER_COPY];
-    let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer[..length]);
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(length).is_err() {
+        return -ENOMEM;
+    }
+    buffer.resize(length, 0);
+    let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer);
     match file.read(&mut output) {
         Ok(read) => {
-            if copy_to_user(address, output.filled_bytes()).is_err() {
+            let filled = output.filled_bytes();
+            if copy_to_user(address, filled).is_err() {
                 return -EFAULT;
             }
             read as isize
@@ -6082,14 +6436,10 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
-    // Save/restore file position so pread64 doesn't affect fd offset.
-    let old_position = file.position();
-    if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
-        return -(myos_vfs::Errno::Einval.to_isize());
-    }
     // Read in chunks: sys_read caps at MAX_USER_COPY, but pread64
     // must be able to read larger amounts (glibc ld-linux reads
-    // ELF header + program headers in a single pread64 call).
+    // ELF header + program headers in a single pread64 call). Each chunk is a
+    // positioned operation so shared descriptors cannot race their offsets.
     let mut total: usize = 0;
     let mut remaining = length;
     while remaining > 0 {
@@ -6097,7 +6447,11 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
         // Build a chunk-sized buffer and read into it.
         let mut chunk_buf = [0_u8; MAX_USER_COPY];
         let mut output = myos_vfs::MutableIoBuffer::new(&mut chunk_buf[..chunk]);
-        match file.read(&mut output) {
+        let chunk_offset = match offset.checked_add(total) {
+            Some(chunk_offset) => chunk_offset,
+            None => return if total > 0 { total as isize } else { -EINVAL },
+        };
+        match file.read_at(chunk_offset as u64, &mut output) {
             Ok(0) => break, // EOF
             Ok(read) => {
                 let dest = match address.checked_add(total) {
@@ -6108,7 +6462,6 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
                     if total > 0 {
                         break;
                     }
-                    let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
                     return -EFAULT;
                 }
                 total += read;
@@ -6121,12 +6474,10 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
                 if total > 0 {
                     break;
                 }
-                let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
                 return errno.to_isize();
             }
         }
     }
-    let _ = file.seek(old_position as i64, myos_vfs::SeekWhence::Set);
     total as isize
 }
 
@@ -6525,12 +6876,15 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     let current_thread =
         crate::task::current_user_thread().expect("clone arrived without a current user Thread");
 
-    let child = if wants_thread {
-        // A real thread shares the parent's address space and file table.
-        match parent.fork_child_thread() {
-            Ok(child) => child,
-            Err(_) => return -ENOMEM,
-        }
+    let (child, child_thread) = if wants_thread {
+        // A real thread is another Thread object in the same Process. This is
+        // the sharing boundary required by CLONE_THREAD and CLONE_FILES.
+        let child_thread =
+            match parent.create_thread(current_thread.entry(), current_thread.user_stack()) {
+                Ok(thread) => thread,
+                Err(_) => return -ENOMEM,
+            };
+        (Arc::clone(&parent), child_thread)
     } else {
         // glibc implements posix_spawn with CLONE_VM | CLONE_VFORK but expects
         // the parent to remain suspended until exec/exit. Until the kernel has
@@ -6541,13 +6895,20 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
             Ok(mm) => mm,
             Err(_) => return -ENOMEM,
         };
-        match parent.fork_child(child_mm) {
+        let child = match parent.fork_child(child_mm) {
             Ok(child) => child,
             Err(_) => return -ENOMEM,
-        }
+        };
+        let child_thread = match child
+            .create_initial_thread(current_thread.entry(), current_thread.user_stack())
+        {
+            Ok(thread) => thread,
+            Err(_) => return -ENOMEM,
+        };
+        (child, child_thread)
     };
 
-    if !wants_thread {
+    if !wants_thread && oscomp_lifecycle_trace_allow() {
         crate::println!(
             "clone-process: parent={} child={} flags={:#x} child_stack={:#x}",
             parent.id().get(),
@@ -6556,12 +6917,6 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
             arguments[1],
         );
     }
-
-    let child_thread =
-        match child.create_initial_thread(current_thread.entry(), current_thread.user_stack()) {
-            Ok(thread) => thread,
-            Err(_) => return -ENOMEM,
-        };
 
     // Copy signal mask from parent thread.
     child_thread.set_blocked_signals(current_thread.blocked_signals());
@@ -6603,8 +6958,18 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     }
     child_thread.save_trap_frame(child_frame);
 
+    let child_tid = child_thread.id().get();
     let _task = crate::task::spawn_user_thread_from_user_trap(child_thread);
-    child.id().get() as isize
+    if oscomp_lifecycle_trace_allow() {
+        crate::println!(
+            "sudoos-diag: lifecycle clone-result parent_pid={} child_tid={} flags={:#x} child_tid_addr={:#x}",
+            parent.id().get(),
+            child_tid,
+            flags,
+            arguments[4],
+        );
+    }
+    child_tid as isize
 }
 
 fn sys_clone3(
@@ -6660,6 +7025,19 @@ fn sys_clone3(
             cgroup,
         );
     }
+    if oscomp_lifecycle_trace_allow() {
+        crate::println!(
+            "sudoos-diag: lifecycle clone3 parent_pid={} parent_tid={} flags={:#x} child_tid={:#x} parent_tid_ptr={:#x} stack={:#x}+{:#x} tls={:#x}",
+            current_process().id().get(),
+            crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+            flags,
+            child_tid,
+            parent_tid,
+            stack,
+            stack_size,
+            tls,
+        );
+    }
 
     if flags & CLONE_PIDFD != 0
         || exit_signal > 64
@@ -6710,19 +7088,35 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         Ok(path) => path,
         Err(errno) => return errno,
     };
-    crate::println!(
-        "execve-attempt: pid={} raw={} resolved={}",
-        current_process().id().get(),
-        raw_path,
-        path,
-    );
+    if oscomp_lifecycle_trace_allow() {
+        crate::println!(
+            "execve-attempt: pid={} raw={} resolved={}",
+            current_process().id().get(),
+            raw_path,
+            path,
+        );
+    }
     let argv = match copy_user_string_array(arguments[1], MAX_EXEC_ARGS, Some(&raw_path)) {
         Ok(values) => values,
-        Err(errno) => return errno,
+        Err(errno) => {
+            crate::println!(
+                "execve-fail: phase=argv-copy path={} errno={}",
+                path,
+                errno,
+            );
+            return errno;
+        }
     };
     let envp = match copy_user_string_array(arguments[2], MAX_EXEC_ENVS, None) {
         Ok(values) => values,
-        Err(errno) => return errno,
+        Err(errno) => {
+            crate::println!(
+                "execve-fail: phase=envp-copy path={} errno={}",
+                path,
+                errno,
+            );
+            return errno;
+        }
     };
     let mut exec_argv = argv;
     let exec_path = path;
@@ -6949,6 +7343,10 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
 
     let process = current_process();
+    if process.thread_count() > 1 {
+        crate::task::request_process_thread_exit(process.id(), thread.id(), 0);
+        process.wait_until_single_thread();
+    }
     if process.files().close_on_exec().is_err() {
         return -ENOMEM;
     }
@@ -7634,22 +8032,26 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
         pid as isize
     };
     let process = current_process();
-    crate::println!(
-        "process-wait: pid={} requested={} options={:#x}",
-        process.id().get(),
-        requested,
-        options,
-    );
+    if oscomp_lifecycle_trace_allow() {
+        crate::println!(
+            "process-wait: pid={} requested={} options={:#x}",
+            process.id().get(),
+            requested,
+            options,
+        );
+    }
     loop {
         match process.wait_zombie_child(requested) {
             Ok(Some((child, raw_status))) => {
                 let child_pid = child.id().get();
-                crate::println!(
-                    "process-wait: pid={} reaped={} status={}",
-                    process.id().get(),
-                    child_pid,
-                    raw_status,
-                );
+                if oscomp_lifecycle_trace_allow() {
+                    crate::println!(
+                        "process-wait: pid={} reaped={} status={}",
+                        process.id().get(),
+                        child_pid,
+                        raw_status,
+                    );
+                }
                 if status_address != 0 {
                     // Linux wait status encoding for external programs.
                     // Gate tests (verifier=true) expect raw exit codes.
@@ -7673,14 +8075,12 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
                         return -EFAULT;
                     }
                 }
-                match Arc::try_unwrap(child) {
-                    Ok(child) => {
-                        if child.destroy().is_err() {
-                            return -EINVAL;
-                        }
-                    }
-                    Err(_) => return -EINVAL,
-                }
+                // Reaping removes the parent's durable child owner. Other
+                // CPUs may transiently hold an Arc from process-registry
+                // lookup (for example signal delivery); that is not a wait4
+                // error. Process teardown is RAII-backed, so release this
+                // reference and let the actual final owner perform cleanup.
+                drop(child);
                 return child_pid as isize;
             }
             Ok(None) if !process.has_child(requested) => return -ECHILD,
@@ -8227,6 +8627,17 @@ fn sys_futex(
             if current_val != val {
                 return -(crate::syscall::errno::EAGAIN);
             }
+            if timeout == 0 && oscomp_lifecycle_trace_allow() {
+                crate::println!(
+                    "sudoos-diag: lifecycle futex-wait pid={} tid={} addr={:#x} val={:#x} seq={} timeout={:#x}",
+                    current_process().id().get(),
+                    crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+                    uaddr,
+                    val,
+                    wake_sequence,
+                    timeout,
+                );
+            }
             // Timed wait: if timeout != 0, sleep a bounded duration and
             // return ETIMEDOUT without blocking on the futex queue.
             if timeout != 0 {
@@ -8268,6 +8679,17 @@ fn sys_futex(
                 }
                 woken += 1;
             }
+            if woken != 0 && oscomp_lifecycle_trace_allow() {
+                crate::println!(
+                    "sudoos-diag: lifecycle futex-wake pid={} tid={} addr={:#x} requested={} woken={} seq={}",
+                    current_process().id().get(),
+                    crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+                    uaddr,
+                    val,
+                    woken,
+                    queue.wake_sequence.load(Ordering::Acquire),
+                );
+            }
             woken as isize
         }
         _ => -(crate::syscall::errno::ENOSYS),
@@ -8288,7 +8710,17 @@ pub(crate) fn clear_child_tid_on_exit(thread: &crate::process::Thread) {
 
     let queue = get_futex_queue_for_mm(mm, ctid);
     queue.wake_sequence.fetch_add(1, Ordering::AcqRel);
-    let _ = queue.waiters.wake_one();
+    let woken = queue.waiters.wake_one();
+    if oscomp_lifecycle_trace_allow() {
+        crate::println!(
+            "sudoos-diag: lifecycle clear-child-tid pid={} tid={} addr={:#x} woken={} seq={}",
+            thread.process().id().get(),
+            thread.id().get(),
+            ctid,
+            woken,
+            queue.wake_sequence.load(Ordering::Acquire),
+        );
+    }
 }
 
 pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
@@ -9488,9 +9920,6 @@ fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
     if buf == 0 && count > 0 {
         return -EFAULT;
     }
-    if count > MAX_USER_COPY {
-        return -EINVAL;
-    }
     if offset > isize::MAX as usize {
         return -EINVAL;
     }
@@ -9498,30 +9927,41 @@ fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
         Ok(f) => f,
         Err(errno) => return errno.to_isize(),
     };
-    // Seek-save-write-restore (VFS lacks atomic write_at).
-    let saved = match file.seek(0, myos_vfs::SeekWhence::Current) {
-        Ok(off) => off,
-        Err(_) => {
-            // non-seekable fd — write_at not supported
-            return -(crate::syscall::errno::ENOSYS);
+    let mut total = 0_usize;
+    let mut data = [0_u8; MAX_USER_COPY];
+    while total < count {
+        let chunk = (count - total).min(MAX_USER_COPY);
+        let source = match buf.checked_add(total) {
+            Some(source) => source,
+            None => break,
+        };
+        if copy_from_user(source, &mut data[..chunk]).is_err() {
+            if total == 0 {
+                return -EFAULT;
+            }
+            break;
         }
-    };
-    if file.seek(offset as i64, myos_vfs::SeekWhence::Set).is_err() {
-        let _ = file.seek(saved as i64, myos_vfs::SeekWhence::Set);
-        return -EINVAL;
+        let chunk_offset = match offset.checked_add(total) {
+            Some(chunk_offset) => chunk_offset,
+            None => return if total > 0 { total as isize } else { -EINVAL },
+        };
+        match file.write_at(chunk_offset as u64, &myos_vfs::IoBuffer::new(&data[..chunk])) {
+            Ok(0) => break,
+            Ok(written) => {
+                total += written;
+                if written != chunk {
+                    break;
+                }
+            }
+            Err(errno) => {
+                if total == 0 {
+                    return errno.to_isize();
+                }
+                break;
+            }
+        }
     }
-    let mut data = alloc::vec![0_u8; count];
-    if copy_from_user(buf, &mut data).is_err() {
-        let _ = file.seek(saved as i64, myos_vfs::SeekWhence::Set);
-        return -EFAULT;
-    }
-    let io_buf = myos_vfs::IoBuffer::new(&data);
-    let written = match file.write(&io_buf) {
-        Ok(n) => n as isize,
-        Err(errno) => errno.to_isize(),
-    };
-    let _ = file.seek(saved as i64, myos_vfs::SeekWhence::Set);
-    written
+    total as isize
 }
 
 fn sys_ftruncate(fd: usize, length: usize) -> isize {
@@ -9694,8 +10134,15 @@ fn resolve_path_from_user(dirfd: usize, path: &str) -> Result<alloc::string::Str
 }
 
 fn copy_user_c_string(address: usize) -> Result<alloc::string::String, isize> {
+    copy_user_c_string_with_limit(address, MAX_USER_PATH)
+}
+
+fn copy_user_c_string_with_limit(
+    address: usize,
+    maximum: usize,
+) -> Result<alloc::string::String, isize> {
     let mut path = alloc::string::String::new();
-    for offset in 0..MAX_USER_PATH {
+    for offset in 0..maximum {
         let mut byte = [0_u8; 1];
         if copy_from_user(address.checked_add(offset).ok_or(-EFAULT)?, &mut byte).is_err() {
             return Err(-EFAULT);
@@ -9745,7 +10192,7 @@ fn copy_user_string_array(
             }
             return Ok(values);
         }
-        let value = copy_user_c_string(pointer)?;
+        let value = copy_user_c_string_with_limit(pointer, MAX_EXEC_STRING)?;
         values.try_reserve(1).map_err(|_| -ENOMEM)?;
         values.push(value);
     }
