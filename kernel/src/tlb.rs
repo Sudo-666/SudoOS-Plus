@@ -388,12 +388,10 @@ pub fn shootdown_user_local(request: PerMmTlbRequest) {
         .expect("per-mm CPU mask exceeds the kernel target-mask width");
     let current = crate::smp::current_cpu_id();
     let current_bit = cpu_bit(current);
-    assert_eq!(
-        requested & !current_bit,
-        0,
-        "local-only per-mm request targeted another CPU: current={} targets={requested:#x}",
-        current.get(),
-    );
+    if requested & !current_bit != 0 {
+        shootdown_user(request);
+        return;
+    }
 
     if requested & current_bit != 0 {
         flush_local(request.flush());
