@@ -112,4 +112,52 @@ SMOKE_TEST: PASS
 
 - **Disk I/O error 3850**: cargo 写入缓存到 ext4 overlay 时偶发失败
 - **ioctl TCGETS/TIOCGWINSZ**: 无害终端探测，可安全返回 -ENOTTY
+
+---
+
+# LoongArch 测试结果
+
+## CAgent: ❌ 全部超时（日志: cagent-la.log）
+
+```
+/tmp/cagent_testcode.official.sh : FAIL (signal=14)
+pass=0  fail=1  signal14=1
+```
+
+## BuildStorm diag: ❌ 无法启动（日志: buildstorm-la-diag.log）
+
+```
+write preflight exit=-14
+```
+
+## 根因：bash/ld-linux 在 LA 上崩溃
+
+G7 的 DT_RELR 和 R_LARCH_64 修复正常工作：
+```
+exec-reloc: DT_RELR=0xa18  DT_RELRSZ=0x20
+exec-reloc: LA R_ABS64 sym=38 off=0x3ffb0 symtab=true
+exec-reloc: applied=1 skipped=0 relr applied=21
+```
+
+但 ld-linux 完成重定位后立即触发未处理异常：
+
+```
+oscomp-la-user-exception: index=0 code=16 era=0x200177d4 sp=0xfff610 last_syscall=0
+```
+
+- **code=16**: LoongArch ECode 未在 trap.rs 中处理（已处理的: 0-7, 11, 12），落入 `handle_exception()` 直接杀进程
+- **era=0x200177d4**: ld-linux 内部偏移 0x177d4，可能是 PLT/GOT 写入段权限问题或未实现指令
+- 此问题是**预存问题**（与备份日志 `LoongArch输出online.txt` 中错误完全一致），不是今日修改引入
+
+## LA 整体状态
+
+| Gate | 状态 | 说明 |
+|---|---|---|
+| G7 DT_RELR + R_ABS64 | ✅ | 重定位处理代码正常 |
+| G7 动态链接器 | ❌ | ld-linux 加载后崩溃 (code=16) |
+| G8 CAgent | ❌ | bash 无法启动 |
+| G9 工具链 | ❌ | 同因 bash 无法启动 |
+| G10 BuildStorm | ❌ | write preflight 即失败 |
+
+**下一步**: 需要在 QEMU 中调试 LA ld-linux 崩溃（确定 ECode=16 的具体含义、检查 `0x200177d4` 处的指令、验证页表权限）
 - **rustfmt 缺失**: `/tmp/cargo-cache/bin/rustfmt` 不存在，自动回退到 `/root/.cargo/bin/rustfmt`
