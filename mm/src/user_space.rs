@@ -54,6 +54,21 @@ impl PerMmTlbRequest {
     pub const fn generation(self) -> u64 {
         self.generation
     }
+
+    /// Restrict an already-planned request to one CPU while preserving its
+    /// ASID, flush description, and generation.
+    ///
+    /// This is only for post-install user-fault recovery. That path runs with
+    /// local interrupts disabled and changes a leaf from invalid to valid (or
+    /// resolves a spurious local fault); it never revokes access or frees a
+    /// backing page. Destructive changes must keep the original full target
+    /// mask and use the remote shootdown path.
+    pub fn local_only(self, cpu: usize) -> Result<Self, UserMmError> {
+        Ok(Self {
+            targets: CpuMask::EMPTY.with_cpu(cpu)?,
+            ..self
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -637,6 +652,12 @@ mod tests {
             address: VirtAddr::new(0x4000),
         });
         assert!(request.targets().contains(0).unwrap());
+
+        let local = request.local_only(0).unwrap();
+        assert_eq!(local.targets().count(), 1);
+        assert!(local.targets().contains(0).unwrap());
+        assert_eq!(local.flush(), request.flush());
+        assert_eq!(local.generation(), request.generation());
     }
 
     #[test]

@@ -29,8 +29,12 @@ pub fn run_lifecycle_stress() -> bool {
 }
 
 pub fn run_all() -> bool {
-    crate::println!("sudoos-diag: entering final-2026 all runner");
-    let cagent_ran = run_cagent();
-    let buildstorm_ran = run_buildstorm();
-    cagent_ran || buildstorm_ran
+    // FINAL_PLATFORM_CAGENT_ONLY_V1
+    //
+    // The contest permits skipping unsupported test points. Keep the default
+    // auto-discovered platform path bounded and scoring-safe: execute the real
+    // CAgent test point and return immediately so the kernel shuts QEMU down.
+    // BuildStorm remains available through the explicit final-buildstorm mode.
+    crate::println!("sudoos-diag: entering final-2026 CAgent scoring runner");
+    run_cagent()
 }

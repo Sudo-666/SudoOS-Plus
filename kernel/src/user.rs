@@ -48,6 +48,7 @@ const SYS_UMOUNT2: usize = crate::syscall::number::UMOUNT2;
 const SYS_MOUNT: usize = crate::syscall::number::MOUNT;
 const SYS_FTRUNCATE: usize = crate::syscall::number::FTRUNCATE;
 const SYS_FACCESSAT: usize = crate::syscall::number::FACCESSAT;
+const SYS_FCHMODAT: usize = crate::syscall::number::FCHMODAT;
 const SYS_CHDIR: usize = crate::syscall::number::CHDIR;
 const SYS_GETDENTS64: usize = crate::syscall::number::GETDENTS64;
 const SYS_PIPE2: usize = crate::syscall::number::PIPE2;
@@ -89,6 +90,7 @@ const SYS_RT_SIGTIMEDWAIT: usize = crate::syscall::number::RT_SIGTIMEDWAIT;
 const SYS_RT_SIGRETURN: usize = crate::syscall::number::RT_SIGRETURN;
 const SYS_TIMES: usize = crate::syscall::number::TIMES;
 const SYS_UNAME: usize = crate::syscall::number::UNAME;
+const SYS_UMASK: usize = crate::syscall::number::UMASK;
 const SYS_GETTIMEOFDAY: usize = crate::syscall::number::GETTIMEOFDAY;
 const SYS_GETPID: usize = crate::syscall::number::GETPID;
 const SYS_GETPPID: usize = crate::syscall::number::GETPPID;
@@ -300,6 +302,10 @@ fn oscomp_la_status_trace(source: &str, value: isize) {
         crate::println!("oscomp-la-status-trace: source={} value={}", source, value,);
     }
 }
+// The current VFS does not apply umask during openat(O_CREAT), but real
+// toolchains query and restore it. Keep Linux-compatible observable state so
+// those probes do not receive -ENOSYS and feed that value back into umask().
+static COMPAT_UMASK: AtomicUsize = AtomicUsize::new(0o022);
 static SYSCALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAULT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -2333,8 +2339,13 @@ fn lifecycle_stress_shell(label: &str, script: &str) -> bool {
 
 fn lifecycle_stress_repeat(label: &str, count: usize, path: &str, argv: &[&str]) -> bool {
     let baseline = crate::task::task_lifecycle_snapshot();
+    let progress_stride = if label.starts_with("T4") {
+        if count <= 16 { 1 } else { 10 }
+    } else {
+        500
+    };
     for iteration in 0..count {
-        if iteration.is_multiple_of(500) {
+        if iteration.is_multiple_of(progress_stride) {
             crate::task::print_lifecycle_stress_progress(label, iteration);
         }
         let result = run_rootfs_program_with_cwd(
@@ -2412,18 +2423,43 @@ fn verify_task_lifecycle_stress_thread() {
             "/bin/sh",
             &["sh", "-c", "echo x | cat >/dev/null"],
         );
-    let t4 = t3
+    // Concurrency ladder: the last PASS identifies the first unsafe width.
+    let t4a = t3
+        && lifecycle_stress_repeat(
+            "T4a-concurrent-8x8",
+            8,
+            "/bin/sh",
+            &["sh", "-c", "j=0; while test $j -lt 8; do /bin/true & j=$((j+1)); done; wait"],
+        );
+    let t4b = t4a
+        && lifecycle_stress_repeat(
+            "T4b-concurrent-16x8",
+            8,
+            "/bin/sh",
+            &["sh", "-c", "j=0; while test $j -lt 16; do /bin/true & j=$((j+1)); done; wait"],
+        );
+    let t4c = t4b
+        && lifecycle_stress_repeat(
+            "T4c-concurrent-32x8",
+            8,
+            "/bin/sh",
+            &["sh", "-c", "j=0; while test $j -lt 32; do /bin/true & j=$((j+1)); done; wait"],
+        );
+    let t4d = t4c
+        && lifecycle_stress_repeat(
+            "T4d-concurrent-48x8",
+            8,
+            "/bin/sh",
+            &["sh", "-c", "j=0; while test $j -lt 48; do /bin/true & j=$((j+1)); done; wait"],
+        );
+    let t4 = t4d
         && lifecycle_stress_repeat(
             "T4-concurrent-64x200",
             200,
             "/bin/sh",
-            &[
-                "sh",
-                "-c",
-                "j=0; while test $j -lt 64; do /bin/true & j=$((j+1)); done; wait",
-            ],
+            &["sh", "-c", "j=0; while test $j -lt 64; do /bin/true & j=$((j+1)); done; wait"],
         );
-    let t5 = t4 && lifecycle_stress_shell(
+let t5 = t4 && lifecycle_stress_shell(
         "T5-signals",
         "set +e; /bin/sleep 30 & p=$!; /bin/kill -TERM $p; wait $p; r=$?; test $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill -KILL $p; wait $p; r=$?; test $r -eq 137 || exit 1; /bin/timeout 1 /bin/sleep 30; r=$?; test $r -eq 124 -o $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill $p; wait $p; r=$?; test $r -eq 143",
     );
@@ -2437,7 +2473,43 @@ fn verify_task_lifecycle_stress_thread() {
             &["sh", "-c", "/bin/true & p=$!; wait $p"],
         );
 
-    if t6 {
+    // Repeat a same-boot steady-state workload. This distinguishes bounded
+    // allocator/cache high-water retention from a per-process lifecycle leak.
+    crate::task::synchronize_user_task_reclamation();
+    let steady_before = crate::page_alloc::total_free_pages().unwrap_or(0);
+    let t7 = t6
+        && lifecycle_stress_repeat(
+            "T7-steady-warmup-1000",
+            1_000,
+            "/bin/true",
+            &["true"],
+        );
+    crate::task::synchronize_user_task_reclamation();
+    let steady_mid = crate::page_alloc::total_free_pages().unwrap_or(0);
+    let t8 = t7
+        && lifecycle_stress_repeat(
+            "T8-steady-check-1000",
+            1_000,
+            "/bin/true",
+            &["true"],
+        );
+    crate::task::synchronize_user_task_reclamation();
+    let steady_after = crate::page_alloc::total_free_pages().unwrap_or(0);
+    let steady_loss = steady_mid.saturating_sub(steady_after);
+    // Allow up to 1 MiB of one-time metadata/cache growth between the two
+    // identical 1,000-process passes. Object counters must still return to
+    // baseline in lifecycle_stress_repeat.
+    let steady_clean = t8 && steady_loss <= 256;
+    crate::println!(
+        "G2_STEADY_STATE {} before={} warm={} after={} loss_pages={}",
+        if steady_clean { "PASS" } else { "FAIL" },
+        steady_before,
+        steady_mid,
+        steady_after,
+        steady_loss,
+    );
+
+    if steady_clean {
         LIFECYCLE_STRESS_PASSED.store(true, Ordering::Release);
         crate::println!("G2_LIFECYCLE_STRESS: PASS");
     } else {
@@ -2507,13 +2579,13 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
         let _ = crate::fs::mkdir("/tmp", 0o1777);
     }
 
-    let script = "/tmp/buildstorm_testcode.official.sh";
-    if let Err(error) =
-        crate::fs::install_bytes(script, include_bytes!("final_buildstorm_testcode.sh"))
-    {
+    // BUILDSTORM_REAL_SDCARD_SCRIPT_V1
+    // Explicit BuildStorm runs also execute the evaluator-provided test point.
+    let script = "/mnt/sdcard/glibc/buildstorm_testcode.sh";
+    if crate::fs::stat(script).is_err() {
         crate::println!(
-            "sudoos-diag: final-buildstorm: official script install failed: {:?}",
-            error,
+            "sudoos-diag: final-buildstorm: evaluator script missing: {}",
+            script,
         );
         return;
     }
@@ -2526,11 +2598,13 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
             "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
             "HOME=/root",
             "RUSTUP_HOME=/root/.rustup",
-            "CARGO_HOME=/tmp/cargo-cache",
+            // BUILDSTORM_DIAG_PROD_CARGO_HOME=1
+            "CARGO_HOME=/root/.cargo",
             "RUSTUP_TOOLCHAIN=nightly-2026-05-28",
             "CARGO_NET_OFFLINE=true",
             "TERM=dumb",
         ];
+
         crate::println!("sudoos-diag: final-buildstorm: write preflight begin");
         let preflight = concat!(
             "set -eu; ",
@@ -2544,8 +2618,9 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
             "rm /work/.sudoos-write-probe; ",
             "echo x > /tmp/.sudoos-write-probe; ",
             "test \"$(cat /tmp/.sudoos-write-probe)\" = x; ",
-            "rm /tmp/.sudoos-write-probe",
+            "rm /tmp/.sudoos-write-probe"
         );
+
         match run_rootfs_program_with_cwd(
             "/bin/sh",
             &["sh", "-c", preflight],
@@ -2554,7 +2629,10 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
         ) {
             Ok(0) => crate::println!("sudoos-diag: final-buildstorm: write preflight ok"),
             Ok(code) => {
-                crate::println!("sudoos-diag: final-buildstorm: write preflight exit={}", code);
+                crate::println!(
+                    "sudoos-diag: final-buildstorm: write preflight exit={}",
+                    code
+                );
                 return;
             }
             Err(error) => {
@@ -2565,8 +2643,49 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
                 return;
             }
         }
-        crate::println!("sudoos-diag: final-buildstorm: diagnostic minibuild begin");
-        let diagnostic = "echo DIAG_PHASE=start; rm -rf /tmp/minibuild-diag; cargo new --vcs none /tmp/minibuild-diag; new_rc=$?; echo BUILDSTORM_DIAG_NEW_RC=$new_rc; test $new_rc -eq 0 || { echo DIAG_FAIL=new; exit $new_rc; }; cd /tmp/minibuild-diag || { echo DIAG_FAIL=cd; exit 97; }; echo DIAG_PHASE=cargo-build; cargo build; build_rc=$?; echo BUILDSTORM_DIAG_BUILD_RC=$build_rc; echo DIAG_PHASE=cargo-build-done; test $build_rc -eq 0 || { echo DIAG_FAIL=build; exit $build_rc; }; echo DIAG_PHASE=run; /tmp/minibuild-diag/target/debug/minibuild-diag; run_rc=$?; echo BUILDSTORM_DIAG_RUN_RC=$run_rc; echo DIAG_PHASE=done; exit $run_rc";
+
+        crate::println!(
+            "sudoos-diag: final-buildstorm: repeat/xtask diagnostic begin"
+        );
+
+        // BUILDSTORM_REPEAT_XTASK_DIAG_V2
+        // BUILDSTORM_JOBSERVER_PIPE_DIAG_V1
+        let diagnostic = r#"
+rm -rf /tmp/bs-jobserver-mini
+rm -f /tmp/bs-jobserver-xtask.out
+
+echo BUILDSTORM_JOBSERVER_XTASK_BEGIN
+cd /work/tgoskits || exit 97
+cargo xtask --help > /tmp/bs-jobserver-xtask.out 2>&1
+xtask_rc=$?
+echo "BUILDSTORM_JOBSERVER_XTASK_RC=$xtask_rc"
+echo BUILDSTORM_JOBSERVER_XTASK_OUT_BEGIN
+cat /tmp/bs-jobserver-xtask.out 2>&1
+echo BUILDSTORM_JOBSERVER_XTASK_OUT_END
+
+if [ "$xtask_rc" -ne 0 ]; then
+    echo "BUILDSTORM_DIAG_BUILD_RC=$xtask_rc"
+    exit "$xtask_rc"
+fi
+
+cd /
+cargo new --vcs none /tmp/bs-jobserver-mini 2>&1
+new_rc=$?
+echo "BUILDSTORM_DIAG_NEW_RC=$new_rc"
+test "$new_rc" -eq 0 || exit "$new_rc"
+
+cd /tmp/bs-jobserver-mini || exit 98
+cargo build 2>&1
+build_rc=$?
+echo "BUILDSTORM_DIAG_BUILD_RC=$build_rc"
+test "$build_rc" -eq 0 || exit "$build_rc"
+
+/tmp/bs-jobserver-mini/target/debug/bs-jobserver-mini
+run_rc=$?
+echo "BUILDSTORM_DIAG_RUN_RC=$run_rc"
+exit "$run_rc"
+"#;
+
         EXEC_TRACE_COUNT.store(0, Ordering::Release);
         OSCOMP_LIFECYCLE_TRACE_BUDGET.store(2048, Ordering::Release);
         OSCOMP_LIFECYCLE_TRACE.store(true, Ordering::Release);
@@ -2574,16 +2693,22 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
             final_buildstorm_lifecycle_watchdog,
             crate::smp::CpuId::BOOT,
         );
+
         let diagnostic_result = run_rootfs_program_with_cwd(
             "/bin/sh",
             &["sh", "-c", diagnostic],
             &environment,
             Some("/"),
         );
+
         OSCOMP_LIFECYCLE_TRACE.store(false, Ordering::Release);
+
         match diagnostic_result {
             Ok(code) => {
-                crate::println!("sudoos-diag: final-buildstorm: diagnostic exit={}", code)
+                crate::println!(
+                    "sudoos-diag: final-buildstorm: diagnostic exit={}",
+                    code
+                )
             }
             Err(error) => crate::println!(
                 "sudoos-diag: final-buildstorm: diagnostic exec failed: {:?}",
@@ -2592,7 +2717,6 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
         }
         return;
     }
-
     let environment = [
         "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
         "HOME=/root",
@@ -2744,12 +2868,15 @@ fn verify_final_cagent_thread() {
     let _ = crate::fs::unlink("/mnt/sdcard/glibc/touch", false);
     let _ = crate::fs::symlink("/bin/touch", "/mnt/sdcard/glibc/touch");
 
-    let script = "/tmp/cagent_testcode.official.sh";
-    if let Err(error) = crate::fs::install_bytes(script, include_bytes!("final_cagent_testcode.sh"))
-    {
+    // CAGENT_REAL_SDCARD_SCRIPT_V1
+    // Execute the evaluator-provided test point itself. Do not replace it
+    // with a repository-embedded copy: the mounted image is the source of
+    // truth for test contents and platform-side test-point accounting.
+    let script = "/mnt/sdcard/glibc/cagent_testcode.sh";
+    if crate::fs::stat(script).is_err() {
         crate::println!(
-            "sudoos-diag: final-cagent: failed to install current official script: {:?}",
-            error
+            "sudoos-diag: final-cagent: evaluator script missing: {}",
+            script,
         );
         return;
     }
@@ -2796,7 +2923,6 @@ fn verify_final_cagent_thread() {
     crate::println!("sdcard scripts: discovered 1");
     crate::println!("sdcard scripts: using shell {}", shell_path);
     crate::println!("oscomp: arch={} final-cagent", crate::arch::ARCH_NAME);
-    crate::println!("#### OS COMP TEST GROUP START {} ####", script);
 
     let environment = [
         "PATH=/tmp/cagent-bin:.:/mnt/sdcard/glibc:/mnt/sdcard/glibc/lib:/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin",
@@ -2817,7 +2943,7 @@ fn verify_final_cagent_thread() {
 
     match raw {
         Ok(0) => {
-            crate::println!("{} : PASS", script);
+            crate::println!("sudoos-diag: final-cagent: official script exit=0");
             OSCOMP_PASS.store(1, Ordering::Release);
         }
         Ok(code) => {
@@ -2829,28 +2955,28 @@ fn verify_final_cagent_thread() {
                 if signal == 14 {
                     OSCOMP_SIGNAL14.store(1, Ordering::Release);
                 }
-                crate::println!("{} : FAIL (signal={})", script, signal);
+                crate::println!(
+                    "sudoos-diag: final-cagent: official script signal={}",
+                    signal,
+                );
             } else {
-                crate::println!("{} : FAIL (exit={})", script, code);
+                crate::println!(
+                    "sudoos-diag: final-cagent: official script exit={}",
+                    code,
+                );
             }
             OSCOMP_FAIL.store(1, Ordering::Release);
         }
         Err(error) => {
-            crate::println!("{} : FAIL (exec={:?})", script, error);
+            crate::println!(
+                "sudoos-diag: final-cagent: official script exec failed: {:?}",
+                error,
+            );
             OSCOMP_FAIL.store(1, Ordering::Release);
         }
     }
 
     OSCOMP_COMPLETED.store(1, Ordering::Release);
-    crate::println!("#### OS COMP TEST GROUP END {} ####", script);
-    oscomp_print_summary(
-        1,
-        OSCOMP_PASS.load(Ordering::Acquire),
-        OSCOMP_FAIL.load(Ordering::Acquire),
-        0,
-        OSCOMP_SIGNAL11.load(Ordering::Acquire),
-        OSCOMP_SIGNAL14.load(Ordering::Acquire),
-    );
     OSCOMP_FINALIZED.store(true, Ordering::Release);
     OSCOMP_ACTIVE.store(false, Ordering::Release);
 }
@@ -5199,6 +5325,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_GETTIMEOFDAY => set_syscall_result(frame, sys_gettimeofday(arguments[0])),
         SYS_TIMES => set_syscall_result(frame, sys_times(arguments[0])),
         SYS_UNAME => set_syscall_result(frame, sys_uname(arguments[0])),
+        SYS_UMASK => set_syscall_result(frame, sys_umask(arguments[0])),
         SYS_SYSINFO => set_syscall_result(frame, sys_sysinfo(arguments[0])),
         SYS_GETRANDOM => set_syscall_result(
             frame,
@@ -5237,6 +5364,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_FACCESSAT => set_syscall_result(
             frame,
             sys_faccessat(arguments[0], arguments[1], arguments[2]),
+        ),
+        SYS_FCHMODAT => set_syscall_result(
+            frame,
+            sys_fchmodat(arguments[0], arguments[1], arguments[2]),
         ),
         SYS_FTRUNCATE => set_syscall_result(frame, sys_ftruncate(arguments[0], arguments[1])),
         SYS_CHDIR => set_syscall_result(frame, sys_chdir(arguments[0])),
@@ -9524,6 +9655,13 @@ fn sys_umount2(target_address: usize, flags: usize) -> isize {
     }
 }
 
+fn sys_umask(mask: usize) -> isize {
+    // Linux returns the previous mask and stores only the low permission bits.
+    // This compatibility state is sufficient because openat(O_CREAT) currently
+    // uses the VFS default mode and permission checks are not enforced.
+    COMPAT_UMASK.swap(mask & 0o777, Ordering::AcqRel) as isize
+}
+
 fn sys_faccessat(dirfd: usize, path_address: usize, mode: usize) -> isize {
     if mode & !(R_OK | W_OK | X_OK) != 0 {
         return -EINVAL;
@@ -9537,6 +9675,31 @@ fn sys_faccessat(dirfd: usize, path_address: usize, mode: usize) -> isize {
         result = crate::fs::stat(&path);
     }
     match result {
+        Ok(_) => 0,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
+fn sys_fchmodat(dirfd: usize, path_address: usize, mode: usize) -> isize {
+    // chmod accepts the permission and special-mode bits, not file-type bits.
+    if mode & !0o7777 != 0 {
+        return -EINVAL;
+    }
+
+    let path = match resolve_user_path(dirfd, path_address) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
+
+    let mut result = crate::fs::stat(&path);
+    if result.is_err() && crate::ensure_sdcard_dir_materialized(&path) {
+        result = crate::fs::stat(&path);
+    }
+
+    match result {
+        // Node.mode is immutable and open/exec do not enforce Unix permission
+        // bits yet. Treat chmod as a validated no-op so rustc can finalize its
+        // output artifact without weakening path/error handling.
         Ok(_) => 0,
         Err(errno) => errno.to_isize(),
     }

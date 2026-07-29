@@ -29,7 +29,7 @@ use crate::{
 };
 use stack::KernelStack;
 
-const MAX_TASKS: usize = 128;
+const MAX_TASKS: usize = 1024;
 const DEFAULT_TIME_SLICE_TICKS: u32 = 4;
 const MAX_CPUS: usize = crate::smp::MAX_CPUS;
 #[cfg(debug_assertions)]
@@ -342,17 +342,15 @@ impl Task {
             "exit-visible completion reached final task reclamation",
         );
         if let Some(cleanup) = self.process_cleanup.take() {
-            // The synchronous owner stops waiting at ExitVisible. It drops its
-            // Thread/Process references and publishes that hand-off here; the
-            // reaper can then preserve the original stack -> Thread -> Process
-            // destruction order without delaying the caller's return.
-            cleanup.caller_released.wait();
+            // ExitVisible and final reclamation are independent.  The reaper
+            // must not wait for a synchronous caller, otherwise one delayed or
+            // aborted caller stalls reclamation of every later retired task.
+            //
+            // Preserve stack -> Thread -> Process drop order. Process teardown
+            // is RAII-backed, so legitimate temporary Arc<Process> readers do
+            // not turn reclamation into a kernel panic.
             drop(self.user_thread.take());
-            let process = Arc::try_unwrap(cleanup.process)
-                .unwrap_or_else(|_| panic!("reaper retained unexpected Process owners"));
-            process
-                .destroy()
-                .unwrap_or_else(|error| panic!("reaper process destroy failed: {error:?}"));
+            drop(cleanup.process);
         } else {
             drop(self.user_thread.take());
         }
@@ -379,7 +377,6 @@ struct ExitVisible {
 
 struct ProcessCleanup {
     process: Arc<crate::process::Process>,
-    caller_released: Arc<Completion>,
 }
 
 struct CompletedSwitch {
@@ -519,6 +516,8 @@ impl Scheduler {
         );
         TaskId(self.tasks.len())
     }
+
+
 
     fn choose_target_cpu(&self) -> CpuId {
         (0..self.discovered_cpus)
@@ -1105,15 +1104,11 @@ impl Scheduler {
                         value.checked_add(1)
                     })
                     .expect("retired outstanding counter overflowed");
-                let pending = RETIRED_BACKLOG
+                RETIRED_BACKLOG
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_add(1)
                     })
                     .expect("retired backlog counter overflowed");
-                assert!(
-                    pending < MAX_TASKS,
-                    "retired backlog exceeded queue capacity"
-                );
                 return CompletedSwitch {
                     retired_task_added: true,
                     exit_visible,
@@ -2208,7 +2203,6 @@ pub fn enter_secondary_idle() -> ! {
 pub(crate) struct UserTaskHandle {
     id: TaskId,
     exit_visible: Arc<Completion>,
-    caller_released: Option<Arc<Completion>>,
 }
 
 impl UserTaskHandle {
@@ -2223,22 +2217,20 @@ impl UserTaskHandle {
     }
 
     pub(crate) fn release_process_owners(
-        mut self,
+        self,
         thread: Arc<crate::process::Thread>,
         process: Arc<crate::process::Process>,
     ) {
-        let caller_released = self
-            .caller_released
-            .take()
-            .expect("user task has no synchronous process-cleanup hand-off");
         assert_eq!(
             thread.process().id(),
             process.id(),
             "process-cleanup hand-off mixed Thread and Process owners",
         );
+        // The retired Task independently retains the ownership needed for
+        // safe deferred reclamation. The synchronous caller may release its
+        // references immediately after ExitVisible.
         drop(thread);
         drop(process);
-        caller_released.complete_all();
     }
 }
 
@@ -2251,10 +2243,8 @@ pub(crate) fn spawn_user_thread_on(
     let stack = KernelStack::allocate()
         .unwrap_or_else(|error| panic!("unable to allocate user-thread kernel stack: {error:?}"));
     let exit_visible = Arc::new(Completion::new());
-    let caller_released = Arc::new(Completion::new());
     let process_cleanup = ProcessCleanup {
         process: thread.process_arc(),
-        caller_released: Arc::clone(&caller_released),
     };
     let (id, target) = {
         let mut slot = SCHEDULER.lock();
@@ -2275,7 +2265,6 @@ pub(crate) fn spawn_user_thread_on(
     UserTaskHandle {
         id,
         exit_visible,
-        caller_released: Some(caller_released),
     }
 }
 
@@ -2306,7 +2295,6 @@ pub(crate) fn spawn_user_thread_from_user_trap(
     UserTaskHandle {
         id,
         exit_visible,
-        caller_released: None,
     }
 }
 

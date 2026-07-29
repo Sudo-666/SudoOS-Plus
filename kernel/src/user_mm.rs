@@ -850,7 +850,21 @@ impl UserMm {
         };
 
         if let Some(request) = request {
+            // User faults execute with local interrupts disabled, so they
+            // cannot enter the synchronous remote IPI/ACK path. This path only
+            // installs a previously invalid leaf or repairs a spurious local
+            // translation; no page is unmapped, freed, or permission-revoked.
+            //
+            // Restrict the post-install request to this CPU. Another CPU using
+            // the same mm either observes the new valid PTE directly or faults
+            // on its own stale invalid translation and performs the same local
+            // recovery. munmap/mprotect/retirement still retain the original
+            // full active_cpus mask and use shootdown_user().
+            let request = request
+                .local_only(crate::smp::current_cpu_id().get())
+                .map_err(UserMmRuntimeError::from)?;
             crate::tlb::shootdown_user_local(request);
+            // post-install fault recovery is local-only by construction
         }
         Ok(resolution)
     }
@@ -978,6 +992,10 @@ impl UserMm {
             asid,
             "M8-B3 hardware ASID does not match the active user mm",
         );
+        // `active_cpus` is the Linux-like mm_cpumask, not a single-owner
+        // marker. A CLONE_VM/pthread process may legally execute this same mm
+        // on multiple CPUs at once. Hardware root/ASID checks above and the
+        // current-CPU membership check below are the required local invariant.
         assert!(active.count() >= 1, "M8-B3 published an unexpected CPU mask");
         let current_is_active = active.contains(cpu).map_err(UserMmError::from)?;
         assert!(
