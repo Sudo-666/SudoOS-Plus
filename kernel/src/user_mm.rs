@@ -222,7 +222,7 @@ impl UserMm {
                 .ok_or(UserMmRuntimeError::NotMapped)?;
             let mut mapped_pages = Vec::new();
             mapped_pages
-                .try_reserve(state.pages.len())
+                .try_reserve(page_count)
                 .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
             for mapping in &state.pages {
                 let physical = page_table
@@ -248,23 +248,50 @@ impl UserMm {
             child.set_program_break(program_break.current())?;
         }
 
-        for (i, source) in mapped_pages.iter().enumerate() {
-            if i % 100 == 0 && i > 0 {
-                crate::println!("fork-clone: progress {}/{}", i, mapped_pages.len());
-            }
-            let destination = match child.populate_page(source.page.start_address()) {
-                Ok(dst) => dst,
-                Err(e) => {
-                    crate::println!("fork-clone: FAIL at page {}/{}: {:?}", i, mapped_pages.len(), e);
-                    return Err(e);
+        // COW fork: share physical pages, mark read-only in both parent and child.
+        // On first write fault, the page is copied (COW break).
+        let cow_count = mapped_pages.len();
+        // Collect VMA options first (needs immutable state borrow).
+        let cow_ops: Vec<_> = {
+            let child_state = child.state.lock();
+            mapped_pages.iter().map(|source| {
+                let area = child_state.core.layout().find_area(source.page.start_address())
+                    .ok_or(UserMmRuntimeError::PermissionDenied)?;
+                let orig_opts = area.mapping_options();
+                let ro_opts = myos_mm::MappingOptions::new(
+                    myos_mm::PagePermissions::read_only()
+                ).with_user(orig_opts.is_user())
+                 .with_memory_type(orig_opts.memory_type());
+                let frame = myos_mm::PhysFrame::from_start_address(source.physical)
+                    .ok_or(UserMmRuntimeError::InvalidRange)?;
+                Ok((source.page, frame, ro_opts))
+            }).collect::<Result<Vec<(VirtPage, myos_mm::PhysFrame, myos_mm::MappingOptions)>, UserMmRuntimeError>>()?
+        };
+        // Now take mutable page-table borrows for parent and child.
+        {
+            let mut parent_state = self.state.lock();
+            let parent_pt = parent_state
+                .page_table
+                .as_mut()
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let mut child_state = child.state.lock();
+            let child_pt = child_state
+                .page_table
+                .as_mut()
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+
+            for (i, (page, frame, ro_opts)) in cow_ops.iter().enumerate() {
+                if let Err(e) = child_pt.map_page(*page, *frame, *ro_opts) {
+                    crate::println!("fork-clone: FAIL COW map child page {}/{}: {:?}", i, cow_count, e);
+                    return Err(UserMmRuntimeError::PageTable(e.into()));
                 }
-            };
-            if let Err(e) = copy_physical_page(source.physical, destination) {
-                crate::println!("fork-clone: FAIL at copy page {}/{}: {:?}", i, mapped_pages.len(), e);
-                return Err(UserMmRuntimeError::MetadataOutOfMemory);
+                if let Err(e) = parent_pt.protect_page(*page, *ro_opts) {
+                    crate::println!("fork-clone: FAIL COW protect parent page {}/{}: {:?}", i, cow_count, e);
+                    return Err(UserMmRuntimeError::PageTable(e.into()));
+                }
             }
         }
-        crate::println!("fork-clone: OK copied {} pages", mapped_pages.len());
+        crate::println!("fork-clone: COW shared {} pages", cow_count);
 
         Ok(child)
     }
@@ -751,10 +778,18 @@ impl UserMm {
                         Some(request),
                     )
                 }
-                UserFaultPlan::CopyOnWriteUnsupported { .. } => (
-                    UserFaultResolution::Fatal(UserFaultFailure::CopyOnWriteUnsupported),
-                    None,
-                ),
+                UserFaultPlan::CopyOnWriteUnsupported { area } => {
+                    // G7 COW break: allocate a fresh page with full VMA permissions.
+                    // The write that triggered this fault will populate the content.
+                    let page = fault.address().align_down(PAGE_SIZE)
+                        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                    let request = state.core.plan_post_install_tlb(page)?;
+                    map_zero_page_locked(&mut state, area, page)?;
+                    (
+                        UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
+                        Some(request),
+                    )
+                },
                 UserFaultPlan::ProtectionViolation { .. } => (
                     UserFaultResolution::Fatal(UserFaultFailure::ProtectionViolation),
                     None,
