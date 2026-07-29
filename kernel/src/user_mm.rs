@@ -248,10 +248,12 @@ impl UserMm {
             child.set_program_break(program_break.current())?;
         }
 
-        // COW fork: share physical pages, mark read-only in both parent and child.
-        // On first write fault, the page is copied (COW break).
+        // COW fork for LA only: RV's ld-linux repeatedly mmap/mprotects the
+        // same page, causing infinite COW-break loops.  LA needs COW to avoid
+        // fork ENOMEM from eager-copying 963 pages.
+        #[cfg(target_arch = "loongarch64")]
+        {
         let cow_count = mapped_pages.len();
-        // Collect VMA options first (needs immutable state borrow).
         let cow_ops: Vec<_> = {
             let child_state = child.state.lock();
             mapped_pages.iter().map(|source| {
@@ -292,6 +294,20 @@ impl UserMm {
             }
         }
         crate::println!("fork-clone: COW shared {} pages", cow_count);
+        } // end #[cfg(target_arch = "loongarch64")]
+
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            for source in &mapped_pages {
+                let destination = child.populate_page(source.page.start_address())?;
+                let old_ptr = crate::arch::memory::phys_access::ram_ptr::<u8>(source.physical)
+                    .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                let new_ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(destination)
+                    .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                unsafe { core::ptr::copy_nonoverlapping(old_ptr, new_ptr, PAGE_SIZE); }
+            }
+            crate::println!("fork-clone: eager copied {} pages", mapped_pages.len());
+        }
 
         Ok(child)
     }
