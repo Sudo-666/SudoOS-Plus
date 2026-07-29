@@ -56,3 +56,28 @@ pub fn enable_fpu() {
         );
     }
 }
+
+/// Enable LSX (128-bit SIMD) by setting EUEN.SXE.
+///
+/// G7 LA: ld-linux uses LSX vector store instructions (vst) which trigger
+/// EXCCODE_SXD when SXE=0.  Enable eagerly so user-space SIMD works.
+pub fn enable_lsx() {
+    const CSR_EUEN: usize = 0x2;
+    const EUEN_SXE: usize = 1 << 1;
+    unsafe {
+        let value: usize;
+        core::arch::asm!("csrrd {}, {}", out(reg) value, const CSR_EUEN, options(nomem, nostack));
+        core::arch::asm!("csrwr {}, {}", in(reg) (value | EUEN_SXE), const CSR_EUEN, options(nomem, nostack));
+    }
+}
+
+/// Enable LASX (256-bit SIMD) by setting EUEN.ASXE.
+pub fn enable_lasx() {
+    const CSR_EUEN: usize = 0x2;
+    const EUEN_ASXE: usize = 1 << 2;
+    unsafe {
+        let value: usize;
+        core::arch::asm!("csrrd {}, {}", out(reg) value, const CSR_EUEN, options(nomem, nostack));
+        core::arch::asm!("csrwr {}, {}", in(reg) (value | EUEN_ASXE), const CSR_EUEN, options(nomem, nostack));
+    }
+}

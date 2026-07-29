@@ -155,13 +155,13 @@ impl LeafPageTableEntry {
         PhysFrame::from_start_address(self.physical_address())
     }
 
-    /// 不存在的全局 PTE。
+    /// 不存在的全局 PTE（仅用于内核直接映射）。
     ///
-    /// LoongArch 的 TLB 以相邻奇偶页组成一对。为保证内核全局映射
-    /// 旁边的空 PTE 不会清除整对 TLB 项的 global 属性，Linux 也会
-    /// 使用只带 GLOBAL 位的空内核 PTE。
+    /// G7 LA: user-page-table fill changed to empty() — the GLOBAL bit
+    /// on odd PTE halves was poisoning TLB pairs, making ASID-based
+    /// invalidation unable to evict the stale entry after an SXD fault.
     pub const fn invalid_global() -> Self {
-        Self(GLOBAL)
+        Self(0)
     }
 }
 

@@ -142,12 +142,14 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
         ECODE_PAGE_PRIVILEGE => {
             handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Read, true)
         }
-        // G7: EXCCODE_SXD (16) — LoongArch fires this instead of PIS when the
-        // TLB entry exists but the page's storage attribute (MAT) is incompatible
-        // with the store instruction.  Handle like a write page fault so the
-        // kernel can re-map the page with correct attributes.
+        // G7 LA: EXCCODE_SXD (16) = LSX 128-bit SIMD disabled.
+        // ld-linux uses vector store instructions; enable LSX and retry.
         16 if frame.previous_mode_was_user() => {
-            handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Write, false)
+            crate::arch::cpu::enable_lsx();
+        }
+        // G7 LA: EXCCODE_ASXD (17) = LASX 256-bit SIMD disabled.
+        17 if frame.previous_mode_was_user() => {
+            crate::arch::cpu::enable_lasx();
         }
         ECODE_INTERRUPT => {
             crate::irq::enter();
