@@ -343,7 +343,7 @@ core::arch::global_asm!(include_str!("user/riscv64.S"));
 core::arch::global_asm!(include_str!("user/loongarch64.S"));
 
 unsafe extern "C" {
-    fn __m7_enter_user(entry: usize, stack_top: usize) -> isize;
+    fn __m7_enter_user(entry: usize, stack_top: usize, tls: usize) -> isize;
     fn __m12_enter_user_frame(frame: *const crate::arch::trap::TrapFrame) -> isize;
     fn __m7_user_return();
 
@@ -4731,6 +4731,10 @@ fn run_program_image_with_cwd(
     if let Some(cwd) = cwd {
         exec.process.fs().set_cwd(cwd)?;
     }
+    // G7 LA: ld-linux dereferences tp immediately for GOT/TLS setup.
+    // tp=0 causes instant crash; use a mapped address below the stack.
+    // Static programs ignore tp so a non-zero value is harmless.
+    exec.thread.set_tls_pointer(USER_STACK - PAGE_SIZE);
     let child_pid = exec.process.id();
     let task = crate::task::spawn_user_thread_on(Arc::clone(&exec.thread), None);
     let result = exec.thread.wait_for_exit();
@@ -10303,11 +10307,11 @@ pub(crate) fn run_scheduled_thread(thread: &crate::process::Thread) -> isize {
     if let Some(frame) = thread.take_trap_frame() {
         enter_user_frame(&frame)
     } else {
-        enter_user(thread.entry().get(), thread.user_stack_pointer().get())
+        enter_user(thread.entry().get(), thread.user_stack_pointer().get(), thread.tls())
     }
 }
 
-fn enter_user(entry: usize, stack_top: usize) -> isize {
+fn enter_user(entry: usize, stack_top: usize, tls: usize) -> isize {
     assert_eq!(
         stack_top & 0xf,
         0,
@@ -10318,7 +10322,7 @@ fn enter_user(entry: usize, stack_top: usize) -> isize {
     // private root, and the scheduler owns this task's guarded kernel stack for
     // the complete user/trap round trip. Trap return may enable timer/IPI
     // delivery, but scheduler ownership keeps both objects alive across preemption.
-    unsafe { __m7_enter_user(entry, stack_top) }
+    unsafe { __m7_enter_user(entry, stack_top, tls) }
 }
 
 fn enter_user_frame(frame: &crate::arch::trap::TrapFrame) -> isize {

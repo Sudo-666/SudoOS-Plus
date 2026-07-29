@@ -328,12 +328,6 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
             }
             // Apply static PIE relocations on interpreter.
             apply_static_pie_relocations(&mm, interp_data, interp)?;
-            // G7 LA: eagerly fault a zero page at USER_MMAP_START so the first
-            // store from ld-linux hits a correctly-populated TLB (MAT=Coherent
-            // Cached) instead of triggering EXCCODE_SXD.
-            if let Err(e) = mm.populate_page(VirtAddr::new(0x1000000)) {
-                crate::println!("exec-reloc: pre-fault mmap base failed: {:?}", e);
-            }
         }
         mm.copy_to_user(USER_SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE_BYTES)?;
         build_initial_stack(

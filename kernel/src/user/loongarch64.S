@@ -4,13 +4,16 @@
 .type __m7_enter_user, @function
 
 /*
- * r4 = user entry, r5 = user stack top.
+ * r4 = user entry, r5 = user stack top, r6 = TLS (tp).
  * SAVE0 (CSR 0x30) owns the kernel stack pointer while PLV3 is active.
  */
 __m7_enter_user:
     addi.d $r3, $r3, -112
     st.d $r1, $r3, 0
     st.d $r2, $r3, 8
+    // G7: set tp from the Thread's TLS field before entering user mode.
+    // ld-linux dereferences tp immediately for GOT/TLS setup.
+    or $r2, $r6, $r0
     st.d $r21, $r3, 16
     st.d $r22, $r3, 24
     st.d $r23, $r3, 32

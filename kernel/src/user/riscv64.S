@@ -9,7 +9,7 @@
 .equ RISCV_USER_ANCHOR_USER_TP, 16
 
 /*
- * a0 = user entry, a1 = user stack top.
+ * a0 = user entry, a1 = user stack top, a2 = user TLS (tp).
  *
  * M9-B runs as a schedulable task. While U-mode is active, sscratch
  * points at a task-stack anchor containing the saved kernel SP and kernel tp.
@@ -56,7 +56,7 @@ __m7_enter_user:
     mv sp, a1
     li ra, 0
     li gp, 0
-    li tp, 0
+    mv tp, a2
     li t0, 0
     li t1, 0
     li t2, 0
