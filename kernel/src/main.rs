@@ -366,6 +366,9 @@ fn kernel_main(boot: BootInfo) -> ! {
     println!("BOOT13 rootfs-ready");
     tty::initialize();
 
+    #[cfg(target_arch = "loongarch64")]
+    crate::arch::cpu::enable_all_user_extensions();
+
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     vm::verify();
 

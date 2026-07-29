@@ -27,40 +27,17 @@ pub unsafe fn enable_and_wait_for_interrupt() {
 }
 
 /// Enable the LoongArch FPU by setting EUEN.FPE.
-///
-/// This is an eager-enable contest fixup.  Full per-thread FPU
-/// save/restore is future work.
 pub fn enable_fpu() {
     const CSR_EUEN: usize = 0x2;
     const EUEN_FPE: usize = 1 << 0;
-
-    let value: usize;
-    // SAFETY: CSR read is side-effect-free, does not access memory or stack.
     unsafe {
-        core::arch::asm!(
-            "csrrd {}, {}",
-            out(reg) value,
-            const CSR_EUEN,
-            options(nomem, nostack),
-        );
-    }
-
-    let new_value = value | EUEN_FPE;
-    // SAFETY: CSR write enables the FPU.
-    unsafe {
-        core::arch::asm!(
-            "csrwr {}, {}",
-            in(reg) new_value,
-            const CSR_EUEN,
-            options(nomem, nostack),
-        );
+        let value: usize;
+        core::arch::asm!("csrrd {}, {}", out(reg) value, const CSR_EUEN, options(nomem, nostack));
+        core::arch::asm!("csrwr {}, {}", in(reg) (value | EUEN_FPE), const CSR_EUEN, options(nomem, nostack));
     }
 }
 
-/// Enable LSX (128-bit SIMD) by setting EUEN.SXE.
-///
-/// G7 LA: ld-linux uses LSX vector store instructions (vst) which trigger
-/// EXCCODE_SXD when SXE=0.  Enable eagerly so user-space SIMD works.
+/// Enable LSX (128-bit SIMD).
 pub fn enable_lsx() {
     const CSR_EUEN: usize = 0x2;
     const EUEN_SXE: usize = 1 << 1;
@@ -71,7 +48,7 @@ pub fn enable_lsx() {
     }
 }
 
-/// Enable LASX (256-bit SIMD) by setting EUEN.ASXE.
+/// Enable LASX (256-bit SIMD).
 pub fn enable_lasx() {
     const CSR_EUEN: usize = 0x2;
     const EUEN_ASXE: usize = 1 << 2;
@@ -80,4 +57,12 @@ pub fn enable_lasx() {
         core::arch::asm!("csrrd {}, {}", out(reg) value, const CSR_EUEN, options(nomem, nostack));
         core::arch::asm!("csrwr {}, {}", in(reg) (value | EUEN_ASXE), const CSR_EUEN, options(nomem, nostack));
     }
+}
+
+/// Enable FPU + LSX + LASX eagerly at boot.  User-space never triggers
+/// FPD / SXD / ASXD — no per-trap enable latency.
+pub fn enable_all_user_extensions() {
+    enable_fpu();
+    enable_lsx();
+    enable_lasx();
 }
