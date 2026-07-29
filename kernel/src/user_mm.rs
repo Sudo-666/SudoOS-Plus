@@ -233,9 +233,37 @@ impl UserMm {
             child.set_program_break(program_break.current())?;
         }
 
-        for source in mapped_pages {
-            let destination = child.populate_page(source.page.start_address())?;
-            copy_physical_page(source.physical, destination)?;
+        #[cfg(target_arch = "loongarch64")]
+        {
+            // COW: share physical pages read-only in child, protect parent.
+            // LA ld-linux creates 963+ pages before first fork; eager copy
+            // exhausts kernel heap.  RV keeps eager copy (no loop issue).
+            for source in &mapped_pages {
+                let area = child.state.lock().core.layout()
+                    .find_area(source.page.start_address())
+                    .ok_or(UserMmRuntimeError::PermissionDenied)?;
+                let orig = area.mapping_options();
+                let ro_opts = myos_mm::MappingOptions::new(myos_mm::PagePermissions::read_only())
+                    .with_user(orig.is_user())
+                    .with_memory_type(orig.memory_type());
+                // Map parent's frame read-only in child.
+                let frame = PhysFrame::from_start_address(source.physical)
+                    .ok_or(UserMmRuntimeError::InvalidRange)?;
+                child.state.lock().page_table.as_mut()
+                    .ok_or(UserMmRuntimeError::NotMapped)?
+                    .map_page(source.page, frame, ro_opts)?;
+                // Protect parent's PTE to read-only.
+                self.state.lock().page_table.as_mut()
+                    .ok_or(UserMmRuntimeError::NotMapped)?
+                    .protect_page(source.page, ro_opts)?;
+            }
+        }
+        #[cfg(not(target_arch = "loongarch64"))]
+        {
+            for source in mapped_pages {
+                let destination = child.populate_page(source.page.start_address())?;
+                copy_physical_page(source.physical, destination)?;
+            }
         }
 
         Ok(child)
@@ -723,10 +751,40 @@ impl UserMm {
                         Some(request),
                     )
                 }
-                UserFaultPlan::CopyOnWriteUnsupported { .. } => (
-                    UserFaultResolution::Fatal(UserFaultFailure::CopyOnWriteUnsupported),
-                    None,
-                ),
+                UserFaultPlan::CopyOnWriteUnsupported { area } => {
+                    let fault_page = VirtPage::from_start_address(
+                        fault.address().align_down(PAGE_SIZE).ok_or(UserMmError::AddressOverflow)?
+                    ).ok_or(UserMmError::AddressOverflow)?;
+                    let old_phys = state.page_table.as_ref()
+                        .ok_or(UserMmRuntimeError::NotMapped)?
+                        .translate(fault_page.start_address())?
+                        .ok_or(UserMmRuntimeError::NotMapped)?;
+                    let new_backing = crate::page_alloc::allocate(0,
+                        crate::page_alloc::PageAllocationOptions::kernel_zeroed())?;
+                    let new_frame = new_backing.start();
+                    // copy old -> new
+                    let old_ptr = crate::arch::memory::phys_access::ram_ptr::<u8>(old_phys)
+                        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                    let new_ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(
+                        new_frame.start_address())
+                        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                    unsafe { core::ptr::copy_nonoverlapping(old_ptr, new_ptr, PAGE_SIZE); }
+                    // replace PTE with writable frame
+                    if let Err(e) = state.page_table.as_mut()
+                        .ok_or(UserMmRuntimeError::NotMapped)?
+                        .replace_page(fault_page, new_frame, area.mapping_options())
+                    {
+                        crate::page_alloc::free(new_backing).ok();
+                        return Err(UserMmRuntimeError::PageTable(e.into()));
+                    }
+                    state.pages.push(MappedPage { page: fault_page, backing: new_backing });
+                    LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+                    let request = state.core.plan_post_install_tlb(fault_page.start_address())?;
+                    (
+                        UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
+                        Some(request),
+                    )
+                },
                 UserFaultPlan::ProtectionViolation { .. } => (
                     UserFaultResolution::Fatal(UserFaultFailure::ProtectionViolation),
                     None,
