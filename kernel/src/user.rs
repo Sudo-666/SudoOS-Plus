@@ -7386,6 +7386,16 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     // start with a clean tp.  For dynamic programs, set a non-zero
     // initial TLS so ld-linux can access tp-relative GOT before its
     // own TLS_INIT_TP runs.  For static programs, tp=0 is fine.
+    //
+    // G7 LA: use a higher TLS base so negative tp-relative offsets
+    // (common in LA glibc TLS layout) have mapped pages below.
+    #[cfg(target_arch = "loongarch64")]
+    let init_tls = if prepared.interp_base.is_some() {
+        USER_STACK - PAGE_SIZE
+    } else {
+        0_usize
+    };
+    #[cfg(not(target_arch = "loongarch64"))]
     let init_tls = if prepared.interp_base.is_some() {
         USER_DEMAND
     } else {
