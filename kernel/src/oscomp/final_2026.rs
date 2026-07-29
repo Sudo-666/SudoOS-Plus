@@ -29,12 +29,15 @@ pub fn run_lifecycle_stress() -> bool {
 }
 
 pub fn run_all() -> bool {
-    // FINAL_PLATFORM_CAGENT_ONLY_V1
+    // FINAL_PLATFORM_ALL_SCORING_POINTS_V1
     //
-    // The contest permits skipping unsupported test points. Keep the default
-    // auto-discovered platform path bounded and scoring-safe: execute the real
-    // CAgent test point and return immediately so the kernel shuts QEMU down.
-    // BuildStorm remains available through the explicit final-buildstorm mode.
-    crate::println!("sudoos-diag: entering final-2026 CAgent scoring runner");
-    run_cagent()
+    // The platform boots the submitted kernel without our local Makefile's
+    // `sudoos.oscomp=...` argument.  Run CAgent first so its short judge can
+    // finish exactly as before, then continue with the real BuildStorm script
+    // for a BuildStorm-scoring invocation of the same kernel.  The explicit
+    // modes remain available for isolated local regression runs.
+    crate::println!("sudoos-diag: entering final-2026 all scoring runners");
+    let cagent_ran = run_cagent();
+    let buildstorm_ran = run_buildstorm();
+    cagent_ran || buildstorm_ran
 }

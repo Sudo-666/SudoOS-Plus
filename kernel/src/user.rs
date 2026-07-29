@@ -2741,6 +2741,30 @@ printf '%s\n' "$captured"
 echo "BUILDSTORM_DIAG_RUN_RC=$run_rc"
 test "$run_rc" -eq 0 || exit "$run_rc"
 test "$captured" = "Hello, world!" || exit 99
+
+for path in \
+    /root/.cargo/registry/index/*/.cache/pk/g-/pkg-config \
+    /root/.cargo/registry/cache/*/pkg-config-0.3.33.crate \
+    /root/.cargo/registry/src/*/pkg-config-0.3.33/Cargo.toml
+do
+    if test -r "$path"; then
+        bytes="$(wc -c < "$path")"
+        printf 'BUILDSTORM_DIAG_CARGO_FILE readable=true bytes=%s path=%s\n' "$bytes" "$path"
+        sha256sum "$path" 2>/dev/null || true
+    else
+        printf 'BUILDSTORM_DIAG_CARGO_FILE readable=false path=%s\n' "$path"
+    fi
+done
+
+( cd /work/tgoskits && cargo metadata --offline --no-deps >/tmp/buildstorm-metadata.json )
+metadata_rc=$?
+echo "BUILDSTORM_DIAG_METADATA_RC=$metadata_rc"
+
+( cd /work/tgoskits && \
+  CARGO_LOG=cargo::sources::registry::http_remote=trace \
+  cargo build --offline -p tg-xtask )
+xtask_build_rc=$?
+echo "BUILDSTORM_DIAG_XTASK_BUILD_RC=$xtask_build_rc"
 exit 0
 "#;
 
