@@ -42,12 +42,22 @@ const AT_RANDOM: usize = 25;
 const AT_EXECFN: usize = 31;
 const DT_NULL: u64 = 0;
 const DT_PLTRELSZ: u64 = 2;
+#[cfg(target_arch = "loongarch64")]
+const DT_SYMTAB: u64 = 6;
 const DT_RELA: u64 = 7;
 const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
+#[cfg(target_arch = "loongarch64")]
+const DT_SYMENT: u64 = 11;
 const DT_REL: u64 = 17;
 const DT_RELSZ: u64 = 18;
 const DT_JMPREL: u64 = 23;
+#[cfg(target_arch = "loongarch64")]
+const DT_RELRSZ: u64 = 35;
+#[cfg(target_arch = "loongarch64")]
+const DT_RELR: u64 = 36;
+#[cfg(target_arch = "loongarch64")]
+const DT_RELRENT: u64 = 37;
 
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 const R_RELATIVE: u32 = 3;
@@ -441,6 +451,7 @@ fn load_segment(
     Ok(())
 }
 
+#[cfg(target_arch = "riscv64")]
 fn apply_static_pie_relocations(
     mm: &UserMm,
     image: &[u8],
@@ -556,6 +567,275 @@ fn apply_static_pie_relocations(
     }
 
     Ok(())
+}
+
+
+#[cfg(target_arch = "loongarch64")]
+fn apply_static_pie_relocations(
+    mm: &UserMm,
+    image: &[u8],
+    elf: &crate::elf::ElfImage,
+) -> Result<(), ExecError> {
+    let Some(dynamic) = elf.dynamic else {
+        return Ok(());
+    };
+    let entries = image
+        .get(dynamic.file_offset..dynamic.file_offset + dynamic.memory_size)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader))?;
+
+    let mut symtab_vaddr = 0_usize;
+    let mut sym_ent = 24_usize;
+    let mut rela_vaddr = 0_usize;
+    let mut rela_size = 0_usize;
+    let mut rela_ent = 24_usize;
+    let mut rel_size = 0_usize;
+    let mut relr_vaddr = 0_usize;
+    let mut relr_size = 0_usize;
+    let mut relr_ent = 8_usize;
+    let mut jmprel = 0_usize;
+    let mut pltrel_size = 0_usize;
+
+    for entry in entries.chunks_exact(16) {
+        let tag = read_u64(entry, 0)?;
+        let value = usize::try_from(read_u64(entry, 8)?)
+            .map_err(|_| ExecError::AddressOverflow)?;
+        match tag {
+            DT_NULL => break,
+            DT_SYMTAB => symtab_vaddr = value,
+            DT_SYMENT => sym_ent = value,
+            DT_RELA => rela_vaddr = value,
+            DT_RELASZ => rela_size = value,
+            DT_RELAENT => rela_ent = value,
+            DT_REL => {}
+            DT_RELSZ => rel_size = value,
+            DT_RELR => relr_vaddr = value,
+            DT_RELRSZ => relr_size = value,
+            DT_RELRENT => relr_ent = value,
+            DT_JMPREL => jmprel = value,
+            DT_PLTRELSZ => pltrel_size = value,
+            _ => {}
+        }
+    }
+
+    if rel_size != 0 {
+        // ELF64 LoongArch uses RELA/RELR.  Do not consume REL entries with
+        // RELA semantics because their addends live at the destination.
+        return Err(ExecError::Elf(crate::elf::ElfError::Unsupported));
+    }
+    if symtab_vaddr != 0 && sym_ent != 24 {
+        return Err(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader));
+    }
+
+    let relr_applied = apply_loongarch_relr(
+        mm,
+        image,
+        elf,
+        relr_vaddr,
+        relr_size,
+        relr_ent,
+    )?;
+
+    let mut rela_applied = 0_usize;
+    let mut rela_skipped = 0_usize;
+    if rela_size != 0 {
+        if rela_vaddr == 0 || rela_ent != 24 || !rela_size.is_multiple_of(rela_ent) {
+            return Err(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader));
+        }
+        let rela_addr = rela_vaddr
+            .checked_add(elf.load_bias)
+            .ok_or(ExecError::AddressOverflow)?;
+        let rela_offset = virtual_to_file_offset(elf, VirtAddr::new(rela_addr), rela_size)?;
+        let rela_bytes = image
+            .get(rela_offset..rela_offset + rela_size)
+            .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
+
+        for entry in rela_bytes.chunks_exact(rela_ent) {
+            let raw_offset = read_u64(entry, 0)?;
+            let info = read_u64(entry, 8)?;
+            let addend = read_i64(entry, 16)?;
+            let relocation_type = (info & 0xffff_ffff) as u32;
+            let symbol = info >> 32;
+            let destination = usize::try_from(raw_offset)
+                .map_err(|_| ExecError::AddressOverflow)?
+                .checked_add(elf.load_bias)
+                .ok_or(ExecError::AddressOverflow)?;
+
+            let value = if relocation_type == R_RELATIVE && symbol == 0 {
+                Some(add_signed_u64(elf.load_bias as u64, addend)?)
+            } else if relocation_type == R_ABS64 {
+                let symbol_value = if symbol == 0 {
+                    Some(0_u64)
+                } else {
+                    read_loongarch_dynamic_symbol(
+                        image,
+                        elf,
+                        symtab_vaddr,
+                        sym_ent,
+                        symbol,
+                    )?
+                };
+                match symbol_value {
+                    Some(symbol_value) => Some(add_signed_u64(symbol_value, addend)?),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(value) = value {
+                loader_copy_to_user_physical(
+                    mm,
+                    VirtAddr::new(destination),
+                    &value.to_le_bytes(),
+                )?;
+                rela_applied += 1;
+            } else {
+                // Undefined dynamic symbols and PLT relocations are resolved
+                // by ld-linux after its self-relocation has completed.
+                rela_skipped += 1;
+            }
+        }
+    }
+
+    if relr_applied != 0 || rela_applied != 0 || rela_skipped != 0 {
+        crate::println!(
+            "exec-reloc-la: rela-applied={} relr-applied={} skipped={} jmprel={} pltrel={}",
+            rela_applied,
+            relr_applied,
+            rela_skipped,
+            jmprel,
+            pltrel_size,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn apply_loongarch_relr(
+    mm: &UserMm,
+    image: &[u8],
+    elf: &crate::elf::ElfImage,
+    relr_vaddr: usize,
+    relr_size: usize,
+    relr_ent: usize,
+) -> Result<usize, ExecError> {
+    if relr_size == 0 {
+        return Ok(0);
+    }
+    if relr_vaddr == 0 || relr_ent != 8 || !relr_size.is_multiple_of(8) {
+        return Err(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader));
+    }
+
+    let table_address = relr_vaddr
+        .checked_add(elf.load_bias)
+        .ok_or(ExecError::AddressOverflow)?;
+    let table_offset = virtual_to_file_offset(elf, VirtAddr::new(table_address), relr_size)?;
+    let bytes = image
+        .get(table_offset..table_offset + relr_size)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
+
+    let mut cursor = 0_usize;
+    let mut have_cursor = false;
+    let mut applied = 0_usize;
+    for encoded in bytes.chunks_exact(8) {
+        let entry = usize::try_from(read_u64(encoded, 0)?)
+            .map_err(|_| ExecError::AddressOverflow)?;
+        if entry & 1 == 0 {
+            cursor = entry
+                .checked_add(elf.load_bias)
+                .ok_or(ExecError::AddressOverflow)?;
+            apply_one_loongarch_relr(mm, VirtAddr::new(cursor), elf.load_bias)?;
+            applied += 1;
+            cursor = cursor.checked_add(8).ok_or(ExecError::AddressOverflow)?;
+            have_cursor = true;
+            continue;
+        }
+        if !have_cursor {
+            return Err(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader));
+        }
+
+        // Bit zero marks a bitmap entry. Bits 1..63 select the next 63
+        // machine words beginning at the current cursor.
+        let bitmap = entry >> 1;
+        for bit in 0..63_usize {
+            if bitmap & (1_usize << bit) == 0 {
+                continue;
+            }
+            let delta = bit.checked_mul(8).ok_or(ExecError::AddressOverflow)?;
+            let address = cursor
+                .checked_add(delta)
+                .ok_or(ExecError::AddressOverflow)?;
+            apply_one_loongarch_relr(mm, VirtAddr::new(address), elf.load_bias)?;
+            applied += 1;
+        }
+        cursor = cursor
+            .checked_add(63 * 8)
+            .ok_or(ExecError::AddressOverflow)?;
+    }
+    Ok(applied)
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn apply_one_loongarch_relr(
+    mm: &UserMm,
+    address: VirtAddr,
+    load_bias: usize,
+) -> Result<(), ExecError> {
+    let current = loader_read_u64_physical(mm, address)?;
+    let relocated = current
+        .checked_add(load_bias as u64)
+        .ok_or(ExecError::AddressOverflow)?;
+    loader_copy_to_user_physical(mm, address, &relocated.to_le_bytes())
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn read_loongarch_dynamic_symbol(
+    image: &[u8],
+    elf: &crate::elf::ElfImage,
+    symtab_vaddr: usize,
+    sym_ent: usize,
+    symbol: u64,
+) -> Result<Option<u64>, ExecError> {
+    const SHN_UNDEF: u16 = 0;
+    const SHN_ABS: u16 = 0xfff1;
+    if symtab_vaddr == 0 || sym_ent != 24 {
+        return Ok(None);
+    }
+    let symbol_index = usize::try_from(symbol).map_err(|_| ExecError::AddressOverflow)?;
+    let symbol_delta = symbol_index
+        .checked_mul(sym_ent)
+        .ok_or(ExecError::AddressOverflow)?;
+    let symbol_address = symtab_vaddr
+        .checked_add(elf.load_bias)
+        .and_then(|base| base.checked_add(symbol_delta))
+        .ok_or(ExecError::AddressOverflow)?;
+    let symbol_offset = virtual_to_file_offset(elf, VirtAddr::new(symbol_address), sym_ent)?;
+    let entry = image
+        .get(symbol_offset..symbol_offset + sym_ent)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
+
+    let section = u16::from_le_bytes([entry[6], entry[7]]);
+    if section == SHN_UNDEF {
+        return Ok(None);
+    }
+    let value = read_u64(entry, 8)?;
+    if section == SHN_ABS {
+        return Ok(Some(value));
+    }
+    value
+        .checked_add(elf.load_bias as u64)
+        .map(Some)
+        .ok_or(ExecError::AddressOverflow)
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn add_signed_u64(base: u64, addend: i64) -> Result<u64, ExecError> {
+    u64::try_from(
+        (base as i128)
+            .checked_add(addend as i128)
+            .ok_or(ExecError::AddressOverflow)?,
+    )
+    .map_err(|_| ExecError::AddressOverflow)
 }
 
 fn virtual_to_file_offset(
@@ -797,6 +1077,23 @@ fn build_at_random_bytes(entry: VirtAddr, stack: VirtRange, execfn: usize) -> [u
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
     out
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn loader_read_u64_physical(mm: &UserMm, address: VirtAddr) -> Result<u64, ExecError> {
+    if address.get() & 7 != 0 {
+        return Err(ExecError::Elf(crate::elf::ElfError::InvalidAlignment));
+    }
+    let physical = mm.populate_page(address)?;
+    let source = crate::arch::memory::phys_access::ram_ptr::<u8>(physical)
+        .map_err(|_| UserMmRuntimeError::NotMapped)?;
+    let mut bytes = [0_u8; 8];
+    // SAFETY: populate_page returned the RAM byte corresponding to this VA;
+    // an aligned 8-byte relocation cannot cross the 4 KiB page boundary.
+    unsafe {
+        core::ptr::copy_nonoverlapping(source, bytes.as_mut_ptr(), bytes.len());
+    }
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn loader_copy_to_user_physical(

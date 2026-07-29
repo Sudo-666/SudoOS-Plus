@@ -56,7 +56,6 @@ const TLBREHI_PAGE_SIZE_SHIFT: usize = 0;
 const TLBREHI_PAGE_SIZE_MASK: usize = 0x3f << TLBREHI_PAGE_SIZE_SHIFT;
 
 const INVTLB_ALL: usize = 0x0;
-const INVTLB_MATCHING_ASID: usize = 0x4;
 const INVTLB_GLOBAL_OR_MATCHING_ASID_AND_VA: usize = 0x6;
 const TLB_PAIR_SIZE: usize = PAGE_SIZE * 2;
 const HARDWARE_ASID_MASK: usize = 0x03ff;
@@ -185,21 +184,15 @@ pub unsafe fn activate(root: PhysFrame) -> Result<PagingHardwareState, HardwareP
 
 /// Invalidate every non-global entry for one user ASID on this CPU.
 pub fn flush_asid(asid: AddressSpaceId) {
-    let asid = validate_user_asid(asid);
+    let _ = validate_user_asid(asid);
 
-    // SAFETY: INVTLB op 0x4 uses the register-specified ASID and changes only
-    // local translation state.  DBAR publishes prior page-table writes.
-    unsafe {
-        data_barrier();
-        asm!(
-            "invtlb {operation}, {asid}, $r0",
-            operation = const INVTLB_MATCHING_ASID,
-            asid = in(reg) asid,
-            options(nostack),
-        );
-        data_barrier();
-        instruction_barrier();
-    }
+    // A process fork gives the child a private page table and a distinct
+    // ASID.  QEMU's LoongArch TLB nevertheless retained an old translation
+    // across the op-4 ASID invalidation, allowing the resumed parent to read
+    // the child's freed page.  Address-space switches are correctness
+    // boundaries, so conservatively invalidate the complete local TLB here.
+    // This is LoongArch-only; RISC-V keeps its selective ASID path.
+    flush_all();
 }
 
 /// Invalidate one non-global ASID/virtual-address pair on this CPU.

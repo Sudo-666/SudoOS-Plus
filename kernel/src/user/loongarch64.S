@@ -608,3 +608,140 @@ __m12_m13_user_probe:
 
 .globl __m7_user_image_end
 __m7_user_image_end:
+
+/* SIGNAL_EXTENDED_STATE_V1 */
+.section .text
+.align 4
+.globl __sudoos_loongarch_save_signal_extended_state
+.type __sudoos_loongarch_save_signal_extended_state, @function
+/*
+ * r4 = LoongArchSignalExtendedState*
+ *
+ * Layout:
+ *   0..511   vr0..vr31 (32 x 16 bytes)
+ *   512      fcsr0
+ *   520..583 fcc0..fcc7
+ */
+__sudoos_loongarch_save_signal_extended_state:
+    csrrd $r12, 0x2
+    ori $r12, $r12, 0x3
+    csrwr $r12, 0x2
+
+    vst $vr0, $r4, 0
+    vst $vr1, $r4, 16
+    vst $vr2, $r4, 32
+    vst $vr3, $r4, 48
+    vst $vr4, $r4, 64
+    vst $vr5, $r4, 80
+    vst $vr6, $r4, 96
+    vst $vr7, $r4, 112
+    vst $vr8, $r4, 128
+    vst $vr9, $r4, 144
+    vst $vr10, $r4, 160
+    vst $vr11, $r4, 176
+    vst $vr12, $r4, 192
+    vst $vr13, $r4, 208
+    vst $vr14, $r4, 224
+    vst $vr15, $r4, 240
+    vst $vr16, $r4, 256
+    vst $vr17, $r4, 272
+    vst $vr18, $r4, 288
+    vst $vr19, $r4, 304
+    vst $vr20, $r4, 320
+    vst $vr21, $r4, 336
+    vst $vr22, $r4, 352
+    vst $vr23, $r4, 368
+    vst $vr24, $r4, 384
+    vst $vr25, $r4, 400
+    vst $vr26, $r4, 416
+    vst $vr27, $r4, 432
+    vst $vr28, $r4, 448
+    vst $vr29, $r4, 464
+    vst $vr30, $r4, 480
+    vst $vr31, $r4, 496
+
+    movfcsr2gr $r12, $fcsr0
+    st.d $r12, $r4, 512
+    movcf2gr $r12, $fcc0
+    st.d $r12, $r4, 520
+    movcf2gr $r12, $fcc1
+    st.d $r12, $r4, 528
+    movcf2gr $r12, $fcc2
+    st.d $r12, $r4, 536
+    movcf2gr $r12, $fcc3
+    st.d $r12, $r4, 544
+    movcf2gr $r12, $fcc4
+    st.d $r12, $r4, 552
+    movcf2gr $r12, $fcc5
+    st.d $r12, $r4, 560
+    movcf2gr $r12, $fcc6
+    st.d $r12, $r4, 568
+    movcf2gr $r12, $fcc7
+    st.d $r12, $r4, 576
+
+    jirl $r0, $r1, 0
+.size __sudoos_loongarch_save_signal_extended_state, . - __sudoos_loongarch_save_signal_extended_state
+
+.align 4
+.globl __sudoos_loongarch_restore_signal_extended_state
+.type __sudoos_loongarch_restore_signal_extended_state, @function
+__sudoos_loongarch_restore_signal_extended_state:
+    csrrd $r12, 0x2
+    ori $r12, $r12, 0x3
+    csrwr $r12, 0x2
+
+    vld $vr0, $r4, 0
+    vld $vr1, $r4, 16
+    vld $vr2, $r4, 32
+    vld $vr3, $r4, 48
+    vld $vr4, $r4, 64
+    vld $vr5, $r4, 80
+    vld $vr6, $r4, 96
+    vld $vr7, $r4, 112
+    vld $vr8, $r4, 128
+    vld $vr9, $r4, 144
+    vld $vr10, $r4, 160
+    vld $vr11, $r4, 176
+    vld $vr12, $r4, 192
+    vld $vr13, $r4, 208
+    vld $vr14, $r4, 224
+    vld $vr15, $r4, 240
+    vld $vr16, $r4, 256
+    vld $vr17, $r4, 272
+    vld $vr18, $r4, 288
+    vld $vr19, $r4, 304
+    vld $vr20, $r4, 320
+    vld $vr21, $r4, 336
+    vld $vr22, $r4, 352
+    vld $vr23, $r4, 368
+    vld $vr24, $r4, 384
+    vld $vr25, $r4, 400
+    vld $vr26, $r4, 416
+    vld $vr27, $r4, 432
+    vld $vr28, $r4, 448
+    vld $vr29, $r4, 464
+    vld $vr30, $r4, 480
+    vld $vr31, $r4, 496
+
+    ld.d $r12, $r4, 512
+    movgr2fcsr $fcsr0, $r12
+    ld.d $r12, $r4, 520
+    movgr2cf $fcc0, $r12
+    ld.d $r12, $r4, 528
+    movgr2cf $fcc1, $r12
+    ld.d $r12, $r4, 536
+    movgr2cf $fcc2, $r12
+    ld.d $r12, $r4, 544
+    movgr2cf $fcc3, $r12
+    ld.d $r12, $r4, 552
+    movgr2cf $fcc4, $r12
+    ld.d $r12, $r4, 560
+    movgr2cf $fcc5, $r12
+    ld.d $r12, $r4, 568
+    movgr2cf $fcc6, $r12
+    ld.d $r12, $r4, 576
+    movgr2cf $fcc7, $r12
+
+    jirl $r0, $r1, 0
+.size __sudoos_loongarch_restore_signal_extended_state, . - __sudoos_loongarch_restore_signal_extended_state
+

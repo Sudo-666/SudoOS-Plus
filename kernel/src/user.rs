@@ -286,7 +286,13 @@ pub(crate) fn oscomp_lifecycle_trace_active() -> bool {
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_FPD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
+static OSCOMP_LA_SXD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_REAL_EXCEPTION_LOGS: AtomicUsize = AtomicUsize::new(0); // SUDOOS_FINAL_DIRECT_FIX_V1
+#[cfg(target_arch = "loongarch64")]
+static OSCOMP_LA_CLONE_DIAG_BUDGET: AtomicUsize = AtomicUsize::new(96);
+#[cfg(target_arch = "loongarch64")]
+static OSCOMP_LA_ENTER_DIAG_BUDGET: AtomicUsize = AtomicUsize::new(96);
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
@@ -370,6 +376,53 @@ struct UserImage {
     thread: Arc<Thread>,
 }
 
+// SIGNAL_EXTENDED_STATE_V1
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+struct LoongArchSignalExtendedState {
+    vector: [[u64; 2]; 32],
+    fcsr0: u64,
+    fcc: [u64; 8],
+}
+
+#[cfg(target_arch = "loongarch64")]
+impl LoongArchSignalExtendedState {
+    fn capture() -> Self {
+        let mut state = Self::default();
+        unsafe {
+            __sudoos_loongarch_save_signal_extended_state(
+                core::ptr::addr_of_mut!(state),
+            );
+        }
+        state
+    }
+
+    fn restore(&self) {
+        unsafe {
+            __sudoos_loongarch_restore_signal_extended_state(
+                core::ptr::addr_of!(*self),
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "loongarch64")]
+unsafe extern "C" {
+    fn __sudoos_loongarch_save_signal_extended_state(
+        output: *mut LoongArchSignalExtendedState,
+    );
+    fn __sudoos_loongarch_restore_signal_extended_state(
+        input: *const LoongArchSignalExtendedState,
+    );
+}
+
+#[cfg(target_arch = "loongarch64")]
+const _: () = {
+    assert!(core::mem::size_of::<LoongArchSignalExtendedState>() == 592);
+    assert!(core::mem::align_of::<LoongArchSignalExtendedState>() == 16);
+};
+
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
 struct UserSignalFrame {
@@ -378,6 +431,20 @@ struct UserSignalFrame {
     old_mask: u64,
     reserved: u64,
     trap_frame: crate::arch::trap::TrapFrame,
+    #[cfg(target_arch = "loongarch64")]
+    extended_state: LoongArchSignalExtendedState,
+}
+
+/// LoongArch follows the asm-generic kernel sigaction ABI. Unlike RISC-V's
+/// legacy ABI, it does not expose the obsolete `sa_restorer` word, so the
+/// userspace structure is exactly handler, flags, and mask.
+#[cfg(target_arch = "loongarch64")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LoongArchUserSigAction {
+    handler: usize,
+    flags: usize,
+    mask: u64,
 }
 
 #[allow(dead_code)]
@@ -5884,36 +5951,74 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         return;
     }
 
-    // ── P9-H14: handle LoongArch user FPD by enabling the FPU ──
+    // LoongArch extended-component-disabled exceptions.  ECODE 0x0f is
+    // scalar FPD; ECODE 0x10 is SXD (128-bit LSX disabled), not a store fault.
+    // Enable the component and retry the same instruction.  The architecture
+    // context switch preserves the enabled FP/LSX register file per task.
     #[cfg(target_arch = "loongarch64")]
     if _code == 15 {
-        if frame.previous_mode_was_user() {
+        let n = OSCOMP_LA_FPD_FIXUPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 {
             crate::println!(
-                "oscomp-la-fpd: enable-fpu era={:#x} sp={:#x}",
+                "oscomp-la-fpd: fixup count={} era={:#x} badi={:#x}",
+                n,
                 frame.era,
-                frame.stack_pointer(),
+                frame.badi,
             );
-            let n = OSCOMP_LA_FPD_FIXUPS.fetch_add(1, Ordering::Relaxed) + 1;
-            if n <= 16 {
-                crate::println!("oscomp-la-fpd: fixup count={} era={:#x}", n, frame.era,);
-            }
-            crate::arch::cpu::enable_fpu();
-            // Return without advancing PC — the instruction will retry.
-            return;
         }
-        // Kernel-mode FPD is a bug — fall through to the assertion below.
+        crate::arch::cpu::enable_fpu();
+        return;
+    }
+    #[cfg(target_arch = "loongarch64")]
+    if _code == 16 {
+        let n = OSCOMP_LA_SXD_FIXUPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 {
+            crate::println!(
+                "oscomp-la-sxd: fixup count={} era={:#x} badi={:#x}",
+                n,
+                frame.era,
+                frame.badi,
+            );
+        }
+        crate::arch::cpu::enable_lsx();
+        return;
     }
 
+    #[cfg(target_arch = "loongarch64")]
+    if _code == 8 {
+        let process = current_process();
+        let tid = crate::task::current_user_thread().map_or(0, |thread| thread.id().get());
+        crate::println!(
+            "oscomp-la-adem-gprs: pid={} tid={} era={:#x} badv={:#x} badi={:#x} prmd={:#x} r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} r7={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} r16={:#x} r17={:#x} r18={:#x} r19={:#x} r20={:#x} r21={:#x} r22={:#x} r23={:#x} r24={:#x} r25={:#x} r26={:#x} r27={:#x} r28={:#x} r29={:#x} r30={:#x} r31={:#x}",
+            process.id().get(),
+            tid,
+            frame.era,
+            frame.badv,
+            frame.badi,
+            frame.prmd,
+            frame.gpr[1], frame.gpr[2], frame.gpr[3], frame.gpr[4],
+            frame.gpr[5], frame.gpr[6], frame.gpr[7], frame.gpr[8],
+            frame.gpr[9], frame.gpr[10], frame.gpr[11], frame.gpr[12],
+            frame.gpr[13], frame.gpr[14], frame.gpr[15], frame.gpr[16],
+            frame.gpr[17], frame.gpr[18], frame.gpr[19], frame.gpr[20],
+            frame.gpr[21], frame.gpr[22], frame.gpr[23], frame.gpr[24],
+            frame.gpr[25], frame.gpr[26], frame.gpr[27], frame.gpr[28],
+            frame.gpr[29], frame.gpr[30], frame.gpr[31],
+        );
+    }
     // SUDOOS_FINAL_DIRECT_FIX_V1: bounded telemetry from the real LoongArch trap frame.
     #[cfg(target_arch = "loongarch64")]
     {
         let index = OSCOMP_LA_REAL_EXCEPTION_LOGS.fetch_add(1, Ordering::Relaxed);
         if index < 32 {
             crate::println!(
-                "oscomp-la-user-exception: index={} code={} era={:#x} sp={:#x} last_syscall={}",
+                "oscomp-la-user-exception: index={} code={} subcode={} era={:#x} badv={:#x} badi={:#x} sp={:#x} last_syscall={}",
                 index,
                 _code,
+                frame.exception_subcode(),
                 frame.era,
+                frame.badv,
+                frame.badi,
                 frame.stack_pointer(),
                 LAST_TRACED_SYSCALL_NR.load(Ordering::Relaxed),
             );
@@ -6977,19 +7082,23 @@ fn sys_sigaltstack(ss: usize, old_ss: usize) -> isize {
     0
 }
 
-fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
+fn sys_clone_canonical(
+    frame: &crate::arch::trap::TrapFrame,
+    flags: usize,
+    child_stack: usize,
+    parent_tid_address: usize,
+    child_tid_address: usize,
+    tls_address: usize,
+) -> isize {
+    // CLONE_ARCH_ARGUMENT_ORDER_V1
     const CSIGNAL_MASK: usize = 0xff;
     const CLONE_VM: usize = 0x0000_0100;
-    const CLONE_FS: usize = 0x0000_0200;
-    const CLONE_FILES: usize = 0x0000_0400;
-    const CLONE_SIGHAND: usize = 0x0000_0800;
     const CLONE_THREAD: usize = 0x0001_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
+    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
     const CLONE_CHILD_CLEARTID: usize = 0x0020_0000;
     const CLONE_CHILD_SETTID: usize = 0x0100_0000;
-    const CLONE_PARENT_SETTID: usize = 0x0010_0000;
 
-    let flags = arguments[0];
     let wants_thread = flags & CLONE_THREAD != 0;
     let wants_vm_share = flags & CLONE_VM != 0;
     let wants_tls = flags & CLONE_SETTLS != 0;
@@ -6997,7 +7106,6 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
     let wants_child_settid = flags & CLONE_CHILD_SETTID != 0;
     let wants_parent_settid = flags & CLONE_PARENT_SETTID != 0;
 
-    // Thread creation requires CLONE_VM (shared address space).
     if wants_thread && !wants_vm_share {
         return -(crate::syscall::errno::EINVAL);
     }
@@ -7008,8 +7116,6 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
         crate::task::current_user_thread().expect("clone arrived without a current user Thread");
 
     let (child, child_thread) = if wants_thread {
-        // A real thread is another Thread object in the same Process. This is
-        // the sharing boundary required by CLONE_THREAD and CLONE_FILES.
         let child_thread =
             match parent.create_thread(current_thread.entry(), current_thread.user_stack()) {
                 Ok(thread) => thread,
@@ -7017,11 +7123,6 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
             };
         (Arc::clone(&parent), child_thread)
     } else {
-        // glibc implements posix_spawn with CLONE_VM | CLONE_VFORK but expects
-        // the parent to remain suspended until exec/exit. Until the kernel has
-        // a full vfork completion hand-off, give every non-thread child a
-        // private eager copy so an immediately returning parent cannot unmap
-        // the child's temporary spawn stack.
         let child_mm = match parent.mm().fork_clone_eager() {
             Ok(mm) => mm,
             Err(_) => return -ENOMEM,
@@ -7045,62 +7146,83 @@ fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isi
             parent.id().get(),
             child.id().get(),
             flags,
-            arguments[1],
+            child_stack,
         );
     }
 
-    // Copy signal mask from parent thread.
     child_thread.set_blocked_signals(current_thread.blocked_signals());
 
-    // CLONE_SETTLS: set the new thread's TLS pointer.
-    // On RISC-V this is the `tp` register; on LoongArch it's `tp` (r2).
-    if wants_tls && arguments[3] != 0 {
-        child_thread.set_tls_pointer(arguments[3]);
+    if wants_tls && tls_address != 0 {
+        child_thread.set_tls_pointer(tls_address);
     }
 
-    // CLONE_CHILD_CLEARTID: write the child tid pointer for futex wake on exit.
-    // Linux's generic clone ABI uses the fifth argument for both
-    // CHILD_SETTID and CHILD_CLEARTID; there is no sixth clone argument.
-    if wants_child_cleartid && arguments[4] != 0 {
-        child_thread.set_clear_child_tid(arguments[4]);
+    if wants_child_cleartid && child_tid_address != 0 {
+        child_thread.set_clear_child_tid(child_tid_address);
     }
 
-    // CLONE_PARENT_SETTID: write child TID to parent's user-space pointer.
-    if wants_parent_settid && arguments[2] != 0 {
+    if wants_parent_settid && parent_tid_address != 0 {
         let tid = child_thread.id().get() as u32;
-        let _ = copy_to_user(arguments[2], &tid.to_ne_bytes());
+        let _ = parent
+            .mm()
+            .copy_to_user(parent_tid_address, &tid.to_ne_bytes());
     }
 
-    // CLONE_CHILD_SETTID: write child TID to child's user-space pointer.
-    if wants_child_settid && arguments[4] != 0 {
+    // CHILD_SETTID is defined in the child's address space.  For a process
+    // clone the eager child MM is private, so using the current-process
+    // copy_to_user helper would write the parent and corrupt its libc state.
+    if wants_child_settid && child_tid_address != 0 {
         let tid = child_thread.id().get() as u32;
-        let _ = copy_to_user(arguments[4], &tid.to_ne_bytes());
+        let _ = child
+            .mm()
+            .copy_to_user(child_tid_address, &tid.to_ne_bytes());
     }
 
-    // Prepare the child's trap frame (copy of parent's, with return value 0).
     let mut child_frame = *frame;
     set_syscall_result(&mut child_frame, 0);
-    // If child stack is specified (arguments[1] != 0), use it.
-    if arguments[1] != 0 {
-        set_frame_stack_pointer(&mut child_frame, arguments[1]);
+
+    if child_stack != 0 {
+        set_frame_stack_pointer(&mut child_frame, child_stack);
     }
     if wants_tls {
-        set_frame_tls(&mut child_frame, arguments[3]);
+        set_frame_tls(&mut child_frame, tls_address);
     }
-    child_thread.save_trap_frame(child_frame);
 
+    child_thread.save_trap_frame(child_frame);
     let child_tid = child_thread.id().get();
     let _task = crate::task::spawn_user_thread_from_user_trap(child_thread);
+
     if oscomp_lifecycle_trace_allow() {
         crate::println!(
             "sudoos-diag: lifecycle clone-result parent_pid={} child_tid={} flags={:#x} child_tid_addr={:#x}",
             parent.id().get(),
             child_tid,
             flags,
-            arguments[4],
+            child_tid_address,
         );
     }
+
     child_tid as isize
+}
+
+fn sys_clone(frame: &crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
+    // Linux clone has an architecture-specific raw argument order:
+    //
+    // RISC-V:   flags, stack, parent_tid, tls,       child_tid
+    // LoongArch:flags, stack, parent_tid, child_tid, tls
+    #[cfg(target_arch = "loongarch64")]
+    let (child_tid_address, tls_address) = (arguments[3], arguments[4]);
+
+    #[cfg(target_arch = "riscv64")]
+    let (tls_address, child_tid_address) = (arguments[3], arguments[4]);
+
+    sys_clone_canonical(
+        frame,
+        arguments[0],
+        arguments[1],
+        arguments[2],
+        child_tid_address,
+        tls_address,
+    )
 }
 
 fn sys_clone3(
@@ -7120,6 +7242,7 @@ fn sys_clone3(
     if copy_from_user(clone_args_address, &mut raw[..size]).is_err() {
         return -EFAULT;
     }
+
     let field = |offset: usize| -> u64 {
         u64::from_ne_bytes(
             raw[offset..offset + 8]
@@ -7156,6 +7279,7 @@ fn sys_clone3(
             cgroup,
         );
     }
+
     if oscomp_lifecycle_trace_allow() {
         crate::println!(
             "sudoos-diag: lifecycle clone3 parent_pid={} parent_tid={} flags={:#x} child_tid={:#x} parent_tid_ptr={:#x} stack={:#x}+{:#x} tls={:#x}",
@@ -7178,6 +7302,7 @@ fn sys_clone3(
     {
         return -EINVAL;
     }
+
     if flags > usize::MAX as u64
         || child_tid > usize::MAX as u64
         || parent_tid > usize::MAX as u64
@@ -7196,15 +7321,19 @@ fn sys_clone3(
             None => return -EINVAL,
         }
     };
-    let legacy_flags = (flags as usize) | exit_signal as usize;
-    sys_clone(frame, [
-        legacy_flags,
+
+    let canonical_flags = (flags as usize) | exit_signal as usize;
+
+    // clone3 already uses a canonical named structure, so do not route it
+    // through either architecture's raw clone register order.
+    sys_clone_canonical(
+        frame,
+        canonical_flags,
         child_stack,
         parent_tid as usize,
-        tls as usize,
         child_tid as usize,
-        0,
-    ])
+        tls as usize,
+    )
 }
 
 fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -> isize {
@@ -7771,14 +7900,35 @@ fn sys_rt_sigaction(arguments: [usize; 6]) -> isize {
     let signals = process.signals();
     if old_action != 0 {
         let action = signals.action(signal).unwrap_or_default();
+        #[cfg(target_arch = "riscv64")]
         let result = copy_plain_to_user(old_action, &action);
+        #[cfg(target_arch = "loongarch64")]
+        let result = copy_plain_to_user(
+            old_action,
+            &LoongArchUserSigAction {
+                handler: action.handler,
+                flags: action.flags,
+                mask: action.mask,
+            },
+        );
         if result != 0 {
             return result;
         }
     }
     if new_action != 0 {
+        #[cfg(target_arch = "riscv64")]
         let mut action = match copy_plain_from_user::<crate::signal::KernelSigAction>(new_action) {
             Ok(action) => action,
+            Err(errno) => return errno,
+        };
+        #[cfg(target_arch = "loongarch64")]
+        let mut action = match copy_plain_from_user::<LoongArchUserSigAction>(new_action) {
+            Ok(action) => crate::signal::KernelSigAction {
+                handler: action.handler,
+                flags: action.flags,
+                restorer: 0,
+                mask: action.mask,
+            },
             Err(errno) => return errno,
         };
         action.mask &= !crate::signal::unblockable_mask();
@@ -7944,6 +8094,8 @@ fn sys_rt_sigreturn(frame: &mut crate::arch::trap::TrapFrame) -> Result<(), isiz
     let thread =
         crate::task::current_user_thread().expect("rt_sigreturn arrived without current Thread");
     thread.set_blocked_signals(signal_frame.old_mask);
+    #[cfg(target_arch = "loongarch64")]
+    signal_frame.extended_state.restore();
     *frame = signal_frame.trap_frame;
     Ok(())
 }
@@ -8130,6 +8282,8 @@ fn install_signal_frame(
         old_mask,
         reserved: 0,
         trap_frame: *frame,
+        #[cfg(target_arch = "loongarch64")]
+        extended_state: LoongArchSignalExtendedState::capture(),
     };
     let result = copy_plain_to_user(signal_sp, &signal_frame);
     if result != 0 {
@@ -10437,6 +10591,26 @@ pub(crate) fn run_scheduled_thread(thread: &crate::process::Thread) -> isize {
     );
 
     if let Some(frame) = thread.take_trap_frame() {
+        #[cfg(target_arch = "loongarch64")]
+        if OSCOMP_LA_ENTER_DIAG_BUDGET
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
+            .is_ok()
+        {
+            crate::println!(
+                "oscomp-la-enter-clone-frame: pid={} tid={} era={:#x} sp={:#x} r1={:#x} r2={:#x} r22={:#x} r23={:#x} r24={:#x} r25={:#x} r26={:#x}",
+                thread.process().id().get(),
+                thread.id().get(),
+                frame.era,
+                frame.gpr[3],
+                frame.gpr[1],
+                frame.gpr[2],
+                frame.gpr[22],
+                frame.gpr[23],
+                frame.gpr[24],
+                frame.gpr[25],
+                frame.gpr[26],
+            );
+        }
         enter_user_frame(&frame)
     } else {
         enter_user(thread.entry().get(), thread.user_stack_pointer().get())

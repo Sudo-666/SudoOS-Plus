@@ -26,33 +26,48 @@ pub unsafe fn enable_and_wait_for_interrupt() {
     }
 }
 
-/// Enable the LoongArch FPU by setting EUEN.FPE.
+/// Extended-component enable bits in CSR.EUEN.
+const CSR_EUEN: usize = 0x2;
+const EUEN_FPE: usize = 1 << 0;
+const EUEN_SXE: usize = 1 << 1;
+
+/// Enable a set of architectural extended components on the current CPU.
 ///
-/// This is an eager-enable contest fixup.  Full per-thread FPU
-/// save/restore is future work.
-pub fn enable_fpu() {
-    const CSR_EUEN: usize = 0x2;
-    const EUEN_FPE: usize = 1 << 0;
-
+/// The bits remain enabled on this CPU.  `task/switch.S` independently
+/// enables FPE+SXE at every context-switch boundary and saves/restores the
+/// complete 128-bit register state, so this helper is the exception fallback.
+#[inline]
+fn enable_extended(mask: usize) {
     let value: usize;
-    // SAFETY: CSR read is side-effect-free, does not access memory or stack.
+    // SAFETY: EUEN is a per-CPU architectural control register.  The caller
+    // only requests architecturally defined enable bits.
     unsafe {
-        core::arch::asm!(
-            "csrrd {}, {}",
-            out(reg) value,
-            const CSR_EUEN,
+        asm!(
+            "csrrd {value}, {csr}",
+            value = out(reg) value,
+            csr = const CSR_EUEN,
+            options(nomem, nostack),
+        );
+        let mut new_value = value | mask;
+        asm!(
+            "csrwr {value}, {csr}",
+            value = inout(reg) new_value => _,
+            csr = const CSR_EUEN,
             options(nomem, nostack),
         );
     }
+}
 
-    let new_value = value | EUEN_FPE;
-    // SAFETY: CSR write enables the FPU.
-    unsafe {
-        core::arch::asm!(
-            "csrwr {}, {}",
-            in(reg) new_value,
-            const CSR_EUEN,
-            options(nomem, nostack),
-        );
-    }
+/// Enable scalar floating point on the current CPU.
+pub fn enable_fpu() {
+    enable_extended(EUEN_FPE);
+}
+
+/// Enable scalar floating point and the 128-bit LSX register file.
+///
+/// SXD (ECODE 0x10) is an extended-component-disabled exception, not a page
+/// fault.  Enabling both FPE and SXE and retrying the faulting instruction is
+/// the architectural recovery path.
+pub fn enable_lsx() {
+    enable_extended(EUEN_FPE | EUEN_SXE);
 }

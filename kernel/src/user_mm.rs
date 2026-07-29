@@ -191,10 +191,12 @@ impl UserMm {
             && page_table.root_frame() != crate::vm::kernel_page_table_root()?)
     }
 
+    // FORK_CLONE_PRESERVE_PROT_NONE_V1
     pub fn fork_clone_eager(&self) -> Result<alloc::boxed::Box<Self>, UserMmRuntimeError> {
         let (areas, program_break, mapped_pages) = {
             let state = self.state.lock();
             let layout = state.core.layout();
+
             let mut areas = Vec::new();
             areas
                 .try_reserve(layout.area_count())
@@ -211,19 +213,37 @@ impl UserMm {
                 .page_table
                 .as_ref()
                 .ok_or(UserMmRuntimeError::NotMapped)?;
+
             let mut mapped_pages = Vec::new();
             mapped_pages
                 .try_reserve(state.pages.len())
                 .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+
             for mapping in &state.pages {
-                let physical = page_table
-                    .translate(mapping.page.start_address())?
-                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                let area = layout
+                    .find_area(mapping.page.start_address())
+                    .ok_or(UserMmRuntimeError::PermissionDenied)?;
+                let physical = mapping.backing.start().start_address();
+
+                match page_table.translate(mapping.page.start_address())? {
+                    Some(translated) => {
+                        if translated != physical {
+                            return Err(UserMmRuntimeError::NotMapped);
+                        }
+                    }
+                    None => {
+                        if area.flags().access_only() != VmAreaFlags::empty() {
+                            return Err(UserMmRuntimeError::NotMapped);
+                        }
+                    }
+                }
+
                 mapped_pages.push(MappedPageSource {
                     page: mapping.page,
                     physical,
                 });
             }
+
             (areas, layout.program_break(), mapped_pages)
         };
 
@@ -234,8 +254,48 @@ impl UserMm {
         }
 
         for source in mapped_pages {
-            let destination = child.populate_page(source.page.start_address())?;
-            copy_physical_page(source.physical, destination)?;
+            let mut state = child.state.lock();
+            let area = state
+                .core
+                .layout()
+                .find_area(source.page.start_address())
+                .ok_or(UserMmRuntimeError::PermissionDenied)?;
+
+            state
+                .pages
+                .try_reserve(1)
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+
+            let backing = crate::page_alloc::allocate(
+                0,
+                crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+            )?;
+            let destination = backing.start().start_address();
+
+            if let Err(error) = copy_physical_page(source.physical, destination) {
+                crate::page_alloc::free(backing)?;
+                return Err(error);
+            }
+
+            if area.flags().access_only() != VmAreaFlags::empty() {
+                let page_table = state
+                    .page_table
+                    .as_mut()
+                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                if let Err(error) =
+                    page_table.map_page(source.page, backing.start(), area.mapping_options())
+                {
+                    crate::page_alloc::free(backing)?;
+                    return Err(error.into());
+                }
+            }
+
+
+            state.pages.push(MappedPage {
+                page: source.page,
+                backing,
+            });
+            LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
         }
 
         Ok(child)
@@ -940,6 +1000,7 @@ impl UserMm {
             }
             page_table.reclaim_empty_tables(mapping.page, &mut retired)?;
             let backing_start = mapping.backing.start().start_address().get();
+
             let backing_order = mapping.backing.order();
             if let Err(error) = crate::page_alloc::free(mapping.backing) {
                 crate::println!(
