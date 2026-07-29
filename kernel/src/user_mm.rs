@@ -236,20 +236,22 @@ impl UserMm {
             (areas, layout.program_break(), mapped_pages)
         };
 
-        let child = alloc::boxed::Box::new(Self::new(&areas)?);
-        // Pre-allocate the pages Vec so incremental try_reserve(1) during
-        // populate_page does not fragment the kernel heap across 963 calls.
-        {
-            let mut child_state = child.state.lock();
-            child_state.pages.try_reserve(mapped_pages.len())
-                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-        }
+        let child = alloc::boxed::Box::new(match Self::new(&areas) {
+            Ok(mm) => mm,
+            Err(e) => {
+                crate::println!("fork-clone: FAIL at UserMm::new: {:?}", e);
+                return Err(e);
+            }
+        });
         if let Some(program_break) = program_break {
             child.configure_program_break(program_break.start(), program_break.limit())?;
             child.set_program_break(program_break.current())?;
         }
 
         for (i, source) in mapped_pages.iter().enumerate() {
+            if i % 100 == 0 && i > 0 {
+                crate::println!("fork-clone: progress {}/{}", i, mapped_pages.len());
+            }
             let destination = match child.populate_page(source.page.start_address()) {
                 Ok(dst) => dst,
                 Err(e) => {
