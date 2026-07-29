@@ -779,12 +779,40 @@ impl UserMm {
                     )
                 }
                 UserFaultPlan::CopyOnWriteUnsupported { area } => {
-                    // G7 COW break: allocate a fresh page with full VMA permissions.
-                    // The write that triggered this fault will populate the content.
-                    let page = fault.address().align_down(PAGE_SIZE)
-                        .ok_or(UserMmRuntimeError::AddressOverflow)?;
-                    let request = state.core.plan_post_install_tlb(page)?;
-                    map_zero_page_locked(&mut state, area, page)?;
+                    // G7 COW break: copy the shared read-only page to a new
+                    // writable frame, preserving content from the old frame.
+                    let fault_vpage = VirtPage::from_start_address(
+                        fault.address().align_down(PAGE_SIZE)
+                            .ok_or(UserMmRuntimeError::AddressOverflow)?
+                    ).ok_or(UserMmRuntimeError::InvalidRange)?;
+                    let old_physical = state.page_table.as_ref()
+                        .ok_or(UserMmRuntimeError::NotMapped)?
+                        .translate(fault_vpage.start_address())?
+                        .ok_or(UserMmRuntimeError::NotMapped)?;
+                    let new_backing = crate::page_alloc::allocate(
+                        0, crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+                    ).map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                    let new_frame = new_backing.start();
+                    // Copy the old page contents into the new frame.
+                    let old_ptr = crate::arch::memory::phys_access::ram_ptr::<u8>(old_physical)
+                        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                    let new_ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(
+                        new_frame.start_address()
+                    ).map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                    unsafe { core::ptr::copy_nonoverlapping(old_ptr, new_ptr, PAGE_SIZE); }
+                    // Replace the PTE with the new writable frame.
+                    let orig_opts = area.mapping_options();
+                    let replace_result = state.page_table.as_mut()
+                        .ok_or(UserMmRuntimeError::NotMapped)?
+                        .replace_page(fault_vpage, new_frame, orig_opts);
+                    if let Err(e) = replace_result {
+                        crate::page_alloc::free(new_backing).ok();
+                        return Err(UserMmRuntimeError::PageTable(e.into()));
+                    }
+                    // Track the new backing so it's freed on mm teardown.
+                    state.pages.push(MappedPage { page: fault_vpage, backing: new_backing });
+                    LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+                    let request = state.core.plan_post_install_tlb(fault_vpage.start_address())?;
                     (
                         UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
                         Some(request),
