@@ -195,10 +195,19 @@ impl UserMm {
         let (areas, program_break, mapped_pages) = {
             let state = self.state.lock();
             let layout = state.core.layout();
+            let area_count = layout.area_count();
+            let page_count = state.pages.len();
+            crate::println!(
+                "fork-clone: areas={} pages={} vma_cap={}",
+                area_count, page_count, VMA_CAPACITY,
+            );
             let mut areas = Vec::new();
             areas
-                .try_reserve(layout.area_count())
-                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                .try_reserve(area_count)
+                .map_err(|_| {
+                    crate::println!("fork-clone: FAIL at areas.try_reserve");
+                    UserMmRuntimeError::MetadataOutOfMemory
+                })?;
             for index in 0..layout.area_count() {
                 areas.push(
                     layout
@@ -228,15 +237,32 @@ impl UserMm {
         };
 
         let child = alloc::boxed::Box::new(Self::new(&areas)?);
+        // Pre-allocate the pages Vec so incremental try_reserve(1) during
+        // populate_page does not fragment the kernel heap across 963 calls.
+        {
+            let mut child_state = child.state.lock();
+            child_state.pages.try_reserve(mapped_pages.len())
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        }
         if let Some(program_break) = program_break {
             child.configure_program_break(program_break.start(), program_break.limit())?;
             child.set_program_break(program_break.current())?;
         }
 
-        for source in mapped_pages {
-            let destination = child.populate_page(source.page.start_address())?;
-            copy_physical_page(source.physical, destination)?;
+        for (i, source) in mapped_pages.iter().enumerate() {
+            let destination = match child.populate_page(source.page.start_address()) {
+                Ok(dst) => dst,
+                Err(e) => {
+                    crate::println!("fork-clone: FAIL at page {}/{}: {:?}", i, mapped_pages.len(), e);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = copy_physical_page(source.physical, destination) {
+                crate::println!("fork-clone: FAIL at copy page {}/{}: {:?}", i, mapped_pages.len(), e);
+                return Err(UserMmRuntimeError::MetadataOutOfMemory);
+            }
         }
+        crate::println!("fork-clone: OK copied {} pages", mapped_pages.len());
 
         Ok(child)
     }
