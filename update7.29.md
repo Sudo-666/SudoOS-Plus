@@ -82,13 +82,39 @@ fork: Cannot allocate memory (exit=254) ❌ 963 页复制耗尽内核堆
 **ld-linux 已能完整运行**——加载 libtinfo、libc，mmap/mprotect 正常。bash 启动后 `fork()` 子进程失败：fork 需要复制 963 个已映射页（`fork-clone: areas=18 pages=963`），每个 `populate_page` 分配新物理页并推入 `pages` Vec，963 次 `try_reserve(1)` 耗尽内核堆。
 
 **修复方向**：
-1. copy-on-write fork（推荐，但工作量大）
-2. 扩大内核堆（快速但治标）
-3. fork 时共享 file-backed 页（库页面）
+---
+
+## 四、COW Fork 实现（fork ENOMEM 修复）
+
+### 4.1 问题
+
+`fork_clone_eager` 需要复制 963 页——为每个匿名页分配新物理页并推入 `pages` Vec。963 次 `try_reserve(1)` 耗尽内核堆 → fork 返回 ENOMEM。
+
+### 4.2 实现
+
+[user_mm.rs](kernel/src/user_mm.rs):
+
+**COW fork** (`fork_clone_eager`):
+- 不再分配新页复制内容
+- 将父进程物理页共享给子进程（`map_page`），标记只读
+- 父进程 PTE 降级为只读（`protect_page`）
+- 子进程不追踪 page ownership（不加入 `pages` Vec）→ 零堆开销
+
+**COW break** (`resolve_user_fault`):
+- 写缺页命中 `CopyOnWriteUnsupported` → 不再返回 fatal
+- 分配新物理页，通过 `phys_access` + `copy_nonoverlapping` 复制旧页内容
+- 用 `replace_page` 换入带 WRITE 权限的新映射
+- 新页加入当前进程的 `pages` Vec（谁写谁拥有）
+
+### 4.3 效果
+
+- fork 不再 ENOMEM ✅
+- 首次小 fork（4 页）：COW shared 成功 ✅
+- 大 fork（963 页）：COW 共享成功，但 LA CAgent 整体运行极慢（COW break 开销）⚠️
 
 ---
 
-## 四、评测平台评分差异
+## 五、评测平台评分差异
 
 | 测试 | 本地 judge 分数 | 评测平台分数 |
 |---|---|---|
@@ -96,19 +122,17 @@ fork: Cannot allocate memory (exit=254) ❌ 963 页复制耗尽内核堆
 | RV BuildStorm | **8.0** | 0 |
 | LA CAgent | 0 | 0 |
 
-本地 judge 脚本（`testsuits-for-oskernel/judge/`）对同一份输出能正常评分。评测平台 `pass=0` 但 `all=1`，说明测试被识别但标记为不通过——可能是平台 judge 脚本匹配规则不同或日志文件被错误拆分。
-
----
-
-## 五、本地未推送修改
-
-`pym7.29` 上已 commit 未推送：
+## 六、pym7.29 完整提交记录
 
 | commit | 内容 |
 |---|---|
-| `e477d0d` | G7 LA: eager mmap page + higher TLS base |
-| `410cd56` | G7 LA: pass TLS through enter_user → __m7_enter_user |
-| `5afab45` | G7 LA: fix EXCCODE_SXD/ASXD — enable LSX/LASX SIMD |
-| `263e7c8` | G7 LA: fork-clone diagnostics, pre-allocate pages Vec |
+| `02e64b3` | update7.29 report |
+| `263e7c8` | LA: fork-clone diagnostics, pre-allocate pages Vec |
+| `5afab45` | LA: fix EXCCODE_SXD/ASXD — enable LSX/LASX SIMD |
+| `410cd56` | LA: pass TLS (tp) through enter_user → __m7_enter_user |
+| `e477d0d` | LA: eager mmap page + higher TLS base |
+| `be03fac` | LA: COW fork — share pages read-only |
+| `2c8f6a1` | LA: COW break — copy old page content |
+| `10047b3` | RV: heap 1MiB→10MiB (linker OOM fix) |
 
-**建议先推送**——至少让评测机上的 LA 不再 SIGSEGV（code=16 修复），从"0 分超时"变成"有输出但 fork 失败"。RV 的堆修复也已包含在内。
+全部已推送到 GitHub + GitLab。
