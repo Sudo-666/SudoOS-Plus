@@ -243,7 +243,7 @@ contest-la: kernel-la
 final-cagent-rv: kernel-rv
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/cagent-rv-$(FINAL_RUN_ID).log \
-		--success-pattern "#### OS COMP TEST GROUP END cagent ####" \
+		--success-pattern "#### OS COMP TEST GROUP END cagent-glibc ####" \
 		--success-regex '^testcase cagent factorial pass [0-9]+$$' \
 		--success-regex '^testcase cagent date pass [0-9]+$$' \
 		--success-regex '^testcase cagent network pass [0-9]+$$' \
@@ -277,7 +277,7 @@ final-cagent-rv: kernel-rv
 final-cagent-la: kernel-la
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/cagent-la-$(FINAL_RUN_ID).log \
-		--success-pattern "#### OS COMP TEST GROUP END cagent ####" \
+		--success-pattern "#### OS COMP TEST GROUP END cagent-glibc ####" \
 		--success-regex '^testcase cagent factorial pass [0-9]+$$' \
 		--success-regex '^testcase cagent date pass [0-9]+$$' \
 		--success-regex '^testcase cagent network pass [0-9]+$$' \
@@ -310,7 +310,7 @@ final-buildstorm-rv: verify-final-script-sha256 kernel-rv
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-rv-$(FINAL_RUN_ID).log \
 		--success-regex '^BUILDSTORM_COMPILE mode=multi ok=true .*cores=8 .*bytes=[1-9][0-9]{5,} .*' \
-		--success-pattern "#### OS COMP TEST GROUP END buildstorm ####" \
+		--success-pattern "#### OS COMP TEST GROUP END buildstorm-glibc ####" \
 		--failure-pattern "BUILDSTORM_TOOLCHAIN fail" --failure-pattern "BUILDSTORM_MINIBUILD fail" \
 		--failure-regex '^BUILDSTORM_COMPILE mode=multi ok=false .*' --failure-regex '^panicked at .*' \
 		--timeout $(FINAL_BUILDSTORM_TIMEOUT) -- qemu-system-riscv64 \
@@ -336,7 +336,7 @@ final-buildstorm-la: verify-final-script-sha256 kernel-la
 	@mkdir -p $(FINAL_LOG_DIR)
 	python3 scripts/qemu_log_wait.py --log $(FINAL_LOG_DIR)/buildstorm-la-$(FINAL_RUN_ID).log \
 		--success-regex '^BUILDSTORM_COMPILE mode=multi ok=true .*cores=8 .*bytes=[1-9][0-9]{5,} .*' \
-		--success-pattern "#### OS COMP TEST GROUP END buildstorm ####" \
+		--success-pattern "#### OS COMP TEST GROUP END buildstorm-glibc ####" \
 		--failure-pattern "BUILDSTORM_TOOLCHAIN fail" --failure-pattern "BUILDSTORM_MINIBUILD fail" \
 		--failure-regex '^BUILDSTORM_COMPILE mode=multi ok=false .*' --failure-regex '^panicked at .*' \
 		--timeout $(FINAL_BUILDSTORM_TIMEOUT) -- qemu-system-loongarch64 \

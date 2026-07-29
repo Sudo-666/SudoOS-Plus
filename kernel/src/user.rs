@@ -2636,7 +2636,7 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
     }
     // P1: Cargo needs writable cache but the ext4 overlay is read-only.
     // If /tmp was symlinked to ext4 above, replace it with tmpfs.
-    if crate::fs::stat("/tmp").map_or(false, |s| {
+    if crate::fs::lstat("/tmp").map_or(false, |s| {
         s.mode & myos_vfs::FileMode::S_IFMT == myos_vfs::FileMode::S_IFLNK
     }) {
         let _ = crate::fs::unlink("/tmp", false);
@@ -2712,42 +2712,36 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
             "sudoos-diag: final-buildstorm: repeat/xtask diagnostic begin"
         );
 
-        // BUILDSTORM_REPEAT_XTASK_DIAG_V2
-        // BUILDSTORM_JOBSERVER_PIPE_DIAG_V1
+        // BUILDSTORM_MINIBUILD_CAPTURE_DIAG_V1
+        // Reproduce the evaluator's three minibuild operations separately so
+        // a silent `>/dev/null 2>&1` failure is attributable to new/build/run
+        // or to command-substitution capture.  This diagnostic mode never
+        // emits the evaluator's BUILDSTORM_* scoring markers.
         let diagnostic = r#"
-rm -rf /tmp/bs-jobserver-mini
-rm -f /tmp/bs-jobserver-xtask.out
+rm -rf /tmp/minibuild-diag
+uname -m >/dev/null 2>&1
+rustc --version >/dev/null 2>&1
+cargo --version >/dev/null 2>&1
 
-echo BUILDSTORM_JOBSERVER_XTASK_BEGIN
-cd /work/tgoskits || exit 97
-cargo xtask --help > /tmp/bs-jobserver-xtask.out 2>&1
-xtask_rc=$?
-echo "BUILDSTORM_JOBSERVER_XTASK_RC=$xtask_rc"
-echo BUILDSTORM_JOBSERVER_XTASK_OUT_BEGIN
-cat /tmp/bs-jobserver-xtask.out 2>&1
-echo BUILDSTORM_JOBSERVER_XTASK_OUT_END
-
-if [ "$xtask_rc" -ne 0 ]; then
-    echo "BUILDSTORM_DIAG_BUILD_RC=$xtask_rc"
-    exit "$xtask_rc"
-fi
-
-cd /
-cargo new --vcs none /tmp/bs-jobserver-mini 2>&1
+cargo new --vcs none /tmp/minibuild-diag >/dev/null 2>&1
 new_rc=$?
 echo "BUILDSTORM_DIAG_NEW_RC=$new_rc"
 test "$new_rc" -eq 0 || exit "$new_rc"
 
-cd /tmp/bs-jobserver-mini || exit 98
-cargo build 2>&1
+( cd /tmp/minibuild-diag && cargo build >/dev/null 2>&1 )
 build_rc=$?
 echo "BUILDSTORM_DIAG_BUILD_RC=$build_rc"
 test "$build_rc" -eq 0 || exit "$build_rc"
 
-/tmp/bs-jobserver-mini/target/debug/bs-jobserver-mini
+captured="$(/tmp/minibuild-diag/target/debug/minibuild-diag)"
 run_rc=$?
+captured_len="${#captured}"
+printf 'BUILDSTORM_DIAG_CAPTURE rc=%s len=%s value=<%s>\n' "$run_rc" "$captured_len" "$captured"
+printf '%s\n' "$captured"
 echo "BUILDSTORM_DIAG_RUN_RC=$run_rc"
-exit "$run_rc"
+test "$run_rc" -eq 0 || exit "$run_rc"
+test "$captured" = "Hello, world!" || exit 99
+exit 0
 "#;
 
         EXEC_TRACE_COUNT.store(0, Ordering::Release);
@@ -6012,14 +6006,24 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         let index = OSCOMP_LA_REAL_EXCEPTION_LOGS.fetch_add(1, Ordering::Relaxed);
         if index < 32 {
             crate::println!(
-                "oscomp-la-user-exception: index={} code={} subcode={} era={:#x} badv={:#x} badi={:#x} sp={:#x} last_syscall={}",
+                "oscomp-la-user-exception: index={} code={} subcode={} era={:#x} badv={:#x} badi={:#x} ra={:#x} tp={:#x} sp={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} t0={:#x} t1={:#x} t2={:#x} t3={:#x} last_syscall={}",
                 index,
                 _code,
                 frame.exception_subcode(),
                 frame.era,
                 frame.badv,
                 frame.badi,
+                frame.gpr[1],
+                frame.gpr[2],
                 frame.stack_pointer(),
+                frame.gpr[4],
+                frame.gpr[5],
+                frame.gpr[6],
+                frame.gpr[7],
+                frame.gpr[12],
+                frame.gpr[13],
+                frame.gpr[14],
+                frame.gpr[15],
                 LAST_TRACED_SYSCALL_NR.load(Ordering::Relaxed),
             );
         }

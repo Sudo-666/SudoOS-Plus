@@ -336,8 +336,18 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
             for segment in &interp.segments {
                 load_segment(&mm, interp_data, *segment)?;
             }
-            // Apply static PIE relocations on interpreter.
+            // RISC-V's bundled interpreter currently relies on the kernel's
+            // bootstrap relocation pass.  The LoongArch glibc loader is a
+            // self-relocating static PIE: pre-applying its RELR table here
+            // makes rtld apply the load bias a second time (for example
+            // 0x200011b0 becomes 0x400011b0 in _rtld_global_ro callbacks).
+            // Keep static-PIE main binaries on apply_static_pie_relocations,
+            // but let a LoongArch PT_INTERP loader relocate itself exactly
+            // once.
+            #[cfg(target_arch = "riscv64")]
             apply_static_pie_relocations(&mm, interp_data, interp)?;
+            #[cfg(target_arch = "loongarch64")]
+            crate::println!("exec-reloc-la: defer interpreter self-relocation");
         }
         mm.copy_to_user(USER_SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE_BYTES)?;
         build_initial_stack(
