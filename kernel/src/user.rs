@@ -2576,13 +2576,13 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
         let _ = crate::fs::mkdir("/tmp", 0o1777);
     }
 
-    let script = "/tmp/buildstorm_testcode.official.sh";
-    if let Err(error) =
-        crate::fs::install_bytes(script, include_bytes!("final_buildstorm_testcode.sh"))
-    {
+    // BUILDSTORM_REAL_SDCARD_SCRIPT_V1
+    // Explicit BuildStorm runs also execute the evaluator-provided test point.
+    let script = "/mnt/sdcard/glibc/buildstorm_testcode.sh";
+    if crate::fs::stat(script).is_err() {
         crate::println!(
-            "sudoos-diag: final-buildstorm: official script install failed: {:?}",
-            error,
+            "sudoos-diag: final-buildstorm: evaluator script missing: {}",
+            script,
         );
         return;
     }
@@ -2865,13 +2865,15 @@ fn verify_final_cagent_thread() {
     let _ = crate::fs::unlink("/mnt/sdcard/glibc/touch", false);
     let _ = crate::fs::symlink("/bin/touch", "/mnt/sdcard/glibc/touch");
 
-    // CAGENT_OFFICIAL_MARKERS_ONLY_V1
-    let script = "/tmp/cagent_testcode.official.sh";
-    if let Err(error) = crate::fs::install_bytes(script, include_bytes!("final_cagent_testcode.sh"))
-    {
+    // CAGENT_REAL_SDCARD_SCRIPT_V1
+    // Execute the evaluator-provided test point itself. Do not replace it
+    // with a repository-embedded copy: the mounted image is the source of
+    // truth for test contents and platform-side test-point accounting.
+    let script = "/mnt/sdcard/glibc/cagent_testcode.sh";
+    if crate::fs::stat(script).is_err() {
         crate::println!(
-            "sudoos-diag: final-cagent: failed to install current official script: {:?}",
-            error
+            "sudoos-diag: final-cagent: evaluator script missing: {}",
+            script,
         );
         return;
     }
