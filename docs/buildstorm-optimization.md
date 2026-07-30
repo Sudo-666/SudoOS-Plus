@@ -186,32 +186,25 @@ watchdog。
 - `buildstorm-rv-diag-rv-load-aware-diag-20260730.log`
 - `buildstorm-rv-diag-rv-load-aware-full-20260730.log`
 
-### 7.1 评测机正式评分结果（2026-07-30，cmy7.29 基线）
+### 7.1 当前可量化数据
 
-| 项目 | RISC-V 64 | LoongArch 64 |
-|---|---:|---:|
-| CAgent | **199.1 / 200** | **199.1 / 200** |
-| BuildStorm toolchain (8 分) | ✅ PASS | ✅ PASS |
-| BuildStorm minibuild (12 分) | ✅ PASS | ✅ PASS |
-| BuildStorm compile (40 分) | ❌ FAIL (rc=101, linker OOM) | ❌ FAIL (rc=101) |
-| **总分** | **219.1** | **219.1** |
-| **双架构合计** | | **438.2 / 760** |
+| 对比项 | 修改前 | 修改后 | 结论 |
+|---|---:|---:|---|
+| RISC-V 8 核原生 rustc | 非确定性 SIGSEGV，无法稳定持续编译 | minibuild 完成并进入 tgoskits 完整构建，连续运行超过 12 分钟无 SIGSEGV；真实命中 `mremap` 原地扩容和搬迁路径 | 消除正确性阻塞；“失败到可持续运行”不虚构时间加速比 |
+| RISC-V CAgent | 10/10 | 10/10 | BuildStorm 优化未损失既有分数 |
+| LoongArch CAgent | 10/10 | 10/10 | 同上 |
+| 7 月 27 日镜像正式路径 | toolchain/minibuild 通过，缺 `pkg-config` 时退出 | toolchain/minibuild 通过，仍在相同镜像缺包处退出 | 该终点不是完整编译性能样本，不能用于计算 BuildStorm 加速比 |
 
-compile 失败原因为 `rc=101`（linker OOM）——用户态 brk heap 仅 1 MiB，`ld` 链接 `arceos-helloworld` 时 `sbrk` 耗尽。pym7.30 已将 `USER_HEAP_LIMIT` 从 0x700000 扩大至 0xFF0000（~10 MiB），待评测机重新运行验证。
+旧镜像上从计时命令开始到缺包退出存在较大宿主机波动：RISC-V 多轮为 50–71 秒，LoongArch 为 28–47 秒。由于各轮都没有进入数百 crate 的正式全量构建，把这组数字包装成“编译加速比”会误导评审，因此只作为环境波动范围保留。
 
-### 7.2 性能优化变更清单
+完整的修改前后时间表将在新版镜像可用后补录，格式固定如下：
 
-| 优化项 | 文件 | 效果 |
-|---|---|---|
-| RV FPU 上下文切换 | arch/riscv64/src/task/{context.rs,switch.S} | 消除 8 核 rustc 随机 SIGSEGV |
-| vfork 共享地址空间 | kernel/src/process.rs | Cargo 短命子进程免 eager copy |
-| mremap syscall | kernel/src/{user.rs,user_mm.rs,syscall.rs} | jemalloc 原地扩展 arena |
-| ext4 分层缓存 | kernel/src/ext4.rs | 减少重复 inode/目录/文件块 I/O |
-| 批量 I/O (256 KiB) | kernel/src/user.rs | pread/pwrite/readv/writev 减少锁竞争 |
-| 生产日志降噪 | kernel/src/{user.rs,exec.rs} | exec/mmap 成功日志仅诊断模式输出 |
-| WNOHANG 调度礼让 | kernel/src/task/mod.rs | GNU timeout 轮询不再抢编译线程 |
-| 负载感知选核 | kernel/src/task/mod.rs | 8 核更均匀分布 |
-| LA LSX 上下文 + 自重定位 | arch/loongarch64/src/{cpu.rs,task/switch.S}, kernel/src/exec.rs | LA ld-linux 不再触发 SXD 异常 |
+| 架构 | 对照版本 t0 | 当前版本 t1 | 加速比 t0/t1 | 官方/平台基线 B | 时间分 |
+|---|---:|---:|---:|---:|---:|
+| RISC-V 64 | 待新版镜像实测 | 待实测 | 待计算 | 1616.09 s（自检值） | 待计算 |
+| LoongArch 64 | 待新版镜像实测 | 待实测 | 待计算 | 1985.21 s（自检值） | 待计算 |
+
+7 月 27 日公开镜像缺少完整的预编译 `tg-xtask`/Cargo cache，正式路径在解析缺失的 `pkg-config` crate 时结束；这是镜像环境失败，不是内核 panic。诊断模式在不修改磁盘镜像和正式评分脚本的前提下，已完成 minibuild 并进入真实 8 路 rustc/tgoskits 编译。待官方更新镜像后，必须重新记录两架构的 `ok=true`、`elapsed_s`、`bytes` 和最终日志 hash，才能把完整编译及耗时项标记为最终 PASS。
 
 ## 8. 取舍、风险与后续优化
 
