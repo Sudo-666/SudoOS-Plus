@@ -500,7 +500,11 @@ fn mount_sdcard_if_present() {
     let root_entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(&device), "/") {
         Ok(entries) => entries,
         Err(error) => {
+            // CLOUD_EXT4_MOUNT_FAILURE_V1
             crate::println!("sdcard: failed to list ext4 root directory: {error:?}");
+            crate::println!(
+                "sdcard: final-all fallback remains enabled; inspect ext4-super diagnostics above"
+            );
             return;
         }
     };
@@ -860,6 +864,13 @@ fn oscomp_materialize_ext4_dir_flat(
 /// on a path under /mnt/sdcard, try installing the parent directory's
 /// children from ext4 before giving up.
 pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
+    // BuildStorm remounts /mnt/sdcard as a native lazy ext4 overlay. Its VFS
+    // lookup already resolves children and symlinks directly from ext4, so
+    // the legacy tmpfs materializer is both redundant and harmful there.
+    if fs::is_ext4_overlay_directory("/mnt/sdcard") {
+        return false;
+    }
+
     let rel = match vfs_path.strip_prefix("/mnt/sdcard/") {
         Some(r) if !r.is_empty() => r,
         _ => return false,

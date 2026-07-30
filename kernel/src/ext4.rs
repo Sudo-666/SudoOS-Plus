@@ -1,7 +1,12 @@
 // SUDOOS_M15A_EXT4_RO_PATCH_V1
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::block::{self, BlockDevice};
+use crate::irq_lock::IrqSpinLock;
+use crate::lockdep::{LockClass, LockRank};
+
+const EXT4_METADATA_LOCK: LockClass = LockClass::new("ext4.metadata", LockRank::Vfs, 20);
 
 const EXT4_SUPER_MAGIC: u16 = 0xef53;
 const EXT4_SUPER_OFFSET: u64 = 1024;
@@ -18,6 +23,53 @@ const EXT4_SUPPORTED_INCOMPAT: u32 = EXT4_FEATURE_INCOMPAT_FILETYPE
     | EXT4_FEATURE_INCOMPAT_EXTENTS
     | EXT4_FEATURE_INCOMPAT_64BIT
     | EXT4_FEATURE_INCOMPAT_FLEX_BG;
+// CLOUD_IMAGE_EXT4_COMPAT_V1
+//
+// Newer e2fsprogs/cloud images may set incompat feature bits that do not
+// change the on-disk data path used by this read-only contest reader.
+// Keep layout-changing features explicit, print the complete superblock
+// fingerprint once, and support META_BG descriptor placement.
+const EXT4_FEATURE_INCOMPAT_COMPRESSION: u32 = 0x0000_0001;
+const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0000_0004;
+const EXT4_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0000_0008;
+const EXT4_FEATURE_INCOMPAT_META_BG: u32 = 0x0000_0010;
+const EXT4_FEATURE_INCOMPAT_MMP: u32 = 0x0000_0100;
+const EXT4_FEATURE_INCOMPAT_EA_INODE: u32 = 0x0000_0400;
+const EXT4_FEATURE_INCOMPAT_DIRDATA: u32 = 0x0000_1000;
+const EXT4_FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x0000_2000;
+const EXT4_FEATURE_INCOMPAT_LARGEDIR: u32 = 0x0000_4000;
+const EXT4_FEATURE_INCOMPAT_INLINE_DATA: u32 = 0x0000_8000;
+const EXT4_FEATURE_INCOMPAT_ENCRYPT: u32 = 0x0001_0000;
+const EXT4_FEATURE_INCOMPAT_CASEFOLD: u32 = 0x0002_0000;
+
+const EXT4_FEATURE_COMPAT_SPARSE_SUPER2: u32 = 0x0000_0200;
+const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0000_0001;
+const EXT4_FEATURE_RO_COMPAT_BIGALLOC: u32 = 0x0000_0200;
+
+const EXT4_READONLY_IGNORABLE_INCOMPAT: u32 = EXT4_FEATURE_INCOMPAT_RECOVER
+    | EXT4_FEATURE_INCOMPAT_MMP
+    | EXT4_FEATURE_INCOMPAT_EA_INODE
+    | EXT4_FEATURE_INCOMPAT_CSUM_SEED
+    | EXT4_FEATURE_INCOMPAT_LARGEDIR
+    | EXT4_FEATURE_INCOMPAT_ENCRYPT
+    | EXT4_FEATURE_INCOMPAT_CASEFOLD;
+
+const EXT4_LAYOUT_SUPPORTED_INCOMPAT: u32 =
+    EXT4_SUPPORTED_INCOMPAT | EXT4_FEATURE_INCOMPAT_META_BG;
+
+const EXT4_KNOWN_HARD_INCOMPAT: u32 = EXT4_FEATURE_INCOMPAT_COMPRESSION
+    | EXT4_FEATURE_INCOMPAT_JOURNAL_DEV
+    | EXT4_FEATURE_INCOMPAT_DIRDATA
+    | EXT4_FEATURE_INCOMPAT_INLINE_DATA;
+
+const EXT4_KNOWN_INCOMPAT: u32 = EXT4_LAYOUT_SUPPORTED_INCOMPAT
+    | EXT4_READONLY_IGNORABLE_INCOMPAT
+    | EXT4_KNOWN_HARD_INCOMPAT;
+
+const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
+const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
+
+static EXT4_SUPER_DIAG_PRINTED: AtomicBool = AtomicBool::new(false);
 const EXT4_S_IFMT: u16 = 0o170000;
 const EXT4_S_IFREG: u16 = 0o100000;
 const EXT4_S_IFDIR: u16 = 0o040000;
@@ -26,6 +78,8 @@ const MAX_EXT4_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXT4_NODES: usize = 65536;
 const MAX_EXT4_DEPTH: usize = 16;
 const MAX_EXTENT_TREE_DEPTH: usize = 5;
+const EXT4_DATA_CACHE_CHUNK_SIZE: usize = 256 * 1024;
+const EXT4_DATA_CACHE_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ext4Error {
@@ -127,6 +181,20 @@ pub struct Ext4FileSystem {
     inodes_per_group: u32,
     blocks_per_group: u32,
     group_desc_size: u16,
+    first_data_block: u32,
+    feature_compat: u32,
+    feature_incompat: u32,
+    feature_ro_compat: u32,
+    first_meta_bg: u32,
+    backup_bgs: [u32; 2],
+    metadata: IrqSpinLock<Ext4MetadataCache>,
+}
+
+struct Ext4MetadataCache {
+    inodes: BTreeMap<u32, Ext4Inode>,
+    inode_tables: BTreeMap<u32, u64>,
+    data_chunks: BTreeMap<(u32, u64), Arc<[u8]>>,
+    data_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -158,6 +226,51 @@ impl NodeBudget {
         self.remaining -= 1;
         Ok(())
     }
+}
+
+fn ext4_print_incompat_features(mask: u32) {
+    let features = [
+        (EXT4_FEATURE_INCOMPAT_COMPRESSION, "compression"),
+        (EXT4_FEATURE_INCOMPAT_FILETYPE, "filetype"),
+        (EXT4_FEATURE_INCOMPAT_RECOVER, "recover"),
+        (EXT4_FEATURE_INCOMPAT_JOURNAL_DEV, "journal_dev"),
+        (EXT4_FEATURE_INCOMPAT_META_BG, "meta_bg"),
+        (EXT4_FEATURE_INCOMPAT_EXTENTS, "extents"),
+        (EXT4_FEATURE_INCOMPAT_64BIT, "64bit"),
+        (EXT4_FEATURE_INCOMPAT_MMP, "mmp"),
+        (EXT4_FEATURE_INCOMPAT_FLEX_BG, "flex_bg"),
+        (EXT4_FEATURE_INCOMPAT_EA_INODE, "ea_inode"),
+        (EXT4_FEATURE_INCOMPAT_DIRDATA, "dirdata"),
+        (EXT4_FEATURE_INCOMPAT_CSUM_SEED, "csum_seed"),
+        (EXT4_FEATURE_INCOMPAT_LARGEDIR, "largedir"),
+        (EXT4_FEATURE_INCOMPAT_INLINE_DATA, "inline_data"),
+        (EXT4_FEATURE_INCOMPAT_ENCRYPT, "encrypt"),
+        (EXT4_FEATURE_INCOMPAT_CASEFOLD, "casefold"),
+    ];
+
+    for (bit, name) in features {
+        if mask & bit != 0 {
+            crate::println!("ext4-super: incompat-feature {name} bit={bit:#010x}");
+        }
+    }
+
+    let unknown = mask & !EXT4_KNOWN_INCOMPAT;
+    if unknown != 0 {
+        crate::println!("ext4-super: incompat-feature unknown mask={unknown:#010x}");
+    }
+}
+
+fn ext4_exact_power(mut value: u32, base: u32) -> bool {
+    if value < 1 {
+        return false;
+    }
+    while value > 1 {
+        if value % base != 0 {
+            return false;
+        }
+        value /= base;
+    }
+    true
 }
 
 impl Ext4FileSystem {
@@ -196,8 +309,93 @@ impl Ext4FileSystem {
             return Err(Ext4Error::InvalidSuperblock);
         }
 
+        let feature_compat = le_u32(&superblock, 92)?;
         let feature_incompat = le_u32(&superblock, 96)?;
-        if feature_incompat & !EXT4_SUPPORTED_INCOMPAT != 0 {
+        let feature_ro_compat = le_u32(&superblock, 100)?;
+        let first_data_block = le_u32(&superblock, 20)?;
+        let filesystem_state = le_u16(&superblock, 58)?;
+        let errors_behavior = le_u16(&superblock, 60)?;
+        let journal_inode = le_u32(&superblock, 224).unwrap_or(0);
+        let last_orphan = le_u32(&superblock, 232).unwrap_or(0);
+        let first_meta_bg = le_u32(&superblock, 260).unwrap_or(0);
+        let backup_bgs = [
+            le_u32(&superblock, 588).unwrap_or(0),
+            le_u32(&superblock, 592).unwrap_or(0),
+        ];
+
+        let hard_incompat = feature_incompat & EXT4_KNOWN_HARD_INCOMPAT;
+        let unknown_incompat = feature_incompat & !EXT4_KNOWN_INCOMPAT;
+        let readonly_ignored =
+            feature_incompat & EXT4_READONLY_IGNORABLE_INCOMPAT;
+        let dangerous_ro = feature_ro_compat & EXT4_FEATURE_RO_COMPAT_BIGALLOC;
+
+        let first_diagnostic =
+            !EXT4_SUPER_DIAG_PRINTED.swap(true, Ordering::AcqRel);
+        if first_diagnostic {
+            let uuid0 = le_u32(&superblock, 104).unwrap_or(0);
+            let uuid1 = le_u32(&superblock, 108).unwrap_or(0);
+            let uuid2 = le_u32(&superblock, 112).unwrap_or(0);
+            let uuid3 = le_u32(&superblock, 116).unwrap_or(0);
+            crate::println!(
+                "ext4-super: magic={:#06x} logical_block={} fs_block={} first_data={} inode_size_raw={} desc_size_raw={}",
+                EXT4_SUPER_MAGIC,
+                logical_block_size,
+                block_size,
+                first_data_block,
+                le_u16(&superblock, 88).unwrap_or(0),
+                le_u16(&superblock, 254).unwrap_or(0),
+            );
+            crate::println!(
+                "ext4-super: compat={:#010x} incompat={:#010x} ro_compat={:#010x} ignored={:#010x} hard={:#010x} unknown={:#010x}",
+                feature_compat,
+                feature_incompat,
+                feature_ro_compat,
+                readonly_ignored,
+                hard_incompat,
+                unknown_incompat,
+            );
+            crate::println!(
+                "ext4-super: state={:#06x} errors={:#06x} journal_ino={} last_orphan={} first_meta_bg={} backup_bgs=[{},{}]",
+                filesystem_state,
+                errors_behavior,
+                journal_inode,
+                last_orphan,
+                first_meta_bg,
+                backup_bgs[0],
+                backup_bgs[1],
+            );
+            crate::println!(
+                "ext4-super: uuid={:08x}-{:08x}-{:08x}-{:08x}",
+                uuid0,
+                uuid1,
+                uuid2,
+                uuid3,
+            );
+            ext4_print_incompat_features(feature_incompat);
+
+            if readonly_ignored != 0 {
+                crate::println!(
+                    "ext4-super: read-only compatibility mode enabled mask={readonly_ignored:#010x}"
+                );
+            }
+            if feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER != 0 {
+                crate::println!(
+                    "ext4-super: WARNING journal recovery requested; contest reader proceeds read-only"
+                );
+            }
+            if feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG != 0 {
+                crate::println!(
+                    "ext4-super: META_BG descriptor addressing enabled"
+                );
+            }
+        }
+
+        if hard_incompat != 0 || unknown_incompat != 0 || dangerous_ro != 0 {
+            if first_diagnostic {
+                crate::println!(
+                    "ext4-super: rejected hard={hard_incompat:#010x} unknown={unknown_incompat:#010x} dangerous_ro={dangerous_ro:#010x}"
+                );
+            }
             return Err(Ext4Error::InvalidFeatureSet);
         }
 
@@ -223,6 +421,21 @@ impl Ext4FileSystem {
             inodes_per_group,
             blocks_per_group,
             group_desc_size,
+            first_data_block,
+            feature_compat,
+            feature_incompat,
+            feature_ro_compat,
+            first_meta_bg,
+            backup_bgs,
+            metadata: IrqSpinLock::new_with_class(
+                Ext4MetadataCache {
+                    inodes: BTreeMap::new(),
+                    inode_tables: BTreeMap::new(),
+                    data_chunks: BTreeMap::new(),
+                    data_bytes: 0,
+                },
+                EXT4_METADATA_LOCK,
+            ),
         })
     }
 
@@ -267,8 +480,90 @@ impl Ext4FileSystem {
         if inode.flags & EXT4_EXTENTS_FL == 0 {
             return Err(Ext4Error::Unsupported);
         }
-        self.read_extent_range(&inode.block, offset, &mut output[..count], 0)?;
+        let mut copied = 0_usize;
+        while copied < count {
+            let current = offset
+                .checked_add(copied as u64)
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let chunk_index = current / EXT4_DATA_CACHE_CHUNK_SIZE as u64;
+            let chunk_start = chunk_index
+                .checked_mul(EXT4_DATA_CACHE_CHUNK_SIZE as u64)
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let in_chunk = usize::try_from(current - chunk_start)
+                .map_err(|_| Ext4Error::AddressOverflow)?;
+            let chunk_len = usize::try_from(
+                (inode.size - chunk_start).min(EXT4_DATA_CACHE_CHUNK_SIZE as u64),
+            )
+            .map_err(|_| Ext4Error::AddressOverflow)?;
+            let copy_len = (count - copied).min(chunk_len - in_chunk);
+
+            let Some(chunk) = self.read_data_chunk_cached(
+                &inode,
+                chunk_index,
+                chunk_start,
+                chunk_len,
+            )? else {
+                // A full cache or memory pressure must not turn a valid read
+                // into ENOMEM.  Preserve the original direct, bulk-I/O path
+                // for this request and all remaining bytes.
+                self.read_extent_range(
+                    &inode.block,
+                    current,
+                    &mut output[copied..count],
+                    0,
+                )?;
+                return Ok(count);
+            };
+            output[copied..copied + copy_len]
+                .copy_from_slice(&chunk[in_chunk..in_chunk + copy_len]);
+            copied += copy_len;
+        }
         Ok(count)
+    }
+
+    fn read_data_chunk_cached(
+        &self,
+        inode: &Ext4Inode,
+        chunk_index: u64,
+        chunk_start: u64,
+        chunk_len: usize,
+    ) -> Result<Option<Arc<[u8]>>, Ext4Error> {
+        let key = (inode.ino, chunk_index);
+        {
+            let metadata = self.metadata.lock();
+            if let Some(chunk) = metadata.data_chunks.get(&key) {
+                return Ok(Some(Arc::clone(chunk)));
+            }
+            if metadata
+                .data_bytes
+                .checked_add(chunk_len)
+                .is_none_or(|bytes| bytes > EXT4_DATA_CACHE_CAPACITY_BYTES)
+            {
+                return Ok(None);
+            }
+        }
+
+        let mut data = Vec::new();
+        if data.try_reserve(chunk_len).is_err() {
+            return Ok(None);
+        }
+        data.resize(chunk_len, 0);
+        self.read_extent_range(&inode.block, chunk_start, &mut data, 0)?;
+        let loaded: Arc<[u8]> = Arc::from(data.into_boxed_slice());
+
+        let mut metadata = self.metadata.lock();
+        if let Some(chunk) = metadata.data_chunks.get(&key) {
+            return Ok(Some(Arc::clone(chunk)));
+        }
+        if metadata
+            .data_bytes
+            .checked_add(chunk_len)
+            .is_some_and(|bytes| bytes <= EXT4_DATA_CACHE_CAPACITY_BYTES)
+        {
+            metadata.data_bytes += chunk_len;
+            metadata.data_chunks.insert(key, Arc::clone(&loaded));
+        }
+        Ok(Some(loaded))
     }
 
     pub fn read_symlink_inode(&self, ino: u32) -> Result<String, Ext4Error> {
@@ -752,6 +1047,9 @@ impl Ext4FileSystem {
         if ino == 0 {
             return Err(Ext4Error::BadInode);
         }
+        if let Some(inode) = self.metadata.lock().inodes.get(&ino).cloned() {
+            return Ok(inode);
+        }
         let group = (ino - 1) / self.inodes_per_group;
         let index = (ino - 1) % self.inodes_per_group;
         let inode_table_block = self.inode_table_block(group)?;
@@ -774,26 +1072,105 @@ impl Ext4FileSystem {
         };
         let size = size_lo | (size_hi << 32);
         let flags = le_u32(&raw, 32)?;
+        let unsupported_inode_flags =
+            flags & (EXT4_ENCRYPT_FL | EXT4_INLINE_DATA_FL);
+        if unsupported_inode_flags != 0 {
+            crate::println!(
+                "ext4-inode: unsupported ino={} flags={:#010x} mask={:#010x}",
+                ino,
+                flags,
+                unsupported_inode_flags,
+            );
+            return Err(Ext4Error::Unsupported);
+        }
         let mut block = [0_u8; EXT4_N_BLOCKS_BYTES];
         block.copy_from_slice(raw.get(40..100).ok_or(Ext4Error::BadInode)?);
-        Ok(Ext4Inode {
+        let inode = Ext4Inode {
             ino,
             mode,
             size,
             flags,
             block,
-        })
+        };
+        self.metadata
+            .lock()
+            .inodes
+            .entry(ino)
+            .or_insert_with(|| inode.clone());
+        Ok(inode)
+    }
+
+    fn group_has_superblock(&self, group: u32) -> bool {
+        if self.feature_compat & EXT4_FEATURE_COMPAT_SPARSE_SUPER2 != 0 {
+            return group == 0
+                || group == self.backup_bgs[0]
+                || group == self.backup_bgs[1];
+        }
+
+        if self.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER == 0 {
+            return true;
+        }
+
+        group == 0
+            || group == 1
+            || ext4_exact_power(group, 3)
+            || ext4_exact_power(group, 5)
+            || ext4_exact_power(group, 7)
     }
 
     fn inode_table_block(&self, group: u32) -> Result<u64, Ext4Error> {
         if self.blocks_per_group == 0 {
             return Err(Ext4Error::InvalidSuperblock);
         }
-        let descriptor_table_block: u64 = if self.block_size == 1024 { 2 } else { 1 };
+        if let Some(block) = self.metadata.lock().inode_tables.get(&group).copied() {
+            return Ok(block);
+        }
+
+        let descriptors_per_block = self
+            .block_size
+            .checked_div(u64::from(self.group_desc_size))
+            .filter(|count| *count != 0)
+            .ok_or(Ext4Error::BadGroupDescriptor)?;
+        let descriptor_block_index =
+            u64::from(group) / descriptors_per_block;
+        let descriptor_index =
+            u64::from(group) % descriptors_per_block;
+
+        let descriptor_table_block =
+            if self.feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG == 0
+                || descriptor_block_index < u64::from(self.first_meta_bg)
+            {
+                u64::from(self.first_data_block)
+                    .checked_add(1)
+                    .and_then(|base| base.checked_add(descriptor_block_index))
+                    .ok_or(Ext4Error::AddressOverflow)?
+            } else {
+                let meta_group = descriptor_block_index
+                    .checked_mul(descriptors_per_block)
+                    .ok_or(Ext4Error::AddressOverflow)?;
+                let meta_group_u32 =
+                    u32::try_from(meta_group).map_err(|_| Ext4Error::AddressOverflow)?;
+                let group_first = u64::from(self.first_data_block)
+                    .checked_add(
+                        meta_group
+                            .checked_mul(u64::from(self.blocks_per_group))
+                            .ok_or(Ext4Error::AddressOverflow)?,
+                    )
+                    .ok_or(Ext4Error::AddressOverflow)?;
+                group_first
+                    .checked_add(u64::from(self.group_has_superblock(meta_group_u32)))
+                    .ok_or(Ext4Error::AddressOverflow)?
+            };
+
         let descriptor_offset = descriptor_table_block
             .checked_mul(self.block_size)
-            .and_then(|base| base.checked_add(u64::from(group) * u64::from(self.group_desc_size)))
+            .and_then(|base| {
+                base.checked_add(
+                    descriptor_index * u64::from(self.group_desc_size),
+                )
+            })
             .ok_or(Ext4Error::AddressOverflow)?;
+
         let mut descriptor = Vec::new();
         let descriptor_size = usize::from(self.group_desc_size);
         descriptor
@@ -801,6 +1178,7 @@ impl Ext4FileSystem {
             .map_err(|_| Ext4Error::OutOfMemory)?;
         descriptor.resize(descriptor_size, 0);
         read_exact(&self.device, descriptor_offset, &mut descriptor)?;
+
         let lo = u64::from(le_u32(&descriptor, 8)?);
         let hi = if descriptor_size >= 44 {
             u64::from(le_u32(&descriptor, 40)?)
@@ -809,10 +1187,24 @@ impl Ext4FileSystem {
         };
         let block = lo | (hi << 32);
         if block == 0 {
+            crate::println!(
+                "ext4-gdt: invalid group={} desc_block={} desc_index={} offset={:#x}",
+                group,
+                descriptor_table_block,
+                descriptor_index,
+                descriptor_offset,
+            );
             return Err(Ext4Error::BadGroupDescriptor);
         }
+
+        self.metadata
+            .lock()
+            .inode_tables
+            .entry(group)
+            .or_insert(block);
         Ok(block)
     }
+
 
     fn read_block(&self, block: u64) -> Result<Vec<u8>, Ext4Error> {
         let size = usize::try_from(self.block_size).map_err(|_| Ext4Error::AddressOverflow)?;

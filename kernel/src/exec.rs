@@ -254,13 +254,15 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         match parsed.kind {
             crate::elf::ElfKind::Executable | crate::elf::ElfKind::PositionIndependent => {}
         }
-        crate::println!(
-            "exec: interp={} kind={:?} entry={:#x} bias={:#x}",
-            interpreter_load_path,
-            parsed.kind,
-            parsed.entry.get(),
-            INTERP_LOAD_BIAS,
-        );
+        if crate::user::oscomp_verbose_user_trace_active() {
+            crate::println!(
+                "exec: interp={} kind={:?} entry={:#x} bias={:#x}",
+                interpreter_load_path,
+                parsed.kind,
+                parsed.entry.get(),
+                INTERP_LOAD_BIAS,
+            );
+        }
         interp_entry = Some(parsed.entry);
         main_entry = Some(elf.entry);
         interp_base = Some(VirtAddr::new(INTERP_LOAD_BIAS));
@@ -323,13 +325,13 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         // get their GOT/PLT fixed up by ld-linux at runtime; the kernel
         // must not touch them here.
         let has_interp = elf.interpreter.is_some();
-        if has_interp {
+        if !has_interp {
+            apply_static_pie_relocations(&mm, image, &elf)?;
+        } else if crate::user::oscomp_verbose_user_trace_active() {
             crate::println!(
                 "exec-reloc: skip main (has PT_INTERP) rela={}",
                 elf.dynamic.map_or(0, |d| d.memory_size),
             );
-        } else {
-            apply_static_pie_relocations(&mm, image, &elf)?;
         }
         // Load interpreter segments if present.
         if let (Some(interp_data), Some(interp)) = (interp_image.as_ref(), interp_elf.as_ref()) {
@@ -347,7 +349,9 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
             #[cfg(target_arch = "riscv64")]
             apply_static_pie_relocations(&mm, interp_data, interp)?;
             #[cfg(target_arch = "loongarch64")]
-            crate::println!("exec-reloc-la: defer interpreter self-relocation");
+            if crate::user::oscomp_verbose_user_trace_active() {
+                crate::println!("exec-reloc-la: defer interpreter self-relocation");
+            }
         }
         mm.copy_to_user(USER_SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE_BYTES)?;
         build_initial_stack(
@@ -566,7 +570,7 @@ fn apply_static_pie_relocations(
             skipped += 1;
         }
     }
-    if applied > 0 || skipped > 0 {
+    if (applied > 0 || skipped > 0) && crate::user::oscomp_verbose_user_trace_active() {
         crate::println!(
             "exec-reloc: applied={} skipped={} jmprel={} pltrel={}",
             applied,
@@ -707,7 +711,9 @@ fn apply_static_pie_relocations(
         }
     }
 
-    if relr_applied != 0 || rela_applied != 0 || rela_skipped != 0 {
+    if (relr_applied != 0 || rela_applied != 0 || rela_skipped != 0)
+        && crate::user::oscomp_verbose_user_trace_active()
+    {
         crate::println!(
             "exec-reloc-la: rela-applied={} relr-applied={} skipped={} jmprel={} pltrel={}",
             rela_applied,

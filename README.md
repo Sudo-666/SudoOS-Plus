@@ -894,6 +894,7 @@ oscomp-la-busybox-direct: summary
 | `m16*.md` | 动态 ELF/auxv/preflight |
 | `oscomp_group_matrix.md` | 测试组分类矩阵 |
 | `oscomp-submit-checklist.md` | 提交检查清单 |
+| `buildstorm-optimization.md` | BuildStorm 双架构优化设计、测量方法与回归证据 |
 | `ci.md` | 本地 release gate 与 CI 说明 |
 
 ## 13. 当前问题与风险

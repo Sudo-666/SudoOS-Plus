@@ -8,7 +8,9 @@
 //! IDs, so the ownership graph cannot form a strong-reference cycle.
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering,
+};
 
 use myos_mm::{VirtAddr, VirtRange};
 
@@ -439,14 +441,20 @@ pub struct Process {
     session: AtomicIsize,
     thread_group: IrqSpinLock<ThreadGroup>,
     thread_exit: WaitQueue,
+    vfork_pending: AtomicBool,
+    vfork_done: Completion,
 }
 
 impl Process {
     pub fn create(mm: Box<UserMm>) -> Arc<Self> {
+        Self::create_with_mm(Arc::from(mm))
+    }
+
+    fn create_with_mm(mm: Arc<UserMm>) -> Arc<Self> {
         let id = ProcessId(allocate_process_id());
         let process = Arc::new(Self {
             id,
-            mm: IrqSpinLock::new_with_class(Arc::from(mm), PROCESS_MM_LOCK),
+            mm: IrqSpinLock::new_with_class(mm, PROCESS_MM_LOCK),
             files: FileTable::new(),
             signals: SignalState::new(),
             credentials: Credentials::bootstrap(),
@@ -460,6 +468,8 @@ impl Process {
                 PROCESS_THREAD_GROUP_LOCK,
             ),
             thread_exit: WaitQueue::new(),
+            vfork_pending: AtomicBool::new(false),
+            vfork_done: Completion::new(),
         });
         register_process(&process);
         LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
@@ -467,7 +477,30 @@ impl Process {
     }
 
     pub fn fork_child(self: &Arc<Self>, mm: Box<UserMm>) -> Result<Arc<Self>, ProcessError> {
-        let child = Self::create(mm);
+        self.fork_child_with_mm(Arc::from(mm), false)
+    }
+
+    /// Create a distinct process that temporarily shares this process's MM.
+    ///
+    /// This is the address-space half of Linux `CLONE_VM | CLONE_VFORK`.
+    /// The caller must wait on `wait_vfork_done` after making the child
+    /// runnable; the child releases it after replacing the shared MM in exec,
+    /// or on exit.  Keeping distinct Process objects preserves copied fd/fs
+    /// state while avoiding an eager copy of a large Cargo/rustc address space.
+    pub fn fork_child_shared_mm(
+        self: &Arc<Self>,
+        vfork_pending: bool,
+    ) -> Result<Arc<Self>, ProcessError> {
+        self.fork_child_with_mm(self.mm_arc(), vfork_pending)
+    }
+
+    fn fork_child_with_mm(
+        self: &Arc<Self>,
+        mm: Arc<UserMm>,
+        vfork_pending: bool,
+    ) -> Result<Arc<Self>, ProcessError> {
+        let child = Self::create_with_mm(mm);
+        child.vfork_pending.store(vfork_pending, Ordering::Release);
         {
             let mut child_files = child.files.table.lock();
             *child_files = self.files.table.lock().fork_clone();
@@ -482,6 +515,18 @@ impl Process {
         child.set_parent(self.id())?;
         self.add_child(Arc::clone(&child))?;
         Ok(child)
+    }
+
+    pub fn wait_vfork_done(&self) {
+        if self.vfork_pending.load(Ordering::Acquire) {
+            self.vfork_done.wait();
+        }
+    }
+
+    pub fn complete_vfork(&self) {
+        if self.vfork_pending.swap(false, Ordering::AcqRel) {
+            self.vfork_done.complete_all();
+        }
     }
 
     pub const fn id(&self) -> ProcessId {
@@ -998,6 +1043,7 @@ impl Thread {
             .map_err(|_| ProcessError::ThreadAlreadyExited)?;
         self.exit_status.store(status, Ordering::Relaxed);
         self.lifecycle.store(THREAD_EXITED, Ordering::Release);
+        self.process.complete_vfork();
         self.exited.complete_all();
         Ok(())
     }

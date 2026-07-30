@@ -517,13 +517,25 @@ impl Scheduler {
         TaskId(self.tasks.len())
     }
 
-
+    fn cpu_runnable_load(&self, cpu: CpuId) -> usize {
+        let queued = self.cpus[cpu.get()].run_queue.len();
+        let current = self.cpus[cpu.get()].current;
+        let running = current
+            .map(|id| usize::from(!self.task(id).kind.is_idle()))
+            .unwrap_or(0);
+        queued.saturating_add(running)
+    }
 
     fn choose_target_cpu(&self) -> CpuId {
         (0..self.discovered_cpus)
             .filter_map(CpuId::new)
             .filter(|cpu| crate::smp::is_scheduler_active(*cpu))
-            .min_by_key(|cpu| self.cpus[cpu.get()].run_queue.len())
+            // User tasks are deliberately pinned after their first placement
+            // until the RISC-V trap-anchor migration window is redesigned.
+            // Count the task already running on each CPU as well as queued
+            // work; considering only queue length repeatedly selected CPU0
+            // while other CPUs were idle during parallel rustc builds.
+            .min_by_key(|cpu| (self.cpu_runnable_load(*cpu), cpu.get()))
             .expect("scheduler has no active CPU")
     }
 

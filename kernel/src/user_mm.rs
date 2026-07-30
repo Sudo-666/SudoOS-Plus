@@ -143,6 +143,17 @@ impl UserMm {
         (state.core.layout().area_count(), VMA_CAPACITY)
     }
 
+    /// Return the single VMA that completely contains `range`.
+    ///
+    /// mremap uses this snapshot to preserve access flags while resizing an
+    /// anonymous mapping.  Requiring one containing VMA avoids silently
+    /// merging mappings with different protections or backing kinds.
+    pub fn area_containing(&self, range: VirtRange) -> Option<VmArea> {
+        let state = self.state.lock();
+        let area = state.core.layout().find_area(range.start())?;
+        area.range().contains_range(range).then_some(area)
+    }
+
     pub fn new(areas: &[VmArea]) -> Result<Self, UserMmRuntimeError> {
         let asid = reserve_asid_for_mm()?;
         let result: Result<Self, UserMmRuntimeError> = (|| {
@@ -1015,7 +1026,7 @@ impl UserMm {
             LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
         }
 
-        if already_unmapped != 0 {
+        if already_unmapped != 0 && crate::user::oscomp_verbose_user_trace_active() {
             crate::println!(
                 "user-mm: reclaimed {} backing pages whose leaves were already unmapped",
                 already_unmapped,
