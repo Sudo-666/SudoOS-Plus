@@ -38,6 +38,7 @@ enum NodeState {
     Ext4Directory {
         fs: Arc<crate::ext4::Ext4FileSystem>,
         ino: u32,
+        populated: bool,
         children: Vec<(String, Arc<Node>)>,
         whiteouts: Vec<String>,
     },
@@ -509,10 +510,26 @@ pub fn mount_ext4_overlay(source: &str, target: &str) -> Result<(), Errno> {
     *target_node.state.lock() = NodeState::Ext4Directory {
         fs,
         ino: root.ino,
+        populated: false,
         children: Vec::new(),
         whiteouts: Vec::new(),
     };
     Ok(())
+}
+
+/// Return whether `path` is backed by the native lazy ext4 overlay.
+///
+/// Older contest boot paths install selected sdcard files into tmpfs and use
+/// a manual materialization fallback on ENOENT. Once a native overlay is
+/// mounted that fallback must stay out of the way: the overlay already loads
+/// children by inode, while materializing an absent PATH candidate can turn a
+/// legitimate ENOENT into a different error and prematurely stop `execvp`.
+pub fn is_ext4_overlay_directory(path: &str) -> bool {
+    let _tree = TREE.lock();
+    let Ok(node) = lookup(path) else {
+        return false;
+    };
+    matches!(&*node.state.lock(), NodeState::Ext4Directory { .. })
 }
 
 pub fn install_ext4_path(source: &str, target_path: &str, source_path: &str) -> Result<(), Errno> {
@@ -843,6 +860,7 @@ fn ext4_node(
         crate::ext4::Ext4NodeKind::Directory => NodeState::Ext4Directory {
             fs,
             ino: info.ino,
+            populated: false,
             children: Vec::new(),
             whiteouts: Vec::new(),
         },
@@ -871,6 +889,9 @@ fn populate_ext4_directory(node: &Arc<Node>) -> Result<(), Errno> {
     let backing = {
         let state = node.state.lock();
         match &*state {
+            NodeState::Ext4Directory {
+                populated: true, ..
+            } => None,
             NodeState::Ext4Directory { fs, ino, .. } => Some((Arc::clone(fs), *ino)),
             NodeState::Directory(_) => None,
             _ => return Err(Errno::Enotdir),
@@ -880,32 +901,40 @@ fn populate_ext4_directory(node: &Arc<Node>) -> Result<(), Errno> {
         return Ok(());
     };
     let entries = fs.list_directory_info(ino).map_err(ext4_errno)?;
+    let mut loaded = Vec::new();
+    loaded
+        .try_reserve(entries.len())
+        .map_err(|_| Errno::Enomem)?;
     for (name, info) in entries {
-        let skip = {
-            let state = node.state.lock();
-            let NodeState::Ext4Directory {
-                children,
-                whiteouts,
-                ..
-            } = &*state
-            else {
-                return Err(Errno::Enotdir);
-            };
-            whiteouts.iter().any(|hidden| hidden == &name)
-                || children.iter().any(|(child_name, _)| child_name == &name)
-        };
-        if skip {
-            continue;
-        }
         let child = ext4_node(Arc::clone(&fs), info)?;
         child.parent_ino.store(node.ino, Ordering::Release);
-        let mut state = node.state.lock();
-        let NodeState::Ext4Directory { children, .. } = &mut *state else {
-            return Err(Errno::Enotdir);
-        };
-        children.try_reserve(1).map_err(|_| Errno::Enomem)?;
+        loaded.push((name, child));
+    }
+    let mut state = node.state.lock();
+    let NodeState::Ext4Directory {
+        populated,
+        children,
+        whiteouts,
+        ..
+    } = &mut *state
+    else {
+        return Err(Errno::Enotdir);
+    };
+    if *populated {
+        return Ok(());
+    }
+    children
+        .try_reserve(loaded.len())
+        .map_err(|_| Errno::Enomem)?;
+    for (name, child) in loaded {
+        if whiteouts.iter().any(|hidden| hidden == &name)
+            || children.iter().any(|(child_name, _)| child_name == &name)
+        {
+            continue;
+        }
         children.push((name, child));
     }
+    *populated = true;
     Ok(())
 }
 
@@ -1037,6 +1066,18 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     let length = usize::try_from(length).map_err(|_| Errno::Eoverflow)?;
     let mut state = node.state.lock();
     match &mut *state {
+        NodeState::Ext4Regular {
+            overlay,
+            size,
+            ..
+        } if overlay.is_none() && length == 0 => {
+            // O_TRUNC is pervasive in compiler output directories.  The new
+            // file has no dependency on the immutable ext4 bytes, so avoid
+            // reading the entire old artifact only to discard it.
+            *overlay = Some(Vec::new());
+            *size = 0;
+            Ok(())
+        }
         NodeState::Regular(_) | NodeState::Ext4Regular { .. } => {
             let data = regular_overlay_mut(&mut *state)?;
             if length > data.len() {
@@ -1378,7 +1419,11 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
         }
         match &*state {
             NodeState::Ext4Directory {
-                fs, ino, whiteouts, ..
+                populated: false,
+                fs,
+                ino,
+                whiteouts,
+                ..
             } if !whiteouts.iter().any(|hidden| hidden == name) => Some((Arc::clone(fs), *ino)),
             _ => None,
         }
@@ -1395,7 +1440,23 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
     child.parent_ino.store(parent.ino, Ordering::Release);
     let stored_name = clone_component(name)?;
     let mut state = parent.state.lock();
-    let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
+    let NodeState::Ext4Directory {
+        children,
+        whiteouts,
+        ..
+    } = &mut *state
+    else {
+        return Err(Errno::Enotdir);
+    };
+    if whiteouts.iter().any(|hidden| hidden == name) {
+        return Ok(None);
+    }
+    if let Some((_, existing)) = children
+        .iter()
+        .find(|(child_name, _)| child_name == name)
+    {
+        return Ok(Some(Arc::clone(existing)));
+    }
     children.try_reserve(1).map_err(|_| Errno::Enomem)?;
     children.push((stored_name, Arc::clone(&child)));
     Ok(Some(child))

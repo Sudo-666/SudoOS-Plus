@@ -654,15 +654,17 @@ pub fn sys_socketpair(
         let _ = process.files().close(second_fd);
         return -(Errno::Efault as isize);
     }
-    crate::println!(
-        "socketpair: pid={} type={:#x} fds={},{} ids={},{}",
-        process.id().get(),
-        sock_type,
-        first_fd,
-        second_fd,
-        first_id,
-        second_id,
-    );
+    if crate::user::oscomp_verbose_user_trace_active() {
+        crate::println!(
+            "socketpair: pid={} type={:#x} fds={},{} ids={},{}",
+            process.id().get(),
+            sock_type,
+            first_fd,
+            second_fd,
+            first_id,
+            second_id,
+        );
+    }
     0
 }
 

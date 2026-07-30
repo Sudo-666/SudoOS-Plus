@@ -15,6 +15,14 @@ pub struct Context {
     s9: usize,
     s10: usize,
     s11: usize,
+
+    // The final-2026 glibc toolchain uses the hard-float lp64d ABI.  FP
+    // registers are architectural task state even though the kernel itself is
+    // built for riscv64imac and never uses floating point.  Carry all 32
+    // registers plus FCSR across scheduler switches so independent rustc
+    // processes and pthreads cannot corrupt one another after migration.
+    fpr: [u64; 32],
+    fcsr: usize,
 }
 
 /// Bytes reserved below the end-exclusive kernel-stack boundary before a
@@ -54,6 +62,6 @@ impl Context {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Context>() == 14 * core::mem::size_of::<usize>());
+    assert!(core::mem::size_of::<Context>() == 47 * core::mem::size_of::<usize>());
     assert!(core::mem::align_of::<Context>() == core::mem::align_of::<usize>());
 };

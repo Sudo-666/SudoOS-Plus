@@ -82,6 +82,7 @@ pub mod number {
     pub const SYSINFO: usize = 179;
     pub const BRK: usize = 214;
     pub const MUNMAP: usize = 215;
+    pub const MREMAP: usize = 216;
     pub const CLONE: usize = 220;
     pub const CLONE3: usize = 435;
     pub const RSEQ: usize = 293;

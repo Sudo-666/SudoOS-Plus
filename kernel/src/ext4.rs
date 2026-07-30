@@ -1,7 +1,11 @@
 // SUDOOS_M15A_EXT4_RO_PATCH_V1
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 
 use crate::block::{self, BlockDevice};
+use crate::irq_lock::IrqSpinLock;
+use crate::lockdep::{LockClass, LockRank};
+
+const EXT4_METADATA_LOCK: LockClass = LockClass::new("ext4.metadata", LockRank::Vfs, 20);
 
 const EXT4_SUPER_MAGIC: u16 = 0xef53;
 const EXT4_SUPER_OFFSET: u64 = 1024;
@@ -26,6 +30,8 @@ const MAX_EXT4_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXT4_NODES: usize = 65536;
 const MAX_EXT4_DEPTH: usize = 16;
 const MAX_EXTENT_TREE_DEPTH: usize = 5;
+const EXT4_DATA_CACHE_CHUNK_SIZE: usize = 256 * 1024;
+const EXT4_DATA_CACHE_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ext4Error {
@@ -127,6 +133,14 @@ pub struct Ext4FileSystem {
     inodes_per_group: u32,
     blocks_per_group: u32,
     group_desc_size: u16,
+    metadata: IrqSpinLock<Ext4MetadataCache>,
+}
+
+struct Ext4MetadataCache {
+    inodes: BTreeMap<u32, Ext4Inode>,
+    inode_tables: BTreeMap<u32, u64>,
+    data_chunks: BTreeMap<(u32, u64), Arc<[u8]>>,
+    data_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -223,6 +237,15 @@ impl Ext4FileSystem {
             inodes_per_group,
             blocks_per_group,
             group_desc_size,
+            metadata: IrqSpinLock::new_with_class(
+                Ext4MetadataCache {
+                    inodes: BTreeMap::new(),
+                    inode_tables: BTreeMap::new(),
+                    data_chunks: BTreeMap::new(),
+                    data_bytes: 0,
+                },
+                EXT4_METADATA_LOCK,
+            ),
         })
     }
 
@@ -267,8 +290,90 @@ impl Ext4FileSystem {
         if inode.flags & EXT4_EXTENTS_FL == 0 {
             return Err(Ext4Error::Unsupported);
         }
-        self.read_extent_range(&inode.block, offset, &mut output[..count], 0)?;
+        let mut copied = 0_usize;
+        while copied < count {
+            let current = offset
+                .checked_add(copied as u64)
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let chunk_index = current / EXT4_DATA_CACHE_CHUNK_SIZE as u64;
+            let chunk_start = chunk_index
+                .checked_mul(EXT4_DATA_CACHE_CHUNK_SIZE as u64)
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let in_chunk = usize::try_from(current - chunk_start)
+                .map_err(|_| Ext4Error::AddressOverflow)?;
+            let chunk_len = usize::try_from(
+                (inode.size - chunk_start).min(EXT4_DATA_CACHE_CHUNK_SIZE as u64),
+            )
+            .map_err(|_| Ext4Error::AddressOverflow)?;
+            let copy_len = (count - copied).min(chunk_len - in_chunk);
+
+            let Some(chunk) = self.read_data_chunk_cached(
+                &inode,
+                chunk_index,
+                chunk_start,
+                chunk_len,
+            )? else {
+                // A full cache or memory pressure must not turn a valid read
+                // into ENOMEM.  Preserve the original direct, bulk-I/O path
+                // for this request and all remaining bytes.
+                self.read_extent_range(
+                    &inode.block,
+                    current,
+                    &mut output[copied..count],
+                    0,
+                )?;
+                return Ok(count);
+            };
+            output[copied..copied + copy_len]
+                .copy_from_slice(&chunk[in_chunk..in_chunk + copy_len]);
+            copied += copy_len;
+        }
         Ok(count)
+    }
+
+    fn read_data_chunk_cached(
+        &self,
+        inode: &Ext4Inode,
+        chunk_index: u64,
+        chunk_start: u64,
+        chunk_len: usize,
+    ) -> Result<Option<Arc<[u8]>>, Ext4Error> {
+        let key = (inode.ino, chunk_index);
+        {
+            let metadata = self.metadata.lock();
+            if let Some(chunk) = metadata.data_chunks.get(&key) {
+                return Ok(Some(Arc::clone(chunk)));
+            }
+            if metadata
+                .data_bytes
+                .checked_add(chunk_len)
+                .is_none_or(|bytes| bytes > EXT4_DATA_CACHE_CAPACITY_BYTES)
+            {
+                return Ok(None);
+            }
+        }
+
+        let mut data = Vec::new();
+        if data.try_reserve(chunk_len).is_err() {
+            return Ok(None);
+        }
+        data.resize(chunk_len, 0);
+        self.read_extent_range(&inode.block, chunk_start, &mut data, 0)?;
+        let loaded: Arc<[u8]> = Arc::from(data.into_boxed_slice());
+
+        let mut metadata = self.metadata.lock();
+        if let Some(chunk) = metadata.data_chunks.get(&key) {
+            return Ok(Some(Arc::clone(chunk)));
+        }
+        if metadata
+            .data_bytes
+            .checked_add(chunk_len)
+            .is_some_and(|bytes| bytes <= EXT4_DATA_CACHE_CAPACITY_BYTES)
+        {
+            metadata.data_bytes += chunk_len;
+            metadata.data_chunks.insert(key, Arc::clone(&loaded));
+        }
+        Ok(Some(loaded))
     }
 
     pub fn read_symlink_inode(&self, ino: u32) -> Result<String, Ext4Error> {
@@ -752,6 +857,9 @@ impl Ext4FileSystem {
         if ino == 0 {
             return Err(Ext4Error::BadInode);
         }
+        if let Some(inode) = self.metadata.lock().inodes.get(&ino).cloned() {
+            return Ok(inode);
+        }
         let group = (ino - 1) / self.inodes_per_group;
         let index = (ino - 1) % self.inodes_per_group;
         let inode_table_block = self.inode_table_block(group)?;
@@ -776,18 +884,27 @@ impl Ext4FileSystem {
         let flags = le_u32(&raw, 32)?;
         let mut block = [0_u8; EXT4_N_BLOCKS_BYTES];
         block.copy_from_slice(raw.get(40..100).ok_or(Ext4Error::BadInode)?);
-        Ok(Ext4Inode {
+        let inode = Ext4Inode {
             ino,
             mode,
             size,
             flags,
             block,
-        })
+        };
+        self.metadata
+            .lock()
+            .inodes
+            .entry(ino)
+            .or_insert_with(|| inode.clone());
+        Ok(inode)
     }
 
     fn inode_table_block(&self, group: u32) -> Result<u64, Ext4Error> {
         if self.blocks_per_group == 0 {
             return Err(Ext4Error::InvalidSuperblock);
+        }
+        if let Some(block) = self.metadata.lock().inode_tables.get(&group).copied() {
+            return Ok(block);
         }
         let descriptor_table_block: u64 = if self.block_size == 1024 { 2 } else { 1 };
         let descriptor_offset = descriptor_table_block
@@ -811,6 +928,11 @@ impl Ext4FileSystem {
         if block == 0 {
             return Err(Ext4Error::BadGroupDescriptor);
         }
+        self.metadata
+            .lock()
+            .inode_tables
+            .entry(group)
+            .or_insert(block);
         Ok(block)
     }
 

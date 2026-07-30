@@ -99,6 +99,7 @@ const SYS_GETTID: usize = crate::syscall::number::GETTID;
 const SYS_SYSINFO: usize = crate::syscall::number::SYSINFO;
 const SYS_BRK: usize = crate::syscall::number::BRK;
 const SYS_MUNMAP: usize = crate::syscall::number::MUNMAP;
+const SYS_MREMAP: usize = crate::syscall::number::MREMAP;
 const SYS_CLONE: usize = crate::syscall::number::CLONE;
 const SYS_CLONE3: usize = crate::syscall::number::CLONE3;
 const SYS_RSEQ: usize = crate::syscall::number::RSEQ;
@@ -177,6 +178,7 @@ const ENOSYS: isize = crate::syscall::errno::ENOSYS;
 const ERANGE: isize = 34;
 
 const MAX_USER_COPY: usize = 4096;
+const MAX_BULK_IO_COPY: usize = 256 * 1024;
 const MAX_USER_PATH: usize = 256;
 const MAX_EXEC_STRING: usize = 64 * 1024;
 const MAX_EXEC_ARGS: usize = 256;
@@ -268,6 +270,7 @@ const OSCOMP_TRACE_PTHREAD_CREATE: bool = false;
 static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(8000);
 static OSCOMP_LIFECYCLE_TRACE: AtomicBool = AtomicBool::new(false);
 static OSCOMP_LIFECYCLE_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static OSCOMP_VERBOSE_USER_TRACE: AtomicBool = AtomicBool::new(false);
 
 fn oscomp_lifecycle_trace_allow() -> bool {
     OSCOMP_LIFECYCLE_TRACE.load(Ordering::Relaxed)
@@ -280,6 +283,13 @@ fn oscomp_lifecycle_trace_allow() -> bool {
 
 pub(crate) fn oscomp_lifecycle_trace_active() -> bool {
     OSCOMP_LIFECYCLE_TRACE.load(Ordering::Relaxed)
+}
+
+/// High-volume success-path tracing is reserved for the explicit diagnostic
+/// boot mode.  In scoring modes serial output is synchronous and can dominate
+/// a parallel compiler workload, so callers must keep it off the hot path.
+pub(crate) fn oscomp_verbose_user_trace_active() -> bool {
+    OSCOMP_VERBOSE_USER_TRACE.load(Ordering::Relaxed)
 }
 
 // ── P9-H14: LoongArch FPD fixup counter ──
@@ -336,13 +346,13 @@ const EXEC_TRACE_LIMIT: usize = 256;
 const EXEC_TRACE_SUCCESS_LIMIT: usize = 32;
 
 fn exec_trace_allow() -> bool {
-    let prev = EXEC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-    prev < EXEC_TRACE_LIMIT
+    oscomp_verbose_user_trace_active()
+        && EXEC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < EXEC_TRACE_LIMIT
 }
 
 fn exec_trace_success_allow() -> bool {
-    let prev = EXEC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-    prev < EXEC_TRACE_SUCCESS_LIMIT
+    oscomp_verbose_user_trace_active()
+        && EXEC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < EXEC_TRACE_SUCCESS_LIMIT
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -2591,7 +2601,7 @@ fn verify_final_buildstorm_diagnostic_thread() {
 }
 
 fn final_buildstorm_lifecycle_watchdog() {
-    for elapsed in [120_u64, 240, 360] {
+    for elapsed in [120_u64, 240, 360, 480, 600, 720] {
         crate::timer::sleep(core::time::Duration::from_secs(120));
         if !OSCOMP_LIFECYCLE_TRACE.load(Ordering::Acquire) {
             return;
@@ -2742,35 +2752,69 @@ echo "BUILDSTORM_DIAG_RUN_RC=$run_rc"
 test "$run_rc" -eq 0 || exit "$run_rc"
 test "$captured" = "Hello, world!" || exit 99
 
-for path in \
-    /root/.cargo/registry/index/*/.cache/pk/g-/pkg-config \
-    /root/.cargo/registry/cache/*/pkg-config-0.3.33.crate \
-    /root/.cargo/registry/src/*/pkg-config-0.3.33/Cargo.toml
-do
-    if test -r "$path"; then
-        bytes="$(wc -c < "$path")"
-        printf 'BUILDSTORM_DIAG_CARGO_FILE readable=true bytes=%s path=%s\n' "$bytes" "$path"
-        sha256sum "$path" 2>/dev/null || true
-    else
-        printf 'BUILDSTORM_DIAG_CARGO_FILE readable=false path=%s\n' "$path"
-    fi
-done
+case "$(uname -m 2>/dev/null)" in
+  loongarch64) axarch=loongarch64; axtgt=loongarch64-unknown-linux-musl ;;
+  *)           axarch=riscv64;     axtgt=riscv64gc-unknown-linux-musl ;;
+esac
 
-( cd /work/tgoskits && cargo metadata --offline --no-deps >/tmp/buildstorm-metadata.json )
-metadata_rc=$?
-echo "BUILDSTORM_DIAG_METADATA_RC=$metadata_rc"
+# The July public image omitted the prebuilt tg-xtask. Resolving its complete
+# workspace also visits unrelated members whose registry cache is incomplete.
+# In diagnostic mode only, narrow the in-memory overlay's root workspace to
+# xtask. Cargo still builds xtask's real path dependencies. The disk image and
+# the official scoring script remain untouched, and this mode emits no scoring
+# result markers.
+cd /work/tgoskits || exit 90
+cp Cargo.toml /tmp/buildstorm-workspace-Cargo.toml
+test ! -f Cargo.lock || cp Cargo.lock /tmp/buildstorm-workspace-Cargo.lock
+sed -i '/^members = \[/,/^]$/c\members = ["xtask"]' Cargo.toml
+sed -i 's#^anyhow = .*#anyhow = { path = "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.103" }#' Cargo.toml
 
-( cd /work/tgoskits && \
-  CARGO_LOG=cargo::sources::registry::http_remote=trace \
-  cargo build --offline -p tg-xtask )
+# The old public image's lockfile can name crate revisions different from the
+# partial registry cache left in that image. Re-resolve only this diagnostic
+# workspace against the actually cached crates. The official image and normal
+# scoring path stay byte-for-byte untouched because QEMU runs with -snapshot.
+rm -f Cargo.lock
+
+timeout 3600 cargo build --offline -p tg-xtask
 xtask_build_rc=$?
 echo "BUILDSTORM_DIAG_XTASK_BUILD_RC=$xtask_build_rc"
+if test "$xtask_build_rc" -ne 0; then
+    if test "$axarch" = riscv64; then
+        driver=/root/.rustup/toolchains/nightly-2026-05-28-riscv64gc-unknown-linux-gnu/lib/librustc_driver-37ff94a6423d6d34.so
+        echo "BUILDSTORM_DIAG_RUSTC_DRIVER_PC_BEGIN"
+        addr2line -f -C -e "$driver" 0x147158 2>&1 || true
+        objdump -d --start-address=0x147130 --stop-address=0x147180 "$driver" 2>&1 || true
+        echo "BUILDSTORM_DIAG_RUSTC_DRIVER_PC_END"
+        rm -f /tmp/libc-build-probe
+        timeout 1800 rustc --crate-name build_script_build --edition=2021 \
+            /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.186/build.rs \
+            --crate-type bin --emit=link -o /tmp/libc-build-probe
+        echo "BUILDSTORM_DIAG_LIBC_SINGLE_RC=$?"
+    fi
+    cp /tmp/buildstorm-workspace-Cargo.toml Cargo.toml
+    test ! -f /tmp/buildstorm-workspace-Cargo.lock || cp /tmp/buildstorm-workspace-Cargo.lock Cargo.lock
+    exit 0
+fi
+
+cp /tmp/buildstorm-workspace-Cargo.toml Cargo.toml
+test ! -f /tmp/buildstorm-workspace-Cargo.lock || cp /tmp/buildstorm-workspace-Cargo.lock Cargo.lock
+rm -rf "target/$axtgt"
+timeout 14400 target/debug/tg-xtask arceos build -p arceos-helloworld --arch "$axarch"
+full_rc=$?
+artifact="$(find target -type f \( -name arceos-helloworld -o -name helloworld \) 2>/dev/null | head -1)"
+artifact_bytes=0
+test -n "$artifact" && artifact_bytes="$(wc -c < "$artifact")"
+printf 'BUILDSTORM_DIAG_FULL rc=%s bytes=%s arch=%s artifact=%s\n' \
+    "$full_rc" "$artifact_bytes" "$axarch" "$artifact"
+cp /tmp/buildstorm-workspace-Cargo.toml Cargo.toml
+test ! -f /tmp/buildstorm-workspace-Cargo.lock || cp /tmp/buildstorm-workspace-Cargo.lock Cargo.lock
 exit 0
 "#;
 
         EXEC_TRACE_COUNT.store(0, Ordering::Release);
         OSCOMP_LIFECYCLE_TRACE_BUDGET.store(2048, Ordering::Release);
         OSCOMP_LIFECYCLE_TRACE.store(true, Ordering::Release);
+        OSCOMP_VERBOSE_USER_TRACE.store(true, Ordering::Release);
         crate::task::spawn_system_thread_on(
             final_buildstorm_lifecycle_watchdog,
             crate::smp::CpuId::BOOT,
@@ -2784,6 +2828,7 @@ exit 0
         );
 
         OSCOMP_LIFECYCLE_TRACE.store(false, Ordering::Release);
+        OSCOMP_VERBOSE_USER_TRACE.store(false, Ordering::Release);
 
         match diagnostic_result {
             Ok(code) => {
@@ -5504,6 +5549,16 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_FDATASYNC => set_syscall_result(frame, sys_fdatasync(arguments[0])),
         SYS_BRK => set_syscall_result(frame, sys_brk(arguments[0])),
         SYS_MUNMAP => set_syscall_result(frame, sys_munmap(arguments[0], arguments[1])),
+        SYS_MREMAP => set_syscall_result(
+            frame,
+            sys_mremap(
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+            ),
+        ),
         SYS_MMAP => set_syscall_result(frame, sys_mmap(arguments)),
         SYS_MPROTECT => set_syscall_result(
             frame,
@@ -5778,7 +5833,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         }
         _ => {
             static UNKNOWN_SYSCALL_PRINTS: AtomicUsize = AtomicUsize::new(0);
-            if UNKNOWN_SYSCALL_PRINTS.fetch_add(1, Ordering::Relaxed) < 128 {
+            if oscomp_verbose_user_trace_active()
+                && UNKNOWN_SYSCALL_PRINTS.fetch_add(1, Ordering::Relaxed) < 128
+            {
                 crate::println!(
                     "unknown-syscall: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
                     number,
@@ -5904,6 +5961,22 @@ pub fn handle_fault(
                         baddr,
                         access,
                         bsp,
+                    );
+                    #[cfg(target_arch = "riscv64")]
+                    crate::println!(
+                        "sigsegv-rv-regs: ra={:#x} gp={:#x} tp={:#x} t0={:#x} t1={:#x} t2={:#x} s0={:#x} s1={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} a7={:#x}",
+                        frame.gpr[1], frame.gpr[3], frame.gpr[4], frame.gpr[5],
+                        frame.gpr[6], frame.gpr[7], frame.gpr[8], frame.gpr[9],
+                        frame.gpr[10], frame.gpr[11], frame.gpr[12], frame.gpr[13],
+                        frame.gpr[14], frame.gpr[15], frame.gpr[16], frame.gpr[17],
+                    );
+                    #[cfg(target_arch = "riscv64")]
+                    crate::println!(
+                        "sigsegv-rv-regs: s2={:#x} s3={:#x} s4={:#x} s5={:#x} s6={:#x} s7={:#x} s8={:#x} s9={:#x} s10={:#x} s11={:#x} t3={:#x} t4={:#x} t5={:#x} t6={:#x}",
+                        frame.gpr[18], frame.gpr[19], frame.gpr[20], frame.gpr[21],
+                        frame.gpr[22], frame.gpr[23], frame.gpr[24], frame.gpr[25],
+                        frame.gpr[26], frame.gpr[27], frame.gpr[28], frame.gpr[29],
+                        frame.gpr[30], frame.gpr[31],
                     );
                 } else if print_idx == 8 {
                     crate::println!("sigsegv: ... further faults suppressed");
@@ -6226,6 +6299,7 @@ fn sys_file_private_mmap(
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
+    let path = file.path().unwrap_or("?");
     let stat = match file.fstat() {
         Ok(stat) => stat,
         Err(errno) => return errno.to_isize(),
@@ -6274,7 +6348,24 @@ fn sys_file_private_mmap(
     };
     let start = match mapping {
         Ok(start) => start,
-        Err(_) => return -ENOMEM,
+        Err(error) => {
+            let (vmas, capacity) = current_user_mm().vma_usage();
+            crate::println!(
+                "mmap-file: ALLOC-FAIL fd={} path={} fixed={} addr={:#x} off={:#x} len={:#x} rounded={:#x} vmas={}/{} free_pages={} err={:?}",
+                fd,
+                path,
+                is_fixed,
+                address,
+                offset,
+                length,
+                rounded,
+                vmas,
+                capacity,
+                crate::page_alloc::total_free_pages().unwrap_or(0),
+                error,
+            );
+            return -ENOMEM;
+        }
     };
     let range = match start
         .checked_add(rounded)
@@ -6286,15 +6377,36 @@ fn sys_file_private_mmap(
 
     let result = copy_file_into_private_mapping(&file, start, offset, readable);
     if result.is_err() {
+        crate::println!(
+            "mmap-file: COPY-FAIL fd={} path={} off={:#x} readable={:#x} len={:#x} free_pages={}",
+            fd,
+            path,
+            offset,
+            readable,
+            length,
+            crate::page_alloc::total_free_pages().unwrap_or(0),
+        );
         let _ = current_user_mm().unmap_range(range);
         return -EFAULT;
     }
     // Zero-fill tail padding (BSS / partial page beyond file size).
     if rounded > readable {
-        let _ = zero_user_mapping(
+        if zero_user_mapping(
             start.checked_add(readable).unwrap_or(start),
             rounded - readable,
-        );
+        )
+        .is_err()
+        {
+            crate::println!(
+                "mmap-file: ZERO-FAIL fd={} path={} tail={:#x} free_pages={}",
+                fd,
+                path,
+                rounded - readable,
+                crate::page_alloc::total_free_pages().unwrap_or(0),
+            );
+            let _ = current_user_mm().unmap_range(range);
+            return -ENOMEM;
+        }
     }
     if let Err(e) = current_user_mm().protect_range(range, vm_flags.access_only()) {
         if mmap_file_fail_trace() {
@@ -6316,13 +6428,10 @@ fn sys_file_private_mmap(
     if ACTIVE.load(Ordering::Acquire) {
         MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
     }
-    let path = file.path().unwrap_or("?");
-    let is_lib = path.contains("/lib/")
-        || path.contains("/lib64/")
-        || path.contains("ld-linux")
-        || path.contains("ld-musl");
-    // Always print mmap for lib paths; rate-limit everything else.
-    if is_lib || mmap_file_ok_trace() {
+    // Successful mappings are routine and extremely frequent under rustc/ld.
+    // Keep only the small diagnostic sample; failures retain their independent
+    // budget above so success traffic cannot hide the first real error.
+    if mmap_file_ok_trace() {
         crate::println!(
             "mmap-file: ok fd={} path={} off={:#x} len={:#x} -> {:#x} prot={:?}",
             fd,
@@ -6401,6 +6510,205 @@ fn sys_munmap(address: usize, length: usize) -> isize {
     }
 }
 
+fn sys_mremap(
+    old_address: usize,
+    old_size: usize,
+    new_size: usize,
+    flags: usize,
+    new_address: usize,
+) -> isize {
+    const MREMAP_MAYMOVE: usize = 1;
+    const MREMAP_FIXED: usize = 2;
+    const MREMAP_DONTUNMAP: usize = 4;
+    const MREMAP_ALLOWED: usize = MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP;
+    const MAX_MREMAP_SIZE: usize = 512 * 1024 * 1024;
+
+    if flags & !MREMAP_ALLOWED != 0
+        || flags & MREMAP_DONTUNMAP != 0
+        || flags & MREMAP_FIXED != 0 && flags & MREMAP_MAYMOVE == 0
+    {
+        return -EINVAL;
+    }
+    let fixed = flags & MREMAP_FIXED != 0;
+
+    let old_range = match syscall_range(old_address, old_size) {
+        Some(range) => range,
+        None => return -EINVAL,
+    };
+    let new_rounded = match new_size.checked_add(PAGE_SIZE - 1) {
+        Some(size) => size & !(PAGE_SIZE - 1),
+        None => return -ENOMEM,
+    };
+    if new_rounded == 0 || new_rounded > MAX_MREMAP_SIZE {
+        return -EINVAL;
+    }
+
+    let mm = current_user_mm();
+    let area = match mm.area_containing(old_range) {
+        Some(area) if matches!(area.kind(), VmAreaKind::Anonymous) => area,
+        _ => return -EINVAL,
+    };
+    let old_rounded = old_range.size();
+
+    if !fixed && new_rounded == old_rounded {
+        mremap_success_trace("unchanged", old_address, old_rounded, new_rounded, old_address);
+        return old_address as isize;
+    }
+
+    if !fixed && new_rounded < old_rounded {
+        let tail = VirtRange::from_bounds(
+            old_address + new_rounded,
+            old_address + old_rounded,
+        );
+        return match mm.unmap_range(tail) {
+            Ok(()) => {
+                mremap_success_trace(
+                    "shrink",
+                    old_address,
+                    old_rounded,
+                    new_rounded,
+                    old_address,
+                );
+                old_address as isize
+            }
+            Err(_) => -ENOMEM,
+        };
+    }
+
+    // First try the Linux fast path: extend into a free adjacent range.  The
+    // VMA layer coalesces equivalent neighbors, and untouched pages remain
+    // demand-zero instead of being eagerly allocated.
+    let grown_end = match old_address.checked_add(new_rounded) {
+        Some(end) => end,
+        None => return -ENOMEM,
+    };
+    let growth = VirtRange::from_bounds(old_address + old_rounded, grown_end);
+    if !fixed && mm.map_anonymous_exact(growth, area.flags()).is_ok() {
+        mremap_success_trace("grow-in-place", old_address, old_rounded, new_rounded, old_address);
+        return old_address as isize;
+    }
+
+    if flags & MREMAP_MAYMOVE == 0 {
+        return -ENOMEM;
+    }
+
+    let target_range = if fixed {
+        if new_address & (PAGE_SIZE - 1) != 0 {
+            return -EINVAL;
+        }
+        let range = match new_address
+            .checked_add(new_rounded)
+            .and_then(|end| VirtRange::new(VirtAddr::new(new_address), VirtAddr::new(end)))
+        {
+            Some(range) => range,
+            None => return -ENOMEM,
+        };
+        if range.overlaps(old_range) {
+            return -EINVAL;
+        }
+        let _ = mm.unmap_range(range);
+        Some(range)
+    } else {
+        None
+    };
+
+    // Copy through a temporary RW mapping, then restore the source VMA's
+    // access bits.  This also handles read-only anonymous mappings without
+    // weakening their final permissions.
+    let destination = match target_range {
+        Some(range) => mm.map_anonymous_exact(range, VmAreaFlags::user_rw()),
+        None => mm.map_anonymous(
+            VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
+            new_rounded,
+            VmAreaFlags::user_rw(),
+        ),
+    };
+    let destination = match destination {
+        Ok(address) => address,
+        Err(_) => return -ENOMEM,
+    };
+    let destination_range = VirtRange::from_bounds(
+        destination.get(),
+        destination.get() + new_rounded,
+    );
+
+    let copy_length = old_rounded.min(new_rounded);
+    let buffer_size = copy_length.min(MAX_BULK_IO_COPY);
+    let mut buffer = Vec::new();
+    if buffer.try_reserve(buffer_size).is_err() {
+        let _ = mm.unmap_range(destination_range);
+        return -ENOMEM;
+    }
+    buffer.resize(buffer_size, 0);
+
+    let mut copied = 0;
+    while copied < copy_length {
+        let chunk = (copy_length - copied).min(buffer.len());
+        let source = old_address + copied;
+        let source_end = source + chunk;
+        let mut page = source & !(PAGE_SIZE - 1);
+        while page < source_end {
+            if mm.populate_page(VirtAddr::new(page)).is_err() {
+                let _ = mm.unmap_range(destination_range);
+                return -EFAULT;
+            }
+            page += PAGE_SIZE;
+        }
+        if mm.copy_from_user(source, &mut buffer[..chunk]).is_err()
+            || mm
+                .copy_to_user(destination.get() + copied, &buffer[..chunk])
+                .is_err()
+        {
+            let _ = mm.unmap_range(destination_range);
+            return -EFAULT;
+        }
+        copied += chunk;
+    }
+
+    if mm
+        .protect_range(destination_range, area.flags().access_only())
+        .is_err()
+    {
+        let _ = mm.unmap_range(destination_range);
+        return -ENOMEM;
+    }
+    if mm.unmap_range(old_range).is_err() {
+        let _ = mm.unmap_range(destination_range);
+        return -ENOMEM;
+    }
+    mremap_success_trace(
+        if fixed { "fixed-move" } else { "move" },
+        old_address,
+        old_rounded,
+        new_rounded,
+        destination.get(),
+    );
+    destination.get() as isize
+}
+
+static MREMAP_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn mremap_success_trace(
+    mode: &str,
+    old_address: usize,
+    old_size: usize,
+    new_size: usize,
+    result: usize,
+) {
+    if oscomp_verbose_user_trace_active()
+        && MREMAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
+    {
+        crate::println!(
+            "mremap: ok mode={} old={:#x}+{:#x} new={:#x} result={:#x}",
+            mode,
+            old_address,
+            old_size,
+            new_size,
+            result,
+        );
+    }
+}
+
 // Separated trace counters: failures print unconditionally up to 64.
 // Successes are rate-limited independently so they don't crowd out failures.
 static MPROTECT_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -6411,13 +6719,15 @@ const TRACE_OK_LIMIT: usize = 8;
 const TRACE_FAIL_LIMIT: usize = 128;
 
 fn mprotect_ok_trace() -> bool {
-    MPROTECT_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
+    oscomp_verbose_user_trace_active()
+        && MPROTECT_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
 }
 fn mprotect_fail_trace() -> bool {
     MPROTECT_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_FAIL_LIMIT
 }
 fn mmap_file_ok_trace() -> bool {
-    MMAP_FILE_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
+    oscomp_verbose_user_trace_active()
+        && MMAP_FILE_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
 }
 fn mmap_file_fail_trace() -> bool {
     MMAP_FILE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_FAIL_LIMIT
@@ -6669,7 +6979,7 @@ fn sys_iov_io(fd: usize, iov_address: usize, iov_count: usize, read: bool) -> is
         };
         let mut done = 0;
         while done < len {
-            let chunk = (len - done).min(MAX_USER_COPY);
+            let chunk = (len - done).min(MAX_BULK_IO_COPY);
             let address = match base.checked_add(done) {
                 Some(address) => address,
                 None => return if total > 0 { total } else { -EFAULT },
@@ -6700,16 +7010,19 @@ fn sys_pread64(fd: usize, address: usize, length: usize, offset: usize) -> isize
         Ok(file) => file,
         Err(errno) => return errno.to_isize(),
     };
-    // Read in chunks: sys_read caps at MAX_USER_COPY, but pread64
-    // must be able to read larger amounts (glibc ld-linux reads
-    // ELF header + program headers in a single pread64 call). Each chunk is a
-    // positioned operation so shared descriptors cannot race their offsets.
+    // Reuse a bulk buffer across the positioned operation.  A 4-KiB internal
+    // loop multiplied VFS locking, seek/restore and virtio traffic for archive
+    // readers even though Linux permits a much larger single pread64.
     let mut total: usize = 0;
     let mut remaining = length;
+    let buffer_size = remaining.min(MAX_BULK_IO_COPY);
+    let mut chunk_buf = Vec::new();
+    if chunk_buf.try_reserve_exact(buffer_size).is_err() {
+        return -ENOMEM;
+    }
+    chunk_buf.resize(buffer_size, 0);
     while remaining > 0 {
-        let chunk = remaining.min(MAX_USER_COPY);
-        // Build a chunk-sized buffer and read into it.
-        let mut chunk_buf = [0_u8; MAX_USER_COPY];
+        let chunk = remaining.min(chunk_buf.len());
         let mut output = myos_vfs::MutableIoBuffer::new(&mut chunk_buf[..chunk]);
         let chunk_offset = match offset.checked_add(total) {
             Some(chunk_offset) => chunk_offset,
@@ -6772,9 +7085,14 @@ fn sys_sendfile(out_fd: usize, in_fd: usize, offset_address: usize, count: usize
 
     let mut total = 0_usize;
     let mut remaining = count;
+    let buffer_size = remaining.min(MAX_BULK_IO_COPY);
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(buffer_size).is_err() {
+        return -ENOMEM;
+    }
+    buffer.resize(buffer_size, 0);
     while remaining != 0 {
-        let chunk = remaining.min(MAX_USER_COPY);
-        let mut buffer = [0_u8; MAX_USER_COPY];
+        let chunk = remaining.min(buffer.len());
         let mut read_buf = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
         let read = match input.read(&mut read_buf) {
             Ok(0) => break,
@@ -7121,6 +7439,7 @@ fn sys_clone_canonical(
     // CLONE_ARCH_ARGUMENT_ORDER_V1
     const CSIGNAL_MASK: usize = 0xff;
     const CLONE_VM: usize = 0x0000_0100;
+    const CLONE_VFORK: usize = 0x0000_4000;
     const CLONE_THREAD: usize = 0x0001_0000;
     const CLONE_SETTLS: usize = 0x0008_0000;
     const CLONE_PARENT_SETTID: usize = 0x0010_0000;
@@ -7129,6 +7448,7 @@ fn sys_clone_canonical(
 
     let wants_thread = flags & CLONE_THREAD != 0;
     let wants_vm_share = flags & CLONE_VM != 0;
+    let wants_vfork = flags & CLONE_VFORK != 0;
     let wants_tls = flags & CLONE_SETTLS != 0;
     let wants_child_cleartid = flags & CLONE_CHILD_CLEARTID != 0;
     let wants_child_settid = flags & CLONE_CHILD_SETTID != 0;
@@ -7150,6 +7470,18 @@ fn sys_clone_canonical(
                 Err(_) => return -ENOMEM,
             };
         (Arc::clone(&parent), child_thread)
+    } else if wants_vm_share {
+        let child = match parent.fork_child_shared_mm(wants_vfork) {
+            Ok(child) => child,
+            Err(_) => return -ENOMEM,
+        };
+        let child_thread = match child
+            .create_initial_thread(current_thread.entry(), current_thread.user_stack())
+        {
+            Ok(thread) => thread,
+            Err(_) => return -ENOMEM,
+        };
+        (child, child_thread)
     } else {
         let child_mm = match parent.mm().fork_clone_eager() {
             Ok(mm) => mm,
@@ -7218,6 +7550,13 @@ fn sys_clone_canonical(
     child_thread.save_trap_frame(child_frame);
     let child_tid = child_thread.id().get();
     let _task = crate::task::spawn_user_thread_from_user_trap(child_thread);
+
+    // A vfork parent must not resume in the shared address space until the
+    // child either installs a private exec image or exits.  Waiting only after
+    // the child is runnable avoids the classic vfork parent/child deadlock.
+    if wants_vfork && wants_vm_share && !wants_thread {
+        child.wait_vfork_done();
+    }
 
     if oscomp_lifecycle_trace_allow() {
         crate::println!(
@@ -7670,6 +8009,7 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     drop(old_mm);
     set_frame_entry(frame, prepared.entry.get());
     set_frame_stack_pointer(frame, prepared.stack_pointer.get());
+    process.complete_vfork();
     0
 }
 
@@ -8397,7 +8737,15 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
                 return child_pid as isize;
             }
             Ok(None) if !process.has_child(requested) => return -ECHILD,
-            Ok(None) if options & WNOHANG != 0 => return 0,
+            Ok(None) if options & WNOHANG != 0 => {
+                // Polling supervisors such as GNU timeout can issue wait4
+                // with WNOHANG in a tight loop.  Preserve the required zero
+                // result, but hand the current run queue to the child first;
+                // this prevents the poller and a freshly spawned Cargo/rustc
+                // task on the same CPU from wasting alternating timer quanta.
+                crate::task::yield_from_user_trap();
+                return 0;
+            }
             Ok(None) => {
                 let _ = crate::task::block_current_on_if_from_user_trap(
                     process.child_wait_queue(),
@@ -10233,15 +10581,17 @@ fn sys_ioctl(fd: usize, command: usize, argument: usize) -> isize {
     match file.ioctl(command, argument) {
         Ok(value) => value as isize,
         Err(errno) => {
-            crate::println!(
-                "ioctl-fail: pid={} tid={} fd={} cmd={:#x} arg={:#x} errno={}",
-                current_process().id().get(),
-                crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
-                fd,
-                command,
-                argument,
-                errno.to_isize(),
-            );
+            if oscomp_verbose_user_trace_active() {
+                crate::println!(
+                    "ioctl-fail: pid={} tid={} fd={} cmd={:#x} arg={:#x} errno={}",
+                    current_process().id().get(),
+                    crate::task::current_user_thread().map_or(0, |thread| thread.id().get()),
+                    fd,
+                    command,
+                    argument,
+                    errno.to_isize(),
+                );
+            }
             errno.to_isize()
         }
     }
@@ -10273,9 +10623,14 @@ fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
         Err(errno) => return errno.to_isize(),
     };
     let mut total = 0_usize;
-    let mut data = [0_u8; MAX_USER_COPY];
+    let buffer_size = count.min(MAX_BULK_IO_COPY);
+    let mut data = Vec::new();
+    if data.try_reserve_exact(buffer_size).is_err() {
+        return -ENOMEM;
+    }
+    data.resize(buffer_size, 0);
     while total < count {
-        let chunk = (count - total).min(MAX_USER_COPY);
+        let chunk = (count - total).min(data.len());
         let source = match buf.checked_add(total) {
             Some(source) => source,
             None => break,
@@ -10620,9 +10975,10 @@ pub(crate) fn run_scheduled_thread(thread: &crate::process::Thread) -> isize {
 
     if let Some(frame) = thread.take_trap_frame() {
         #[cfg(target_arch = "loongarch64")]
-        if OSCOMP_LA_ENTER_DIAG_BUDGET
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
-            .is_ok()
+        if oscomp_verbose_user_trace_active()
+            && OSCOMP_LA_ENTER_DIAG_BUDGET
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
+                .is_ok()
         {
             crate::println!(
                 "oscomp-la-enter-clone-frame: pid={} tid={} era={:#x} sp={:#x} r1={:#x} r2={:#x} r22={:#x} r23={:#x} r24={:#x} r25={:#x} r26={:#x}",

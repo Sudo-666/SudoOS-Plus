@@ -860,6 +860,13 @@ fn oscomp_materialize_ext4_dir_flat(
 /// on a path under /mnt/sdcard, try installing the parent directory's
 /// children from ext4 before giving up.
 pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
+    // BuildStorm remounts /mnt/sdcard as a native lazy ext4 overlay. Its VFS
+    // lookup already resolves children and symlinks directly from ext4, so
+    // the legacy tmpfs materializer is both redundant and harmful there.
+    if fs::is_ext4_overlay_directory("/mnt/sdcard") {
+        return false;
+    }
+
     let rel = match vfs_path.strip_prefix("/mnt/sdcard/") {
         Some(r) if !r.is_empty() => r,
         _ => return false,
