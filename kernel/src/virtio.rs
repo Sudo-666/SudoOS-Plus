@@ -335,11 +335,167 @@ unsafe impl Hal for SudoHal {
     }
 }
 
+// BUILDSTORM_BLOCK_IO_FASTPATH_V16
+const BLOCK_IO_BOUNCE_BYTES: usize = 1024 * 1024;
+
+struct BlockIoBounce {
+    allocation: PageAllocation,
+    capacity: usize,
+}
+
+impl BlockIoBounce {
+    fn new(capacity: usize) -> Result<Self, BlockError> {
+        if capacity == 0 || capacity % SECTOR_SIZE != 0 {
+            return Err(BlockError::InvalidArgument);
+        }
+
+        let pages = capacity
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(BlockError::AddressOverflow)?
+            / PAGE_SIZE;
+        let rounded_pages = pages
+            .checked_next_power_of_two()
+            .ok_or(BlockError::AddressOverflow)?;
+        let order = rounded_pages.trailing_zeros() as usize;
+        let allocation =
+            page_alloc::allocate(order, PageAllocationOptions::dma32_zeroed())
+                .map_err(|_| BlockError::MetadataOutOfMemory)?;
+
+        if allocation.size() < capacity {
+            let _ = page_alloc::free(allocation);
+            return Err(BlockError::MetadataOutOfMemory);
+        }
+
+        Ok(Self {
+            allocation,
+            capacity,
+        })
+    }
+
+    fn buffer_mut(&mut self, length: usize) -> Result<&mut [u8], BlockError> {
+        if length == 0 || length > self.capacity {
+            return Err(BlockError::InvalidArgument);
+        }
+
+        let pointer = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(
+            self.allocation.range().start(),
+        )
+        .map_err(|_| BlockError::InvalidArgument)?;
+
+        // SAFETY: this device owns the contiguous DMA32 allocation for the
+        // kernel lifetime, and the block lock provides exclusive access.
+        Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
+    }
+}
+
+struct VirtioBlockState<T: Transport + Send + 'static> {
+    driver: VirtIOBlk<SudoHal, T>,
+    bounce: Option<BlockIoBounce>,
+}
+
 struct VirtioBlockDevice<T: Transport + Send + 'static> {
-    driver: IrqSpinLock<VirtIOBlk<SudoHal, T>>,
+    state: IrqSpinLock<VirtioBlockState<T>>,
     block_count: u64,
     read_only: bool,
     _mmio_mapping: Option<crate::vm::KernelIoMapping>,
+}
+
+impl<T: Transport + Send + 'static> VirtioBlockDevice<T> {
+    fn new(
+        driver: VirtIOBlk<SudoHal, T>,
+        block_count: u64,
+        read_only: bool,
+        mmio_mapping: Option<crate::vm::KernelIoMapping>,
+    ) -> Self {
+        let bounce = BlockIoBounce::new(BLOCK_IO_BOUNCE_BYTES).ok();
+        crate::println!(
+            "  block DMA bounce: {} KiB",
+            bounce
+                .as_ref()
+                .map_or(0, |buffer| buffer.capacity / 1024),
+        );
+
+        Self {
+            state: IrqSpinLock::new_with_class(
+                VirtioBlockState { driver, bounce },
+                BLK_LOCK,
+            ),
+            block_count,
+            read_only,
+            _mmio_mapping: mmio_mapping,
+        }
+    }
+
+    fn read_dma(
+        &self,
+        block: usize,
+        output: &mut [u8],
+    ) -> Result<(), BlockError> {
+        {
+            let mut state = self.state.lock();
+            let VirtioBlockState { driver, bounce } = &mut *state;
+
+            if let Some(bounce) = bounce.as_mut() {
+                if output.len() <= bounce.capacity {
+                    let buffer = bounce.buffer_mut(output.len())?;
+                    let result = driver
+                        .read_blocks(block, buffer)
+                        .map_err(|_| BlockError::InvalidArgument);
+                    if result.is_ok() {
+                        output.copy_from_slice(buffer);
+                    }
+                    return result;
+                }
+            }
+        }
+
+        let (allocation, buffer) = dma_buffer(output.len())?;
+        let result = self
+            .state
+            .lock()
+            .driver
+            .read_blocks(block, buffer)
+            .map_err(|_| BlockError::InvalidArgument);
+        if result.is_ok() {
+            output.copy_from_slice(buffer);
+        }
+        page_alloc::free(allocation)
+            .map_err(|_| BlockError::InvalidArgument)?;
+        result
+    }
+
+    fn write_dma(
+        &self,
+        block: usize,
+        input: &[u8],
+    ) -> Result<(), BlockError> {
+        {
+            let mut state = self.state.lock();
+            let VirtioBlockState { driver, bounce } = &mut *state;
+
+            if let Some(bounce) = bounce.as_mut() {
+                if input.len() <= bounce.capacity {
+                    let buffer = bounce.buffer_mut(input.len())?;
+                    buffer.copy_from_slice(input);
+                    return driver
+                        .write_blocks(block, buffer)
+                        .map_err(|_| BlockError::InvalidArgument);
+                }
+            }
+        }
+
+        let (allocation, buffer) = dma_buffer(input.len())?;
+        buffer.copy_from_slice(input);
+        let result = self
+            .state
+            .lock()
+            .driver
+            .write_blocks(block, buffer)
+            .map_err(|_| BlockError::InvalidArgument);
+        page_alloc::free(allocation)
+            .map_err(|_| BlockError::InvalidArgument)?;
+        result
+    }
 }
 
 impl<T: Transport + Send + 'static> BlockDevice for VirtioBlockDevice<T> {
@@ -351,54 +507,48 @@ impl<T: Transport + Send + 'static> BlockDevice for VirtioBlockDevice<T> {
         self.block_count
     }
 
-    fn read_block(&self, block: u64, output: &mut [u8]) -> Result<(), BlockError> {
+    fn read_block(
+        &self,
+        block: u64,
+        output: &mut [u8],
+    ) -> Result<(), BlockError> {
         if output.len() != SECTOR_SIZE {
             return Err(BlockError::BufferTooSmall);
         }
         if block >= self.block_count {
             return Err(BlockError::OutOfRange);
         }
-        let block = usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
-        let (allocation, buffer) = dma_sector_buffer()?;
-        let result = self
-            .driver
-            .lock()
-            .read_blocks(block, buffer)
-            .map_err(|_| BlockError::InvalidArgument);
-        if result.is_ok() {
-            output.copy_from_slice(buffer);
-        }
-        page_alloc::free(allocation).map_err(|_| BlockError::InvalidArgument)?;
-        result
+        let block =
+            usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
+        self.read_dma(block, output)
     }
 
-    fn read_blocks(&self, block: u64, output: &mut [u8]) -> Result<(), BlockError> {
+    fn read_blocks(
+        &self,
+        block: u64,
+        output: &mut [u8],
+    ) -> Result<(), BlockError> {
         if output.is_empty() || output.len() % SECTOR_SIZE != 0 {
             return Err(BlockError::BadBlockSize);
         }
-        let sectors =
-            u64::try_from(output.len() / SECTOR_SIZE).map_err(|_| BlockError::AddressOverflow)?;
+        let sectors = u64::try_from(output.len() / SECTOR_SIZE)
+            .map_err(|_| BlockError::AddressOverflow)?;
         if block
             .checked_add(sectors)
             .is_none_or(|end| end > self.block_count)
         {
             return Err(BlockError::OutOfRange);
         }
-        let block = usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
-        let (allocation, buffer) = dma_buffer(output.len())?;
-        let result = self
-            .driver
-            .lock()
-            .read_blocks(block, buffer)
-            .map_err(|_| BlockError::InvalidArgument);
-        if result.is_ok() {
-            output.copy_from_slice(buffer);
-        }
-        page_alloc::free(allocation).map_err(|_| BlockError::InvalidArgument)?;
-        result
+        let block =
+            usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
+        self.read_dma(block, output)
     }
 
-    fn write_block(&self, block: u64, input: &[u8]) -> Result<(), BlockError> {
+    fn write_block(
+        &self,
+        block: u64,
+        input: &[u8],
+    ) -> Result<(), BlockError> {
         if self.read_only {
             return Err(BlockError::DeviceReadOnly);
         }
@@ -408,21 +558,10 @@ impl<T: Transport + Send + 'static> BlockDevice for VirtioBlockDevice<T> {
         if block >= self.block_count {
             return Err(BlockError::OutOfRange);
         }
-        let block = usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
-        let (allocation, buffer) = dma_sector_buffer()?;
-        buffer.copy_from_slice(input);
-        let result = self
-            .driver
-            .lock()
-            .write_blocks(block, buffer)
-            .map_err(|_| BlockError::InvalidArgument);
-        page_alloc::free(allocation).map_err(|_| BlockError::InvalidArgument)?;
-        result
+        let block =
+            usize::try_from(block).map_err(|_| BlockError::AddressOverflow)?;
+        self.write_dma(block, input)
     }
-}
-
-fn dma_sector_buffer() -> Result<(PageAllocation, &'static mut [u8]), BlockError> {
-    dma_buffer(SECTOR_SIZE)
 }
 
 fn dma_buffer(length: usize) -> Result<(PageAllocation, &'static mut [u8]), BlockError> {
@@ -591,12 +730,12 @@ fn probe_mmio_region(region: MmioRegion) -> Result<Option<Arc<dyn BlockDevice>>,
                 block_count,
                 read_only,
             );
-            Ok(Some(Arc::new(VirtioBlockDevice {
-                driver: IrqSpinLock::new_with_class(driver, BLK_LOCK),
+            Ok(Some(Arc::new(VirtioBlockDevice::new(
+                driver,
                 block_count,
                 read_only,
-                _mmio_mapping: Some(mapping),
-            })))
+                Some(mapping),
+            ))))
         }
         DeviceType::EntropySource => {
             let driver = virtio_drivers::device::rng::VirtIORng::<SudoHal, _>::new(transport)
@@ -739,12 +878,12 @@ fn probe_pci_block(
         read_only,
     );
 
-    Ok(Arc::new(VirtioBlockDevice {
-        driver: IrqSpinLock::new_with_class(driver, BLK_LOCK),
+    Ok(Arc::new(VirtioBlockDevice::new(
+        driver,
         block_count,
         read_only,
-        _mmio_mapping: None,
-    }))
+        None,
+    )))
 }
 
 fn probe_pci_rng(

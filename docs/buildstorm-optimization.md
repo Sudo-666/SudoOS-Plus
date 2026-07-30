@@ -247,3 +247,34 @@ watchdog。
 AI 协助完成日志分析、ABI 对照和补丁生成。真实得分必须以评测机输出的
 `BUILDSTORM_COMPILE mode=multi ok=true ... elapsed_s=...` 为准。
 
+## 2026-07-30：BuildStorm 块 I/O 与只读缓存快路径 v16
+
+本轮从稳定基线继续，未修改 UserMm、VMA、调度时钟或官方评分脚本。
+
+### 根因
+
+原 VirtIO block 路径对每次 ext4 批量读取都执行：
+
+1. 从 DMA32 buddy zone 申请 next-power-of-two 连续页；
+2. 将整块内存清零；
+3. 发起 VirtIO I/O；
+4. 复制到调用者；
+5. 归还连续页。
+
+Rust/Cargo 干净构建需要读取大量 sysroot、crate source、rlib 和 metadata，
+上述分配/清零/释放位于正式计时热路径。原 ext4 数据缓存上限只有 256 MiB，
+且没有淘汰；缓存满后余下构建持续退回昂贵的直接读取路径。
+
+### 修复
+
+- 每个 VirtIO block 设备在初始化时申请一个 1 MiB 持久 DMA32 bounce；
+- block lock 同时保护 driver 和 bounce，避免并发复用；
+- 1 MiB 以内的读写不再重复申请、清零和释放 DMA 页；
+- 超过 1 MiB 的请求保留原 fallback，确保兼容；
+- ext4 数据 chunk 从 256 KiB 提升到 1 MiB；
+- ext4 只读数据缓存从 256 MiB 提升到 2 GiB；
+- RV 16 GiB、LoongArch 36 GiB 的正式配置保留充足编译内存。
+
+AI 协助完成热点定位、实现与补丁生成。真实结果必须以评测机原始
+`BUILDSTORM_COMPILE mode=multi ok=true elapsed_s=...` 为准。
+

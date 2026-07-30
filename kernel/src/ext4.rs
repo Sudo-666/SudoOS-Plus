@@ -78,8 +78,9 @@ const MAX_EXT4_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_EXT4_NODES: usize = 65536;
 const MAX_EXT4_DEPTH: usize = 16;
 const MAX_EXTENT_TREE_DEPTH: usize = 5;
-const EXT4_DATA_CACHE_CHUNK_SIZE: usize = 256 * 1024;
-const EXT4_DATA_CACHE_CAPACITY_BYTES: usize = 256 * 1024 * 1024;
+// BUILDSTORM_EXT4_CACHE_V16
+const EXT4_DATA_CACHE_CHUNK_SIZE: usize = 1024 * 1024;
+const EXT4_DATA_CACHE_CAPACITY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ext4Error {
