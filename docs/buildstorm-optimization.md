@@ -227,3 +227,19 @@ watchdog。
 5. 仅依据真实 `elapsed_s` 决定是否继续 COW、文件 demand paging 或 per-CPU allocator，避免无证据优化。
 
 这套实现把 BuildStorm 的性能优化落在通用内核机制上：正确的浮点调度上下文、Linux-like vfork、只读 ext4 缓存、批量 VFS I/O 和可控诊断输出。它们不依赖特定产物名或伪造评分协议，也同时改善普通原生编译和动态 glibc 用户态负载。
+
+## 2026-07-30：BuildStorm 内存回收与工具链 ABI 补齐
+
+本轮只修改内核，不修改官方测试脚本、计时逻辑或评分输出：
+
+- `MADV_DONTNEED`/`MADV_FREE` 在正式 BuildStorm 期间回收匿名驻留页；
+- VMA 容量从 256 提升到 1024；
+- 补齐 `fallocate`、`fadvise64`、`readahead`、`sync_file_range`、
+  `getcpu`、`membarrier`、`copy_file_range`；
+- 正式 BuildStorm 设置 `CARGO_INCREMENTAL=0` 与 `TMPDIR=/tmp`；
+- 未知 syscall 只在 BuildStorm 期间限量输出 48 条；
+- 每 300 秒输出一次低频内核进度，区分慢编译、内存压力与 ABI 阻塞。
+
+AI 协助了日志分析、Linux ABI 对照与补丁生成。真实结果必须以评测机原始
+`BUILDSTORM_COMPILE mode=multi ok=true ...` 及其 `elapsed_s` 为准。
+

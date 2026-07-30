@@ -44,6 +44,13 @@ const SYS_RENAMEAT: usize = crate::syscall::number::RENAMEAT;
 const SYS_UMOUNT2: usize = crate::syscall::number::UMOUNT2;
 const SYS_MOUNT: usize = crate::syscall::number::MOUNT;
 const SYS_FTRUNCATE: usize = crate::syscall::number::FTRUNCATE;
+const SYS_FALLOCATE: usize = crate::syscall::number::FALLOCATE;
+const SYS_SYNC_FILE_RANGE: usize = crate::syscall::number::SYNC_FILE_RANGE;
+const SYS_GETCPU: usize = crate::syscall::number::GETCPU;
+const SYS_READAHEAD: usize = crate::syscall::number::READAHEAD;
+const SYS_FADVISE64: usize = crate::syscall::number::FADVISE64;
+const SYS_MEMBARRIER: usize = crate::syscall::number::MEMBARRIER;
+const SYS_COPY_FILE_RANGE: usize = crate::syscall::number::COPY_FILE_RANGE;
 const SYS_FACCESSAT: usize = crate::syscall::number::FACCESSAT;
 const SYS_FCHMODAT: usize = crate::syscall::number::FCHMODAT;
 const SYS_CHDIR: usize = crate::syscall::number::CHDIR;
@@ -271,6 +278,10 @@ static OSCOMP_PTHREAD_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(8000);
 static OSCOMP_LIFECYCLE_TRACE: AtomicBool = AtomicBool::new(false);
 static OSCOMP_LIFECYCLE_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_VERBOSE_USER_TRACE: AtomicBool = AtomicBool::new(false);
+static BUILDSTORM_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BUILDSTORM_UNKNOWN_BUDGET: AtomicUsize = AtomicUsize::new(0);
+static BUILDSTORM_UNKNOWN_SYSCALLS: AtomicUsize = AtomicUsize::new(0);
+static BUILDSTORM_MADVISE_PAGES: AtomicUsize = AtomicUsize::new(0);
 
 fn oscomp_lifecycle_trace_allow() -> bool {
     OSCOMP_LIFECYCLE_TRACE.load(Ordering::Relaxed)
@@ -2600,6 +2611,26 @@ fn verify_final_buildstorm_diagnostic_thread() {
     verify_final_buildstorm_thread(true);
 }
 
+
+fn final_buildstorm_production_watchdog() {
+    for elapsed in [
+        300_u64, 600, 900, 1_200, 1_500, 1_800,
+        2_100, 2_400, 2_700, 3_000, 3_300, 3_600,
+    ] {
+        crate::timer::sleep(core::time::Duration::from_secs(300));
+        if !BUILDSTORM_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        crate::println!(
+            "buildstorm-kernel-progress: elapsed={}s free_pages={} madvise_pages={} unknown_syscalls={}",
+            elapsed,
+            crate::page_alloc::total_free_pages().unwrap_or(0),
+            BUILDSTORM_MADVISE_PAGES.load(Ordering::Relaxed),
+            BUILDSTORM_UNKNOWN_SYSCALLS.load(Ordering::Relaxed),
+        );
+    }
+}
+
 fn final_buildstorm_lifecycle_watchdog() {
     for elapsed in [120_u64, 240, 360, 480, 600, 720] {
         crate::timer::sleep(core::time::Duration::from_secs(120));
@@ -2851,9 +2882,22 @@ exit 0
         "CARGO_HOME=/root/.cargo",
         "RUSTUP_TOOLCHAIN=nightly-2026-05-28",
         "CARGO_NET_OFFLINE=true",
+        "CARGO_INCREMENTAL=0",
+        "TMPDIR=/tmp",
         "TERM=dumb",
     ];
-    match run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/")) {
+    BUILDSTORM_MADVISE_PAGES.store(0, Ordering::Release);
+    BUILDSTORM_UNKNOWN_SYSCALLS.store(0, Ordering::Release);
+    BUILDSTORM_UNKNOWN_BUDGET.store(48, Ordering::Release);
+    BUILDSTORM_ACTIVE.store(true, Ordering::Release);
+    crate::task::spawn_system_thread_on(
+        final_buildstorm_production_watchdog,
+        crate::smp::CpuId::BOOT,
+    );
+    let buildstorm_result =
+        run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/"));
+    BUILDSTORM_ACTIVE.store(false, Ordering::Release);
+    match buildstorm_result {
         Ok(0) => crate::println!("sudoos-diag: final-buildstorm: script exit=0"),
         Ok(code) => crate::println!("sudoos-diag: final-buildstorm: script exit={}", code),
         Err(error) => crate::println!(
@@ -2861,6 +2905,12 @@ exit 0
             error,
         ),
     }
+    crate::println!(
+        "buildstorm-kernel-summary: free_pages={} madvise_pages={} unknown_syscalls={}",
+        crate::page_alloc::total_free_pages().unwrap_or(0),
+        BUILDSTORM_MADVISE_PAGES.load(Ordering::Relaxed),
+        BUILDSTORM_UNKNOWN_SYSCALLS.load(Ordering::Relaxed),
+    );
 }
 
 fn verify_final_cagent_thread() {
@@ -5482,6 +5532,30 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             sys_fchmodat(arguments[0], arguments[1], arguments[2]),
         ),
         SYS_FTRUNCATE => set_syscall_result(frame, sys_ftruncate(arguments[0], arguments[1])),
+        SYS_FALLOCATE => set_syscall_result(
+            frame,
+            sys_fallocate(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
+        SYS_FADVISE64 => set_syscall_result(
+            frame,
+            sys_fadvise64(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
+        SYS_READAHEAD => set_syscall_result(
+            frame,
+            sys_readahead(arguments[0], arguments[1], arguments[2]),
+        ),
+        SYS_SYNC_FILE_RANGE => set_syscall_result(
+            frame,
+            sys_sync_file_range(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
+        SYS_GETCPU => set_syscall_result(
+            frame,
+            sys_getcpu(arguments[0], arguments[1]),
+        ),
+        SYS_MEMBARRIER => set_syscall_result(
+            frame,
+            sys_membarrier(arguments[0], arguments[1], arguments[2]),
+        ),
         SYS_CHDIR => set_syscall_result(frame, sys_chdir(arguments[0])),
         SYS_OPENAT => {
             let result = sys_openat(arguments[0], arguments[1], arguments[2]);
@@ -5520,6 +5594,17 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             let result = sys_sendfile(arguments[0], arguments[1], arguments[2], arguments[3]);
             set_syscall_result(frame, result);
         }
+        SYS_COPY_FILE_RANGE => set_syscall_result(
+            frame,
+            sys_copy_file_range(
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+                arguments[5],
+            ),
+        ),
         SYS_PWRITE64 => {
             let result = sys_pwrite64(arguments[0], arguments[1], arguments[2], arguments[3]);
             set_syscall_result(frame, result);
@@ -5833,8 +5918,19 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         }
         _ => {
             static UNKNOWN_SYSCALL_PRINTS: AtomicUsize = AtomicUsize::new(0);
-            if oscomp_verbose_user_trace_active()
-                && UNKNOWN_SYSCALL_PRINTS.fetch_add(1, Ordering::Relaxed) < 128
+            let buildstorm_unknown = BUILDSTORM_ACTIVE.load(Ordering::Relaxed);
+            if buildstorm_unknown {
+                BUILDSTORM_UNKNOWN_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            let buildstorm_trace = buildstorm_unknown
+                && BUILDSTORM_UNKNOWN_BUDGET
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        value.checked_sub(1)
+                    })
+                    .is_ok();
+            if (oscomp_verbose_user_trace_active()
+                && UNKNOWN_SYSCALL_PRINTS.fetch_add(1, Ordering::Relaxed) < 128)
+                || buildstorm_trace
             {
                 crate::println!(
                     "unknown-syscall: nr={} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x}",
@@ -6845,22 +6941,71 @@ fn sys_madvise(address: usize, length: usize, advice: usize) -> isize {
     const MADV_SEQUENTIAL: usize = 2;
     const MADV_WILLNEED: usize = 3;
     const MADV_DONTNEED: usize = 4;
-    if !matches!(
-        advice,
-        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED
-    ) {
-        return -EINVAL;
-    }
+    const MADV_FREE: usize = 8;
+    const MADV_DONTFORK: usize = 10;
+    const MADV_DOFORK: usize = 11;
+    const MADV_MERGEABLE: usize = 12;
+    const MADV_UNMERGEABLE: usize = 13;
+    const MADV_HUGEPAGE: usize = 14;
+    const MADV_NOHUGEPAGE: usize = 15;
+    const MADV_DONTDUMP: usize = 16;
+    const MADV_DODUMP: usize = 17;
+    const MADV_WIPEONFORK: usize = 18;
+    const MADV_KEEPONFORK: usize = 19;
+    const MADV_COLD: usize = 20;
+    const MADV_PAGEOUT: usize = 21;
+    const MADV_POPULATE_READ: usize = 22;
+    const MADV_POPULATE_WRITE: usize = 23;
+
     if length == 0 {
         return 0;
     }
-    if address & (PAGE_SIZE - 1) != 0
-        || address.checked_add(length).is_none()
-        || !crate::arch::memory::layout::USER_RANGE.contains(VirtAddr::new(address))
-    {
-        return -EINVAL;
+    let range = match syscall_range(address, length) {
+        Some(range)
+            if crate::arch::memory::layout::USER_RANGE.contains_range(range) =>
+        {
+            range
+        }
+        _ => return -EINVAL,
+    };
+
+    match advice {
+        MADV_DONTNEED | MADV_FREE => {
+            if !BUILDSTORM_ACTIVE.load(Ordering::Acquire) {
+                return 0;
+            }
+            match current_user_mm().discard_anonymous_pages(range) {
+                Ok(discarded) => {
+                    BUILDSTORM_MADVISE_PAGES.fetch_add(discarded, Ordering::Relaxed);
+                    0
+                }
+                // Advice must not make a valid workload fail merely because a
+                // mapping kind cannot be safely reconstructed by this kernel.
+                Err(crate::user_mm::UserMmRuntimeError::PermissionDenied) => 0,
+                Err(crate::user_mm::UserMmRuntimeError::NotMapped) => 0,
+                Err(_) => -ENOMEM,
+            }
+        }
+        MADV_NORMAL
+        | MADV_RANDOM
+        | MADV_SEQUENTIAL
+        | MADV_WILLNEED
+        | MADV_DONTFORK
+        | MADV_DOFORK
+        | MADV_MERGEABLE
+        | MADV_UNMERGEABLE
+        | MADV_HUGEPAGE
+        | MADV_NOHUGEPAGE
+        | MADV_DONTDUMP
+        | MADV_DODUMP
+        | MADV_WIPEONFORK
+        | MADV_KEEPONFORK
+        | MADV_COLD
+        | MADV_PAGEOUT
+        | MADV_POPULATE_READ
+        | MADV_POPULATE_WRITE => 0,
+        _ => -EINVAL,
     }
-    0
 }
 
 fn syscall_range(address: usize, mut length: usize) -> Option<VirtRange> {
@@ -10661,6 +10806,249 @@ fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
             }
         }
     }
+    total as isize
+}
+
+
+// BUILDSTORM_TOOLCHAIN_SYSCALLS_V1
+
+fn sys_fallocate(
+    fd: usize,
+    mode: usize,
+    offset: usize,
+    length: usize,
+) -> isize {
+    const FALLOC_FL_KEEP_SIZE: usize = 0x01;
+
+    if mode & !FALLOC_FL_KEEP_SIZE != 0 {
+        return -crate::syscall::errno::EOPNOTSUPP;
+    }
+    let end = match offset.checked_add(length) {
+        Some(end) if end <= isize::MAX as usize => end,
+        _ => return -EINVAL,
+    };
+    let file = match current_process_file(fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+
+    if mode & FALLOC_FL_KEEP_SIZE != 0 {
+        return 0;
+    }
+    let current_size = match file.fstat() {
+        Ok(stat) if stat.size > 0 => stat.size as u64,
+        Ok(_) => 0,
+        Err(errno) => return errno.to_isize(),
+    };
+    if end as u64 <= current_size {
+        return 0;
+    }
+    match file.truncate(end as u64) {
+        Ok(()) => 0,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
+fn sys_fadvise64(fd: usize, _offset: usize, _length: usize, advice: usize) -> isize {
+    if advice > 5 {
+        return -EINVAL;
+    }
+    match current_process_file(fd) {
+        Ok(_) => 0,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
+fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> isize {
+    match current_process_file(fd) {
+        Ok(_) => 0,
+        Err(errno) => errno.to_isize(),
+    }
+}
+
+fn sys_sync_file_range(
+    fd: usize,
+    _offset: usize,
+    _length: usize,
+    flags: usize,
+) -> isize {
+    const ALLOWED: usize = 1 | 2 | 4;
+    if flags & !ALLOWED != 0 {
+        return -EINVAL;
+    }
+    sys_fsync(fd)
+}
+
+fn sys_getcpu(cpu_address: usize, node_address: usize) -> isize {
+    let cpu = crate::smp::current_cpu_id().get() as u32;
+    let node = 0_u32;
+
+    if cpu_address != 0 && copy_plain_to_user(cpu_address, &cpu) < 0 {
+        return -EFAULT;
+    }
+    if node_address != 0 && copy_plain_to_user(node_address, &node) < 0 {
+        return -EFAULT;
+    }
+    0
+}
+
+fn sys_membarrier(command: usize, flags: usize, _cpu_id: usize) -> isize {
+    const CMD_QUERY: usize = 0;
+    const CMD_GLOBAL: usize = 1 << 0;
+    const CMD_GLOBAL_EXPEDITED: usize = 1 << 1;
+    const CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
+    const CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
+    const CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+    const CMD_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 5;
+    const CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: usize = 1 << 6;
+    const SUPPORTED: usize = CMD_GLOBAL
+        | CMD_GLOBAL_EXPEDITED
+        | CMD_REGISTER_GLOBAL_EXPEDITED
+        | CMD_PRIVATE_EXPEDITED
+        | CMD_REGISTER_PRIVATE_EXPEDITED
+        | CMD_PRIVATE_EXPEDITED_SYNC_CORE
+        | CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE;
+
+    if flags != 0 {
+        return -EINVAL;
+    }
+    if command == CMD_QUERY {
+        return SUPPORTED as isize;
+    }
+    if command & !SUPPORTED != 0 || !command.is_power_of_two() {
+        return -EINVAL;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    0
+}
+
+fn sys_copy_file_range(
+    in_fd: usize,
+    in_offset_address: usize,
+    out_fd: usize,
+    out_offset_address: usize,
+    length: usize,
+    flags: usize,
+) -> isize {
+    if flags != 0 {
+        return -EINVAL;
+    }
+
+    let input = match current_process_file(in_fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+    let output = match current_process_file(out_fd) {
+        Ok(file) => file,
+        Err(errno) => return errno.to_isize(),
+    };
+
+    let input_start = if in_offset_address == 0 {
+        input.position()
+    } else {
+        match copy_plain_from_user::<u64>(in_offset_address) {
+            Ok(offset) if offset <= isize::MAX as u64 => offset,
+            Ok(_) => return -EINVAL,
+            Err(errno) => return errno,
+        }
+    };
+    let output_start = if out_offset_address == 0 {
+        output.position()
+    } else {
+        match copy_plain_from_user::<u64>(out_offset_address) {
+            Ok(offset) if offset <= isize::MAX as u64 => offset,
+            Ok(_) => return -EINVAL,
+            Err(errno) => return errno,
+        }
+    };
+
+    let buffer_size = length.min(MAX_BULK_IO_COPY);
+    if buffer_size == 0 {
+        return 0;
+    }
+    let mut buffer = Vec::new();
+    if buffer.try_reserve_exact(buffer_size).is_err() {
+        return -ENOMEM;
+    }
+    buffer.resize(buffer_size, 0);
+
+    let mut total = 0_usize;
+    while total < length {
+        let chunk = (length - total).min(buffer.len());
+        let input_offset = match input_start.checked_add(total as u64) {
+            Some(offset) => offset,
+            None => return if total == 0 { -EINVAL } else { total as isize },
+        };
+        let output_offset = match output_start.checked_add(total as u64) {
+            Some(offset) => offset,
+            None => return if total == 0 { -EINVAL } else { total as isize },
+        };
+
+        let mut read_buffer = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
+        let read = match input.read_at(input_offset, &mut read_buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(errno) => {
+                return if total == 0 {
+                    errno.to_isize()
+                } else {
+                    total as isize
+                }
+            }
+        };
+
+        let mut written = 0_usize;
+        while written < read {
+            let count = match output.write_at(
+                output_offset + written as u64,
+                &myos_vfs::IoBuffer::new(
+                    &read_buffer.filled_bytes()[written..read],
+                ),
+            ) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(errno) => {
+                    return if total == 0 && written == 0 {
+                        errno.to_isize()
+                    } else {
+                        (total + written) as isize
+                    }
+                }
+            };
+            written += count;
+        }
+
+        total += written;
+        if written != read || read != chunk {
+            break;
+        }
+    }
+
+    let input_end = input_start.saturating_add(total as u64);
+    let output_end = output_start.saturating_add(total as u64);
+
+    if in_offset_address != 0 {
+        if copy_plain_to_user(in_offset_address, &input_end) < 0 {
+            return if total == 0 { -EFAULT } else { total as isize };
+        }
+    } else if input
+        .seek(input_end as i64, myos_vfs::SeekWhence::Set)
+        .is_err()
+    {
+        return if total == 0 { -EINVAL } else { total as isize };
+    }
+
+    if out_offset_address != 0 {
+        if copy_plain_to_user(out_offset_address, &output_end) < 0 {
+            return if total == 0 { -EFAULT } else { total as isize };
+        }
+    } else if output
+        .seek(output_end as i64, myos_vfs::SeekWhence::Set)
+        .is_err()
+    {
+        return if total == 0 { -EINVAL } else { total as isize };
+    }
+
     total as isize
 }
 

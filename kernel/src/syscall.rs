@@ -100,6 +100,14 @@ pub mod number {
     pub const GETRANDOM: usize = 278;
     pub const STATX: usize = 291;
     pub const FTRUNCATE: usize = 46;
+    // BUILDSTORM_TOOLCHAIN_SYSCALLS_V1
+    pub const FALLOCATE: usize = 47;
+    pub const SYNC_FILE_RANGE: usize = 84;
+    pub const GETCPU: usize = 168;
+    pub const READAHEAD: usize = 213;
+    pub const FADVISE64: usize = 223;
+    pub const MEMBARRIER: usize = 283;
+    pub const COPY_FILE_RANGE: usize = 285;
     pub const FUTEX: usize = 98;
     pub const MKNODAT: usize = 33;
     // Socket syscalls (Linux asm-generic)

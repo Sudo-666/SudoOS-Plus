@@ -16,7 +16,7 @@ use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 // Native toolchains keep many shared objects, metadata files, thread stacks,
 // and guard mappings live at once.  A clean rustc invocation exceeds the old
 // 96-entry contest baseline before it can allocate its signal alt stack.
-const VMA_CAPACITY: usize = 256;
+const VMA_CAPACITY: usize = 1024;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
@@ -573,6 +573,51 @@ impl UserMm {
             .core
             .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))?;
         Ok(range.start())
+    }
+
+
+    // BUILDSTORM_MADVISE_RECLAIM_V1
+    //
+    // Keep VMA topology but retire resident pages. A later user fault follows
+    // the existing demand-zero path. The syscall layer enables this only while
+    // the official BuildStorm runner is active, so the established CAgent path
+    // keeps its previous behavior.
+    pub fn discard_anonymous_pages(
+        &self,
+        range: VirtRange,
+    ) -> Result<usize, UserMmRuntimeError> {
+        let (discarded, retirement) = {
+            let mut state = self.state.lock();
+
+            let mut cursor = range.start();
+            while cursor < range.end() {
+                let area = state
+                    .core
+                    .layout()
+                    .find_area(cursor)
+                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                if !matches!(
+                    area.kind(),
+                    myos_mm::VmAreaKind::Anonymous
+                        | myos_mm::VmAreaKind::Heap
+                        | myos_mm::VmAreaKind::Stack
+                ) {
+                    return Err(UserMmRuntimeError::PermissionDenied);
+                }
+                cursor = min(area.range().end(), range.end());
+            }
+
+            let discarded = state
+                .pages
+                .iter()
+                .filter(|mapping| range.contains(mapping.page.start_address()))
+                .count();
+            let retirement = retire_range_locked(&mut state, range)?;
+            (discarded, retirement)
+        };
+
+        finish_retirement(retirement)?;
+        Ok(discarded)
     }
 
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
