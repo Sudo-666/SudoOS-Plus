@@ -5,6 +5,8 @@ fn path_exists(path: &str) -> bool {
 pub fn looks_like_final_image() -> bool {
     path_exists("/mnt/sdcard/glibc/cagent_testcode.sh")
         || path_exists("/mnt/sdcard/musl/cagent_testcode.sh")
+        || path_exists("/mnt/sdcard/glibc/buildstorm_testcode.sh")
+        || path_exists("/mnt/sdcard/musl/buildstorm_testcode.sh")
         || path_exists("/mnt/sdcard/work/tgoskits/Cargo.toml")
 }
 
@@ -28,6 +30,32 @@ pub fn run_lifecycle_stress() -> bool {
     crate::user::verify_task_lifecycle_stress()
 }
 
+// CLOUD_FINAL_IMAGE_CONTRACT_V1
+fn report_final_image_contract() {
+    let paths = [
+        "/mnt/sdcard/glibc/cagent_testcode.sh",
+        "/mnt/sdcard/musl/cagent_testcode.sh",
+        "/mnt/sdcard/glibc/buildstorm_testcode.sh",
+        "/mnt/sdcard/musl/buildstorm_testcode.sh",
+        "/mnt/sdcard/work/tgoskits/Cargo.toml",
+    ];
+
+    crate::println!("final-image-contract:");
+    for path in paths {
+        crate::println!(
+            "  {} = {}",
+            path,
+            if path_exists(path) { "present" } else { "missing" },
+        );
+    }
+
+    let scripts = crate::SCANNED_TEST_SCRIPTS.lock();
+    crate::println!("  scanned-test-scripts = {}", scripts.len());
+    for script in scripts.iter().take(12) {
+        crate::println!("  scanned-script = {}", script);
+    }
+}
+
 pub fn run_all() -> bool {
     // FINAL_PLATFORM_ALL_SCORING_POINTS_V1
     //
@@ -37,6 +65,7 @@ pub fn run_all() -> bool {
     // for a BuildStorm-scoring invocation of the same kernel.  The explicit
     // modes remain available for isolated local regression runs.
     crate::println!("sudoos-diag: entering final-2026 all scoring runners");
+    report_final_image_contract();
     let cagent_ran = run_cagent();
     let buildstorm_ran = run_buildstorm();
     cagent_ran || buildstorm_ran

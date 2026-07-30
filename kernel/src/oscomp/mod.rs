@@ -63,7 +63,14 @@ pub fn select_mode(explicit: Option<RunMode>) -> RunMode {
         return RunMode::FinalAll;
     }
 
-    crate::println!("sudoos-diag: oscomp mode selected: preliminary (default discovery)");
+    // CLOUD_FINAL_MODE_FALLBACK_V1
+    if crate::block::open_device("vda").is_some() {
+        crate::println!(
+            "sudoos-diag: oscomp mode selected: final-all (contest block fallback)"
+        );
+        return RunMode::FinalAll;
+    }
+    crate::println!("sudoos-diag: oscomp mode selected: preliminary (no contest disk)");
     RunMode::Preliminary
 }
 

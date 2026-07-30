@@ -500,7 +500,11 @@ fn mount_sdcard_if_present() {
     let root_entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(&device), "/") {
         Ok(entries) => entries,
         Err(error) => {
+            // CLOUD_EXT4_MOUNT_FAILURE_V1
             crate::println!("sdcard: failed to list ext4 root directory: {error:?}");
+            crate::println!(
+                "sdcard: final-all fallback remains enabled; inspect ext4-super diagnostics above"
+            );
             return;
         }
     };
