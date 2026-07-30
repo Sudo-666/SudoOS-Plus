@@ -228,18 +228,22 @@ watchdog。
 
 这套实现把 BuildStorm 的性能优化落在通用内核机制上：正确的浮点调度上下文、Linux-like vfork、只读 ext4 缓存、批量 VFS I/O 和可控诊断输出。它们不依赖特定产物名或伪造评分协议，也同时改善普通原生编译和动态 glibc 用户态负载。
 
-## 2026-07-30：BuildStorm 内存回收与工具链 ABI 补齐
+## 2026-07-30：BuildStorm 安全冲分补丁 v15
 
-本轮只修改内核，不修改官方测试脚本、计时逻辑或评分输出：
+本轮从已恢复的稳定基线继续，不修改用户地址空间容量，不实现高风险页面回收，
+不修改评测脚本、计时和评分输出。
 
-- `MADV_DONTNEED`/`MADV_FREE` 在正式 BuildStorm 期间回收匿名驻留页；
-- VMA 容量从 256 提升到 1024；
-- 补齐 `fallocate`、`fadvise64`、`readahead`、`sync_file_range`、
-  `getcpu`、`membarrier`、`copy_file_range`；
-- 正式 BuildStorm 设置 `CARGO_INCREMENTAL=0` 与 `TMPDIR=/tmp`；
-- 未知 syscall 只在 BuildStorm 期间限量输出 48 条；
-- 每 300 秒输出一次低频内核进度，区分慢编译、内存压力与 ABI 阻塞。
+修改内容：
 
-AI 协助了日志分析、Linux ABI 对照与补丁生成。真实结果必须以评测机原始
-`BUILDSTORM_COMPILE mode=multi ok=true ...` 及其 `elapsed_s` 为准。
+- 补齐 Rust/Cargo 常见的 asm-generic syscall：
+  `fallocate`、`sync_file_range`、`getcpu`、`readahead`、
+  `fadvise64`、`membarrier`、`copy_file_range`；
+- 扩充只作为 hint 的 `madvise` 取值，保持非破坏性行为；
+- 正式 BuildStorm 环境设置 `CARGO_INCREMENTAL=0`、`TMPDIR=/tmp`；
+- 使用 Cargo 官方 `CARGO_TERM_QUIET`、`CARGO_TERM_COLOR` 和
+  `CARGO_TERM_PROGRESS_WHEN` 降低同步串口输出；
+- 只在 BuildStorm 执行期间打印最多 32 条未知 syscall，并在脚本退出后汇总。
+
+AI 协助完成日志分析、ABI 对照和补丁生成。真实得分必须以评测机输出的
+`BUILDSTORM_COMPILE mode=multi ok=true ... elapsed_s=...` 为准。
 

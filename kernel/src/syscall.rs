@@ -100,7 +100,7 @@ pub mod number {
     pub const GETRANDOM: usize = 278;
     pub const STATX: usize = 291;
     pub const FTRUNCATE: usize = 46;
-    // BUILDSTORM_TOOLCHAIN_SYSCALLS_V1
+    // BUILDSTORM_SAFE_ABI_V15
     pub const FALLOCATE: usize = 47;
     pub const SYNC_FILE_RANGE: usize = 84;
     pub const GETCPU: usize = 168;
