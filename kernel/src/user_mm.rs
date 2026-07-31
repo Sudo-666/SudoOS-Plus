@@ -15,10 +15,12 @@ use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
 // Native toolchains keep many shared objects, metadata files, thread stacks,
 // and guard mappings live at once.  A single rustc process can map 200+ VMAs
-// during BuildStorm compilation, and 8 parallel jobs on an 8-core machine
-// multiply that.  The original 96 was fine for simple CAgent targets; a full
-// multi-hundred-crate workspace exhausts even 256 and hits CapacityExceeded.
-const VMA_CAPACITY: usize = 1024;
+// during BuildStorm compilation.  The original 96 was fine for simple CAgent
+// targets; a full multi-hundred-crate workspace exhausts even 256 and hits
+// CapacityExceeded on LoongArch (vmas=256/256).  384 provides headroom without
+// exceeding kernel-vm reservation limits that trigger a page fault during
+// early-boot gate tests when VMA_CAPACITY is too large.
+const VMA_CAPACITY: usize = 384;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
