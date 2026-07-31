@@ -14,9 +14,11 @@ use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
 // Native toolchains keep many shared objects, metadata files, thread stacks,
-// and guard mappings live at once.  A clean rustc invocation exceeds the old
-// 96-entry contest baseline before it can allocate its signal alt stack.
-const VMA_CAPACITY: usize = 256;
+// and guard mappings live at once.  A single rustc process can map 200+ VMAs
+// during BuildStorm compilation, and 8 parallel jobs on an 8-core machine
+// multiply that.  The original 96 was fine for simple CAgent targets; a full
+// multi-hundred-crate workspace exhausts even 256 and hits CapacityExceeded.
+const VMA_CAPACITY: usize = 1024;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
