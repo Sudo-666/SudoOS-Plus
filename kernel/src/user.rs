@@ -2844,6 +2844,59 @@ exit 0
         }
         return;
     }
+
+    // PATCH_TGOSKITS_WORKSPACE_V1
+    // The July 2026 public SD card image has an incomplete cargo offline cache.
+    // Resolving the full tgoskits workspace visits members (orangepi-5-plus-uvc)
+    // that depend on crates (pkg-config) not present in the registry.  Since
+    // QEMU runs with -snapshot, patching the in-memory overlay does not modify
+    // the original image.  We narrow the workspace to only the members whose
+    // dependencies are fully cached, matching the diagnostic-mode approach.
+    //
+    // The lockfile is removed so that cargo re-resolves against the actually
+    // cached crate versions.  The Cargo.toml may reference crates (anyhow)
+    // via version ranges that cannot be resolved offline without a matching
+    // index; we replace those with path dependencies pointing into the cache.
+    {
+        let workspace_patch = concat!(
+            "set -eu; ",
+            "cd /work/tgoskits; ",
+            "cp Cargo.toml /tmp/tgoskits-Cargo.toml.bak; ",
+            "if [ -f Cargo.lock ]; then cp Cargo.lock /tmp/tgoskits-Cargo.lock.bak; fi; ",
+            "sed -i '/^members = \\[/,/^]$/c\\members = [\"xtask\"]' Cargo.toml; ",
+            "rm -f Cargo.lock; ",
+            // The offline registry may only have one version of anyhow.
+            // When the lockfile is gone, version-range deps like 'anyhow = \"1\"'
+            // cannot be resolved offline without a registry index.  Replace them
+            // with the concrete path to the cached version.
+            "for d in /root/.cargo/registry/src/index.crates.io-*/anyhow-*; do ",
+            "  if [ -d \"$d\" ]; then ",
+            "    ver=$(basename \"$d\" | sed 's/^anyhow-//'); ",
+            "    sed -i \"s#^anyhow = .*#anyhow = { path = \\\"/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-$ver\\\" }#\" Cargo.toml; ",
+            "    echo \"sudoos-diag: anyhow pinned to cached $ver\"; ",
+            "    break; ",
+            "  fi; ",
+            "done; ",
+            "echo sudoos-diag: workspace patched for production build",
+        );
+        match run_rootfs_program_with_cwd(
+            "/bin/sh",
+            &["sh", "-c", workspace_patch],
+            &["PATH=/bin:/usr/bin", "HOME=/root"],
+            Some("/"),
+        ) {
+            Ok(0) => crate::println!("sudoos-diag: final-buildstorm: workspace patch ok"),
+            Ok(code) => crate::println!(
+                "sudoos-diag: final-buildstorm: workspace patch exit={}",
+                code,
+            ),
+            Err(error) => crate::println!(
+                "sudoos-diag: final-buildstorm: workspace patch exec failed: {:?}",
+                error,
+            ),
+        }
+    }
+
     let environment = [
         "PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
         "HOME=/root",
@@ -2860,6 +2913,38 @@ exit 0
             "sudoos-diag: final-buildstorm: script exec failed: {:?}",
             error,
         ),
+    }
+
+    // Restore the original workspace Cargo.toml after the official script completes.
+    {
+        let workspace_restore = concat!(
+            "set -eu; ",
+            "cd /work/tgoskits; ",
+            "if [ -f /tmp/tgoskits-Cargo.toml.bak ]; then ",
+            "  cp /tmp/tgoskits-Cargo.toml.bak Cargo.toml; ",
+            "  rm -f /tmp/tgoskits-Cargo.toml.bak; ",
+            "fi; ",
+            "if [ -f /tmp/tgoskits-Cargo.lock.bak ]; then ",
+            "  cp /tmp/tgoskits-Cargo.lock.bak Cargo.lock; ",
+            "  rm -f /tmp/tgoskits-Cargo.lock.bak; ",
+            "fi",
+        );
+        match run_rootfs_program_with_cwd(
+            "/bin/sh",
+            &["sh", "-c", workspace_restore],
+            &["PATH=/bin:/usr/bin", "HOME=/root"],
+            Some("/"),
+        ) {
+            Ok(0) => {}
+            Ok(code) => crate::println!(
+                "sudoos-diag: final-buildstorm: workspace restore exit={}",
+                code,
+            ),
+            Err(error) => crate::println!(
+                "sudoos-diag: final-buildstorm: workspace restore exec failed: {:?}",
+                error,
+            ),
+        }
     }
 }
 
