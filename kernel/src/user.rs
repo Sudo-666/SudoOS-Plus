@@ -17,7 +17,12 @@ const USER_HEAP_LIMIT: usize = 0x0000_0000_00FF_0000;
 const USER_STACK: usize = 0x0000_0000_0080_0000;
 const USER_MMAP_START: usize = 0x0000_0000_0100_0000;
 const USER_STACK_TOP: usize = USER_STACK + PAGE_SIZE;
-const RUNTIME_STACK: usize = USER_HEAP_LIMIT;
+// The stack and heap share the gap between USER_HEAP_START and USER_MMAP_START
+// (0x0060_0000–0x0100_0000 = 10 MiB).  Default to an 8 MiB stack so rustc's deep
+// call chains do not hit a SIGSEGV during BuildStorm compilation.  The heap can
+// still use the first 2 MiB before brk bumps into the stack guard gap; glibc's
+// malloc already prefers mmap for allocations ≥128 KiB, keeping brk usage modest.
+const RUNTIME_STACK: usize = 0x0000_0000_0080_0000;
 const RUNTIME_STACK_TOP: usize = USER_MMAP_START;
 // Leave the top 4 GiB of the smallest supported user address space unused.
 // Rustc maps enough metadata and shared objects to exhaust the former 1 GiB
