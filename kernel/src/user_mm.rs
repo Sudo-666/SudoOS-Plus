@@ -15,12 +15,11 @@ use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
 // Native toolchains keep many shared objects, metadata files, thread stacks,
 // and guard mappings live at once.  A single rustc process can map 200+ VMAs
-// during BuildStorm compilation.  The original 96 was fine for simple CAgent
-// targets; a full multi-hundred-crate workspace exhausts even 256 and hits
-// CapacityExceeded on LoongArch (vmas=256/256).  384 provides headroom without
-// exceeding kernel-vm reservation limits that trigger a page fault during
-// early-boot gate tests when VMA_CAPACITY is too large.
-const VMA_CAPACITY: usize = 384;
+// during BuildStorm compilation, and the original 96-entry contest baseline
+// exhausts at 256 on LoongArch (vmas=256/256) mid-compile.  `UserAddressSpace`
+// is built in place on the heap (`new_in_box`), so a 1024-entry VMA table is
+// never materialized on the 64 KiB kernel stack and cannot overflow it.
+const VMA_CAPACITY: usize = 1024;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
@@ -161,10 +160,10 @@ impl UserMm {
     pub fn new(areas: &[VmArea]) -> Result<Self, UserMmRuntimeError> {
         let asid = reserve_asid_for_mm()?;
         let result: Result<Self, UserMmRuntimeError> = (|| {
-            let mut core = Box::new(UserAddressSpace::new(
+            let mut core = UserAddressSpace::new_in_box(
                 crate::arch::memory::layout::USER_RANGE,
                 asid,
-            ));
+            );
 
             // Reject invalid VMA topology before allocating a hardware root so
             // metadata failure cannot leak page-table ownership.
@@ -518,7 +517,10 @@ impl UserMm {
     pub fn set_program_break(&self, new_break: VirtAddr) -> Result<VirtAddr, UserMmRuntimeError> {
         let (current, retirement) = {
             let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
+            // Snapshot on the heap: the derived Clone copies the whole VMA
+            // table through a stack temporary that overflows the 64 KiB
+            // kernel stack at large capacities.
+            let old_layout = state.core.layout().clone_in_box();
             let old = old_layout
                 .program_break()
                 .ok_or(UserMmRuntimeError::InvalidRange)?;
@@ -540,7 +542,9 @@ impl UserMm {
                 match retire_range_locked(&mut state, range) {
                     Ok(retirement) => (current, retirement),
                     Err(error) => {
-                        *state.core.layout_mut() = old_layout;
+                        // Heap-to-heap restore; the destination lives inside
+                        // the boxed UserAddressSpace.
+                        *state.core.layout_mut() = *old_layout;
                         return Err(error);
                     }
                 }
@@ -582,7 +586,7 @@ impl UserMm {
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
+            let old_layout = state.core.layout().clone_in_box();
             state
                 .core
                 .layout_mut()
@@ -591,7 +595,7 @@ impl UserMm {
             match retire_range_locked(&mut state, range) {
                 Ok(retirement) => retirement,
                 Err(error) => {
-                    *state.core.layout_mut() = old_layout;
+                    *state.core.layout_mut() = *old_layout;
                     return Err(error);
                 }
             }
@@ -606,7 +610,7 @@ impl UserMm {
     ) -> Result<(), UserMmRuntimeError> {
         let request = {
             let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
+            let old_layout = state.core.layout().clone_in_box();
             let mapped_count = state
                 .pages
                 .iter()
@@ -688,7 +692,7 @@ impl UserMm {
                 // Calling it a second time can split an already-updated layout
                 // and makes rollback operate on a different topology.
                 if let Err(error) = layout_result {
-                    *state.core.layout_mut() = old_layout;
+                    *state.core.layout_mut() = *old_layout;
                     return Err(UserMmError::from(error).into());
                 }
 
@@ -726,7 +730,7 @@ impl UserMm {
                             let _ = apply_page_protection(page_table, *page, *frame, *old_area);
                         }
                     }
-                    *state.core.layout_mut() = old_layout;
+                    *state.core.layout_mut() = *old_layout;
                     crate::println!(
                         "sudoos-diag: mprotect PTE update failed range=[{:#x},{:#x}) updated={} error={:?}",
                         range.start().get(),

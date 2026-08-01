@@ -142,6 +142,32 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
         }
     }
 
+    /// Build the address space directly inside a fresh heap allocation.
+    ///
+    /// `Box::new(UserAddressSpace::new(..))` materializes the whole
+    /// `[Option<VmArea>; VMA_CAPACITY]` table as a stack temporary first; with
+    /// a capacity of 1024 that table is ~49 KiB and overflows the 64 KiB kernel
+    /// stack during early boot gates.  This form writes the table straight into
+    /// the heap slot and keeps only a pointer on the stack.
+    pub fn new_in_box(user_range: VirtRange, asid: AsidToken) -> alloc::boxed::Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let ptr = alloc::alloc::alloc(layout) as *mut Self;
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+            let this = &mut *ptr;
+            AddressSpace::init_in_place(core::ptr::addr_of_mut!(this.layout), user_range);
+            core::ptr::write(&mut this.asid, asid);
+            core::ptr::write(
+                &mut this.active_cpus,
+                AtomicCpuMask::new(CpuMask::EMPTY),
+            );
+            core::ptr::write(&mut this.tlb_generation, AtomicU64::new(0));
+            alloc::boxed::Box::from_raw(ptr)
+        }
+    }
+
     pub const fn asid(&self) -> AsidToken {
         self.asid
     }

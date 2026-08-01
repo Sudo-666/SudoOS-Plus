@@ -162,6 +162,49 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
         }
     }
 
+    /// Initialize a VmAreaSet in place at `ptr` (uninitialized, 8-aligned
+    /// memory), equivalent to `VmAreaSet::new()`.
+    ///
+    /// Writing each `None` slot directly into the destination avoids
+    /// materializing the `[Option<VmArea>; CAPACITY]` table on the caller's
+    /// stack.  With a large capacity the table alone is tens of KiB, enough
+    /// to overflow a 64 KiB kernel stack when built as a temporary.
+    pub(crate) unsafe fn init_in_place(ptr: *mut Self) {
+        // SAFETY: caller guarantees `ptr` is uninitialized but 8-aligned
+        // storage of size size_of::<Self>().
+        let this = unsafe { &mut *ptr };
+        for slot in this.areas.iter_mut() {
+            *slot = None;
+        }
+        this.len = 0;
+    }
+
+    /// Copy this set's entries directly into `dst` without ever materializing
+    /// the table on the stack.  A derived `Clone` builds a stack temporary the
+    /// size of `[Option<VmArea>; CAPACITY]`, which overflows a 64 KiB kernel
+    /// stack once the capacity grows past a few hundred entries.
+    pub(crate) fn copy_into(&self, dst: &mut Self) {
+        for (destination, source) in dst.areas.iter_mut().zip(self.areas.iter()) {
+            *destination = *source;
+        }
+        dst.len = self.len;
+    }
+
+    /// Snapshot this set into a fresh heap allocation, keeping only a pointer
+    /// on the caller's stack.  Used for rollback backups of the VMA table.
+    pub fn clone_in_box(&self) -> alloc::boxed::Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let ptr = alloc::alloc::alloc(layout) as *mut Self;
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+            let this = &mut *ptr;
+            self.copy_into(this);
+            alloc::boxed::Box::from_raw(ptr)
+        }
+    }
+
     pub const fn len(&self) -> usize {
         self.len
     }

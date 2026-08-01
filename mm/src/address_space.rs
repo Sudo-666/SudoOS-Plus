@@ -65,6 +65,46 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
         }
     }
 
+    /// Initialize an AddressSpace in place at `ptr` (uninitialized, 8-aligned
+    /// memory), equivalent to `AddressSpace::new(user_range)`.
+    ///
+    /// The in-place form exists so `UserAddressSpace::new_in_box` can build a
+    /// large VMA table directly inside its heap allocation instead of on the
+    /// caller's kernel stack.
+    pub(crate) unsafe fn init_in_place(ptr: *mut Self, user_range: VirtRange) {
+        // SAFETY: caller guarantees `ptr` is uninitialized but 8-aligned
+        // storage of size size_of::<Self>().
+        let this = unsafe { &mut *ptr };
+        // SAFETY: `ptr` is uninitialized but 8-aligned storage for Self, and
+        // the callee only writes the VMA table slots.
+        unsafe {
+            VmAreaSet::init_in_place(core::ptr::addr_of_mut!(this.areas));
+        }
+        this.user_range = user_range;
+        this.program_break = None;
+    }
+
+    /// Snapshot this address space into a fresh heap allocation.
+    ///
+    /// `AddressSpace` embeds the whole VMA table; a derived `Clone` copies it
+    /// through a stack temporary that overflows a 64 KiB kernel stack when the
+    /// capacity is large.  This form copies every slot straight into the heap
+    /// and only ever keeps a pointer on the stack.
+    pub fn clone_in_box(&self) -> alloc::boxed::Box<Self> {
+        unsafe {
+            let layout = core::alloc::Layout::new::<Self>();
+            let ptr = alloc::alloc::alloc(layout) as *mut Self;
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+            let this = &mut *ptr;
+            VmAreaSet::copy_into(&self.areas, &mut this.areas);
+            this.user_range = self.user_range;
+            this.program_break = self.program_break;
+            alloc::boxed::Box::from_raw(ptr)
+        }
+    }
+
     pub const fn user_range(&self) -> VirtRange {
         self.user_range
     }
@@ -166,7 +206,10 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
         new_break: VirtAddr,
     ) -> Result<VirtAddr, AddressSpaceError> {
         let old_break = self.program_break;
-        let old_areas = self.areas.clone();
+        // Snapshot on the heap: the derived Clone copies the VMA table through
+        // a stack temporary that overflows a 64 KiB kernel stack at large
+        // capacities.  This is on the brk() hot path.
+        let old_areas = self.areas.clone_in_box();
 
         let result = (|| {
             let current = self.set_program_break(new_break)?;
@@ -193,7 +236,9 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
 
         if result.is_err() {
             self.program_break = old_break;
-            self.areas = old_areas;
+            // Heap-to-heap restore; the destination is this address space's
+            // own VMA table, never a stack temporary.
+            self.areas = *old_areas;
         }
         result
     }
