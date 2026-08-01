@@ -202,7 +202,40 @@ const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
 const F_GETOWN: usize = 9;
 const F_SETOWN: usize = 8;
+const F_GETLK: usize = 5;
+const F_SETLK: usize = 6;
+const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_RDLCK: usize = 0;
+const F_WRLCK: usize = 1;
+const F_UNLCK: usize = 2;
+const SEEK_SET: usize = 0;
+const SEEK_CUR: usize = 1;
+const SEEK_END: usize = 2;
+
+/// Linux `struct flock` layout for the 64-bit LP64 ABI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Flock {
+    l_type: i16,
+    l_whence: i16,
+    l_start: i64,
+    l_len: i64,
+    l_pid: i32,
+}
+
+impl Flock {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `Flock` is a plain-Copy struct with no padding bytes read;
+        // the byte slice is only written back verbatim to the same address.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(*self).cast::<u8>(),
+                core::mem::size_of::<Flock>(),
+            )
+        }
+    }
+}
 const R_OK: usize = 4;
 const W_OK: usize = 2;
 const X_OK: usize = 1;
@@ -10625,6 +10658,41 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
         }
         F_GETOWN => 0,
         F_SETOWN => 0,
+        F_GETLK => {
+            // POSIX record-lock query. Report an unlocked state: the kernel
+            // does not track record locks, and cargo's SQLite-backed
+            // `.global-cache` only needs F_GETLK to observe no conflict.
+            let mut lock = match copy_plain_from_user::<Flock>(argument) {
+                Ok(lock) => lock,
+                Err(errno) => return errno,
+            };
+            if !matches!(lock.l_type as usize, F_RDLCK | F_WRLCK | F_UNLCK) {
+                return -EINVAL;
+            }
+            lock.l_type = F_UNLCK as i16;
+            lock.l_pid = 0;
+            match copy_to_user(argument, lock.as_bytes()) {
+                Ok(()) => 0,
+                Err(()) => -EFAULT,
+            }
+        }
+        F_SETLK | F_SETLKW => {
+            // Accept POSIX record locks without tracking them. Single-process
+            // cache access (cargo `.global-cache`, rustc metadata) never
+            // contends; SQLite requires F_SETLK to succeed or it reports
+            // SQLITE_IOERR_LOCK and cargo drops its last-use cache.
+            let lock = match copy_plain_from_user::<Flock>(argument) {
+                Ok(lock) => lock,
+                Err(errno) => return errno,
+            };
+            if !matches!(lock.l_type as usize, F_RDLCK | F_WRLCK | F_UNLCK)
+                || lock.l_whence as usize > SEEK_END
+                || lock.l_start < 0
+            {
+                return -EINVAL;
+            }
+            0
+        }
         _ => -EINVAL,
     }
 }
