@@ -188,6 +188,76 @@ impl WaitQueue {
         }
     }
 
+    /// Like [`Self::wait_until_deadline`], but blocks through the syscall trap
+    /// path used by futex waits.  The syscall trap may hold the interrupt-save
+    /// guard, so it must not use the task-context variant of `block_current_on`.
+    pub fn wait_until_deadline_from_user_trap<F>(
+        &self,
+        deadline: MonotonicInstant,
+        condition: F,
+    ) -> WaitOutcome
+    where
+        F: Fn() -> bool,
+    {
+        crate::context::assert_task_context();
+        if condition() {
+            return WaitOutcome::Satisfied;
+        }
+        if crate::time::deadline_reached(crate::time::now(), deadline) {
+            return if condition() {
+                WaitOutcome::Satisfied
+            } else {
+                WaitOutcome::TimedOut
+            };
+        }
+
+        let timeout = TimeoutContext {
+            state: AtomicU8::new(TIMEOUT_WAITING),
+            queue: self as *const WaitQueue,
+            task: super::current_task_id(),
+        };
+        let handle = crate::timer::arm_at(
+            deadline,
+            timeout_callback,
+            core::ptr::addr_of!(timeout) as usize,
+        )
+        .unwrap_or_else(|error| panic!("unable to allocate wait timeout: {error:?}"));
+
+        let outcome = loop {
+            if condition() {
+                break WaitOutcome::Satisfied;
+            }
+            if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
+                break if condition() {
+                    WaitOutcome::Satisfied
+                } else {
+                    WaitOutcome::TimedOut
+                };
+            }
+            let _ = super::block_current_on_if_from_user_trap(self, || {
+                !condition() && timeout.state.load(Ordering::Acquire) == TIMEOUT_WAITING
+            });
+        };
+
+        if outcome == WaitOutcome::Satisfied {
+            let _ = timeout.state.compare_exchange(
+                TIMEOUT_WAITING,
+                TIMEOUT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        let _ = crate::timer::cancel_sync(handle);
+
+        if condition() {
+            WaitOutcome::Satisfied
+        } else if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
+            WaitOutcome::TimedOut
+        } else {
+            outcome
+        }
+    }
+
     pub fn wake_one(&self) -> usize {
         super::wake_queue(self, 1)
     }

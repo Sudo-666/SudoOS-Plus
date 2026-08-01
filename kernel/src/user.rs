@@ -9422,8 +9422,12 @@ fn sys_futex(
                     timeout,
                 );
             }
-            // Timed wait: if timeout != 0, sleep a bounded duration and
-            // return ETIMEDOUT without blocking on the futex queue.
+            // Timed wait: block on the futex queue with a real deadline so
+            // FUTEX_WAKE can interrupt the wait, and the timeout returns
+            // ETIMEDOUT only when it actually expires.  The previous 50 ms
+            // busy-sleep stub made every pthread_cond_timedwait cost 50 ms of
+            // wall time, slowing rustc's thread-pool synchronization by
+            // hundreds of times during BuildStorm compilation.
             if timeout != 0 {
                 let ts = match copy_plain_from_user::<KernelTimespec>(timeout) {
                     Ok(ts) => ts,
@@ -9433,12 +9437,17 @@ fn sys_futex(
                     return -EINVAL;
                 }
                 let duration = core::time::Duration::new(ts.sec as u64, ts.nsec as u32);
-                // Cap at 50ms to avoid hanging the contest runner.
-                let capped = core::cmp::min(duration, core::time::Duration::from_millis(50));
-                if !capped.is_zero() {
-                    crate::timer::sleep(capped);
-                }
-                return -(crate::syscall::errno::ETIMEDOUT);
+                let deadline = crate::time::deadline_after(duration);
+                let outcome = queue.waiters.wait_until_deadline_from_user_trap(
+                    deadline,
+                    || queue.wake_sequence.load(Ordering::Acquire) != wake_sequence,
+                );
+                return match outcome {
+                    crate::task::WaitOutcome::TimedOut => {
+                        -(crate::syscall::errno::ETIMEDOUT)
+                    }
+                    _ => 0,
+                };
             }
             // The wake sequence closes the check/enqueue race without doing
             // user-memory access while the scheduler lock is held.
