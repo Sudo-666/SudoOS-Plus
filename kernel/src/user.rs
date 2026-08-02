@@ -9013,6 +9013,26 @@ fn sys_eventfd2(initial_value: usize, flags: usize) -> isize {
     }
 }
 
+/// One fd registered on an epoll instance.
+struct EpollEntry {
+    file: myos_vfs::ArcFile,
+    events: u32,
+    data: u64,
+}
+
+/// Global epoll registry keyed by the epoll instance's `Arc<File>`.
+///
+/// epoll_pwait previously returned 0 unconditionally and never checked fd
+/// readiness, so cargo/mio never drained rustc's stdout pipe.  rustc blocked
+/// writing a full pipe, its worker threads busy-waited for work, and the
+/// whole compile stalled after the first few crates.  The poll() machinery
+/// already existed (used by ppoll/pselect6); wire the registered fd set to it.
+static EPOLL_REGISTRY: crate::irq_lock::IrqSpinLock<Vec<(myos_vfs::ArcFile, Vec<EpollEntry>)>> =
+    crate::irq_lock::IrqSpinLock::new_with_class(
+        Vec::new(),
+        crate::lockdep::LockClass::new("epoll.registry", crate::lockdep::LockRank::WaitQueue, 6),
+    );
+
 struct EpollFile;
 
 impl myos_vfs::FileOperations for EpollFile {}
@@ -9039,14 +9059,72 @@ fn sys_epoll_ctl(epfd: usize, operation: usize, fd: usize, event_address: usize)
     if !matches!(operation, EPOLL_CTL_ADD | EPOLL_CTL_DEL | EPOLL_CTL_MOD) {
         return -EINVAL;
     }
-    if current_process_file(epfd).is_err() || current_process_file(fd).is_err() {
-        return -EBADF;
-    }
+    let epoll = match current_process_file(epfd) {
+        Ok(file) => file,
+        Err(_) => return -EBADF,
+    };
+    let watched = match current_process_file(fd) {
+        Ok(file) => file,
+        Err(_) => return -EBADF,
+    };
+    // EPOLL_CTL_DEL ignores the event argument.
+    let mut events = 0_u32;
+    let mut data = 0_u64;
     if operation != EPOLL_CTL_DEL {
-        let mut event = [0_u8; 12];
-        if event_address == 0 || copy_from_user(event_address, &mut event).is_err() {
+        if event_address == 0 {
             return -EFAULT;
         }
+        let mut event = [0_u8; 12];
+        if copy_from_user(event_address, &mut event).is_err() {
+            return -EFAULT;
+        }
+        events = u32::from_ne_bytes(event[0..4].try_into().expect("epoll events"));
+        data = u64::from_ne_bytes(event[4..12].try_into().expect("epoll data"));
+    }
+
+    let mut registry = EPOLL_REGISTRY.lock();
+    let slot = match registry
+        .iter_mut()
+        .find(|(instance, _)| Arc::ptr_eq(instance, &epoll))
+    {
+        Some(slot) => slot,
+        None => {
+            registry.push((epoll.clone(), Vec::new()));
+            registry.last_mut().expect("registry entry was just pushed")
+        }
+    };
+    let entries = &mut slot.1;
+    match operation {
+        EPOLL_CTL_ADD => {
+            if entries.iter().any(|entry| Arc::ptr_eq(&entry.file, &watched)) {
+                return myos_vfs::Errno::Eexist.to_isize();
+            }
+            entries.push(EpollEntry {
+                file: watched,
+                events,
+                data,
+            });
+        }
+        EPOLL_CTL_MOD => {
+            match entries
+                .iter_mut()
+                .find(|entry| Arc::ptr_eq(&entry.file, &watched))
+            {
+                Some(entry) => {
+                    entry.events = events;
+                    entry.data = data;
+                }
+                None => return myos_vfs::Errno::Enoent.to_isize(),
+            }
+        }
+        EPOLL_CTL_DEL => {
+            let before = entries.len();
+            entries.retain(|entry| !Arc::ptr_eq(&entry.file, &watched));
+            if entries.len() == before {
+                return myos_vfs::Errno::Enoent.to_isize();
+            }
+        }
+        _ => unreachable!(),
     }
     0
 }
@@ -9066,6 +9144,52 @@ fn sys_epoll_pwait(
     if events_address == 0 {
         return -EFAULT;
     }
+    let epoll = match current_process_file(epfd) {
+        Ok(file) => file,
+        Err(_) => return -EBADF,
+    };
+
+    // Readiness check through the same file.poll() path ppoll/pselect6 use.
+    // Readied entries are written as epoll_event { events, data } (12 bytes).
+    let mut ready = 0_isize;
+    let mut events_buf = [0_u8; MAX_USER_COPY];
+    {
+        let registry = EPOLL_REGISTRY.lock();
+        let Some(entries) = registry
+            .iter()
+            .find(|(instance, _)| Arc::ptr_eq(instance, &epoll))
+            .map(|(_, entries)| entries)
+        else {
+            return 0;
+        };
+        for entry in entries.iter() {
+            if ready >= max_events as isize {
+                break;
+            }
+            let requested = myos_vfs::PollEvents::from_bits(entry.events as u16);
+            let polled = entry.file.poll(requested);
+            if polled.is_empty() {
+                continue;
+            }
+            let offset = (ready as usize) * 12;
+            events_buf[offset..offset + 4].copy_from_slice(&(polled.bits() as u32).to_ne_bytes());
+            events_buf[offset + 4..offset + 12].copy_from_slice(&entry.data.to_ne_bytes());
+            ready += 1;
+        }
+    }
+
+    if ready > 0 {
+        let bytes_len = (ready as usize) * 12;
+        if copy_to_user(events_address, &events_buf[..bytes_len]).is_err() {
+            return -EFAULT;
+        }
+        return ready;
+    }
+
+    // No registered fd is ready.  A blocking wait needs pipe/socket wakeup
+    // plumbing that is not wired up yet; yielding once keeps busy-polling
+    // callers (cargo/mio) from hogging the CPU between retries while still
+    // making forward progress once data arrives.
     if timeout_ms != 0 && timeout_ms != usize::MAX {
         crate::task::yield_now();
     }
