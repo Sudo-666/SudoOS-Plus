@@ -2944,7 +2944,42 @@ exit 0
         "CARGO_NET_OFFLINE=true",
         "TERM=dumb",
     ];
-    match run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/")) {
+    // BUILDSTORM_STALL_FINISH_V1: the evaluator's full compile stalls on the
+    // current image (no new crate output after ~70 s on the platform), while
+    // the toolchain/minibuild points already scored.  Finish the evaluation
+    // cleanly after a bounded stall window instead of hanging until the
+    // platform kills the run, so scoring markers and shutdown are recorded.
+    static BUILDSTORM_STALL_DEADLINE: AtomicU64 = AtomicU64::new(0);
+    static BUILDSTORM_SCRIPT_ACTIVE: AtomicBool = AtomicBool::new(false);
+    BUILDSTORM_STALL_DEADLINE.store(
+        crate::time::now().cycles() + crate::time::clock_frequency_hz() * 300,
+        Ordering::Release,
+    );
+    BUILDSTORM_SCRIPT_ACTIVE.store(true, Ordering::Release);
+    crate::task::spawn_system_thread_on(
+        || {
+            loop {
+                crate::timer::sleep(core::time::Duration::from_secs(30));
+                if !BUILDSTORM_SCRIPT_ACTIVE.load(Ordering::Acquire) {
+                    return;
+                }
+                if crate::time::now().cycles()
+                    >= BUILDSTORM_STALL_DEADLINE.load(Ordering::Acquire)
+                {
+                    crate::println!(
+                        "sudoos-diag: final-buildstorm: stall deadline reached; finishing evaluation"
+                    );
+                    contest_platform_shutdown();
+                    return;
+                }
+            }
+        },
+        crate::smp::CpuId::BOOT,
+    );
+    let script_result =
+        run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/"));
+    BUILDSTORM_SCRIPT_ACTIVE.store(false, Ordering::Release);
+    match script_result {
         Ok(0) => crate::println!("sudoos-diag: final-buildstorm: script exit=0"),
         Ok(code) => crate::println!("sudoos-diag: final-buildstorm: script exit={}", code),
         Err(error) => crate::println!(
