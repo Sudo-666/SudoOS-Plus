@@ -11,7 +11,12 @@ use crate::{
     lockdep::{LockClass, LockRank},
 };
 
-const VMALLOC_RESERVATIONS: usize = 128;
+// A parallel rustc process creates substantially more kernel-backed threads
+// than ordinary CAgent workloads (especially on the 12-vCPU LoongArch
+// runner).  Reservations are metadata slots, not eagerly allocated memory;
+// size this table for the legitimate transient stack burst while the reaper
+// performs TLB-safe stack retirement.
+const VMALLOC_RESERVATIONS: usize = 256;
 
 static VMALLOC: IrqSpinLock<Option<KernelVirtualAllocator<VMALLOC_RESERVATIONS>>> =
     IrqSpinLock::new_with_class(None, LockClass::new("vmalloc", LockRank::Vm, 1));

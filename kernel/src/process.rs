@@ -177,6 +177,7 @@ pub struct SignalState {
     pending: AtomicU64,
     blocked: AtomicU64,
     actions: IrqSpinLock<[crate::signal::KernelSigAction; 64]>,
+    waiters: WaitQueue,
 }
 
 impl SignalState {
@@ -188,6 +189,7 @@ impl SignalState {
                 [crate::signal::KernelSigAction::default(); 64],
                 PROCESS_SIGNAL_ACTION_LOCK,
             ),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -209,7 +211,12 @@ impl SignalState {
         }
         let bit = 1_u64 << (signal - 1);
         self.pending.fetch_or(bit, Ordering::AcqRel);
+        self.waiters.wake_all();
         Ok(())
+    }
+
+    pub const fn wait_queue(&self) -> &WaitQueue {
+        &self.waiters
     }
 
     pub fn action(&self, signal: u32) -> Option<crate::signal::KernelSigAction> {
@@ -827,6 +834,7 @@ impl Process {
             // point and must close inherited pipe/jobserver descriptors before
             // the parent observes the zombie.
             let _ = self.files.close_all();
+            crate::user::fcntl_release_process_locks(self.id.get());
         }
         self.thread_exit.wake_all();
         Ok(empty)

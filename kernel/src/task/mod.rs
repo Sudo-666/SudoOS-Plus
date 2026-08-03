@@ -530,8 +530,6 @@ impl Scheduler {
         (0..self.discovered_cpus)
             .filter_map(CpuId::new)
             .filter(|cpu| crate::smp::is_scheduler_active(*cpu))
-            // User tasks are deliberately pinned after their first placement
-            // until the RISC-V trap-anchor migration window is redesigned.
             // Count the task already running on each CPU as well as queued
             // work; considering only queue length repeatedly selected CPU0
             // while other CPUs were idle during parallel rustc builds.
@@ -609,10 +607,6 @@ impl Scheduler {
             exit_visible,
             process_cleanup,
             stack,
-            // Pin after the initial load-balanced placement. On RISC-V a
-            // runnable migration in the narrow anchor-rebuild-to-sret window
-            // can preserve the source CPU's kernel `tp` in sscratch and poison
-            // per-CPU state on the next user trap.
             Some(target),
         );
         if id.0 == self.tasks.len() {

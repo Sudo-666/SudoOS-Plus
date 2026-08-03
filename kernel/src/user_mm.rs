@@ -13,10 +13,12 @@ use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 
-// Native toolchains keep many shared objects, metadata files, thread stacks,
-// and guard mappings live at once.  A clean rustc invocation exceeds the old
-// 96-entry contest baseline before it can allocate its signal alt stack.
-const VMA_CAPACITY: usize = 256;
+// Native toolchains keep many shared objects, allocator arenas, thread stacks,
+// and guard mappings live at once. LoongArch rustc crosses 1024 VMAs while
+// loading librustc_driver and its jemalloc arenas. VmAreaSet stores only live
+// entries on the heap, so this Linux-like ceiling does not preallocate 64K
+// records and does not consume a kernel task's 64-KiB stack.
+const VMA_CAPACITY: usize = 65_536;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
@@ -393,6 +395,72 @@ impl UserMm {
         Ok(physical)
     }
 
+    /// Populate and initialize a loader-owned range while the address space is
+    /// still private and inactive.  Keeping the MM lock across the complete
+    /// ELF segment avoids one lock acquisition, VMA lookup, and page-table
+    /// setup pass per 4 KiB page when execve loads large toolchain binaries.
+    pub(crate) fn load_bytes(
+        &self,
+        address: VirtAddr,
+        input: &[u8],
+    ) -> Result<(), UserMmRuntimeError> {
+        if input.is_empty() {
+            return Ok(());
+        }
+        let end = address
+            .get()
+            .checked_add(input.len())
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let covered = input
+            .len()
+            .checked_add(address.get() & (PAGE_SIZE - 1))
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let page_count = covered
+            .checked_add(PAGE_SIZE - 1)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?
+            / PAGE_SIZE;
+        let mut state = self.state.lock();
+        state
+            .pages
+            .try_reserve(page_count)
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+
+        let mut copied = 0;
+        while copied < input.len() {
+            let current = address
+                .checked_add(copied)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            let area = state
+                .core
+                .layout()
+                .find_area(current)
+                .ok_or(UserMmRuntimeError::PermissionDenied)?;
+            map_zero_page_locked(&mut state, area, current)?;
+            let physical = state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?
+                .translate(current)?
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let in_page = current.get() & (PAGE_SIZE - 1);
+            let chunk = min(PAGE_SIZE - in_page, input.len() - copied);
+            let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
+                .map_err(|_| UserMmRuntimeError::NotMapped)?;
+            // SAFETY: the newly populated translation names RAM owned by this
+            // inactive MM, and the copy is bounded to its current page.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    input.as_ptr().add(copied),
+                    destination,
+                    chunk,
+                );
+            }
+            copied += chunk;
+        }
+        debug_assert_eq!(address.get() + copied, end);
+        Ok(())
+    }
+
     pub fn copy_from_user(
         &self,
         address: usize,
@@ -438,9 +506,23 @@ impl UserMm {
             return Ok(());
         }
 
+        // The overwhelmingly common read(2) destination is an already
+        // resident libc/rustc heap buffer. Keep validation and copying under
+        // one MM lock in that case. The old path called populate_page() for
+        // every page even when present, taking the lock and walking the page
+        // table once per page before validating and walking it all over again.
         {
             let state = self.state.lock();
             validate_range(&state, address, input.len(), FaultAccess::Write)?;
+            let page_table = state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            match validate_mapped_range(page_table, address, input.len()) {
+                Ok(()) => return copy_to_mapped_pages(page_table, address, input),
+                Err(UserMmRuntimeError::NotMapped) => {}
+                Err(error) => return Err(error),
+            }
         }
 
         // Linux uaccess faults in a valid demand-mapped destination. Do the
@@ -463,28 +545,7 @@ impl UserMm {
             .as_ref()
             .ok_or(UserMmRuntimeError::NotMapped)?;
         validate_mapped_range(page_table, address, input.len())?;
-
-        let mut copied = 0;
-        while copied < input.len() {
-            let current = address
-                .checked_add(copied)
-                .ok_or(UserMmRuntimeError::AddressOverflow)?;
-            let physical = page_table
-                .translate(VirtAddr::new(current))?
-                .ok_or(UserMmRuntimeError::NotMapped)?;
-            let in_page = current & (PAGE_SIZE - 1);
-            let chunk = min(PAGE_SIZE - in_page, input.len() - copied);
-            let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
-                .map_err(|_| UserMmRuntimeError::NotMapped)?;
-
-            // SAFETY: VMA permissions and every translated page were checked;
-            // input owns at least `chunk` bytes from this offset.
-            unsafe {
-                core::ptr::copy_nonoverlapping(input.as_ptr().add(copied), destination, chunk);
-            }
-            copied += chunk;
-        }
-        Ok(())
+        copy_to_mapped_pages(page_table, address, input)
     }
 
     pub fn configure_program_break(
@@ -602,24 +663,82 @@ impl UserMm {
     ) -> Result<(), UserMmRuntimeError> {
         let request = {
             let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
-            let mapped_count = state
-                .pages
-                .iter()
-                .filter(|mapping| range.contains(mapping.page.start_address()))
-                .count();
-            let mut changed_pages = Vec::new();
-            changed_pages
-                .try_reserve(mapped_count)
-                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-            for mapping in &state.pages {
-                if !range.contains(mapping.page.start_address()) {
-                    continue;
+
+            // glibc/rustc frequently repeats mprotect() over ranges that
+            // already have the requested access (allocator arenas and thread
+            // stack guards are the main cases). Such a call is observably a
+            // no-op: avoid cloning/rebuilding the VMA table, rewriting the
+            // same PTE bits, and issuing a synchronous cross-CPU shootdown.
+            // Walk by VMA rather than by page so the check stays cheap even
+            // for large mappings, while gaps still fall through to the normal
+            // validation path and return the same error as before.
+            let requested_access = access.access_only();
+            let mut cursor = range.start();
+            let mut already_protected = true;
+            loop {
+                let Some(area) = state.core.layout().find_area(cursor) else {
+                    already_protected = false;
+                    break;
+                };
+                let old_access = area.flags().access_only();
+                if old_access != requested_access {
+                    already_protected = false;
                 }
-                let old_area = old_layout
-                    .find_area(mapping.page.start_address())
-                    .expect("mapped user page has no old VMA");
-                changed_pages.push((mapping.page, old_area, mapping.backing.start()));
+                let next = core::cmp::min(area.range().end(), range.end());
+                if next == range.end() {
+                    break;
+                }
+                cursor = next;
+            }
+            if already_protected {
+                return Ok(());
+            }
+
+            let old_layout = state.core.layout().clone();
+            let mut changed_pages = Vec::new();
+            let range_pages = range
+                .size()
+                .checked_add(PAGE_SIZE - 1)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?
+                / PAGE_SIZE;
+            changed_pages
+                .try_reserve(range_pages)
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+
+            // mprotect is extremely hot in rustc. Scanning every resident page
+            // in the process for each small stack/allocator protection change
+            // made the operation O(total address-space pages). Walk only the
+            // requested virtual range and query the page table directly.
+            let page_table = state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let mut address = range.start().get();
+            while address < range.end().get() {
+                let page_address = VirtAddr::new(address);
+                let page = VirtPage::from_start_address(page_address)
+                    .ok_or(UserMmRuntimeError::InvalidRange)?;
+                let old_area = old_layout.find_area(page_address);
+                let frame = match page_table.translate(page_address)? {
+                    Some(physical) => Some(PhysFrame::from_start_address(physical).ok_or(
+                        UserMmRuntimeError::AddressOverflow,
+                    )?),
+                    None => state
+                        .pages
+                        .iter()
+                        .find(|mapping| mapping.page == page)
+                        .map(|mapping| mapping.backing.start()),
+                };
+                if let Some(frame) = frame {
+                    changed_pages.push((
+                        page,
+                        old_area.expect("mapped user page has no old VMA"),
+                        frame,
+                    ));
+                }
+                address = address
+                    .checked_add(PAGE_SIZE)
+                    .ok_or(UserMmRuntimeError::AddressOverflow)?;
             }
 
             let request = if changed_pages.is_empty() {
@@ -1342,6 +1461,35 @@ fn validate_mapped_range(
             .checked_add(1)
             .ok_or(UserMmRuntimeError::AddressOverflow)?;
         cursor = min(next_page, end);
+    }
+    Ok(())
+}
+
+fn copy_to_mapped_pages(
+    page_table: &RuntimePageTable,
+    address: usize,
+    input: &[u8],
+) -> Result<(), UserMmRuntimeError> {
+    let mut copied = 0;
+    while copied < input.len() {
+        let current = address
+            .checked_add(copied)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let physical = page_table
+            .translate(VirtAddr::new(current))?
+            .ok_or(UserMmRuntimeError::NotMapped)?;
+        let in_page = current & (PAGE_SIZE - 1);
+        let chunk = min(PAGE_SIZE - in_page, input.len() - copied);
+        let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
+            .map_err(|_| UserMmRuntimeError::NotMapped)?;
+
+        // SAFETY: the caller validated write permission and residency for the
+        // complete range while holding the MM lock; input contains `chunk`
+        // bytes from this offset and the translation names owned user RAM.
+        unsafe {
+            core::ptr::copy_nonoverlapping(input.as_ptr().add(copied), destination, chunk);
+        }
+        copied += chunk;
     }
     Ok(())
 }

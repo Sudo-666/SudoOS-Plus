@@ -425,13 +425,18 @@ struct BlkConfig {
 }
 
 /// A VirtIO block device request.
-#[repr(C)]
+// SUDOOS_VIRTIO_BLKREQ_DMA_ALIGN_V1: a 16-byte request must not begin at page+0xff8.
+#[repr(C, align(16))]
 #[derive(Debug, Immutable, IntoBytes, KnownLayout)]
 pub struct BlkReq {
     type_: ReqType,
     reserved: u32,
     sector: u64,
 }
+
+// Keep the VirtIO wire ABI at exactly 16 bytes while forcing safe DMA alignment.
+const _: [(); 16] = [(); core::mem::size_of::<BlkReq>()];
+const _: [(); 16] = [(); core::mem::align_of::<BlkReq>()];
 
 impl Default for BlkReq {
     fn default() -> Self {

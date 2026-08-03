@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::{MappingOptions, PAGE_SIZE, PhysAddr, VirtAddr, VirtRange};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +145,7 @@ pub enum VmAreaError {
     UnalignedRange,
     InvalidFlags,
     CapacityExceeded,
+    MetadataOutOfMemory,
     Overlap,
     NotFound,
     AddressOverflow,
@@ -150,69 +153,106 @@ pub enum VmAreaError {
 
 #[derive(Clone)]
 pub struct VmAreaSet<const CAPACITY: usize> {
-    areas: [Option<VmArea>; CAPACITY],
-    len: usize,
+    areas: Vec<VmArea>,
 }
 
 impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
     pub const fn new() -> Self {
-        Self {
-            areas: [None; CAPACITY],
-            len: 0,
-        }
+        Self { areas: Vec::new() }
     }
 
-    pub const fn len(&self) -> usize {
-        self.len
+    pub fn len(&self) -> usize {
+        self.areas.len()
     }
 
     pub const fn capacity(&self) -> usize {
         CAPACITY
     }
 
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.areas.is_empty()
     }
 
     pub fn area_at(&self, index: usize) -> Option<VmArea> {
-        if index < self.len {
-            self.areas[index]
-        } else {
-            None
-        }
+        self.areas.get(index).copied()
     }
 
     pub fn insert(&mut self, area: VmArea) -> Result<(), VmAreaError> {
         validate_area(area)?;
 
-        if self.len == CAPACITY {
-            return Err(VmAreaError::CapacityExceeded);
-        }
-
         let index = self.insertion_index(area.range().start());
 
         if index > 0 {
-            let previous = self.areas[index - 1].expect("VMA slot below len is empty");
+            let previous = self.areas[index - 1];
 
             if previous.range().overlaps(area.range()) {
                 return Err(VmAreaError::Overlap);
             }
         }
 
-        if index < self.len {
-            let next = self.areas[index].expect("VMA slot below len is empty");
+        if index < self.len() {
+            let next = self.areas[index];
 
             if next.range().overlaps(area.range()) {
                 return Err(VmAreaError::Overlap);
             }
         }
 
-        for slot in (index..self.len).rev() {
-            self.areas[slot + 1] = self.areas[slot];
+        // Linux coalesces adjacent VMAs with identical attributes. This is
+        // essential for allocators such as jemalloc, which issue many
+        // contiguous MAP_FIXED arena mappings; retaining every call as a
+        // separate entry exhausts bounded kernel metadata even though the
+        // resulting address-space topology is simple.
+        let coalescible = matches!(area.kind(), VmAreaKind::Anonymous);
+        let merge_previous = coalescible
+            && index > 0
+            && {
+                let previous = self.areas[index - 1];
+                previous.range().end() == area.range().start()
+                    && previous.flags() == area.flags()
+                    && previous.kind() == area.kind()
+            };
+        let merge_next = coalescible
+            && index < self.len()
+            && {
+                let next = self.areas[index];
+                area.range().end() == next.range().start()
+                    && next.flags() == area.flags()
+                    && next.kind() == area.kind()
+            };
+
+        if merge_previous && merge_next {
+            let previous = self.areas[index - 1];
+            let next = self.areas[index];
+            let range = VirtRange::new(previous.range().start(), next.range().end())
+                .ok_or(VmAreaError::AddressOverflow)?;
+            self.areas[index - 1] = VmArea::new(range, area.flags(), area.kind());
+            self.areas.remove(index);
+            return Ok(());
+        }
+        if merge_previous {
+            let previous = self.areas[index - 1];
+            let range = VirtRange::new(previous.range().start(), area.range().end())
+                .ok_or(VmAreaError::AddressOverflow)?;
+            self.areas[index - 1] = VmArea::new(range, area.flags(), area.kind());
+            return Ok(());
+        }
+        if merge_next {
+            let next = self.areas[index];
+            let range = VirtRange::new(area.range().start(), next.range().end())
+                .ok_or(VmAreaError::AddressOverflow)?;
+            self.areas[index] = VmArea::new(range, area.flags(), area.kind());
+            return Ok(());
         }
 
-        self.areas[index] = Some(area);
-        self.len += 1;
+        if self.len() == CAPACITY {
+            return Err(VmAreaError::CapacityExceeded);
+        }
+
+        self.areas
+            .try_reserve(1)
+            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
+        self.areas.insert(index, area);
 
         Ok(())
     }
@@ -220,18 +260,7 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
     pub fn remove_exact(&mut self, range: VirtRange) -> Result<VmArea, VmAreaError> {
         let index = self.find_exact_index(range).ok_or(VmAreaError::NotFound)?;
 
-        let removed = self.areas[index]
-            .take()
-            .expect("VMA slot below len is empty");
-
-        for slot in index..self.len - 1 {
-            self.areas[slot] = self.areas[slot + 1];
-        }
-
-        self.len -= 1;
-        self.areas[self.len] = None;
-
-        Ok(removed)
+        Ok(self.areas.remove(index))
     }
 
     /// Removes every part of every VMA intersecting `range`.
@@ -242,14 +271,15 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
     pub fn remove_range(&mut self, range: VirtRange) -> Result<usize, VmAreaError> {
         validate_operation_range(range)?;
 
-        let mut rebuilt = [None; CAPACITY];
-        let mut rebuilt_len = 0;
+        let mut rebuilt = Vec::new();
+        rebuilt
+            .try_reserve(core::cmp::min(self.len().saturating_add(1), CAPACITY))
+            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
         let mut affected = 0;
 
-        for index in 0..self.len {
-            let area = self.areas[index].expect("VMA slot below len is empty");
+        for area in self.areas.iter().copied() {
             if !area.range().overlaps(range) {
-                append_area(&mut rebuilt, &mut rebuilt_len, area)?;
+                append_area(&mut rebuilt, area, CAPACITY)?;
                 continue;
             }
 
@@ -259,8 +289,8 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
                     .ok_or(VmAreaError::AddressOverflow)?;
                 append_area(
                     &mut rebuilt,
-                    &mut rebuilt_len,
                     VmArea::new(left, area.flags(), area.kind()),
+                    CAPACITY,
                 )?;
             }
             if range.end() < area.range().end() {
@@ -268,14 +298,13 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
                     .ok_or(VmAreaError::AddressOverflow)?;
                 append_area(
                     &mut rebuilt,
-                    &mut rebuilt_len,
                     VmArea::new(right, area.flags(), area.kind()),
+                    CAPACITY,
                 )?;
             }
         }
 
         self.areas = rebuilt;
-        self.len = rebuilt_len;
         Ok(affected)
     }
 
@@ -293,8 +322,7 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
 
         let mut cursor = range.start();
         let mut affected = 0;
-        for index in 0..self.len {
-            let area = self.areas[index].expect("VMA slot below len is empty");
+        for area in self.areas.iter().copied() {
             if area.range().end() <= cursor || area.range().start() >= range.end() {
                 continue;
             }
@@ -311,12 +339,13 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
             return Err(VmAreaError::NotFound);
         }
 
-        let mut rebuilt = [None; CAPACITY];
-        let mut rebuilt_len = 0;
-        for index in 0..self.len {
-            let area = self.areas[index].expect("VMA slot below len is empty");
+        let mut rebuilt = Vec::new();
+        rebuilt
+            .try_reserve(core::cmp::min(self.len().saturating_add(2), CAPACITY))
+            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
+        for area in self.areas.iter().copied() {
             if !area.range().overlaps(range) {
-                append_area(&mut rebuilt, &mut rebuilt_len, area)?;
+                append_area(&mut rebuilt, area, CAPACITY)?;
                 continue;
             }
 
@@ -325,8 +354,8 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
                     .ok_or(VmAreaError::AddressOverflow)?;
                 append_area(
                     &mut rebuilt,
-                    &mut rebuilt_len,
                     VmArea::new(left, area.flags(), area.kind()),
+                    CAPACITY,
                 )?;
             }
 
@@ -336,8 +365,8 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
                 .ok_or(VmAreaError::AddressOverflow)?;
             append_area(
                 &mut rebuilt,
-                &mut rebuilt_len,
                 VmArea::new(protected, area.flags().with_access(access), area.kind()),
+                CAPACITY,
             )?;
 
             if range.end() < area.range().end() {
@@ -345,41 +374,40 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
                     .ok_or(VmAreaError::AddressOverflow)?;
                 append_area(
                     &mut rebuilt,
-                    &mut rebuilt_len,
                     VmArea::new(right, area.flags(), area.kind()),
+                    CAPACITY,
                 )?;
             }
         }
 
         self.areas = rebuilt;
-        self.len = rebuilt_len;
         Ok(affected)
     }
 
     pub fn remove_kind(&mut self, kind: VmAreaKind) -> Result<usize, VmAreaError> {
-        let mut rebuilt = [None; CAPACITY];
-        let mut rebuilt_len = 0;
+        let mut rebuilt = Vec::new();
+        rebuilt
+            .try_reserve(self.len())
+            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
         let mut removed = 0;
-        for index in 0..self.len {
-            let area = self.areas[index].expect("VMA slot below len is empty");
+        for area in self.areas.iter().copied() {
             if area.kind() == kind {
                 removed += 1;
             } else {
-                append_area(&mut rebuilt, &mut rebuilt_len, area)?;
+                append_area(&mut rebuilt, area, CAPACITY)?;
             }
         }
         self.areas = rebuilt;
-        self.len = rebuilt_len;
         Ok(removed)
     }
 
     pub fn find(&self, address: VirtAddr) -> Option<VmArea> {
         let mut left = 0;
-        let mut right = self.len;
+        let mut right = self.len();
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let area = self.areas[mid].expect("VMA slot below len is empty");
+            let area = self.areas[mid];
 
             if area.range().contains(address) {
                 return Some(area);
@@ -415,8 +443,7 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
             .align_up(alignment)
             .ok_or(VmAreaError::AddressOverflow)?;
 
-        for index in 0..self.len {
-            let area = self.areas[index].expect("VMA slot below len is empty");
+        for area in self.areas.iter().copied() {
 
             if area.range().end() <= candidate {
                 continue;
@@ -454,11 +481,11 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
 
     fn insertion_index(&self, start: VirtAddr) -> usize {
         let mut left = 0;
-        let mut right = self.len;
+        let mut right = self.len();
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let area = self.areas[mid].expect("VMA slot below len is empty");
+            let area = self.areas[mid];
 
             if start < area.range().start() {
                 right = mid;
@@ -471,11 +498,7 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
     }
 
     fn find_exact_index(&self, range: VirtRange) -> Option<usize> {
-        (0..self.len).find(|index| {
-            self.areas[*index]
-                .map(|area| area.range() == range)
-                .unwrap_or(false)
-        })
+        self.areas.iter().position(|area| area.range() == range)
     }
 }
 
@@ -485,14 +508,13 @@ impl<const CAPACITY: usize> Default for VmAreaSet<CAPACITY> {
     }
 }
 
-fn append_area<const CAPACITY: usize>(
-    areas: &mut [Option<VmArea>; CAPACITY],
-    len: &mut usize,
+fn append_area(
+    areas: &mut Vec<VmArea>,
     area: VmArea,
+    capacity: usize,
 ) -> Result<(), VmAreaError> {
     validate_area(area)?;
-    if *len > 0 {
-        let previous = areas[*len - 1].expect("rebuilt VMA slot below len is empty");
+    if let Some(previous) = areas.last().copied() {
         if previous.range().overlaps(area.range())
             || previous.range().start() > area.range().start()
         {
@@ -504,15 +526,15 @@ fn append_area<const CAPACITY: usize>(
         {
             let merged = VirtRange::new(previous.range().start(), area.range().end())
                 .ok_or(VmAreaError::AddressOverflow)?;
-            areas[*len - 1] = Some(VmArea::new(merged, area.flags(), area.kind()));
+            *areas.last_mut().expect("VMA predecessor disappeared") =
+                VmArea::new(merged, area.flags(), area.kind());
             return Ok(());
         }
     }
-    if *len == CAPACITY {
+    if areas.len() == capacity {
         return Err(VmAreaError::CapacityExceeded);
     }
-    areas[*len] = Some(area);
-    *len += 1;
+    areas.push(area);
     Ok(())
 }
 
@@ -613,6 +635,40 @@ mod tests {
                 VmAreaKind::Anonymous,
             )),
             Err(VmAreaError::Overlap),
+        );
+    }
+
+    #[test]
+    fn dynamic_storage_keeps_the_declared_capacity_contract() {
+        const ENTRIES: usize = 2_048;
+        let mut set: VmAreaSet<ENTRIES> = VmAreaSet::new();
+        for index in 0..ENTRIES {
+            let start = 0x1000 + index * PAGE_SIZE * 2;
+            set.insert(VmArea::new(
+                range(start, start + PAGE_SIZE),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            ))
+            .unwrap();
+        }
+        assert_eq!(set.len(), ENTRIES);
+        assert_eq!(
+            set.insert(VmArea::new(
+                range(0x1000 + ENTRIES * PAGE_SIZE * 2, 0x2000 + ENTRIES * PAGE_SIZE * 2),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            )),
+            Err(VmAreaError::CapacityExceeded),
+        );
+
+        let cloned = set.clone();
+        assert_eq!(cloned.len(), ENTRIES);
+        assert_eq!(
+            cloned.area_at(ENTRIES - 1).unwrap().range(),
+            range(
+                0x1000 + (ENTRIES - 1) * PAGE_SIZE * 2,
+                0x2000 + (ENTRIES - 1) * PAGE_SIZE * 2,
+            ),
         );
     }
 

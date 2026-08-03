@@ -46,7 +46,7 @@ impl<const CAPACITY: usize> KernelVirtualAllocator<CAPACITY> {
         self.arena
     }
 
-    pub const fn reservation_count(&self) -> usize {
+    pub fn reservation_count(&self) -> usize {
         self.areas.len()
     }
 

@@ -1,5 +1,7 @@
 #![no_std]
 
+extern crate alloc;
+
 mod address;
 mod address_space;
 mod asid;

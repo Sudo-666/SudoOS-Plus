@@ -69,7 +69,7 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
         self.user_range
     }
 
-    pub const fn area_count(&self) -> usize {
+    pub fn area_count(&self) -> usize {
         self.areas.len()
     }
 

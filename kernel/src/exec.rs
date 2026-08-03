@@ -7,7 +7,10 @@ use myos_mm::{PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 use crate::process::{Process, Thread};
 use crate::user_mm::{UserMm, UserMmRuntimeError};
 
-pub const USER_SIGNAL_TRAMPOLINE: usize = 0x0000_0000_0051_0000;
+// Keep the signal trampoline immediately below the production TLS/stack
+// reservation. Large fixed-address toolchain executables legitimately cover
+// the old low 0x510000 page.
+pub const USER_SIGNAL_TRAMPOLINE: usize = 0x0000_003e_ff7f_e000;
 
 #[cfg(target_arch = "riscv64")]
 const SIGNAL_TRAMPOLINE_BYTES: &[u8] = &[
@@ -427,27 +430,14 @@ fn load_segment(
     image: &[u8],
     segment: crate::elf::LoadSegment,
 ) -> Result<(), ExecError> {
-    let mut copied = 0;
-    while copied < segment.file_size {
-        let virtual_address = segment
-            .virtual_address
-            .checked_add(copied)
-            .ok_or(ExecError::AddressOverflow)?;
-        let in_page = virtual_address.get() & (PAGE_SIZE - 1);
-        let chunk = core::cmp::min(PAGE_SIZE - in_page, segment.file_size - copied);
-        let source_offset = segment
-            .file_offset
-            .checked_add(copied)
-            .ok_or(ExecError::AddressOverflow)?;
-        loader_copy_to_user_physical(
-            mm,
-            virtual_address,
-            image
-                .get(source_offset..source_offset + chunk)
-                .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?,
-        )?;
-        copied += chunk;
-    }
+    let source_end = segment
+        .file_offset
+        .checked_add(segment.file_size)
+        .ok_or(ExecError::AddressOverflow)?;
+    let source = image
+        .get(segment.file_offset..source_end)
+        .ok_or(ExecError::Elf(crate::elf::ElfError::InvalidSegment))?;
+    mm.load_bytes(segment.virtual_address, source)?;
 
     let page_start = segment
         .virtual_address
@@ -1117,24 +1107,7 @@ fn loader_copy_to_user_physical(
     address: VirtAddr,
     bytes: &[u8],
 ) -> Result<(), ExecError> {
-    let mut copied = 0;
-    while copied < bytes.len() {
-        let current = address
-            .checked_add(copied)
-            .ok_or(ExecError::AddressOverflow)?;
-        let in_page = current.get() & (PAGE_SIZE - 1);
-        let chunk = core::cmp::min(PAGE_SIZE - in_page, bytes.len() - copied);
-        let physical = mm.populate_page(current)?;
-        let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
-            .map_err(|_| UserMmRuntimeError::NotMapped)?;
-        // SAFETY: `populate_page` returned the RAM address for this exact user
-        // VA and this iteration is bounded to the containing page.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr().add(copied), destination, chunk);
-        }
-        copied += chunk;
-    }
-    Ok(())
+    mm.load_bytes(address, bytes).map_err(ExecError::from)
 }
 
 fn destroy_unique_process(process: Arc<Process>) -> Result<(), ExecError> {

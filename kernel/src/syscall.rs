@@ -22,7 +22,11 @@ pub mod number {
     pub const UMOUNT2: usize = 39;
     pub const MOUNT: usize = 40;
     pub const FACCESSAT: usize = 48;
+    pub const FCHDIR: usize = 50;
+    pub const FCHMOD: usize = 52;
     pub const FCHMODAT: usize = 53;
+    pub const FCHOWNAT: usize = 54;
+    pub const FCHOWN: usize = 55;
     pub const CHDIR: usize = 49;
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
@@ -85,6 +89,7 @@ pub mod number {
     pub const MREMAP: usize = 216;
     pub const CLONE: usize = 220;
     pub const CLONE3: usize = 435;
+    pub const FACCESSAT2: usize = 439;
     pub const RSEQ: usize = 293;
     pub const SIGALTSTACK: usize = 132;
     pub const EXECVE: usize = 221;
