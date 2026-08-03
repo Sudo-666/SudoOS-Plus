@@ -9391,11 +9391,14 @@ fn current_time_ns() -> u128 {
     (u128::from(cycles) * 1_000_000_000_u128) / u128::from(crate::time::clock_frequency_hz())
 }
 
+fn clock_base_realtime_seconds() -> u128 {
+    1_767_225_600 // 2026-01-01 UTC
+}
+
 fn clock_time_ns(clock_id: usize) -> u128 {
-    const FALLBACK_REALTIME_SECONDS: u128 = 1_767_225_600; // 2026-01-01 UTC
     let monotonic = current_time_ns();
     if matches!(clock_id, 0 | 5) {
-        FALLBACK_REALTIME_SECONDS * 1_000_000_000 + monotonic
+        clock_base_realtime_seconds() * 1_000_000_000 + monotonic
     } else {
         monotonic
     }
@@ -9595,8 +9598,30 @@ fn sys_futex(
                 if ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1_000_000_000 {
                     return -EINVAL;
                 }
-                let duration = core::time::Duration::new(ts.sec as u64, ts.nsec as u32);
-                let deadline = crate::time::deadline_after(duration);
+                // FUTEX_WAIT (0) takes a RELATIVE timeout; FUTEX_WAIT_BITSET
+                // (9) takes an ABSOLUTE deadline on CLOCK_MONOTONIC, or on
+                // CLOCK_REALTIME when FUTEX_CLOCK_REALTIME is set.  std's
+                // futex_wait uses WAIT_BITSET with an absolute timespec;
+                // treating it as relative previously made every timed wait
+                // effectively infinite, so a lost wake deadlocked the waiter
+                // forever (rustc thread-pool parking during parallel codegen).
+                let deadline = if op == 9 {
+                    let freq = crate::time::clock_frequency_hz();
+                    let ts_ns = u128::from(ts.sec as u64) * 1_000_000_000
+                        + u128::from(ts.nsec as u32);
+                    let mono_ns = if futex_op & FUTEX_CLOCK_REALTIME != 0 {
+                        let base_ns =
+                            u128::from(clock_base_realtime_seconds()) * 1_000_000_000;
+                        ts_ns.saturating_sub(base_ns)
+                    } else {
+                        ts_ns
+                    };
+                    let cycles = (mono_ns * u128::from(freq)) / 1_000_000_000;
+                    crate::time::MonotonicInstant::from_cycles(cycles as u64)
+                } else {
+                    let duration = core::time::Duration::new(ts.sec as u64, ts.nsec as u32);
+                    crate::time::deadline_after(duration)
+                };
                 let outcome = queue.waiters.wait_until_deadline_from_user_trap(
                     deadline,
                     || queue.wake_sequence.load(Ordering::Acquire) != wake_sequence,
