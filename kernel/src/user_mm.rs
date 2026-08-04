@@ -267,6 +267,12 @@ impl UserMm {
             child.set_program_break(program_break.current())?;
         }
 
+        // FORK_CONSISTENCY_V1: hold the parent mm lock across the page copy.
+        // The parent's other threads can concurrently mprotect/mmap/unmap
+        // (mutating VMAs and the page table) while we copy physical pages
+        // into the child; a torn child address space makes the exec'd rustc
+        // misbehave or stall.  Lock order is parent -> child everywhere.
+        let _parent_guard = self.state.lock();
         for source in mapped_pages {
             let mut state = child.state.lock();
             let area = state
