@@ -1580,6 +1580,15 @@ impl Scheduler {
         }
         let current = self.current(cpu);
         if self.task(current).kind.is_idle() {
+            // STALL_FALLBACK_V1: a task woken onto this CPU while it sat in
+            // WFI must be picked up even if the WFI wake path missed it (the
+            // wake can race the interrupt window, and once the CPU is idle
+            // the NO_HZ tick previously returned without rechecking).  Mark
+            // need_resched so the timer IRQ exit re-enters the scheduler and
+            // dequeues the queued task.
+            if !self.cpus[cpu.get()].run_queue.is_empty() {
+                self.cpus[cpu.get()].need_resched = true;
+            }
             return;
         }
         let elapsed = u32::try_from(ticks).unwrap_or(u32::MAX);
