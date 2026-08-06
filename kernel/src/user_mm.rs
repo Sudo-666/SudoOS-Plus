@@ -958,14 +958,17 @@ impl UserMm {
         crate::context::assert_interrupts_disabled();
         let cpu = crate::smp::current_cpu_id().get();
 
-        // Keep the generation stable across root installation and active-mask
-        // publication. A future lazy-renewal path may relax this fail-closed gate.
-        let mut allocator = ASID_ALLOCATOR.lock();
-        ensure_asid_allocator(&mut allocator)?;
-        let current_asid_generation = allocator
-            .as_ref()
-            .expect("ASID allocator was just initialized")
-            .generation();
+        // SUDOOS_BUILDSTORM_ROOTFIX_ASID_SCOPE_V1
+        // Snapshot generation under the global allocator, then release it
+        // before taking user_mm or installing page-table hardware state.
+        let current_asid_generation = {
+            let mut allocator = ASID_ALLOCATOR.lock();
+            ensure_asid_allocator(&mut allocator)?;
+            allocator
+                .as_ref()
+                .expect("ASID allocator was just initialized")
+                .generation()
+        };
 
         loop {
             let (root, token, tlb_generation) = {

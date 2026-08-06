@@ -17,6 +17,9 @@ const MOUNT_LOCK: LockClass = LockClass::new("vfs.mounts", LockRank::Vfs, 2);
 const MAX_COMPONENT_LEN: usize = 255;
 const MAX_SYMLINK_FOLLOWS: usize = 40;
 const BLOCK_CACHE_BLOCKS: usize = 32;
+// SUDOOS_BUILDSTORM_ROOTFIX_EXT4_NEGATIVE_DENTRY_V1
+// Keep failed ext4 component probes bounded per directory.
+const MAX_NEGATIVE_DENTRIES: usize = 256;
 
 static ROOT: IrqSpinLock<Option<Arc<Node>>> = IrqSpinLock::new_with_class(None, ROOT_LOCK);
 static TREE: IrqSpinLock<()> = IrqSpinLock::new_with_class((), TREE_LOCK);
@@ -41,6 +44,7 @@ enum NodeState {
         populated: bool,
         children: Vec<(String, Arc<Node>)>,
         whiteouts: Vec<String>,
+        negative: Vec<String>,
     },
     Ext4Regular {
         fs: Arc<crate::ext4::Ext4FileSystem>,
@@ -164,7 +168,11 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<myos_vfs::ArcFile, Errno> {
     }
 
     let node = {
-        let _tree = TREE.lock();
+        // SUDOOS_BUILDSTORM_ROOTFIX_FS_READ_FASTPATH_V1
+        // Only O_CREAT needs namespace-wide lookup+insert serialization.
+        // Existing-node opens are protected by per-node locks and no longer
+        // disable local IRQs behind the global VFS tree lock.
+        let _tree = flags.contains(OpenFlags::O_CREAT).then(|| TREE.lock());
         let follow_final = !flags.contains(OpenFlags::O_NOFOLLOW);
         let node = match lookup_follow(path, follow_final, 0) {
             Ok(node) => {
@@ -235,12 +243,10 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<myos_vfs::ArcFile, Errno> {
 }
 
 pub fn stat(path: &str) -> Result<Stat, Errno> {
-    let _tree = TREE.lock();
     stat_for_node(&lookup(path)?)
 }
 
 pub fn lstat(path: &str) -> Result<Stat, Errno> {
-    let _tree = TREE.lock();
     stat_for_node(&lookup_nofollow(path)?)
 }
 
@@ -354,7 +360,6 @@ pub fn link(old_path: &str, new_path: &str, follow_source: bool) -> Result<(), E
 }
 
 pub fn readlink(path: &str, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
-    let _tree = TREE.lock();
     let node = lookup_nofollow(path)?;
     let state = node.state.lock();
     let NodeState::Symlink(target) = &*state else {
@@ -394,7 +399,6 @@ pub fn unpack_initramfs(archive: &crate::initramfs::Initramfs<'_>) -> Result<usi
 }
 
 pub fn chdir(path: &str) -> Result<(), Errno> {
-    let _tree = TREE.lock();
     let node = lookup(path)?;
     if node.mode.file_type() != myos_vfs::FileType::Directory {
         return Err(Errno::Enotdir);
@@ -509,11 +513,11 @@ pub fn mount_ext4_overlay(source: &str, target: &str) -> Result<(), Errno> {
     target_node.read_only.store(false, Ordering::Release);
     *target_node.state.lock() = NodeState::Ext4Directory {
         fs,
-        ino: root.ino,
-        populated: false,
+        ino: root.ino,        populated: false,
         children: Vec::new(),
         whiteouts: Vec::new(),
-    };
+        negative: Vec::new(),
+};
     Ok(())
 }
 
@@ -525,7 +529,6 @@ pub fn mount_ext4_overlay(source: &str, target: &str) -> Result<(), Errno> {
 /// children by inode, while materializing an absent PATH candidate can turn a
 /// legitimate ENOENT into a different error and prematurely stop `execvp`.
 pub fn is_ext4_overlay_directory(path: &str) -> bool {
-    let _tree = TREE.lock();
     let Ok(node) = lookup(path) else {
         return false;
     };
@@ -859,11 +862,11 @@ fn ext4_node(
     let state = match info.kind {
         crate::ext4::Ext4NodeKind::Directory => NodeState::Ext4Directory {
             fs,
-            ino: info.ino,
-            populated: false,
-            children: Vec::new(),
-            whiteouts: Vec::new(),
-        },
+            ino: info.ino,        populated: false,
+        children: Vec::new(),
+        whiteouts: Vec::new(),
+        negative: Vec::new(),
+},
         crate::ext4::Ext4NodeKind::Regular => NodeState::Ext4Regular {
             fs,
             ino: info.ino,
@@ -915,6 +918,7 @@ fn populate_ext4_directory(node: &Arc<Node>) -> Result<(), Errno> {
         populated,
         children,
         whiteouts,
+        negative,
         ..
     } = &mut *state
     else {
@@ -934,6 +938,7 @@ fn populate_ext4_directory(node: &Arc<Node>) -> Result<(), Errno> {
         }
         children.push((name, child));
     }
+    negative.clear();
     *populated = true;
     Ok(())
 }
@@ -1349,8 +1354,12 @@ fn allocate_inode() -> u64 {
 fn insert_child(parent: &Arc<Node>, name: &str, child: Arc<Node>) -> Result<(), Errno> {
     validate_component(name)?;
     let mut state = parent.state.lock();
-    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+    if let NodeState::Ext4Directory {
+        whiteouts, negative, ..
+    } = &mut *state
+    {
         whiteouts.retain(|hidden| hidden != name);
+        negative.retain(|missing| missing != name);
     }
     let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     if children.iter().any(|(child_name, _)| child_name == name) {
@@ -1375,8 +1384,12 @@ fn insert_child_prepared(
 ) -> Result<(), Errno> {
     validate_component(&name)?;
     let mut state = parent.state.lock();
-    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+    if let NodeState::Ext4Directory {
+        whiteouts, negative, ..
+    } = &mut *state
+    {
         whiteouts.retain(|hidden| hidden != &name);
+        negative.retain(|missing| missing != &name);
     }
     let children = directory_children_mut(&mut state).ok_or(Errno::Enotdir)?;
     if let Some(index) = children
@@ -1423,8 +1436,13 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
                 fs,
                 ino,
                 whiteouts,
+                negative,
                 ..
-            } if !whiteouts.iter().any(|hidden| hidden == name) => Some((Arc::clone(fs), *ino)),
+            } if !whiteouts.iter().any(|hidden| hidden == name)
+                && !negative.iter().any(|missing| missing == name) =>
+            {
+                Some((Arc::clone(fs), *ino))
+            }
             _ => None,
         }
     };
@@ -1433,7 +1451,34 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
     };
     let info = match fs.lookup_child_info(ino, name) {
         Ok(info) => info,
-        Err(crate::ext4::Ext4Error::NotFound) => return Ok(None),
+        Err(crate::ext4::Ext4Error::NotFound) => {
+            // Cache ENOENT best-effort. Allocation failure must not turn a
+            // successful negative lookup into ENOMEM.
+            if let Ok(cached_name) = clone_component(name) {
+                let mut state = parent.state.lock();
+                if let NodeState::Ext4Directory {
+                    populated: false,
+                    children,
+                    whiteouts,
+                    negative,
+                    ..
+                } = &mut *state
+                {
+                    let still_missing = !children
+                        .iter()
+                        .any(|(child_name, _)| child_name == name)
+                        && !whiteouts.iter().any(|hidden| hidden == name)
+                        && !negative.iter().any(|missing| missing == name);
+                    if still_missing
+                        && negative.len() < MAX_NEGATIVE_DENTRIES
+                        && negative.try_reserve(1).is_ok()
+                    {
+                        negative.push(cached_name);
+                    }
+                }
+            }
+            return Ok(None);
+        }
         Err(error) => return Err(ext4_errno(error)),
     };
     let child = ext4_node(fs, info)?;
@@ -1443,6 +1488,7 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
     let NodeState::Ext4Directory {
         children,
         whiteouts,
+        negative,
         ..
     } = &mut *state
     else {
@@ -1451,6 +1497,7 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
     if whiteouts.iter().any(|hidden| hidden == name) {
         return Ok(None);
     }
+    negative.retain(|missing| missing != name);
     if let Some((_, existing)) = children
         .iter()
         .find(|(child_name, _)| child_name == name)
@@ -1485,7 +1532,11 @@ fn remove_child(parent: &Arc<Node>, name: &str, remove_dir: bool) -> Result<Arc<
 fn remove_child_unchecked(parent: &Arc<Node>, name: &str) -> Result<Arc<Node>, Errno> {
     validate_component(name)?;
     let mut state = parent.state.lock();
-    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+    if let NodeState::Ext4Directory {
+        whiteouts, negative, ..
+    } = &mut *state
+    {
+        negative.retain(|missing| missing != name);
         if !whiteouts.iter().any(|hidden| hidden == name) {
             whiteouts.try_reserve(1).map_err(|_| Errno::Enomem)?;
             whiteouts.push(clone_component(name)?);
@@ -1503,7 +1554,11 @@ fn rename_inside_parent(parent: &Arc<Node>, old_name: &str, new_name: String) ->
     validate_component(old_name)?;
     validate_component(&new_name)?;
     let mut state = parent.state.lock();
-    if let NodeState::Ext4Directory { whiteouts, .. } = &mut *state {
+    if let NodeState::Ext4Directory {
+        whiteouts, negative, ..
+    } = &mut *state
+    {
+        negative.retain(|missing| missing != old_name && missing != &new_name);
         if !whiteouts.iter().any(|hidden| hidden == old_name) {
             whiteouts.try_reserve(1).map_err(|_| Errno::Enomem)?;
             whiteouts.push(clone_component(old_name)?);

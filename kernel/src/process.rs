@@ -27,6 +27,10 @@ const THREAD_RUNNING: u8 = 2;
 const THREAD_EXITING: u8 = 3;
 const THREAD_EXITED: u8 = 4;
 const NO_FORCED_EXIT: isize = isize::MIN;
+// SUDOOS_SIGNAL_PENDING_SIGSUSPEND_FIX_V1
+// unblockable signal bits are always removed from a legal mask, therefore
+// u64::MAX is a safe out-of-band value for "no saved sigsuspend mask".
+const NO_SIGSUSPEND_SAVED_MASK: u64 = u64::MAX;
 const UNBOUND_SCHEDULER_TASK: usize = usize::MAX;
 const PROCESS_MM_LOCK: LockClass = LockClass::new("process.mm", LockRank::Process, 0);
 const PROCESS_THREAD_GROUP_LOCK: LockClass =
@@ -726,6 +730,7 @@ impl Process {
             clear_child_tid: AtomicUsize::new(0),
             robust_list_head: AtomicUsize::new(0),
             blocked_signals: AtomicU64::new(0),
+            sigsuspend_saved_mask: AtomicU64::new(NO_SIGSUSPEND_SAVED_MASK),
             scheduler_task: AtomicUsize::new(UNBOUND_SCHEDULER_TASK),
             visited_cpus: AtomicUsize::new(0),
             schedule_count: AtomicUsize::new(0),
@@ -781,6 +786,7 @@ impl Process {
             clear_child_tid: AtomicUsize::new(0),
             robust_list_head: AtomicUsize::new(0),
             blocked_signals: AtomicU64::new(0),
+            sigsuspend_saved_mask: AtomicU64::new(NO_SIGSUSPEND_SAVED_MASK),
             scheduler_task: AtomicUsize::new(UNBOUND_SCHEDULER_TASK),
             visited_cpus: AtomicUsize::new(0),
             schedule_count: AtomicUsize::new(0),
@@ -913,6 +919,7 @@ pub struct Thread {
     clear_child_tid: AtomicUsize,
     robust_list_head: AtomicUsize,
     blocked_signals: AtomicU64,
+    sigsuspend_saved_mask: AtomicU64,
     scheduler_task: AtomicUsize,
     visited_cpus: AtomicUsize,
     schedule_count: AtomicUsize,
@@ -1084,6 +1091,37 @@ impl Thread {
 
     pub fn blocked_signals(&self) -> u64 {
         self.blocked_signals.load(Ordering::Acquire)
+    }
+
+    /// Install rt_sigsuspend's temporary mask and retain the mask that must
+    /// be restored after a caught handler completes.
+    pub fn begin_sigsuspend(&self, temporary_mask: u64) {
+        let old_mask = self.blocked_signals();
+        let previous = self
+            .sigsuspend_saved_mask
+            .swap(old_mask, Ordering::AcqRel);
+        debug_assert_eq!(
+            previous,
+            NO_SIGSUSPEND_SAVED_MASK,
+            "nested rt_sigsuspend restore state",
+        );
+        self.set_blocked_signals(temporary_mask);
+    }
+
+    /// Consume the mask saved by rt_sigsuspend for a user signal frame.
+    pub fn take_sigsuspend_saved_mask(&self) -> Option<u64> {
+        let saved = self
+            .sigsuspend_saved_mask
+            .swap(NO_SIGSUSPEND_SAVED_MASK, Ordering::AcqRel);
+        (saved != NO_SIGSUSPEND_SAVED_MASK).then_some(saved)
+    }
+
+    /// A signal action that creates no user frame must still end the
+    /// temporary rt_sigsuspend mask interval.
+    pub fn restore_sigsuspend_mask_without_handler(&self) {
+        if let Some(saved) = self.take_sigsuspend_saved_mask() {
+            self.set_blocked_signals(saved);
+        }
     }
 
     #[allow(dead_code)]

@@ -129,32 +129,33 @@ __riscv_trap_entry:
     bne t0, t1, .Lriscv_frame_corrupted
 
     /*
-     * Restore the sscratch invariant before restoring temporary registers.
-     * SPP=0 means sret will return to user mode.
+     * SUDOOS_BUILDSTORM_ROOTFIX_RV_RETURN_V1
+     *
+     * Keep SIE clear while the destination CPU commits its task-local user
+     * entry anchor. SPIE remains intact and sret publishes it atomically into
+     * SIE together with the privilege transition. This closes the interval in
+     * which a migrated task could carry a source-CPU kernel tp in sscratch.
      */
     ld t0, 32*8(sp)
-    csrw sstatus, t0
-
     ld t1, 33*8(sp)
     csrw sepc, t1
 
     andi t1, t0, 0x100
     bnez t1, .Lriscv_return_to_kernel
 
-    /*
-     * Rebuild the task-local entry anchor before restoring user registers.
-     * Current tp belongs to the destination CPU, so migration is reflected in
-     * the next user-to-kernel transition.
-     */
+    /* Rebuild the anchor with the destination CPU's kernel tp. */
     addi t1, sp, 304
     sd t1, RISCV_TF_STVAL(sp)
     sd tp, RISCV_TF_GUARD(sp)
     addi t1, sp, RISCV_TF_STVAL
     csrw sscratch, t1
+    andi t0, t0, -3
+    csrw sstatus, t0
     j .Lriscv_restore_user_tp
-
 .Lriscv_return_to_kernel:
     csrw sscratch, zero
+    andi t0, t0, -3
+    csrw sstatus, t0
     j .Lriscv_restore_registers
 
 .Lriscv_restore_user_tp:

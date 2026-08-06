@@ -601,13 +601,16 @@ impl Scheduler {
         };
 
         let id = self.allocate_task_id();
+        // SUDOOS_BUILDSTORM_ROOTFIX_USER_MIGRATION_V1
+        // `target` chooses only the initial run queue. Preserve explicit
+        // caller affinity while ordinary user tasks remain migratable.
         let task = Task::user_thread(
             id,
             thread,
             exit_visible,
             process_cleanup,
             stack,
-            Some(target),
+            affinity,
         );
         if id.0 == self.tasks.len() {
             self.tasks.push(Some(task));
@@ -726,7 +729,12 @@ impl Scheduler {
 
             let position = self.cpus[donor.get()].run_queue.iter().position(|id| {
                 let task = self.task(*id);
-                task.state == TaskState::Runnable && task.affinity.is_none()
+                // SUDOOS_BUILDSTORM_SAFE_FIRST_RUN_PIN_V4
+                // Only a never-run user task may change its initial CPU.
+                // activate_next() commits it permanently on first use.
+                task.state == TaskState::Runnable
+                    && task.affinity.is_none()
+                    && !task.has_run
             });
 
             let Some(position) = position else {
@@ -758,10 +766,32 @@ impl Scheduler {
                 assert_eq!(owner, cpu, "idle task selected by the wrong CPU");
                 assert_eq!(task.state, TaskState::Idle(cpu));
             }
-            TaskKind::KernelThread | TaskKind::SystemThread | TaskKind::UserThread => {
+            TaskKind::KernelThread | TaskKind::SystemThread => {
                 assert_eq!(task.state, TaskState::Runnable);
                 if let Some(affinity) = task.affinity {
                     assert_eq!(affinity, cpu, "pinned task selected by the wrong CPU");
+                }
+                task.has_run = true;
+            }
+            TaskKind::UserThread => {
+                // SUDOOS_BUILDSTORM_SAFE_FIRST_RUN_PIN_V4
+                // Initial queue placement is movable, but a live user context is not.
+                assert_eq!(task.state, TaskState::Runnable);
+                match task.affinity {
+                    Some(affinity) => {
+                        assert_eq!(
+                            affinity,
+                            cpu,
+                            "pinned user task selected by the wrong CPU",
+                        );
+                    }
+                    None => {
+                        assert!(
+                            !task.has_run,
+                            "previously-run user task attempted cross-CPU migration",
+                        );
+                        task.affinity = Some(cpu);
+                    }
                 }
                 task.has_run = true;
             }
