@@ -46,15 +46,34 @@ pub const MODULES: VirtRange = VirtRange::from_bounds(0xffff_c000_0000_0000, 0xf
 pub const FIXMAP: VirtRange = VirtRange::from_bounds(0xffff_fffe_0000_0000, 0xffff_ffff_0000_0000);
 
 /// 最终运行地址使用 cached DMW 高地址别名。
-/// QEMU 把低地址启动入口加载到 0x0020_0000。
+///
+/// QEMU virt 把低地址启动入口加载到 0x0020_0000；
+/// LS2K1000 的 1GB DDR 物理基址是 0x9000_0000，
+/// U-Boot 把内核镜像加载到 DDR 基址并跳转到那里。
+#[cfg(feature = "platform-qemu-virt")]
 pub const BOOT_PHYS_BASE: PhysAddr = PhysAddr::new(0x0020_0000);
 
+#[cfg(feature = "platform-ls2k1000")]
+pub const BOOT_PHYS_BASE: PhysAddr = PhysAddr::new(0x9000_0000);
+
+#[cfg(feature = "platform-qemu-virt")]
 pub const BOOT_VIRT_BASE: VirtAddr = VirtAddr::new(0x9000_0000_0020_0000);
 
+#[cfg(feature = "platform-ls2k1000")]
+pub const BOOT_VIRT_BASE: VirtAddr = VirtAddr::new(0x9000_0000_9000_0000);
+
 /// 正式内核保持 2 MiB 对齐，方便以后使用大页映射。
+#[cfg(feature = "platform-qemu-virt")]
 pub const KERNEL_PHYS_BASE: PhysAddr = PhysAddr::new(0x0040_0000);
 
+#[cfg(feature = "platform-ls2k1000")]
+pub const KERNEL_PHYS_BASE: PhysAddr = PhysAddr::new(0x9020_0000);
+
+#[cfg(feature = "platform-qemu-virt")]
 pub const KERNEL_LINK_BASE: VirtAddr = VirtAddr::new(0x9000_0000_0040_0000);
+
+#[cfg(feature = "platform-ls2k1000")]
+pub const KERNEL_LINK_BASE: VirtAddr = VirtAddr::new(0x9000_0000_9020_0000);
 
 pub const KERNEL_REGIONS: &[VirtualRegion] = &[
     VirtualRegion::new("uncached-direct-map", UNCACHED_DIRECT_MAP),

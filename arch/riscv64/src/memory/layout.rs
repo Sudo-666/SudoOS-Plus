@@ -109,11 +109,21 @@ pub fn kernel_image_physical_address(virtual_address: VirtAddr) -> Option<PhysAd
 }
 
 // OpenSBI 跳转进入的低物理启动地址。
+// 与 platform/mod.rs 的优先级约定一致: visionfive2 显式启用时优先。
+#[cfg(all(feature = "platform-qemu-virt", not(feature = "platform-visionfive2")))]
 pub const BOOT_PHYS_BASE: PhysAddr = PhysAddr::new(0x8020_0000);
+
+/// VisionFive 2: U-Boot 按 RISC-V 启动协议把内核加载到 0x4020_0000。
+#[cfg(feature = "platform-visionfive2")]
+pub const BOOT_PHYS_BASE: PhysAddr = PhysAddr::new(0x4020_0000);
 
 /// 正式高半内核的物理加载地址。
 ///
 /// 保持 2 MiB 对齐，便于启动临时页表使用 2 MiB 叶项。
+#[cfg(all(feature = "platform-qemu-virt", not(feature = "platform-visionfive2")))]
 pub const KERNEL_PHYS_BASE: PhysAddr = PhysAddr::new(0x8040_0000);
+
+#[cfg(feature = "platform-visionfive2")]
+pub const KERNEL_PHYS_BASE: PhysAddr = PhysAddr::new(0x4040_0000);
 
 pub const KERNEL_LINK_BASE: VirtAddr = VirtAddr::new(0xffff_ffff_8000_0000);

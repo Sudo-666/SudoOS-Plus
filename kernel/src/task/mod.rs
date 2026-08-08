@@ -3130,50 +3130,16 @@ pub fn boot_idle_loop() -> ! {
     idle_loop()
 }
 
+// 这些 worker 验证数组按 MAX_CPUS 自适应大小。
+// riscv64 MAX_CPUS=8,loongarch64 MAX_CPUS=16,不能再写成固定 16 个显式元素。
 #[cfg(debug_assertions)]
-static WORKER_PROGRESS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static WORKER_PROGRESS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 #[cfg(debug_assertions)]
-static WORKER_STACKS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static WORKER_STACKS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 #[cfg(debug_assertions)]
-static WORKER_CPUS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-];
+static WORKER_CPUS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 #[cfg(debug_assertions)]
-static EXPECTED_CPUS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-];
+static EXPECTED_CPUS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 #[cfg(debug_assertions)]
 static WORKER_READY_MASK: AtomicUsize = AtomicUsize::new(0);
 #[cfg(debug_assertions)]
@@ -3269,10 +3235,47 @@ fn worker_6() {
 fn worker_7() {
     verification_worker(7);
 }
-
 #[cfg(debug_assertions)]
-const WORKER_ENTRIES: [KernelThreadEntry; MAX_CPUS] = [
+fn worker_8() {
+    verification_worker(8);
+}
+#[cfg(debug_assertions)]
+fn worker_9() {
+    verification_worker(9);
+}
+#[cfg(debug_assertions)]
+fn worker_10() {
+    verification_worker(10);
+}
+#[cfg(debug_assertions)]
+fn worker_11() {
+    verification_worker(11);
+}
+#[cfg(debug_assertions)]
+fn worker_12() {
+    verification_worker(12);
+}
+#[cfg(debug_assertions)]
+fn worker_13() {
+    verification_worker(13);
+}
+#[cfg(debug_assertions)]
+fn worker_14() {
+    verification_worker(14);
+}
+#[cfg(debug_assertions)]
+fn worker_15() {
+    verification_worker(15);
+}
+
+// worker_* 函数表固定 16 项,覆盖两架构的 MAX_CPUS (8/16)。
+// 实际访问下标恒为 0..topology_worker_count (≤ active_cpu_count ≤ MAX_CPUS)。
+#[cfg(debug_assertions)]
+const WORKER_TABLE_SIZE: usize = 16;
+#[cfg(debug_assertions)]
+const WORKER_ENTRIES: [KernelThreadEntry; WORKER_TABLE_SIZE] = [
     worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7,
+    worker_8, worker_9, worker_10, worker_11, worker_12, worker_13, worker_14, worker_15,
 ];
 
 #[cfg(debug_assertions)]

@@ -20,6 +20,7 @@ ROOT_DIR="$(
 
 ARCH="${1:-${ARCH:-riscv64}}"
 PROFILE="${2:-${PROFILE:-debug}}"
+PLATFORM="${PLATFORM:-}"
 
 KERNEL_PACKAGE="${KERNEL_PACKAGE:-myos-kernel}"
 KERNEL_BINARY="${KERNEL_BINARY:-myos-kernel}"
@@ -37,13 +38,21 @@ Profiles:
     debug
     release
 
+Platforms:
+    qemu-virt      QEMU virtual machine (riscv64/loongarch64)
+    ls2k1000       Loongson 2K1000 real hardware (loongarch64, default)
+    visionfive2    StarFive VisionFive 2 / JH7110 (riscv64)
+
 Examples:
     ./scripts/build.sh riscv64 debug
     ./scripts/build.sh loongarch64 release
+    PLATFORM=qemu-virt ARCH=loongarch64 PROFILE=release ./scripts/build.sh
+    PLATFORM=ls2k1000 ARCH=loongarch64 PROFILE=debug ./scripts/build.sh
+    PLATFORM=visionfive2 ARCH=riscv64 PROFILE=release ./scripts/build.sh
 
 The same values may also be supplied through environment variables:
 
-    ARCH=riscv64 PROFILE=debug ./scripts/build.sh
+    ARCH=riscv64 PROFILE=debug PLATFORM=qemu-virt ./scripts/build.sh
 EOF
 }
 
@@ -69,6 +78,54 @@ select_architecture() {
 
         *)
             die "unsupported architecture '${ARCH}'"
+            ;;
+    esac
+}
+
+select_platform_features() {
+    # 校验平台与架构的兼容性
+    case "${ARCH}:${PLATFORM}" in
+        riscv64:ls2k1000)
+            die "platform 'ls2k1000' is loongarch64-only (riscv64 platforms: qemu-virt, visionfive2)"
+            ;;
+
+        loongarch64:visionfive2)
+            die "platform 'visionfive2' is riscv64-only (loongarch64 platforms: qemu-virt, ls2k1000)"
+            ;;
+    esac
+
+    # 未指定 PLATFORM 时，按架构选择默认平台。
+    # riscv64 的平台化由 arch-riscv64 的 default feature 兜底,这里显式
+    # 传参保证 build.rs 能根据 CARGO_FEATURE_* 选对链接脚本。
+    if [ -z "${PLATFORM}" ]; then
+        if [ "${ARCH}" = "riscv64" ]; then
+            echo "  platform     : qemu-virt (default for riscv64)"
+            CARGO_PLATFORM_ARGS=(--no-default-features --features platform-qemu-virt)
+        else
+            echo "  platform     : default (from Cargo.toml)"
+            CARGO_PLATFORM_ARGS=()
+        fi
+        return
+    fi
+
+    case "${PLATFORM}" in
+        qemu-virt)
+            echo "  platform     : qemu-virt"
+            CARGO_PLATFORM_ARGS=(--no-default-features --features platform-qemu-virt)
+            ;;
+
+        ls2k1000)
+            echo "  platform     : ls2k1000"
+            CARGO_PLATFORM_ARGS=(--no-default-features --features platform-ls2k1000)
+            ;;
+
+        visionfive2)
+            echo "  platform     : visionfive2"
+            CARGO_PLATFORM_ARGS=(--no-default-features --features platform-visionfive2)
+            ;;
+
+        *)
+            die "unsupported platform '${PLATFORM}' (valid: qemu-virt, ls2k1000, visionfive2)"
             ;;
     esac
 }
@@ -145,6 +202,7 @@ build_kernel() {
     --target "${TARGET}" \
     -Z build-std=core,alloc \
     -Z build-std-features=compiler-builtins-mem \
+    ${CARGO_PLATFORM_ARGS[@]+"${CARGO_PLATFORM_ARGS[@]}"} \
     ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
 
     KERNEL_ELF="${CARGO_TARGET_DIR}/${TARGET}/${CARGO_PROFILE_DIR}/${KERNEL_BINARY}"
@@ -164,6 +222,7 @@ build_kernel() {
 main() {
     select_architecture
     select_profile
+    select_platform_features
     check_environment
     build_kernel
 }

@@ -9,9 +9,10 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [features]
-default = ["platform-qemu-virt"]
+default = []
 
 platform-qemu-virt = []
+platform-ls2k1000 = []
 
 [dependencies]
 myos-boot = { path = "../../boot"}

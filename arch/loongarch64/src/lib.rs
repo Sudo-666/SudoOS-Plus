@@ -6,8 +6,8 @@ compile_error!("arch-loongarch64 can only be built for loongarch64");
 
 use core::arch::global_asm;
 
-global_asm!(include_str!("asm/entry.S"));
-global_asm!(include_str!("asm/secondary.S"));
+// entry.S 和 secondary.S 已移至各平台目录（platform/qemu_virt/ 或 platform/ls2k1000/），
+// 不再存在共享的 asm/entry.S 和 asm/secondary.S。
 global_asm!(include_str!("memory/paging/refill.S"));
 global_asm!(include_str!("trap/entry.S"));
 global_asm!(include_str!("task/switch.S"));

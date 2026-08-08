@@ -17,6 +17,28 @@ core
 /kernel-la
 /*.img
 
+# VisionFive 2 (riscv64) board build artifacts
+/kernel-visionfive2
+/kernel-vf2.bin
+
+# LS2K1000 board build artifacts (generated binaries / uImages)
+/kernel-ls2k1000
+/kernel-ls2k1000.uImage
+/kernel.bin
+/uImage
+/uImage.fit
+/uImage-*
+/uImage-test/
+
+# Third-party test suite (nested git repo, not part of this kernel)
+/testsuits-for-oskernel/
+
+# Board manual PDF (large binary; extracted text kept as ls2k1000_manual.txt)
+/广东龙芯2K1000星云板用户手册V1.2.pdf
+
+# Working report documents (kept out of repo; PDF/PPTX snapshots already tracked)
+/SudoOS-Plus_final-beta1_技术架构与系统调用实现详解_2026-08-04.docx
+
 # Editor / IDE state
 .claude/
 .vscode/
@@ -29,6 +51,12 @@ core
 .DS_Store
 ._*
 __MACOSX/
+
+# Board analysis reference: 2K1000 U-Boot BSP source (145 MB, not part of kernel)
+/vendor/u-boot-*/
+
+# Accidental Windows toolchain junk directory (fullwidth-character name)
+/D*nightly-2025-01-18-x86_64-pc-windows-msvc*/
 
 # Local environment overrides
 .env

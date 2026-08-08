@@ -4,6 +4,14 @@
 [build]
 target-dir = "target/oscomp"
 
+# 2K1000 (LA264) 硬件不支持 UAL（未对齐访问）。
+# rustc 的 loongarch64-unknown-none-softfloat 默认启用 target_feature="ual"，
+# 会让 LLVM 生成未对齐 ld.w/st.w（如 core::fmt 参数栈拷贝），真机上触发
+# AddressNotAligned 异常（U-Boot exception_vector 打印 CPU0 exception 后挂死）。
+# 此处禁用 ual，强制 LLVM 将所有访存对齐。
+[target.loongarch64-unknown-none-softfloat]
+rustflags = ["-C", "target-feature=-ual"]
+
 [net]
 git-fetch-with-cli = true
 

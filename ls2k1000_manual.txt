@@ -1,0 +1,4904 @@
+ 2K1000 
+
+                                                           1
+                                                                                              
+
+                                  18  B  4  020-22900688
+
+
+
+
+                  
+
+2022/12/9 V0.9    
+
+2023/4/11 V0.95   
+
+2023/5/19 V1.0    
+                  
+
+2023/7/13 V1.1     docker,nfs 
+
+2024/2/19 V1.2     OpenWRT 
+
+                        2
+                                                           
+
+     18  B  4  020-22900688
+                         
+
+LoongArch 
+
+
+ 
+
+
+
+
+
+ 
+
+U-Boot 
+Linux 
+
+
+                                                                     3
+                                                                                                        
+
+                                           18  B  4  020-22900688
+LoongArch 
+
+1.0 LoongArch
+
+LoongArch()2021RISC ISALoongArch
+32LA3264LA64 LoongArchPLV0~PLV3PLV0
+PLV3 
+ CPULoongson Base LBase
+Loongson
+Virtualization LVZLoongson Binary Translation LBT128 
+Loongson SIMD Extension LSX 256 Loongson Advanced SIMD
+Extension LASXLoongArch
+
+1.1 
+
+LoongArchGPRsFPRsVRs 
+PLV0CSRs
+
+1.1.1 
+
+LoongArch32 $r0 ~ $r31 LA3232 LA64
+64 $r0 0  $r1 
+BL
+
+LoongArchLoongArch ELF psABI :
+
+                              
+$r0          $zero      0     
+$r1          $ra              
+$r2          $tp        TLS/  
+$r3          $sp              
+$r4 - $r11   $a0 - $a7        
+$r4 - $r5    $v0 - $v1        
+$r12 - $r20  $t0 - $t8        
+$r21         $u0        CPU   
+$r22         $fp              
+$r23 - $r31  $s0 - $s8        
+
+Note
+ $r21 ELF psABILinux CPU
+ABI $u0   $v0  $v1 
+$a0  $a1 
+
+1.1.2 
+
+FPULoongArch32 $f0 ~ $f31 LA64 CPU
+64
+LoongArch ELF psABI
+
+                             
+$f0 - $f7    $fa0 - $fa7     
+$f0 - $f1    $fv0 - $fv1     
+$f8 - $f23   $ft0 - $ft15    
+$f24 - $f31  $fs0 - $fs7     
+
+Note
+ $fv0  $fv1  $fa0  $fa1 
+
+
+1.1.3 
+
+LoongArch
+      128LSXLoongson SIMD eXtention
+      256LASXLoongson Advanced SIMD eXtention
+
+LSX $v0 ~ $v31 LASX $x0 ~ $x31 
+LSXLASX $x0  128 $v0
+ $v0 64 $f0 
+
+1.1.4 
+
+PLV0:
+
+                             
+0x0                          CRMD
+0x1                          PRMD
+0x2                          EUEN
+0x3                          MISC
+0x4                          ECFG
+0x5                          ESTAT
+                           
+0x6                        ERA
+0x7            (Faulting)  BADV
+0x8            (Faulting)  BADI
+0xC                        EENTRY
+0x10           TLB         TLBIDX
+0x11           TLB         TLBEHI
+0x12           TLB0        TLBELO0
+0x13           TLB1        TLBELO1
+0x18                       ASID
+0x19                       PGDL
+0x1A                       PGDH
+0x1B                       PGD
+0x1C                       PWCL
+0x1D                       PWCH
+0x1E           STLB        STLBPS
+0x1F                       RVACFG
+0x20           CPU         CPUID
+0x21           1           PRCFG1
+0x22           2           PRCFG2
+0x23           3           PRCFG3
+0x30+n (0n15)              SAVEn
+0x40                       TID
+0x41                       TCFG
+0x42                       TVAL
+0x43                       CNTC
+0x44                       TICLR
+0x60           LLBit       LLBCTL
+0x80           1           IMPCTL1
+0x81           2           IMPCTL2
+                                
+0x88             TLB            TLBRENTRY
+0x89             TLB(Faulting)  TLBRBADV
+0x8A             TLB            TLBRERA
+0x8B             TLB            TLBRSAVE
+0x8C             TLB0           TLBRELO0
+0x8D             TLB1           TLBRELO1
+0x8E             TLB            TLBEHI
+0x8F             TLB            TLBRPRMD
+0x90                            MERRCTL
+0x91             1              MERRINFO1
+0x92             2              MERRINFO2
+0x93                            MERRENTRY
+0x94                            MERRERA
+0x95                            MERRSAVE
+0x98                            CTAG
+0x180+n (0n3)    n              DMWn
+0x200+2n (0n31)  n              PMCFGn
+0x201+2n (0n31)  n              PMCNTn
+0x300                           MWPC
+0x301                           MWPS
+0x310+8n (0n7)   n1             MWPnCFG1
+0x311+8n (0n7)   n2             MWPnCFG2
+0x312+8n (0n7)   n3             MWPnCFG3
+0x313+8n (0n7)   n4             MWPnCFG4
+0x380                           FWPC
+0x381                           FWPS
+0x390+8n (0n7)   n1             FWPnCFG1
+0x391+8n (0n7)   n2             FWPnCFG2
+0x392+8n (0n7)   n3             FWPnCFG3
+                                            
+0x393+8n (0n7)  n4                          FWPnCFG4
+0x500                                       DBG
+0x501                                       DERA
+0x502                                       DSAVE
+
+ERATLBRERAMERRERADERAEPCTLBREPCMERREPCDEPC
+
+1.2 
+
+1.2.1 
+
+LoongArch329:
+
+                
+2R              Opcode + Rj + Rd
+3R              Opcode + Rk + Rj + Rd
+4R              Opcode + Ra + Rk + Rj + Rd
+2RI8            Opcode + I8 + Rj + Rd
+2RI12           Opcode + I12 + Rj + Rd
+2RI14           Opcode + I14 + Rj + Rd
+2RI16           Opcode + I16 + Rj + Rd
+1RI21           Opcode + I21L + Rj + I21H
+I26             Opcode + I26L + I26H
+
+OpcodeRjRkRdRa 4R-type
+I8/I12/I14/I16/I21/I268/12/14/16/ 21/26
+2126 
+I21L/I21HI26L/I26H
+
+1.2.2 
+
+  
+
+   1. :
+      ADD.W SUB.W ADDI.W ADD.D SUB.D ADDI.D
+      SLT SLTU SLTI SLTUI
+      AND OR NOR XOR ANDN ORN ANDI ORI XORI
+      MUL.W MULH.W MULH.WU DIV.W DIV.WU MOD.W MOD.WU
+      MUL.D MULH.D MULH.DU DIV.D DIV.DU MOD.D MOD.DU
+      PCADDI PCADDU12I PCADDU18I
+      LU12I.W LU32I.D LU52I.D ADDU16I.D
+
+2. :
+
+      SLL.W SRL.W SRA.W ROTR.W SLLI.W SRLI.W SRAI.W ROTRI.W
+      SLL.D SRL.D SRA.D ROTR.D SLLI.D SRLI.D SRAI.D ROTRI.D
+
+3. :
+
+      EXT.W.B EXT.W.H CLO.W CLO.D SLZ.W CLZ.D CTO.W CTO.D CTZ.W CTZ.D
+      BYTEPICK.W BYTEPICK.D BSTRINS.W BSTRINS.D BSTRPICK.W BSTRPICK.D
+      REVB.2H REVB.4H REVB.2W REVB.D REVH.2W REVH.D BITREV.4B BITREV.8B BITREV.W
+      BITREV.D
+      MASKEQZ MASKNEZ
+
+4. :
+
+      BEQ BNE BLT BGE BLTU BGEU BEQZ BNEZ B BL JIRL
+
+5. :
+
+      LD.B LD.BU LD.H LD.HU LD.W LD.WU LD.D ST.B ST.H ST.W ST.D
+      LDX.B LDX.BU LDX.H LDX.HU LDX.W LDX.WU LDX.D STX.B STX.H STX.W STX.D
+      LDPTR.W LDPTR.D STPTR.W STPTR.D
+      PRELD PRELDX
+
+6. :
+
+      LL.W SC.W LL.D SC.D
+      AMSWAP.W AMSWAP.D AMADD.W AMADD.D AMAND.W AMAND.D AMOR.W AMOR.D AMXOR.W
+      AMXOR.D
+      AMMAX.W AMMAX.D AMMIN.W AMMIN.D
+
+7. :
+
+      IBAR DBAR
+
+8. :
+
+      SYSCALL BREAK CPUCFG NOP IDLE ERTN(ERET) DBCL(DBGCALL) RDTIMEL.W RDTIMEH.W
+      RDTIME.D
+      ASRTLE.D ASRTGT.D
+
+9. :
+CSRRD CSRWR CSRXCHG
+IOCSRRD.B IOCSRRD.H IOCSRRD.W IOCSRRD.D IOCSRWR.B IOCSRWR.H IOCSRWR.W
+IOCSRWR.D
+CACOP TLBP(TLBSRCH) TLBRD TLBWR TLBFILL TLBCLR TLBFLUSH INVTLB LDDIR LDPTE
+
+1.3 
+
+LoongArch
+CSR.DMWnn=0~3VAPA 
+:
+
+VA = PA + 
+
+VAPATLB 
+LoongArchTLBMTLBMultiple Page Size TLBTLB 
+STLBSingle Page Size TLBTLB
+
+LA32
+
+                                   
+UVRANGE   0x00000000 - 0x7FFFFFFF  , , PLV0~3
+KPRANGE0  0x80000000 - 0x9FFFFFFF  , , PLV0
+KPRANGE1  0xA0000000 - 0xBFFFFFFF  , , PLV0
+KVRANGE   0xC0000000 - 0xFFFFFFFF  , , PLV0
+
+PLV3UVRANGEKPRANGE0KPRANGE1
+30~310x00001000 
+0x800010000xA0001000
+
+LA64
+
+                                   
+XUVRANGE
+XSPRANGE  0x0000000000000000 -     , , PLV0~3
+XKPRANGE  0x3FFFFFFFFFFFFFFF
+XKVRANGE                           ,  / ,
+          0x4000000000000000 -     PLV0
+          0x7FFFFFFFFFFFFFFF       ,  / ,
+                                   PLV0
+          0x8000000000000000 -
+          0xBFFFFFFFFFFFFFFF       , , PLV0
+
+          0xC000000000000000 -
+          0xFFFFFFFFFFFFFFFF
+
+PLV3XUVRANGEXSPRANGEXKPRANGE
+60~63  60~61 0 
+12
+XKPRANGEXSPRANGE
+ 0x00000000_00001000  
+XKPRANGE 0x80000000_00001000 XKPRANGE 
+0x90000000_00001000 XKPRANGE 0xA0000000_
+00001000 
+
+1.4 LoongsonLoongArch
+
+LoongArchRISCISAISALoongson 
+
+Loongson-1132 Loongson-2264
+Loongson-3364 
+MIPSLoongArch3
+3A1000/3B1500/3A2000/3A3000/3A4000MIPS3A5000/3B5000/3C5000
+LoongArch22K2100/2K2000/2K1000/2K500
+LoongArch
+
+1.5 (LoongArch)
+
+LoongArchLA132LA264LA364LA464LA664
+LA13232Cortex M41C1021C103MCU
+
+LA26432/64Cortex A552K05002K1000LA
+SOC
+LA36464Cortex A752K2000SOC
+LA46464SPECCPU200610-12/GHz
+128Zen13A50003C50003D5000CPU
+LA66464SPECCPU200614-17/GHz
+SMT2256Zen23A60003C6000
+3D6000CPU
+LA132LA264CPU
+
+LA364IPSOC
+
+LA464LA664CPU
+
+1.6 
+
+Loongson
+    http://www.loongson.cn/
+
+LoongsonLoongArch
+    http://www.loongnix.cn/
+    https://github.com/loongson/
+    https://github.com/loongsonlab
+    https://loongson.github.io/LoongArch-Documentation/
+
+LoongArch
+    https://github.com/loongson/LoongArch-Documentation/releases/download/2023.04.20/Lo
+    ongArch-Vol1-v1.10-CN.pdf
+    https://github.com/loongson/LoongArch-Documentation/releases/download/2023.04.20/Lo
+    ongArch-Vol1-v1.10-EN.pdf
+
+LoongArchELF psABI
+    https://github.com/loongson/LoongArch-Documentation/releases/download/2023.04.20/Lo
+    ongArch-ELF-ABI-v2.01-CN.pdf
+    https://github.com/loongson/LoongArch-Documentation/releases/download/2023.04.20/Lo
+    ongArch-ELF-ABI-v2.01-EN.pdf 
+
+LoongArch
+    https://github.com/loongson/LoongArch-Documentation/releases/download/2023.04.20/Lo
+    ongArch-toolchain-conventions-v1.00-CN.pdf
+    https://github.com/loongson/LoongArch-Documentation/releases/download/2023.04.20/Lo
+    ongArch-toolchain-conventions-v1.00-EN.pdf
+
+LoongsonLoongArchLinux
+    https://git.kernel.org/pub/scm/linux/kernel/git/chenhuacai/linux-loongson.git
+    https://github.com/chenhuacai/linux/tree/loongarch-next
+
+
+1
+
+2K10002K1000CPU
+USBRS232RS485CAN
+
+
+
+
+
+   1-1 2K1000
+
+2
+      1-2 2K1000
+
+              1-3 2K1000
+CPU
+CPU   
+CPU   2K1000LALoongArch64 
+      
+      800MHz-1000MHz
+      1GB DDR32512MB
+            
+            32GB SSD(M.2 2242)
+            2RJ45
+USB         2USB2.0 HOST4G
+LCD         1LCD24
+            2
+LED         4LED
+            3
+            1MicroUSB
+RS232       2
+RS485       2
+CAN         2
+M.2 KEY-B   1 (SATA)
+M.2 KEY-E   1 (PCIE x1, USB2.0)WIFI/AI(2Tops)
+4G          1 (USB)
+EJTAG       1 (1.27)
+RTC         12PIN
+I2C         2
+SPI         1
+            2TTL
+PWM         4
+GPIO        8
+            5V/3A
+            0 ~ +70
+            20% ~ 90%
+            -40 ~ +85
+            150mm×109mm
+
+
+1PIN
+
+2.54MM3-1
+
+                                                  3-11
+
+2
+
+5VJL_LSGD2K1000-DP
+POWER3-2RESET
+POWER
+                                                           3-2
+
+3
+
+2K1000LA  DDR3 SDRAM JESD79-3
+1G DDR3(2DDR3 )3-3
+
+   3-3 DDR3
+
+4
+SATA SSDSPI FLASHSSD32GBFLASH8MByte3-
+43-5
+
+                                                              3-5 SSD
+
+                                                         3-5 SPI FLASH
+
+5
+
+USB2K1000LAUART0
+USBUSB_DEBUGPC3-6
+
+                                                       3-6 UART
+
+6
+
+2K1000LAMAC GMAC0  GMAC1
+ 2RJ453-7
+
+                                                          3-7 
+
+7USB
+
+USBUSB2WIFIUSB0USB1CON9USB
+USB3-8
+                                                           3-8 USB
+
+USB14G4G2.0MMJ160J160
+3-9
+                                                          3-9 J160
+
+8CAN
+
+2CAN2K1000LACAN0CAN1J166J167CAN
+3-10
+
+                                                          3-10 CAN
+
+9LCD
+
+LCD3-11LCDFPC
+3-1
+
+            3-11 LCD
+
+            3-1 LCD
+
+                
+1  P5V_LCD  21  LCD_B0
+2  P5V_LCD  22  LCD_B1
+3  LCD_R0   23  LCD_B2
+                
+4   LCD_R1  24  LCD_B3
+5   LCD_R2  25  LCD_B4
+6   LCD_R3  26  LCD_B5
+7   LCD_R4  27  LCD_B6
+8   LCD_R5  28  LCD_B7
+9   LCD_R6  29  GND
+10  LCD_R7  30  LCD_CLK
+11  GND     31  LCD_HSYNC
+12  LCD_G0  32  LCD_VSYNC
+13  LCD_G1  33  LCD_DE
+14  LCD_G2  34  GPIO20
+15  LCD_G3  35  T_CS/CT_RST
+16  LCD_G4  36  T_MOSI/CT_SDA
+17  LCD_G5  37  LS2K_SPI_SDI
+18  LCD_G6  38  T_SCL/CT_SCL
+19  LCD_G7  39  GPIO0
+20  GND     40  LS2K_ACPI_PLTRSTN/GPIO30
+
+
+4.1 
+
+1.Debug 
+UART0  Debug  USB MicroUSB PC
+
+2.PC windows MobaXtermlinux minicom  minicom 
+11520081
+
+MobaXterm 
+3.POWERBusybox root 
+ 123 IP192.168.1.10
+
+4. LCD 
+4.2 
+
+"m"u-boot
+u-boot  bootmenu u-boot 
+
+4.2.1 
+
+UTFTPUTFTPIP
+
+
+4.2.1.1U
+
+1.UFAT32Uupdate
+
+2.UupdateuImageu-boot-with-
+spl.bin  u-boot.bin
+3.U
+
+4.2.1.2 TFTP
+
+TFTPTFTP (uImage
+u-boot-with-spl.bin  u-boot.bin(rootfs.tar.gzramdisk.gz))
+TFTPIP 192.168.1.2 ,IP4.2.2 
+a.windowstftp
+windowstftpd.exe(326464)(
+uImageu-boot-with-spl.bin  u-boot.bin
+(rootfs.tar.gzramdisk.gz)tftpd.exe tftp.exe 
+b.linuxTFTP
+1.linuxTFTPtftpd-hpatftp
+ /home/loongson/tftproot/ (uImageu-
+boot-with-spl.bin  u-boot.bin(rootfs.tar.gzramdisk.gz) 
+
+2.IP 192.168.1.2
+3.
+
+4.2.2 
+
+"c" u-boot console
+1."tftpip""ip"
+"tftpip""ip" serverip "tftpip" ipaddr 
+"ip" uboot console  printenv 
+
+   => printenv
+   ...
+   ipaddr=192.168.1.20
+   ...
+   serverip=192.168.1.2
+   ...
+
+   Environment size: 1315/16380 bytes
+   =>
+
+2.ipip
+
+   => setenv serverip 192.168.2.2
+   =>
+
+3.ip
+
+   => setenv ipaddr 192.168.2.20
+   =>
+
+4.
+ipipip gatewayip
+   => setenv gatewayip 192.168.1.1
+   =>
+
+5.
+ip saveenv 
+
+   => saveenv
+   Saving Environment to SPIFlash... Erasing SPI flash...Writing to SPI
+   flash...done
+   OK
+   =>
+
+
+    
+    
+
+4.2.3 
+
+1.uboot"[2] Update kernel"
+
+2."[1] Update kernel (uImage) to sata disk (by usb)""[2] Update kernel (uImage) to sata disk
+(by tftp)"
+3. reboot  reset
+
+4.2.4 
+
+1.uboot"[4] Update u-boot"
+2."[1] Update u-boot to spi flash (by usb)""[2] Update u-boot to spi flash (by tftp)"
+
+
+3. reboot  reset
+4.2.5  SSD
+
+4.2.5.1 U
+
+1.UFAT32Uinstall
+
+2.UinstalluImage
+rootfs.tar.gzramdisk.gz
+
+3.U
+
+4.2.5.2 TFTP 
+
+ (uImage(rootfs.tar.gzramdisk.gz tftp
+tftp
+
+1.uboot"[6] System install or recover"
+2."[1] System install to sata disk (by usb)""[3] Update u-boot to sata disk (by tftp)"
+
+
+
+
+ls2k1000ls2k1000ls2k500
+ubootlinux
+
+
+   1. 
+   2. 
+   3. 
+   4. 
+buildroot>2.
+>buildroot-
+
+
+ls2k500nand
+SSD
+
+
+5.1. 
+
+5.1.1. 
+
+SSD(2242SSD)NAND()
+SSDNAND
+SSD16GB
+NAND256MB
+
+5.1.2. 
+
+SSDext4rootfs.tar.gz
+NANDUBIFSrootfs-ubifs-
+ze.img
+
+5.1.3. 
+
+Loongnix
+" " 
+
+
+  Debian 10 64
+
+
+ Java 1.8/11Qt5.15QtCreator, .Net 6.0
+
+
+  CPU
+
+  
+
+
+  GTK+ 2
+
+
+  MATE
+
+Loongnix2BASEGUIBASE
+GUI
+BASEGUI
+Loongnix
+
+                                                      5-1 
+
+                      BASE  GUI
+1   sudo
+2   file                    
+3   vim                     
+4   net-tools               
+5   wget                    
+6   telnet-client           
+7   openssh-server          
+8   python3                 
+9   sqlite3                 
+10  mariadb-server          
+11  java(1.8/11)            
+12  dotnet(6.0)             
+13  docker-ce(20.10)        
+14  minicom                 
+15  iperf3                  
+16  strace                  
+17  usbutils                
+18  i2c-tools               
+19  mtd-utils               
+20  can-utils               
+21  ethtool                 
+22  pciutils                
+                            
+                        BASE                  GUI
+23     alsa-utils
+24     psmisc                                 
+25     ffmpeg                                 
+26     nodejs                                 
+27     lightdm()                              
+28     network-manager                        
+29     mate()                                 
+30     gedit()                                
+31     lbrowser()                             
+32     fcitx()                                
+33     vlc                                    
+34     wps                                    
+35     gcc                                    
+36     g++                                    
+37     gdb                                    
+38     make                                   
+39     cmake                                  
+40     go                                     
+41     rust                                   
+42     qt5.15                                 
+43     qt-mysql()                             
+44     qt-serailport()                        
+45     qt-charts()                            
+                                              
+
+GUIjavadotnetqtcreatorwps
+
+
+       
+java
+dotet  
+       http://www.loongnix.cn/zh/api/java/
+
+       
+       http://www.loongnix.cn/zh/api/dotnet/
+            
+qtcreator
+            apt
+
+wps         sudo apt install qtcreator
+
+            wps.deb
+
+            https://www.wps.cn/product/wpslinux
+
+            dpkg -i .deb
+
+            sudo dpkg -i wps-office_11.1.0.11664_loongarch64.deb 
+
+            loongarch.debdpkg -i .deb
+            .debrootsudo
+
+
+
+   1. LoongnixGUI PC
+   2. LoongnixBASEQt
+
+      
+   3. busyboxbuildroot
+
+      Qt
+
+
+
+                                                   5-2 
+
+            Loongnix(GUI)   Loongnix(BASE)   busybox buildroot
+                                             
+                            SSD
+            SSD                              SSDNAND
+                            700M
+            1.8G                             rootfs.tar.gz185M
+
+                                             rootfs-ubifs-ze.img
+Qt(5.15.2)                                   90M
+ssh                                          
+gcc                                          
+systemd                     loongson
+        
+            loongson
+       root             
+            root
+                                             root
+
+ 123  loongson 
+
+IP 192.168.1.10
+
+5.2. 
+
+SSD
+NANDuboot
+
+NANDSSD
+uboot
+
+
+5.2.1. uboot
+
+PCm
+"m"
+uboot
+
+USB"m"
+
+
+5.2.2. 
+
+U(tftp)
+
+5.2.2.1. U
+
+USB2.0USB3.0U8GU
+WinPEU
+UubootDOS(MSDOS)U
+GPTUDOS
+UFAT32
+ubuntu18.04U
+U
+PCU
+""
+""
+
+5.2.2.2. tftp
+
+tftp
+uboot
+tftptftpPCwindowstftp
+
+
+""
+
+tftpip
+tftpip192.168.1.2PCip
+192.168.1.2
+PCip
+win10
+""
+
+""
+
+""
+""
+""
+""
+5.2.3. NANDU
+
+U
+uboot
+
+Uupdateupdate
+rootfs-ubifs-ze.img
+UU
+uboot
+
+
+5.2.4. NANDtftp
+
+tftpPCip(192.168.1.2)
+uboot
+tftpip:
+
+   setenv serverip 192.168.1.2
+   setenv ipaddr 192.168.1.20
+   saveenv
+serveripPCipaddr255.255.255.0
+PCtftp
+
+tftpd64.exe
+PC1
+2
+
+uboot
+
+
+
+
+5.2.5. SSD
+
+SSDSSDPCSSD
+SSDSSDSSD
+(uboot)
+
+5.2.5.1. 
+
+SSD
+                                                5-3 
+
+           
+/dev/sda1   / 
+/dev/sda2  /home /opt /var 
+/dev/sda3  
+           2G
+           
+/dev/sda4
+           rootfs.tar.gzramdisk.gzuImageuboot
+           
+           (/dev/sda1)
+
+           ramdisk.gzWinPE
+           
+           
+           
+
+5.2.5.2. 
+
+
+
+SSD
+
+                                          5-4 
+
+           
+
+           /dev/sda1/dev/sda3
+
+4part      /dev/sda32GB
+
+           /dev/sda1
+twosys
+           /dev/sda1/dev/sda2/dev/sda3/dev/sda4
+
+twosys_3   /dev/sda32GB
+
+           /dev/sda44G
+
+           1 : 2
+
+           /dev/sda1  /dev/sda2
+
+           /dev/sda1/dev/sda2/dev/sda3/dev/sda4
+
+           /dev/sda32GB
+
+           1 : 2 : 3
+
+           /dev/sda1/dev/sda2 /dev/sda4
+
+           /dev/sda4
+
+           /dev/sda1/dev/sda3/dev/sda4
+
+           /dev/sda32GB
+
+           1 : 1
+
+           /dev/sda1  /dev/sda4
+
+           /dev/sda4
+
+
+
+
+                                          5-5 
+
+           
+/dev/sda1   0
+/dev/sda2   0 
+             
+/dev/sda3
+             -1  2G
+
+/dev/sda4    0 
+
+              0
+
+             -2  5G
+
+             -1  4G
+
+             0 
+
+              0
+
+000
+
+1 2 -1 2/dev/sda1/dev/sda2/dev/sda41 : 2 : 2/dev/sda32G
+
+5.2.5.3. 
+
+USBtftp
+fdisk.txt
+
+
+U
+
+fdisk.txt
+
+
+5.2.6. SSDUSB
+
+U
+ubootSSD
+Uinstall
+
+                                              5-6 install
+
+           
+               
+               
+ramdisk.gz     
+               
+rootfs.tar.gz  
+uImage         
+fdisk.txt
+               
+
+
+
+/dev/sda32GB/dev/sda1
+
+4/dev/sda44G2G
+1 : 2
+
+SSD
+UUU
+uboot
+
+SSD
+
+
+
+SSDSSD
+
+5.2.7. SSDtftp
+
+tftpPCip(192.168.1.2)
+ubootSSD
+
+tftpip:
+setenv serverip 192.168.1.2
+setenv ipaddr 192.168.1.20
+saveenv
+
+serveripPCipaddr255.255.255.0
+tftp
+
+                                  5-7 tftp
+
+               
+ramdisk.gz     
+rootfs.tar.gz  
+uImage         
+fdisk.txt      
+
+
+/dev/sda32GB/dev/sda1
+
+4/dev/sda44G/dev/sda32G/dev/sda1/dev/sda2
+1 : 2
+
+SSD
+tftpd64.exe
+PC1
+Utftftp(
+loongarchls2k1000
+ls2k500loongarch)
+uboot
+
+
+
+
+
+SSDSSD
+5.3. 
+
+busybox
+
+
+(cross compile)
+PC
+CPU
+
+X86ubuntu18.04
+USB
+
+
+busyboxloongnix
+
+
+Qt
+
+IDE
+makefileCmakeautotools-packageconfigure
+
+
+cpu
+loongarch
+
+
+
+
+3export
+
+loongarch6464loongarch)toolchain-loongarch64-
+linux-gnu-gcc8-host-x86_64-2022-07-18.tar.gz
+
+
+export PATH=$PATH:/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/bin/
+
+export ARCH=loongarch64
+
+export CROSS_COMPILE=loongarch64-linux-gnu-
+
+mips64el64mipsmips64elmips64el-linux-gcc-
+8.x.tar.gz
+
+
+export PATH=$PATH:/opt/mips64el-linux-gcc-8.x/host/bin
+
+export ARCH=mips
+
+export CROSS_COMPILE=mips64el-linux-
+
+PATHbin
+
+5.3.1. 
+
+
+
+shell
+
+export PATH=$PATH:/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/bin/
+
+export ARCH=loongarch64
+
+export CROSS_COMPILE=loongarch64-linux-gnu-
+
+
+
+loongarch64-linux-gnu-gcc main.c -o main
+
+filemain  *unknown arch 0x102* LoongArch
+258(0x102)file LoongArch
+mainUSB
+
+
+5.3.2. Makefile
+
+Makefile
+
+
+main.cuart_testuart_testuart
+
+Makefile
+
+
+   CC=gcc
+   FLAGS=-g -Wall -std=gnu11
+   INC=-I./
+   LIB=
+   SRC=$(wildcard *.c )
+   OBJS=$(patsubst %c,%o, $(SRC))
+   TARGET=uart_test
+   all:$(TARGET)
+   $(TARGET):$(OBJS)
+
+          @echo "makeing target"
+          @echo $(SRC)
+          @echo $(OBJS)
+          $(CC) ${FLAGS} -o $@ $? $(LIB)
+   %.o:%.c
+          $(CC) ${FLAGS} -c $< -o $@ $(INC)
+   .PHONY:clean
+   clean:
+          -rm $(OBJS) $(TARGET)
+
+makefile
+tab
+
+makefile
+shell
+
+export PATH=$PATH:/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/bin/
+
+export ARCH=loongarch64
+
+export CROSS_COMPILE=loongarch64-linux-gnu-
+
+makeMakfileCC=gcc
+
+
+CCgcc
+loongnixgcc
+make
+
+
+make CC=loongarch64-linux-gnu-gcc
+
+
+
+
+5.3.3. Cmake
+
+CMakecmake
+cmake
+shell
+
+export PATH=$PATH:/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/bin/
+
+export ARCH=loongarch64
+
+export CROSS_COMPILE=loongarch64-linux-gnu-
+
+
+CMakeLists.txtbuildbuild
+
+
+cmake ../
+
+Cmakemake
+
+Makefilegcc
+cmakegccbuild
+
+gccg++
+
+
+cmake -DCMAKE_C_COMPILER=loongarch64-linux-gnu-gcc -
+DCMAKE_CXX_COMPILER=loongarch64-linux-gnu-g++ ../
+
+
+makegcc
+gccCmake
+CMakeLists.txt
+
+5.3.4. autotools-package./configure
+
+configure./configuremake
+make install
+coreutils-8.32
+./configiure --helpCCgcc
+configureCC=loongarch64-linux-gnu-gcc
+
+
+
+shell
+
+export PATH=$PATH:/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/bin/
+
+export ARCH=loongarch64
+
+export CROSS_COMPILE=loongarch64-linux-gnu-
+
+
+
+   ./configure --host=loongarch64 CC=loongarch64-linux-gnu-gcc
+
+loongarchubuntu18.04
+
+build-aux/config.subloongarch64/usr/share/misc
+
+
+root(su root)/usr/share/miscconfig.guessconfig.sub
+config.guessconfig.sub 
+config.sub
+
+sudo wget -O /usr/share/misc/config.sub "git.savannah.gnu.org/gitweb/?
+p=config.git;a=blob_plain;f=config.sub;hb=HEAD"
+
+config.guess
+
+
+sudo wget -O /usr/share/misc/config.guess "git.savannah.gnu.org/gitweb/?
+p=config.git;a=blob_plain;f=config.guess;hb=HEAD"
+
+config.guessconfig.sub
+config.guess964
+
+
+   loongarch32:Linux:\*:\* | loongarch64:Linux:\*:\* | loongarch:linux:\*:\*)
+                 echo "$UNAME_MACHINE"-unknown-linux-"$LIBC"
+                 exit ;;
+
+
+
+config.sub295
+
+   | loongarch32 | loongarch64 | loongarch \
+
+
+
+build-auxroot
+
+cp /usr/share/misc/config.guess /usr/share/misc/config.sub ./
+
+configure
+
+make
+make install
+/usr
+
+configuremake install
+--prefixconfigure
+configure
+config.guess
+
+5.3.5. Qt
+
+ubuntu18.04Qt
+
+ubuntu18.04QtQtCreatorqt-opensource-linux-x64-
+5.12.11.runubuntu18.04
+
+
+QtUIubuntu18.04
+
+loongarch64QtQtcreator
+
+loongarch64QtQt-5.15.2-LA64.tar.gz
+ubuntu18.04()
+
+
+sudo tar -zxf Qt-5.15.2-LA64.tar.gz -C /usr/local
+
+/usr/local/Qt-5.15.2-LA64
+Qtcreator
+Qtcreator
+
+Qtcreator
+
+
+
+
+
+
+QtcreatorQtcreator
+5.3.5.1. Qttslib
+
+tslibls2k500tslibQt
+Qttslibtslib
+
+   export QT_QPA_FB_TSLIB=1
+   ./driver_testcase
+
+
+
+   export QT_QPA_FB_TSLIB=1 && ./driver_testcase
+
+tslibQtQt export
+QT_QPA_FB_TSLIB=1 
+
+bug
+export QT_QPA_FB_TSLIB=1export
+QT_QPA_FB_TSLIB=1/etc/profileQt
+5.4. 
+
+loongnixbusyboxloongnix
+PC
+
+
+5.4.1. 
+
+busyboxsystemdsystemd
+/root/boot_run.sh/etc/profile
+/usr/lib/systemd/system/boot_run.serviceExec_start
+systemd
+boot_run.sh
+
+
+   systemctl disable boot_run
+
+boot_ru.sh
+
+   systemctl enable boot_run
+
+/etc/systemd/system/multi-user.target.wants
+boot_run.service/usr/lib/systemd/system/boot_run.service
+
+boot_run.servicetypeforking&
+&boot_run.servicesystemd-analyze
+
+busyboxboot_run.sh
+ export QT_QPA_FB_TSLIB=1 ls2k1000ls2k500lvds
+tslibls2k500ls2k1000LCDtslib
+Qttslib5.3.1.5.1. Qttslib
+boot_run.sh
+psplash-writepsplashpsplashboot_run.sh
+
+
+   psplash-write "MSG Welcome to Loongson-gd"
+
+Welcome to Loongson-gdSystem banner
+buildrootBR2_TARGET_GENERIC_ISSUE
+
+   psplash-write "PROGRESS 100"
+   psplash-write "QUIT"
+
+100%100%
+(clear
+)
+
+
+   if [ -z "$(cat /proc/cmdline | grep ubifs)" ]; then
+          sleep 5
+
+   fi
+
+SSDboot_run.shQt
+Qt5s
+NANDQtSSDQt
+
+NANDNAND5s
+
+
+   cd /root/logo_player && ./logo_player &
+
+logologo.gifcd
+logo.gif(/root/logo_player)
+
+gif
+buildrootBR2_PACKAGE_QT_MOVIE_AUTOBOOT
+
+5.4.2. RTC
+
+RTCRTC
+hwclock: RTC_RD_TIME: Invalid argument 
+RTC
+RTCRTCUTC
+/etc/timezone
+datebuildroot
+ 'Thu Nov 24 10:44:11 CST 2022' CST
+
+   date
+
+
+
+   date -s '2022-11-24 10:45:00'
+
+rtc hwclock root
+rtc ( -> RTC)
+
+   hwclock -w
+
+rtc RTC -> 
+
+   hwclock -s
+
+hwclock -wUTCRTC
+
+RTC(-u UTC)
+
+   hwclock -w -u
+
+rtc /dev/rtc0
+ /dev/rtc1 : -f /dev/rtc1
+
+5.4.3 ip
+
+ ifconfig  ip 
+buildrootbusyboxipeth0ip
+192.168.1.102eth1ip192.168.2.11
+Network-ManagerNetwork-Manager
+:
+Network-Manager
+
+   systemctl status NetworkManager
+ipeth0ip192.168.3.22
+ ifconfig 
+
+   ifconfig eth0 192.168.3.22
+ipeth0ip192.168.1.10Network-Manager
+eth0ipip192.168.1.10
+ipNetwork-Manager nmtui  nmcli 
+nmcli  ifconfig ip
+nmtui 
+
+   nmtui
+2k1000 
+ip
+
+
+"-connection"
+
+eth0  ip  192.168.3.22 "eth0-connection" 
+ipip"/24"
+24bit255.255.255.0
+ "OK" 
+
+
+ip
+ip: eth0-connection
+
+   nmcli connection reload
+   nmcli connection up eth0-connection
+5.4.3.1 NetworkManager
+
+Networkmanagerip
+Networkmanager
+ Networkmanager 
+
+systemctl disable NetworkManager
+
+ Networkmanager 
+
+systemctl enable NetworkManager
+
+ Networkmanager 
+
+systemctl stop NetworkManager
+
+ Networkmanager 
+
+systemctl start NetworkManager
+
+5.4.4. WIFI 
+
+ WIFI ifconfig  wlan 
+
+ifconfig -a
+
+...
+
+wlan0  Link encap:Ethernet HWaddr D6:EF:AB:03:06:69
+       BROADCAST MULTICAST MTU:1500 Metric:1
+       RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+       TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+       collisions:0 txqueuelen:1000
+       RX bytes:0 (0.0 B) TX bytes:0 (0.0 B)
+
+ wpa  WIFI AP dhcpcd  WIFI AP  IP 
+
+ WIFI :WIFI wifi-test wifi-test123( nmtui 
+5.4.3IP)
+
+wpa_passphrase "wifi-test" "wifi-test123" > /etc/wpa_supplicant.config
+
+
+
+wpa_supplicant -B -i wlan0 -c /etc/wpa_supplicant.config
+
+DHCPCD  IP
+
+dhcpcd wlan0
+ ifconfig  wlan0  IP
+
+ifconfig wlan0
+
+wlan0  Link encap:Ethernet HWaddr D6:EF:AB:03:06:69
+       inet addr:192.168.4.148 Bcast:192.168.4.255 Mask:255.255.255.0
+       inet6 addr: fe80::36be:500c:c7fa:2b4b/64 Scope:Link
+       UP BROADCAST RUNNING MULTICAST MTU:1500 Metric:1
+       RX packets:18 errors:0 dropped:0 overruns:0 frame:0
+       TX packets:32 errors:0 dropped:0 overruns:0 carrier:0
+       collisions:0 txqueuelen:1000
+       RX bytes:1764 (1.7 KiB) TX bytes:3653 (3.5 KiB)
+
+5.4.5. DOCKER 
+
+docker defconfig 
+
+https://docs.docker.com/engine/install/troubleshoot/
+
+https://github.com/coreos/docker/blob/master/contrib/check-config.sh
+
+ loongnix  docker
+
+sudo apt install docker-ce
+
+dockeriptable
+
+sudo update-alternatives --set iptables /usr/sbin/iptables-legacy
+sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
+sudo systemctl start docker
+
+(https://cr.loongnix.cn/)
+
+docker pull cr.loongnix.cn/library/debian:buster-slim
+
+
+
+docker run -d -it --name a1 cr.loongnix.cn/library/debian:buster-slim
+
+
+
+docker exe -it a1 /bin/bash
+
+5.4.6. NFS 
+
+NFSx86
+
+sudo apt install nfs-kernel-server
+
+NFS
+
+sudo systemctl enable --now nfs-server
+
+
+sudo mkdir -p /media/nfs
+
+ /etc/exportsNFS
+
+/media/nfs                192.168.1.0/24(rw,sync,no_subtree_check)
+
+exportfs
+
+sudo exportfs -arv
+
+
+
+sudo chmod go+w /media/nfs
+
+NFS192.168.1.2NFSIP
+
+mount -t nfs4 192.168.1.2:/media/nfs /media/share
+
+5.4.7. 
+
+
+
+arecord -l
+
+
+
+aplay test.wav
+
+
+
+arecord -d 10 -r 48000 -c 2 -f S16_LE audio.wav
+
+5.4.8. AP
+
+USB
+wifi5.4.4. WIFI 
+
+APIPssh
+IP
+
+ dhcpd  hostapd 
+
+      hostapdAP
+      dhcpdIP
+
+
+
+
+      buildroot
+      hostapd/root/hostapd.conf
+      dhcpd/etc/dhcp/dhcpd.conf
+      IP192.168.3.1
+      wlan0
+       testap12345678
+      dhcpdIP 192.168.3.2192.168.3.50
+
+5.4.8.1 hostapd
+
+hostapd
+
+   interface=wlan0
+   driver=nl80211
+   ssid=testap
+   hw_mode=g
+   channel=10
+   macaddr_acl=0
+   auth_algs=3
+   wpa=2
+   wpa_passphrase=12345678
+   wpa_key_mgmt=WPA-PSK
+   wpa_pairwise=TKIP CCMP
+   rsn_pairwise=TKIP CCMP
+
+"wpa=2"
+"ssid""wpa_passphrase"
+
+5.4.8.2 dhcpd
+
+/etc/dhcp/dhcpd.conf
+
+   subnet 192.168.3.0 netmask 255.255.255.0
+   {
+
+          range 192.168.3.2 192.168.3.50;
+          option routers 192.168.3.1;
+          option domain-name-servers 8.8.8.8;
+   }
+
+5.4.8.3 AP
+
+AP
+
+   1. hostapd
+   2. IP
+   3. dhcpd
+
+apcreate.sh
+
+   #! /bin/sh
+
+   hostapd_conf="/root/hostapd.conf"
+   wlan_dev="wlan0"
+   wlan_ip="192.168.3.1"
+NAME="dhcpd"
+DAEMON="/usr/sbin/${NAME}"
+CFG_FILE="/etc/default/${NAME}"
+
+# Read configuration variable file if it is present
+[ -r "${CFG_FILE}" ] && . "${CFG_FILE}"
+
+start_ap()
+{
+
+       hostapd $hostapd_conf -B
+       ifconfig $wlan_dev $wlan_ip
+
+       # start dhcpd
+       test -d /var/lib/dhcp/ || mkdir -p /var/lib/dhcp/
+       test -f /var/lib/dhcp/dhcpd.leases || touch /var/lib/dhcp/dhcpd.leases
+       start-stop-daemon -S -q -x ${DAEMON} -- -q $OPTIONS $INTERFACES
+}
+
+stop_ap()
+{
+
+       killall hostapd 2>/dev/null
+       start-stop-daemon -K -q -x ${DAEMON}
+}
+
+restart_ap()
+{
+
+       stop_ap
+       sleep 1
+       start_ap
+}
+
+tip()
+{
+
+       echo "tip:"
+       echo "$1 (mean restart setup ap)"
+       echo "$1 (mean restart setup ap)"
+       echo "$1 (mean restart setup ap)"
+       echo ""
+       echo "$1 start (mean start setup ap)"
+       echo "$1 s (mean start setup ap)"
+       echo "$1 stop (mean close ap)"
+       echo "$1 close (mean close ap)"
+       echo "$1 e (mean close ap)"
+       echo "$1 restart (mean restart ap setup)"
+       echo "$1 reload (mean restart ap setup)"
+       echo "$1 r (mean restart ap setup)"
+}
+
+if [ $# -eq 0 ]; then
+       restart_ap
+       exit 0
+
+fi
+
+case "$1" in
+       start|s)
+                 start_ap
+                 ;;
+          stop|end|close)
+                 stop_ap
+                 ;;
+          restart|reload|r)
+                 restart_ap
+                 ;;
+          *)
+                 tip $0;
+                 ;;
+   esac
+
+192.168.3.xxxwlan0ip
+/etc/dhcp/dhcpd.conf
+
+
+
+   chmod a+x apcreate.sh
+
+
+      
+      
+      
+
+()
+
+   ./apcreate.sh start
+   ./apcreate.sh s
+
+()
+
+   ./apcreate.sh stop
+   ./apcreate.sh end
+   ./apcreate.sh close
+
+()
+
+   ./apcreate.sh
+   ./apcreate.sh restart
+   ./apcreate.sh reload
+   ./apcreate.sh r
+
+
+
+
+   ./apcreate.sh start
+   ./apcreate.sh start
+
+ssh
+
+5.4.9. dhcpd
+
+buildrootdhcpd
+buildrootipdhcpdip
+ipdhcpd
+
+   [FAILED] Failed to start DHCP server.
+
+dhcpddhcpdbuildroot
+systemddhcpd
+dhcpd
+ dhcpd.service vimvi
+
+   vim /usr/lib/systemd/system/dhcpd.service
+
+
+
+   [Unit]
+   Description=DHCP server
+   After=network.target
+
+   [Service]
+   Type=forking
+   StartLimitIntervalSec=0
+   Restart=always
+   RestartSec=2
+   PIDFile=/run/dhcpd.pid
+   ExecStart=/usr/sbin/dhcpd -q -pf /run/dhcpd.pid $OPTIONS $INTERFACES
+   KillSignal=SIGINT
+   EnvironmentFile=-/etc/default/dhcpd
+
+   [Install]
+   WantedBy=multi-user.target
+
+
+
+   systemctl enable dhcpd.service
+
+
+
+   systemctl start dhcpd.service
+
+dhcpddhcpd.service Restart  RestartSec 
+
+
+   [Unit]
+   Description=DHCP server
+   After=network.target
+
+   [Service]
+Type=forking
+StartLimitIntervalSec=0
+PIDFile=/run/dhcpd.pid
+ExecStart=/usr/sbin/dhcpd -q -pf /run/dhcpd.pid $OPTIONS $INTERFACES
+KillSignal=SIGINT
+EnvironmentFile=-/etc/default/dhcpd
+
+[Install]
+WantedBy=multi-user.target
+
+5.4.10. MAC
+
+MAC2uboot
+
+
+5.4.10.1. MAC
+
+ifconfig
+ubootmac
+eth0mac 56:11:22:33:44:55 
+ eth0 
+
+[root@LS-GD ~]# ifconfig eth0
+
+eth0  Link encap:Ethernet HWaddr 52:A9:2F:C7:67:66
+
+      UP BROADCAST MULTICAST MTU:1500 Metric:1
+
+      RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+
+      TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+
+      collisions:0 txqueuelen:1000
+
+      RX bytes:0 (0.0 B) TX bytes:0 (0.0 B)
+
+      Interrupt:18 Base address:0x8000
+
+
+
+ifconfig eth0 down
+ifconfig eth0 hw ether 56:11:22:33:44:55
+
+ eth0 
+
+[root@LS-GD ~]# ifconfig eth0
+
+eth0  Link encap:Ethernet HWaddr 56:11:22:33:44:55
+
+      BROADCAST MULTICAST MTU:1500 Metric:1
+
+      RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+
+      TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+
+      collisions:0 txqueuelen:1000
+
+      RX bytes:0 (0.0 B) TX bytes:0 (0.0 B)
+
+      Interrupt:18 Base address:0x8000
+
+
+5.4.10.2. ubootMAC
+
+2k5002k1000ubootmac
+
+ubootuboot'c'
+uboot
+
+   U-Boot 2022.04-v2.0.0-00265-g34430548 (Nov 21 2023 - 09:33:23 +0800)
+
+   CPU: LA264
+   Speed: Cpu @ 800 MHz/ Mem @ 400 MHz/ Bus @ 125 MHz
+   Model: loongson-2k1000
+   Board: LS2K1000-DP
+   DRAM: 1 GiB
+   Core: 79 devices, 22 uclasses, devicetree: board
+   SF: Detected w25q64cv with page size 256 Bytes, erase size 4 KiB, total 8 MiB
+   bdinfo is in spi-flash
+   cam_disable:1, vpu_disable:1, pcie0_enable:0, pcie1_enable:1
+   Loading Environment from SPIFlash... OK
+   Cannot get ddc bus
+   In: serial gpiobtn
+   Out: serial vidconsole
+   Err: serial vidconsole
+   Net: eth0: ethernet@40040000, eth1: ethernet@40050000
+   ************************** Notice **************************
+   Press c to enter u-boot console, m to enter boot menu
+   ************************************************************
+   Autoboot in 0 seconds
+
+    => 
+
+   =>
+
+uboot
+
+   print
+
+21mac
+ethaddreth0eth1addreth12k500ethaddr2k10002
+ethaddreth1addr
+
+   eth1addr=aa:dd:12:28:ca:d8
+   ethaddr=52:a9:2f:c7:67:66
+
+2k1000
+ eth0  52:a9:2f:c7:67:99eth1  aa:dd:12:28:88:d8
+
+setenv ethaddr '52:a9:2f:c7:67:99'
+setenv eth1addr 'aa:dd:12:28:88:d8'
+saveenv
+
+(reboot)mac
+
+[root@LS-GD ~]# ifconfig eth0
+
+eth0  Link encap:Ethernet HWaddr 52:A9:2F:C7:67:99
+
+      UP BROADCAST MULTICAST MTU:1500 Metric:1
+
+      RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+
+      TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+
+      collisions:0 txqueuelen:1000
+
+      RX bytes:0 (0.0 B) TX bytes:0 (0.0 B)
+
+      Interrupt:18 Base address:0x8000
+
+[root@LS-GD ~]# ifconfig eth1
+
+eth1  Link encap:Ethernet HWaddr AA:DD:12:28:88:D8
+
+      UP BROADCAST MULTICAST MTU:1500 Metric:1
+
+      RX packets:0 errors:0 dropped:0 overruns:0 frame:0
+
+      TX packets:0 errors:0 dropped:0 overruns:0 carrier:0
+
+      collisions:0 txqueuelen:1000
+
+      RX bytes:0 (0.0 B) TX bytes:0 (0.0 B)
+
+      Interrupt:21 Base address:0x8000
+
+5.5 coredump 
+
+   1.  PC 
+       -g
+
+      loongarch64-linux-gnu-gcc -g 1.c
+
+2. core  
+    ulimit -c unlimited
+
+ulimit 
+
+      # ulimit -a
+
+      core file size        (blocks, -c) unlimited
+
+      data seg size         (kbytes, -d) unlimited
+
+      scheduling priority            (-e) 0
+
+      file size             (blocks, -f) unlimited
+
+      pending signals                (-i) 3145
+
+      max locked memory     (kbytes, -l) 65536
+
+      max memory size       (kbytes, -m) unlimited
+
+      open files                     (-n) 1024
+
+      pipe size             (512 bytes, -p) 8
+
+      POSIX message queues     (bytes, -q) 819200
+
+      real-time priority             (-r) 0
+
+      stack size            (kbytes, -s) unlimited
+
+      cpu time              (seconds, -t) unlimited
+
+      max user processes             (-u) 100000
+virtual memory  (kbytes, -v) unlimited
+file locks                    (-x) unlimited
+
+3. core  
+      # cat /proc/sys/kernel/core_pattern
+      core
+
+   
+      # sysctl kernel.core_pattern
+      kernel.core_pattern = core
+
+4.  
+
+      # ./a.out
+
+      [ 374.566878] do_page_fault(): sending SIGSEGV to a.out for invalid write
+      access to 0000000000000000
+      [ 374.576031] era = 0000000120000748 in a.out[120000000+4000]
+      [ 374.581699] ra = 0000000120000788 in a.out[120000000+4000]
+      Segmentation fault (core dumped)
+
+    core  coredump 
+
+      # ls -sh
+
+      total 508K
+      16K a.out 488K core
+
+5. (PC )
+    core PC gdb 
+   
+
+           1.  loongarch64-linux-gnu-gdb
+           2.  
+           3.  core 
+           4. 
+
+      $ loongarch64-linux-gnu-gdb
+      GNU gdb (LoongArch GNU toolchain rc1.2 (20230615)) 8.1.50.20190122-git
+      Copyright (C) 2018 Free Software Foundation, Inc.
+      License GPLv3+: GNU GPL version 3 or later
+      <http://gnu.org/licenses/gpl.html>
+      This is free software: you are free to change and redistribute it.
+      There is NO WARRANTY, to the extent permitted by law.
+Type "show copying" and "show warranty" for details.
+This GDB was configured as "--host=x86_64-linux-gnu --target=loongarch64-
+linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+
+       <http://www.gnu.org/software/gdb/documentation/>.
+
+For help, type "help".
+
+Type "apropos word" to search for commands related to "word".
+
+(gdb) file a.out          ## 
+
+Reading symbols from a.out...done.
+
+(gdb) core-file ./core    ## core 
+
+warning: exec file is newer than core file.
+
+[New LWP 473]
+
+warning: Section `.reg2/473' in core file too small.
+
+warning: Could not load shared library symbols for /lib/loongarch64-linux-
+
+gnu/libc.so.6.
+
+Do you need "set solib-search-path" or "set sysroot"?
+
+Core was generated by `./a.out'.
+
+Program terminated with signal SIGSEGV, Segmentation fault.
+
+warning: Section `.reg2/473' in core file too small.
+
+#0 0x0000000120000748 in change_val (p=0x0) at 1.c:7 ## 
+
+
+
+7               *p = 10;
+
+(gdb) bt                  ## 
+
+#0 0x0000000120000748 in change_val (p=0x0) at 1.c:7
+
+#1 0x0000000120000788 in main (argc=1, argv=0x7ffbcbc0e8) at 1.c:13
+
+(gdb)
+
+
+
+   #include <stdio.h>
+   #include <stdlib.h>
+   #include <string.h>
+
+   void change_val(char *p)
+   {
+
+                 *p = 10;
+   }
+
+   int main(int argc, char *argv[])
+   {
+
+                 char *p = NULL;
+                 change_val(p);
+                 printf("p:%d\n", *p);
+                 return 0;
+   }
+
+
+6.1 
+
+
+
+# uname -a
+Linux LS-GD 5.10.0.lsgd+ #1 PREEMPT Tue Sep 6 11:18:20 CST 2022 loongarch64
+GNU/Linux
+
+
+
+# cat /etc/hostname
+LS-GD
+
+
+
+# cat /etc/issue
+Welcome to Loongson-gd
+
+ CPU 
+
+# cat /proc/cpuinfo     : generic-loongson-machine
+system type             :0
+processor               :0
+package                 :0
+core                    : Loongson-64bit
+CPU Family              : Loongson-2K1001
+Model Name              : 0x00
+CPU Revision            : 0x00
+FPU Revision            : 900.00
+CPU MHz                 : 1800.00
+BogoMIPS                : 64
+TLB Entries             : 40 bits physical, 40 bits virtual
+Address Sizes           : loongarch32 loongarch64
+ISA                     : cpucfg lam fpu lsx
+Features                : yes, iwatch count: 4, dwatch count: 2
+Hardware Watchpoint
+                        :1
+processor               :0
+package                 :1
+core                    : Loongson-64bit
+CPU Family              : Loongson-2K1001
+Model Name              : 0x00
+CPU Revision            : 0x00
+FPU Revision            : 900.00
+CPU MHz                 : 1800.00
+BogoMIPS                : 64
+TLB Entries             : 40 bits physical, 40 bits virtual
+Address Sizes
+ISA                    : loongarch32 loongarch64
+Features               : cpucfg lam fpu lsx
+Hardware Watchpoint    : yes, iwatch count: 4, dwatch count: 2
+
+
+
+# free -m    total           used    free    shared buff/cache available
+                822           251     428
+Mem:                0             0       0       8              141  446
+Swap:
+
+6.2 DDR 
+
+# memtester 8M 1
+memtester version 4.5.0 (64-bit)
+Copyright (C) 2001-2020 Charles Cazabon.
+Licensed under the GNU General Public License version 2 (only).
+
+pagesize is 16384
+
+pagesizemask is 0xffffffffffffc000
+
+want 8MB (8388608 bytes)
+
+got 8MB (8388608 bytes), trying mlock ...locked.
+
+Loop 1/1:
+
+Stuck Address          : ok
+
+Random Value           : ok
+
+Compare XOR            : ok
+
+Compare SUB            : ok
+
+Compare MUL            : ok
+
+Compare DIV            : ok
+
+Compare OR             : ok
+
+Compare AND            : ok
+
+Sequential Increment: ok
+
+Solid Bits             : ok
+
+Block Sequential : ok
+
+Checkerboard           : ok
+
+Bit Spread             : ok
+
+Bit Flip               : ok
+
+Walking Ones           : ok
+
+Walking Zeroes         : ok
+
+8-bit Writes           : ok
+
+16-bit Writes          : ok
+
+Done.
+
+6.3 U
+
+1.U
+# ls /dev/sd*       /dev/sda3  /dev/sdb  /dev/sdb1
+/dev/sda /dev/sda1  /dev/sda3
+# ls /dev/sd*
+/dev/sda /dev/sda1
+#
+
+2.U
+
+# mkdir /media/usb
+# mount /dev/sdb1 /media/usb
+# ls /media/usb
+
+ BDR108Board_V1.00.pdf
+ Python-3.11.0rc1.tgz
+ Python-3.8.5.tgz
+ SCH-KL_AI_LSGD_V1.pdf
+'Screenshot at 2022-11-03 02-48-50.png'
+'System Volume Information'
+ install
+ loongson11.2.0-jdk11.0.15_10-linux-loongson3a.tar.gz
+ loongson17.1.0-jdk17_35-linux-loongson3a.tar.gz
+ loongson8.1.11-jdk8u332b09-linux-loongson3a.tar.gz
+ ltp-full
+ ltp-full.tar.gz
+ ltp-master.zip
+ ltp.tar.gz
+ platform-loongarch64.patch
+ python_3.11.0-rc1_loongarch64.deb
+ python_3.11.0-rc1_mips64el-bundle.tar.gz
+ python_3.11.0-rc1_mips64el.deb
+ python_3.8.5_loongarch64.deb
+ qtperf
+ rootfs-ubifs-ze.img
+ stressapptest
+ stressapptest-1.0.9.tar.gz
+ stressapptest-master.zip
+ stressapptest.sh
+ stressapptest.tar.gz
+ stressapptest_1.0.6-2.lnd.2.debian.tar.xz
+ stressapptest_1.0.6-2.lnd.2_loongarch64.deb
+ stressapptest_1.0.6.orig.tar.gz
+ test
+ test-iso-4G.zip
+ test.mp3
+ test.wav
+ u-boot-with-spl.bin
+ update
+#
+
+6.4 
+
+ dd  U
+1.
+# time dd if=/dev/zero of=/media/usb/test bs=1024k count=100 conv=fdatasync
+100+0 records in
+100+0 records out
+104857600 bytes (105 MB, 100 MiB) copied, 7.70354 s, 13.6 MB/s
+
+real  0m7.733s
+user  0m0.016s
+sys   0m2.714s
+
+2.
+
+# echo 3 > /proc/sys/vm/drop_caches
+
+3.
+
+# time dd if=/media/usb/test of=/dev/null bs=1024k
+100+0 records in
+100+0 records out
+104857600 bytes (105 MB, 100 MiB) copied, 22.2998 s, 4.7 MB/s
+
+real  0m22.332s
+user  0m0.004s
+sys   0m16.223s
+
+6.5  ping
+
+2K1000eth0192.168.1.2
+
+1.
+
+# ifconfig eth0 192.168.1.5
+
+2.Ping 
+
+# ping 192.168.1.2 -w 10
+PING 192.168.1.2 (192.168.1.2): 56 data bytes
+64 bytes from 192.168.1.2: seq=0 ttl=64 time=2.179 ms
+64 bytes from 192.168.1.2: seq=1 ttl=64 time=1.998 ms
+64 bytes from 192.168.1.2: seq=2 ttl=64 time=2.091 ms
+64 bytes from 192.168.1.2: seq=3 ttl=64 time=1.378 ms
+64 bytes from 192.168.1.2: seq=4 ttl=64 time=2.075 ms
+64 bytes from 192.168.1.2: seq=5 ttl=64 time=2.070 ms
+64 bytes from 192.168.1.2: seq=6 ttl=64 time=2.005 ms
+64 bytes from 192.168.1.2: seq=7 ttl=64 time=2.098 ms
+64 bytes from 192.168.1.2: seq=8 ttl=64 time=2.152 ms
+64 bytes from 192.168.1.2: seq=9 ttl=64 time=2.128 ms
+
+--- 192.168.1.2 ping statistics ---
+10 packets transmitted, 10 packets received, 0% packet loss
+round-trip min/avg/max = 1.378/2.017/2.179 ms
+#
+
+6.6 RTC
+1.
+
+# date   2 11:00:53 CST 2022
+Wed Nov
+#
+
+2.RTC
+
+# hwclock
+Wed Nov 2 03:01:11 2022 0.000000 seconds
+
+3.
+
+   # date -s "2022-11-02 3:00"
+   Wed Nov 2 03:00:00 CST 2022
+
+4.RTC
+
+# hwclock -w
+
+6.7 
+
+# cat /sys/class/thermal/thermal_zone0/temp
+32000
+
+6.8  USB 
+
+       SSD  loongnix 
+   1. LCDLCD LCD 
+
+6.9 
+ wav 
+
+   # aplay test.wav
+   Palying WAVE 'test.wav' : Signed 16 bit Little Endian, Rate 48000Hz, Stereo
+   #
+
+
+ /root/loongson_test_case 
+
+   # ls /root/loongson_test_case/
+     RS232_test
+     RS485_test
+     baudrate_test
+     board_param
+     button_test
+     can_rate_test
+     can_test
+     double_eth_test
+     double_pcie_test
+     driver_testcase
+     gpio_test
+     i2c_test
+     lcd_test
+     led_onoff_test
+     loongson_test_match_board.sh
+     network_bandwidth_test
+     other_test_case
+     pcie_network_bandwidth_test
+     pwm_test
+     rtc_test
+     spi_test
+     tf_test
+     uart_test
+     usb_test
+     watchdog_test
+
+   #
+
+7.1 GPIO
+
+1. GPIO 
+2. gpio_test 
+
+   # cd /root/loongson_test_case/gpio_test
+   # ./gpio_test.sh
+   <BOARD_NAME>
+   cur test <pin-out-0> and <pin-in-0>
+   group_pin(out:<pin-out-0>,in:<pin-in-0>) test passed!
+
+   cur test <pin-out-1> and <pin-in-1>
+   group_pin(out:<pin-out-1>,in:<pin-in-1>) test passed!
+
+   ...
+
+   cur test <pin-n-out> and <pin-n-in>
+   group_pin(out:<pin-n-out>,in:<pin-n-in>) test passed!
+
+   ++++++++++++++++++++++ total result ++++++++++++++++++++++
+   0: test about base: <pin-out-0> <pin-in-0> : passed!
+   1: test about base: <pin-out-1> <pin-in-1> : passed!
+   ...
+   <n>: test about base: <pin-out-n> <pin-in-n> : passed!
+   #
+
+7.2 UART 
+
+1. UART TX-RX 
+2. uart_test 
+
+   # cd /root/loongson_test_case/uart_test
+   # ./uart_test /dev/ttyS0 /dev/ttyS3
+   /dev/ttyS0 send: hello,world
+   /dev/ttyS3 recv: hello,world
+   uart test passed!
+   /dev/ttyS0 send: hello,world
+   /dev/ttyS3 recv: hello,world
+   uart test passed!
+   #
+
+7.3 USB 
+
+1. FAT32 U
+
+2. usb_test 
+
+   # cd /root/loongson_test_case/usb_test
+   # ./test_usb_RW.sh /dev/sdb1
+   probe your rootfs in nand
+   usb test logic:
+
+       copy a big file from usb to usb
+       copy many small file from usb to usb
+   so speed maybe slow
+   ---------------------------------------
+   create a big file
+
+   copy big file
+   1 files (512.0 MiB) copied in 27.5 seconds ( 18.6 MiB/s).
+   delete big file and md5file
+   ---------------------------------------
+   create small file
+   process: 512 / 512
+   copy small file
+   512 files (512.0 MiB) copied in 30.9 seconds ( 16.6 MiB/s).
+   delete small file
+   ---------------------------------------
+   test finish
+   USB IO test finish!
+   #
+3. ext4 U2
+
+7.4 CAN 
+
+1. CAN 
+
+2.CAN  can_rate_test 
+   # cd /root/loongson_test_case/can_rate_test
+   # ./can_rate_test.sh
+   can_name:can0, can_id:0x123 rate:250kpbs
+   cur test baudrate: 250kbps
+   process: 1 / 10000[ 58.851375] sja1000_platform 1ff45000.can can1: setting
+   BTR0=0x18 BTR1=0x5
+   can_name:can1, can_id:0x123 rate:250kpbs
+   cur test baudrate: 250kbps
+   process: 26 / 10000
+   process: 9729 / 10000
+   process: 9955 / 10000
+   process: 9963 / 10000
+   process: 10000 / 10000
+   baud rate: 250kbps test success!
+
+   baud rate: 250kbps test success!
+   can_name:can0, can_id:0x123 rate:500kpbs
+   cur test baudrate: 500kbps
+   process: 1 / 10000can_name:can1, can_id:0x123 rate:500kpbs
+   cur test baudrate: 500kbps
+   process: 9929 / 10000
+   process: 10000 / 10000
+   baud rate: 500kbps test success!
+
+   baud rate: 500kbps test success!
+   can_name:can0, can_id:0x123 rate:1000kpbs
+   cur test baudrate: 1000kbps
+   process: 1 / 10000can_name:can1, can_id:0x123 rate:1000kpbs
+   cur test baudrate: 1000kbps
+   process: 10000 / 10000 process: 7678 / 100000
+   baud rate: 1000kbps test success!
+   test performance passed!
+   CAN performance test passed!
+
+   baud rate: 1000kbps test success!
+   CAN performance test passed!
+   #
+
+3.CAN  can_test 
+
+   # cd /root/loongson_test_case/can_test
+   # ./can_test.sh
+   can_name:can0, can_id:0x123 rate:250kpbs
+   cur test baudrate: 250kbps
+   process: 1 / 1wait recv msg...
+   can_name:can1, can_id:0x123 rate:250kpbs
+   cur test baudrate: 250kbps
+   recevied data: cantest9
+   test data: cantest9
+   can test passed!
+   wait recv msg...
+   recevied data: cantest9
+   test data: cantest9
+   can test passed!
+   #
+
+7.5 SPI 
+
+spi-flashflash
+
+1. spi_test 
+
+   # cd /root/loongson_test_case/spi_test
+   # ./spi_test
+   rx_buf[0] to rx_buf[63]:
+   ae f1 ff 63 4c 01 00 1c 8c 11 db 28 4d 01 00 1c
+   ad 91 d5 28 80 01 80 29 8c 11 c0 02 8d f9 ff 63
+   4c 01 00 1c 8c e1 cf 28 80 01 00 4c 04 08 20 15
+   04 00 00 16 84 00 24 03 01 03 15 00 20 00 00 4c
+
+   rx_buf[0] to rx_buf[63]:
+   ae f1 ff 63 4c 55 66 77 88 11 db 28 4d 01 00 1c
+   ad 91 d5 28 80 01 80 29 8c 11 c0 02 8d f9 ff 63
+   4c 01 00 1c 8c e1 cf 28 80 01 00 4c 04 08 20 15
+   04 00 00 16 84 00 24 03 01 03 15 00 20 00 00 4c
+
+   SPI FLASH test passed!
+   #
+
+7.6 I2C 
+
+i2c-eeprom
+1. i2c 
+
+   # cd /root/loongson_test_case/i2c_test
+   # ./i2c_test
+   <BOARD_NAME>
+   ...
+   I2C test passed!
+   #
+
+7.7 PWM 
+
+ LED  PWM,pwm ledCONFIG_LEDS_PWM
+ PWM 
+1. pwm_test 
+
+   # cd /root/loongson_test_case/pwm_test
+   # ./pwm_test.sh
+   <BOARD_NAME>
+   your board name is:<BOARD_NAME>
+   just will use default param
+   you can modifity pwm_test_* value to fit your board
+   cur test pwm is chip: 3 channel:0
+   test Hz is 100KHz
+
+   cur test duty period is 25 percentage
+   observer signal is standard?(y or n): y
+   test duty period is 50 percentage
+   observer signal is standard?(y or n): y
+   test duty period is 75 percentage
+   observer signal is standard?(y or n): y
+   test duty period is 100 percentage
+   observer signal is standard?(y or n): y
+
+   ++++++++++++++++++++++ total result ++++++++++++++++++++++
+   chip: 3 channel: 0: passed!
+   #
+
+7.8 WTD 
+
+1. watchdog_test 10s
+
+   # cd /root/loongson_test_case/watchdog_test
+   # ./wdt_test 10
+
+2.10s 
+
+   # ./wdt_test feed
+
+   // 10s
+   # ./wdt_test feed
+
+3.10s 
+
+   # ./wdt_test feed
+
+   // 10s
+
+7.9 RTC 
+
+ RTC +1
+1. rtc_test 
+
+   # cd /root/loongson_test_case/rtc_test
+   # ./rtc_test
+   rtc read test
+   RTC data/time: 2022/9/8 03:41:36
+   OS data/time(UTC): 2022/9/8 03:41:34
+   OS data/time(local): 2022/9/8 11:41:34
+   -------------
+   set rtc time test
+   rtc test time add one day
+   set rtc time
+   read cur rtc timu
+   RTC data/time: 2022/9/9 03:41:36
+   recover rtc time
+   rtc time test RW passed!
+   #
+
+2.rtc
+
+7.10 LCD 
+
+1. LCD
+2. LCD_test 
+   # cd /root/loongson_test_case/lcd_test
+   # ./LCD_test
+
+3.LCDLCD
+
+
+
+8.1 
+
+ systemd service 
+1. autoreboot.service 
+
+   [Unit]
+   Description=auto reboot test
+   #Documentation=man:mandb(8)
+   After=getty@.service
+
+   [Service]
+   Type=oneshot
+   #ExecStart=sleep 10
+   ExecStart=/opt/autoreboot.sh &
+
+   [Install]
+   WantedBy=multi-user.target
+
+2./opt  autoreboot.sh
+
+   #!/bin/bash
+   set -x
+
+   test_cnt=1000
+   sleep_time=60
+
+   date=`date +%Y%m%d`
+   log_dir=/opt/log_autoreboot
+   log_file=$log_dir/log_$date.txt
+   cnt_file=$log_dir/cnt.txt
+
+   if [ ! -d $log_dir ] ; then
+          mkdir -p $log_dir
+
+   fi
+
+   if [ -e $cnt_file ] ; then
+          test_cnt=`cat $cnt_file`
+
+   fi
+
+   test_cnt=$(($test_cnt - 1))
+   echo "$test_cnt" >$cnt_file
+   echo "test_cnt:$test_cnt"
+
+   if [ $test_cnt -le 0 ] ; then
+          echo "end .."
+
+   else
+          echo "sleep $sleep_time ..."
+          sleep $sleep_time
+          date_str=`date +%Y%m%d%H%M%S`
+          echo "$date_str reboot test $test_cnt ..." >> $log_file
+          reboot
+   fi
+
+   set +x
+
+3.
+
+   # sudo chmod +x /opt/autoreboot.sh
+   # sudo cp autoreboot.service /lib/systemd/system
+   # sudo systemctl enable autoreboot
+   #
+
+8.2 LTP
+
+ltp-testsuite.tar.gz
+1.ltpSSDU
+2.SSDU /media/usb  ltp  runltp
+
+   # mount /dev/sda1 /media/usb
+   # cd /media/usb/ltp-testsuite
+   # ./runltp
+   ...
+   #
+
+
+    1.
+
+        # ./runltp -p -l /root/log -d /tmp -o /root/printf -t 10h
+
+    -l 
+
+    -o 
+
+    -t 
+
+    -d 
+
+    -p 
+    2.ltpU(sda1) -b 
+    (sda2)
+
+        # ./runltp -b /dev/sda2
+
+8.3 stress
+
+   # stress --cpu 1 --io 4 --vm 2 --vm-bytes 128M --timeout 3600
+   stress: info: [44446] dispatching hogs: 1 cpu, 4 io, 2 vm, 0 hdd
+   stress: info: [44446] successful run completed in 3600s
+   #
+8.4 memtest
+
+# memtester 128M 1
+memtester version 4.5.0 (64-bit)
+Copyright (C) 2001-2020 Charles Cazabon.
+Licensed under the GNU General Public License version 2 (only).
+
+pagesize is 16384
+
+pagesizemask is 0xffffffffffffc000
+
+want 128MB (134217728 bytes)
+
+got 128MB (134217728 bytes), trùing mlock ...locked.
+
+Loop 1/1:
+
+Stuck Address      : ok
+
+Random Value       : ok
+
+Compare XOR        : ok
+
+Compare SUB        : ok
+
+Compare MUL        : ok
+
+Comtare DIV        : ok
+
+Coopare OR         : ok
+
+Compare AND        : ok
+
+Sequential Increment: ok
+
+Solid Bits         : ok
+
+Done.
+#
+
+
+9.1.
+
+x86ubuntu18.04
+(uboot) + (linux) + 
+x86ubuntu 18.04ubootlinuxusb
+tftp
+
+9.2. 
+
+
+            · Ubuntu18.04
+            · 
+
+ubuntu 18.04VMware 15.5
+loongson
+123rootuboot
+
+9.2.1. Ubuntu18.04
+
+ubuntu 18.04
+
+ubuntu:
+
+                                                          1 of 45
+9.2.1.1. 
+
+ubuntu
+:
+163
+/etc/apt/source.listsource.list
+
+  sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+
+                                                          2 of 45
+# 
+deb http://mirrors.aliyun.com/ubuntu/ bionic main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-security main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-updates main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-proposed main restricted universe multiverse
+deb http://mirrors.aliyun.com/ubuntu/ bionic-backports main restricted universe multiverse
+deb-src http://mirrors.aliyun.com/ubuntu/ bionic main restricted universe multiverse
+deb-src http://mirrors.aliyun.com/ubuntu/ bionic-security main restricted universe multiverse
+deb-src http://mirrors.aliyun.com/ubuntu/ bionic-updates main restricted universe multiverse
+deb-src http://mirrors.aliyun.com/ubuntu/ bionic-proposed main restricted universe multiverse
+deb-src http://mirrors.aliyun.com/ubuntu/ bionic-backports main restricted universe multiverse
+
+# See http://help.ubuntu.com/community/UpgradeNotes for how to upgrade to
+# newer versions of the distribution.
+deb http://mirrors.163.com/ubuntu bionic main restricted
+# deb-src http://mirrors.163.com/ubuntu bionic main restricted
+
+## Major bug fix updates produced after the final release of the
+## distribution.
+deb http://mirrors.163.com/ubuntu bionic-updates main restricted
+# deb-src http://mirrors.163.com/ubuntu bionic-updates main restricted
+
+## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
+## team. Also, please note that software in universe WILL NOT receive any
+## review or updates from the Ubuntu security team.
+deb http://mirrors.163.com/ubuntu bionic universe
+# deb-src http://mirrors.163.com/ubuntu bionic universe
+deb http://mirrors.163.com/ubuntu bionic-updates universe
+# deb-src http://mirrors.163.com/ubuntu bionic-updates universe
+
+## N.B. software from this repository is ENTIRELY UNSUPPORTED by the Ubuntu
+## team, and may not be under a free licence. Please satisfy yourself as to
+## your rights to use the software. Also, please note that software in
+## multiverse WILL NOT receive any review or updates from the Ubuntu
+## security team.
+deb http://mirrors.163.com/ubuntu bionic multiverse
+# deb-src http://mirrors.163.com/ubuntu bionic multiverse
+deb http://mirrors.163.com/ubuntu bionic-updates multiverse
+# deb-src http://mirrors.163.com/ubuntu bionic-updates multiverse
+
+## N.B. software from this repository may not have been tested as
+## extensively as that contained in the main release, although it includes
+## newer versions of some applications which may provide useful features.
+## Also, please note that software in backports WILL NOT receive any review
+## or updates from the Ubuntu security team.
+deb http://mirrors.163.com/ubuntu bionic-backports main restricted universe multiverse
+
+                                                        3 of 45
+  # deb-src http://mirrors.163.com/ubuntu bionic-backports main restricted universe multiverse
+  deb http://mirrors.163.com/ubuntu bionic-security main restricted
+  # deb-src http://mirrors.163.com/ubuntu bionic-security main restricted
+  deb http://mirrors.163.com/ubuntu bionic-security universe
+  # deb-src http://mirrors.163.com/ubuntu bionic-security universe
+  deb http://mirrors.163.com/ubuntu bionic-security multiverse
+  # deb-src http://mirrors.163.com/ubuntu bionic-security multiverse
+
+
+
+  sudo gedit /etc/apt/sources.list
+
+
+
+
+
+  sudo apt update
+
+
+
+9.2.1.2. 
+
+
+
+
+                                                          4 of 45
+
+
+
+
+
+
+  5 of 45
+
+
+
+
+  6 of 45
+
+                                                          7 of 45
+8 of 45
+
+                                                          9 of 45
+9.2.1.3. 
+
+apt
+
+
+  sudo apt -y install make git gcc g++ bison flex libncurses5-dev libssl-dev libelf-dev u-boot-tools
+  sudo apt -y install cmake tree build-essential tcl-dev automake libtool
+
+9.2.2 
+
+mips64elloongarch64
+
+mips64elmips64el-linux-gcc-8.x.tar.gz
+
+                                                         10 of 45
+loongarch64toolchain-loongarch64-linux-gnu-
+gcc8-host-x86_64-2022-07-18.tar.xz
+loongarch
+mips64el-linux-gcc-8.x.tar.gzmips64el
+loongarch
+ubuntu18.04toolchain
+
+
+/opt
+
+  sudo tar -zxf mips64el-linux-gcc-8.x.tar.gz -C /opt/
+  sudo tar -xf toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18.tar.xz -C /opt/
+
+9.2.3 loongarch
+
+uboot
+uboot
+
+                                                         11 of 45
+uImage.gz
+                                                         12 of 45
+loongarchu-boot-toolsmkimage
+uImage.gz
+ubootubootloongarch64
+loongson_2k1000_defconfigubootloongarch
+
+                                                         13 of 45
+uboot
+
+  sudo cp tools/mkimage /usr/bin/
+
+uImage.gz
+
+                                                         14 of 45
+15 of 45
+9.2.4 Qt
+
+Qtx86Qt
+
+x86UI
+
+
+9.2.4.1 Qt
+
+Qtx86 ubuntu 18.04Qt
+Qt5.12.11QtQt
+
+qt-opensource-linux-x64-5.12.11.runubuntu 18.04
+
+
+
+  sudo apt install libxcb-xinerama0 libgl1-mesa-dev libgl1
+
+qt-opensource-linux-x64-5.12.11.run
+
+  chmod a+x qt-opensource-linux-x64-5.12.11.run
+  ./qt-opensource-linux-x64-5.12.11.run
+
+qt
+
+                                                         16 of 45
+
+                                                         17 of 45
+18 of 45
+19 of 45
+20 of 45
+Qt
+
+    21 of 45
+22 of 45
+23 of 45
+24 of 45
+qtcreator
+
+9.2.4.2 Qt
+
+9.2.4.1 Qt
+
+Qt
+
+                           9-1 Qt
+
+                                                     
+Qt-5.15.2-mips64el.tar.gz  mips64el  ls2k1000 mips
+
+                           25 of 45
+                                                    
+Qt-5.15.2-LA64.tar.gz  loongarch64
+                                    ls2k1000 LA
+                                    ls2k500 
+
+Qt
+
+                       9-2 Qt
+
+                                                      
+
+Qt         QtQtqmake
+
+                          Qt
+Qt
+
+                          Qt-5.15.2-LA64.tar.gzloongarch64
+
+           Qtqt(gcc)
+
+qtcreator  
+
+Qt5.15.2Qt5.12.11
+
+
+qt-opensource-linux-x64-5.12.11.run
+x86 ubuntu 18.04Qt5.12.11qtcreator
+qtcreatorQtqtccreatorQt
+x86 ubuntu 18.04Qt5.12.11
+
+5.3.5Qt
+
+           1. Qt
+           2. Qt/usr/local/Qt
+
+                Qt
+           3. QtcreatorQt
+           4. Qtcreator3kit
+
+Qt
+Qt-5.15.2-mips64el.tar.gzQt-5.15.2-LA64.tar.gz
+
+                               9-3 Qt
+
+                       26 of 45
+                                                                   
+
+Qt-5.15.2-mips64el.tar.gz mips64el-linux-gcc-8.x
+
+Qt-5.15.2-LA64.tar.gz  toolchain-loongarch64-linux-gnu-gcc8-host-
+                       x86_64-2022-07-18
+
+QtQt-tool
+
+Qt()
+
+  sudo tar -zxf Qt-5.15.2-LA64.tar.gz -C /usr/local/
+  sudo tar -zxf Qt-5.15.2-mips64el.tar.gz -C /usr/local/
+
+qtcreator
+                                                         27 of 45
+Qt
+                                                         28 of 45
+29 of 45
+30 of 45
+
+                                                         31 of 45
+32 of 45
+33 of 45
+Qt
+                                                         34 of 45
+35 of 45
+loongarchmips64elQtQt
+Qt-test
+
+                                                         36 of 45
+37 of 45
+38 of 45
+mips64el
+9.2.4.2.1 mips64el
+Qt
+
+mips64el
+
+                                                         39 of 45
+64mips
+9.2.4.2.2 
+loongarch64qtcreator
+
+
+
+                                                         40 of 45
+
+
+  41 of 45
+9.2.5 
+
+ubuntu 18.04
+
+
+                                                         42 of 45
+43 of 45
+44 of 45
+
+
+9.2.6 buildroot
+
+buildroot
+buildroot12G
+5
+24
+buildroot12.2.1.2. buildroot
+
+9.2.7 loongarchautotool
+
+autotools-package./configure
+loongarchloongarch
+/usr/share/miscconfig.guessconfig.subloongarchconfigure
+
+**5.3.4. autotools-package./configure**
+ubuntu 18.04config.guessconfg.sub
+
+                                                         45 of 45
+U-Boot 
+
+10.0 U-boot 
+
+ U-boot-2022.04 
+
+      USB1.0OHCI,USB2.0(EHCI)otg
+      
+      sata
+      1920x1080bmp logo
+      I2C
+      NAND Flash
+      SLC:, : 256MB/512MB/1GB
+      MLC:
+      SPI Flash BootLoader
+      u-bootLinuxtftpU
+      
+
+10.1 U-Boot
+
+
+$ source ./set_env.sh
+====>setup env for LoongArch...
+
+
+
+$ make loongson_2k1000_dp_defconfig
+
+make[1]: Entering directory '/home/vm/u-boot-2022.04'
+
+   GEN  Makefile
+
+   HOSTCC scripts/kconfig/conf.o
+
+   YACC scripts/kconfig/zconf.tab.c
+
+   LEX  scripts/kconfig/zconf.lex.c
+
+   HOSTCC scripts/kconfig/zconf.tab.o
+
+   HOSTLD scripts/kconfig/conf
+
+#
+# configuration written to .config
+
+#
+
+make[1]: Leaving directory '/home/vm/u-boot-2022.04'
+
+
+
+$ make
+
+make[1]: Entering directory '/home/vm/u-boot-2022.04'
+
+   GEN  Makefile
+
+scripts/kconfig/conf --syncconfig Kconfig
+
+   CFG  u-boot.cfg
+
+   GEN  include/autoconf.mk.dep
+
+   CFG  spl/u-boot.cfg
+
+   GEN  include/autoconf.mk
+
+   GEN  spl/include/autoconf.mk
+
+   GEN  Makefile
+
+   CFGCHK u-boot.cfg
+
+   ...
+CC   spl/lib/rtc-lib.o
+
+CC   spl/lib/elf.o
+
+AR   spl/lib/built-in.o
+
+LD   spl/u-boot-spl
+
+OBJCOPY spl/u-boot-spl-nodtb.bin
+
+SYM  spl/u-boot-spl.sym
+
+CAT  spl/u-boot-spl-dtb.bin
+
+COPY spl/u-boot-spl.bin
+
+CAT  u-boot-with-spl.bin
+
+make[1]: Leaving directory '/home/vm/u-boot-2022.04'
+
+ u-boot-with-spl.bin
+
+10.2 nand
+
+$ make menuconfig   //Default MTD partition scheme 
+
+Command line interface >
+       Filesystem commands >
+              [*] MTD partition support
+              [ ] Padd partition size to take account of bad blocks
+                                                              [ ] Show net size (w/o bad blocks) of
+
+partitions
+              (nand0=ls-nand,nor0=spi0.0) Default MTD IDs
+                                                              (ls-nand:14m(kernel),-
+
+(root);spi0.0:920k(uboot),32k(uboot_env),8k(bdinfo),64k(dtb)) Default MTD
+partition
+
+ defconfig  CONFIG_MTDPARTS_DEFAULT 
+
+$ grep "CONFIG_MTDPARTS_DEFAULT" configs/loongson_2k500_mini_dp_defconfig -n
+
+74:CONFIG_MTDPARTS_DEFAULT="ls-nand:14m(kernel),-
+(root);spi0.0:920k(uboot),32k(uboot_env),8k(bdinfo),64k(dtb)"
+
+mtdparts 
+
+mtddef> := <mtd-id>:<partdef>[,<partdef>]
+<partdef> := <size>[@offset][<name>][ro]
+<mtd-id> := unique id used in mapping driver/device
+<size> := standard linux memsize OR "-" to denote all remaining space
+<name> := (NAME)
+
+
+a. mtd-id  flash  mtd-id  mtdparts 
+b. size  size(xxM,xxk,xx) '-'
+
+10.3 
+   $ make menuconfig
+   Boot options >
+
+          [*] Enable boot arguments
+          (console=ttyS2,115200 root=ubi0:rootfs ubi.mtd=root,2048 noinitrd
+   init=/linuxrc rootfstype=ubifs rw) Boot
+
+ defconfigCONFIG_BOOTARGS
+
+   $ grep "CONFIG_BOOTARGS" configs/loongson_2k500_mini_dp_defconfig -n
+
+   32:CONFIG_BOOTARGS="console=ttyS2,115200 root=ubi0:rootfs ubi.mtd=root,2048
+   noinitrd init=/linuxrc rootfstype=ubifs rw"
+
+10.4 logo
+
+U-boot  logo  ./tools/Makefile  Makefile 
+LOGO_BMP  logo  ./tools/logos/ 
+ $BOARD.bmp   $VENDOR.bmp  U-boot  logo 
+
+       244 # Generic logo
+       245 ifeq ($(LOGO_BMP),)
+       246 LOGO_BMP= $(srctree)/$(src)/logos/denx.bmp
+       247
+       248 # Use board logo and fallback to vendor
+       249 ifneq ($(wildcard $(srctree)/$(src)/logos/$(BOARD).bmp),)
+       250 LOGO_BMP= $(srctree)/$(src)/logos/$(BOARD).bmp
+       251 else
+       252 ifneq ($(wildcard $(srctree)/$(src)/logos/$(VENDOR).bmp),)
+       253 LOGO_BMP= $(srctree)/$(src)/logos/$(VENDOR).bmp
+       254 endif
+       255 endif
+       256
+       257 endif # !LOGO_BMP
+
+ config.mk  BOARD  VENDOR  BORAD  CONFIG_SYS_BOARD , VENDOR 
+CONFIG_SYS_VENDOR
+
+   ARCH := $(CONFIG_SYS_ARCH:"%"=%)
+   CPU := $(CONFIG_SYS_CPU:"%"=%)
+   ifdef CONFIG_SPL_BUILD
+   ifdef CONFIG_ARCH_TEGRA
+   CPU := arm720t
+   endif
+   endif
+   BOARD := $(CONFIG_SYS_BOARD:"%"=%)
+   ifneq ($(CONFIG_SYS_VENDOR),)
+   VENDOR := $(CONFIG_SYS_VENDOR:"%"=%)
+   endif
+   ifneq ($(CONFIG_SYS_SOC),)
+   SOC := $(CONFIG_SYS_SOC:"%"=%)
+   endif
+ board/loongson/Kconfig  CONFIG_SYS_BOARD  CONFIG_SYS_VENDOR 
+
+   config SYS_VENDOR
+          default "loongson"
+
+   if SOC_LS2K1000
+   config SYS_BOARD
+
+          default "ls2k1000"
+
+logo logo, logo
+
+10.4.1 logo
+
+ uboot  LOGO_BMP  logo  uboot  ./tools/logos/
+ loongson_logo.bmp  logo   shell   uboot 
+
+
+CC_PREFIX=/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18
+export PATH=$CC_PREFIX/bin:$PATH
+export LD_LIBRARY_PATH=$CC_PREFIX/lib:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=$CC_PREFIX/loongarch64-linux-gnu/lib64:$LD_LIBRARY_PATH
+
+export ARCH=loongarch
+export CROSS_COMPILE=loongarch64-linux-gnu-
+make loongson_2k500_mini_dp_defconfig
+make LOGO_BMP=tools/logos/loongson_logo.bmp ­j4
+
+10.4.2  logo
+
+ U-boot  ./tools/logos/  denx.bmp  logo 
+ logo  denx.bmp 
+Logo bmp   60KB 8
+
+10.5 CPU
+
+uboot  include/configs/loongson_2k1000_dp.h cpu 
+CORE_FREQ CPU  DDR_FREQ uboot 
+
+
+/* Loongson LS2K1000 clock configuration. */
+
+#define REF_FREQ   100  // 100MHz
+
+#define CORE_FREQ  900  // CPU 900Mhz@1.05v 1100Mhz@1.15v
+
+#define DDR_FREQ   400  // MEM 400~600MHz
+
+#define APB_FREQ   125  // APB 125MHz
+
+10.6 
+
+U-boot  stdout  stderr  U-boot  printenv
+
+
+
+=> setenv stdout serial 
+
+=> saveenv    (spi flash )
+
+
+
+=> setenv stdout vidconsole0,vidconsole1
+=> saveenv
+
+
+
+=> setenv stdout serial,vidconsole0,vidconsole1
+=> saveenv
+
+U-boot 
+ include/configs/loongson_common.h 
+CONSOLE_STDOUT_SETTINGS 
+
+
+#ifdef CONFIG_VIDEO
+#define CONSOLE_STDOUT_SETTINGS \
+
+       "stdin=serial,usbkbd\0" \
+       "stdout=serial\0" \
+       "stderr=serial,vga\0"
+#elif defined(CONFIG_DM_VIDEO)
+#define CONSOLE_STDOUT_SETTINGS \
+       "splashimage=" __stringify(CONFIG_SYS_LOAD_ADDR) "\0" \
+       "stdin=serial,usbkbd\0" \
+       "stdout=serial\0" \
+       "stderr=serial,vidconsole,vidconsole1\0"
+#else
+#define CONSOLE_STDOUT_SETTINGS \
+       "stdin=serial\0" \
+       "stdout=serial\0" \
+       "stderr=serial\0"
+#endif
+
+10.7 U-boot
+
+                                                                            
+                                    
+                                                                            serial driver
+Serial      drivers/serial/serial-uclass. c      CONFIG_DM_SERIAL           model
+            drivers/serial/ns16550.c             CONFIG_SYS_NS16550_SERIAL
+                                                                            
+                                                                            NS16550
+                                                                            UART
+           drivers/gpio/gpio-uclass.c      CONFIG_DM_GPIO         gpio driver
+                                           CONFIG_LOONGSON_GPIO   model
+GPIO       drivers/gpio/ls_gpio.c          CONFIG_CMD_GPIO
+                                                                  GPIO
+           cmd/gpio.c                      CONFIG_CMD_LED         
+                                           CONFIG_DM_SPI
+GPIO LED   drivers/led/led-uclass.c        CONFIG_SPI_MEM         uboot
+           cmd/led.c                       CONFIG_LOONGSON_SPI    gpio
+                                           CONFIG_DM_SPI_FLASH
+           drivers/spi/spi-uclass.c        CONFIG_SPI_FLASH_MTD   led driver
+                                                                  model
+SPI        drivers/spi/spi-mem.c
+                                                                  uboot
+           drivers/spi/ls_spi.c                                   gpio
+
+           drivers/mtd/spi/sf-uclass.c                            spi driver
+                                                                  model
+           drivers/mtd/spi/sf_mtd.c
+                                                                  SPI
+                                                                  Memory
+                                                                  Extension
+
+                                                                  SPI
+                                                                  
+
+                                                                  spi flash
+                                                                  driver
+                                                                  model
+
+                                                                   SPI
+                                                                  Flash MTD
+
+SPI FLASH  drivers/mtd/spi/spi-nor-core.c
+           drivers/mtd/spi/sf_probe.c
+           drivers/mtd/spi/spi-nor-ids.c   CONFIG_SPI_FLASH       spi
+                                                                  flash 
+
+           cmd/sf.c                        CONFIG_CMD_SF          uboot
+                                           CONFIG_MTD             spi flash
+MTD        drivers/mtd/mtdcore.c           CONFIG_DM_MTD          
+           drivers/mtd/mtduboot.c          CONFIG_MTD_PARTITIONS
+           drivers/mtd/mtd-uclass.c        CONFIG_CMD_MTD          mtd 
+                                                                  
+           drivers/mtd/mtdpart.c
+                                                                  mtd driver
+           cmd/mtd.c                                              model
+
+                                                                  mtd
+                                                                  
+
+                                                                   uboot
+                                                                  mtd 
+      cmd/mtdparts.c                       CONFIG_CMD_MTDPARTS     uboot
+                                                                  mtdparts
+NAND  drivers/mtd/nand/raw/nand_bbt.c                             
+LCD   drivers/mtd/nand/raw/nand_ids.c
+      drivers/mtd/nand/raw/nand_utils.c                            raw
+      drivers/mtd/nand/raw/nand_ecc.c                             nand
+      drivers/mtd/nand/raw/nand_base.c                            nand
+      drivers/mtd/nand/raw/nand_timings.c                         
+                                                                   uboot
+      drivers/mtd/nand/raw/nand_bch.c      CONFIG_NAND_ECC_BCH    nand 
+                                                                   panel
+      drivers/mtd/nand/raw/ls_nand.c       CONFIG_NAND_LOONGSON   backlight
+                                                                  
+      cmd/nand.c                           CONFIG_CMD_NAND        gpio
+                                                                  
+      drivers/video/backlight-uclass.c     CONFIG_BACKLIGHT       
+                                                                  
+      drivers/video/backlight_gpio.c       CONFIG_BACKLIGHT_GPIO   display
+                                                                   panel
+      drivers/video/console_normal.c       CONFIG_CONSOLE_NORMAL   simple
+      drivers/video/display-uclass.c       CONFIG_DISPLAY         panel
+      drivers/video/panel-uclass.c         CONFIG_PANEL           
+      drivers/video/simple_panel.c         CONFIG_SIMPLE_PANEL    uboot logo
+                                                                  
+      drivers/video/u_boot_logo.c          CONFIG_VIDEO_LOGO
+                                           CONFIG_DM_VIDEO        lcd/video
+      drivers/video/vidconsole-uclass.c    CONFIG_VIDEO_LOONGSON  driver
+      drivers/video/video-uclass.c                                model
+      drivers/video/video_bmp.c
+      drivers/video/loongson_fb.c                                 
+                                                                  
+                    drivers/net/eth-phy-uclass.c     CONFIG_DM_ETH_PHY        ethernet
+                                                                              driver
+                    drivers/net/designware.c         CONFIG_ETH_DESIGNWARE    model
+NETWORK
+                                                     CONFIG_PHYLIB            
+                    drivers/net/phy/phy.c                                     Synopsys
+                                                     CONFIG_PHY_REALTEK       Designware
+                    drivers/net/phy/realtek.c        CONFIG_DM_USB            Ethernet
+                                                     CONFIG_USB_OHCI_GENERIC  MAC
+                    drivers/usb/host/usb-uclass.c    CONFIG_USB_OHCI_NEW
+                    drivers/usb/host/ohci-generic.c  CONFIG_USB_EHCI_GENERIC  
+                    drivers/usb/host/ohci-hcd.c      CONFIG_USB_EHCI_HCD      PHY
+                    drivers/usb/host/ehci-generic.c  CONFIG_USB_KEYBOARD      physical
+USB                                                  CONFIG_CMD_USB           media
+                    drivers/usb/host/ehci-hcd.c      CONFIG_DM_I2C            interface
+                                                     CONFIG_SYS_I2C_OCORES
+                    common/usb_kbd.c                                          
+                    cmd/usb.c                                                 Realtek 
+                    drivers/i2c/i2c-uclass.c                                   PHY
+I2C
+                    drivers/i2c/ocores_i2c.c                                  usb driver
+                                                                              model
+
+                                                                               OHCI
+
+                                                                               new
+                                                                              OHCI
+
+                                                                               EHCI
+
+                                                                               EHCI
+                                                                              HCD (USB
+                                                                              2.0)
+
+                                                                               USB 
+                                                                              
+
+                                                                               uboot
+                                                                              usb 
+
+                                                                              i2c driver
+                                                                              model
+
+                                                                               ocore
+                                                                              i2c 
+linux
+
+11.0 
+
+linux-5.10.0 
+
+      YAFFS2/CRAMFS/NFS/UBIFS/NFS/FAT32
+      SLC NAND Flash256MB/512MB/1GB
+      
+      RTC
+      LED
+      
+      SPI:4
+      I2C:100KHz400KHz
+      PWM
+      USB Host
+      :12460800
+      GMACRTL8211EYT8521
+      :RGBLVDSVGAHDMIDVI
+      LCD:gpiopwm
+      PCIE:usb 3.0 pciesata 3.0 pcie
+      CAN:1MHz
+      GPIO
+      PINCTRL:
+      CLK
+      
+      :
+
+11.1 
+
+
+
+$ source ./set_env.sh
+
+====>setup env for LoongArch...
+
+
+
+$ make loongson_2k1000_defconfig
+
+make[1]: Entering directory '/home/vm/kernel-5.10-LoongArch'
+
+   GEN  Makefile
+
+#
+
+# No change to .config
+
+#
+
+make[1]: Leaving directory '/home/vm/kernel-5.10-LoongArch'
+
+
+
+$ make uImage
+
+   GEN  .version
+
+   CHK  include/generated/compile.h
+
+   UPD  include/generated/compile.h
+
+   CC   init/version.o
+
+   AR   init/built-in.a
+
+   LD   vmlinux.o
+
+   MODPOST vmlinux.symvers
+
+   MODINFO modules.builtin.modinfo
+
+   GEN  modules.builtin
+
+   LD   .tmp_vmlinux.kallsyms1
+
+   KSYMS .tmp_vmlinux.kallsyms1.S
+
+   AS   .tmp_vmlinux.kallsyms1.S
+LD        .tmp_vmlinux.kallsyms2
+
+KSYMS .tmp_vmlinux.kallsyms2.S
+
+AS        .tmp_vmlinux.kallsyms2.S
+
+LD        vmlinux
+
+SORTTAB vmlinux
+
+SYSMAP System.map
+
+OBJCOPY arch/loongarch/boot/vmlinux.bin
+
+GZIP arch/loongarch/boot/vmlinux.bin.gz
+
+UIMAGE arch/loongarch/boot/uImage.gz
+
+Image Name: Linux-5.10.0.lsgd-g217c34b2e4e3
+
+Created:  Sat Sep 17 14:20:28 2022
+
+Image Type: LoongArch Linux Kernel Image (gzip compressed)
+
+Data Size: 7824190 Bytes = 7640.81 KiB = 7.46 MiB
+
+Load Address: 00200000
+
+Entry Point: 00ca1a44
+
+Image arch/loongarch/boot/uImage is ready
+
+make[1]: Leaving directory '/home/vm/work/kernel-5.10-LoongArch'
+
+ arch/loongarch/boot/  uImage 
+uImage  Invalid architecture 9.2.3mkimage
+
+11.2 
+
+"Device Drivers"
+11.2.1 GPIO
+
+Device Driver "GPIO Support"
+
+"/sys/class/gpio/..."/sys/class/gpio/gpio
+ "Memory mapped GPIO drivers""loongson-2/3 GPIO support"
+"*"2K1000gpio
+11.2.2 RTC
+
+Device Driver "Real Time Clock""*"
+
+
+                                     
+Set system time from RTC on startup  RTC
+and resume                           Set system time from RTC on startup and resume
+                                     RTCRTC
+RTC used to set the system time      RTCNTP
+
+Set the RTC time based on NTP        RTC
+synchronization                      sysfsRTC
+RTC used to synchronize NTP          cat /proc/driver/rtcrtc
+adjustment                           RTC
+/sys/class/rtc/rtcN (sysfs)
+/proc/driver/rtc (procfs for rtcN)
+/dev/rtcN (character devices)
+
+"loongson LS2X RTC""*"2K1000RTC
+11.2.3 PWM
+
+Device Driver "Pulse-Width Modulation (PWM) Support --->""*"
+"Loongson PWM support""*"
+11.2.4 I2C
+
+Device Drivers "I2C support"
+"I2C device interface""*"/dev/i2c-x
+ I2C Hardware Bus support  OpenCores I2C Controller  Loongson LS2X I2C adapter
+![img](res/images/-i2c-hardware-bus.png)
+11.2.5 SPI
+
+Device Driver "SPI support""*"
+"Loongson SPI controller Support""*"2K1000SPI
+SPISPI00SPI-FLASHSPI-FLASHMTD/dev
+spidev0.0mtd4mtdblock4SPI12318
+--
+
+SPI-FLASHubootSPI-FLASHuboot
+4KB
+
+11.2.6 UART
+
+Device Driver "Character devices"
+"Serial device bus""Serial device TTY port controller"
+11.2.7. CAN
+
+"Networking support"
+"CAN bus subsystem support""*"
+"CAN Device Drivers"
+
+11.2.8 GMAC
+
+Networking support "Networking options"
+"*"
+"Device Drivers""Network device support""*"
+
+"Network core driver support""*""Ethernet driver support"
+"*"
+11.2.9. NAND
+
+NANDMTDubootNANDubootNAND
+NAND
+Device Drivers "Memory Technology Device (MTD) support""*"
+"NAND"->"Raw/Parallel NAND Device Support""*"
+"Support software BCH ECC""Support for NAND flash devices on Loongson""*"
+11.2.10 USB
+
+Device Drivers "USB support"
+
+11.2.11 LCD
+
+Device Drivers "Graphics support"
+
+"Backlight & LCD device support"
+11.2.12 WATCHDOG
+
+Device Drivers "Watchdog Timer Support""*"
+"*"
+11.3 
+
+                                                                           
+                                                                  
+                                                                           
+UART     drivers/tty/serial/8250/8250_core.c         CONFIG_SERIAL_8250    8250/16550
+                                                                           
+DVO      drivers/gpu/drm/loongson/lsdc_platform_drv.c CONFIG_DRM_LOONGSON
+                                                                            drm 
+I2C      drivers/i2c/busses/i2c-ls2x.c               CONFIG_I2C_LS2X       
+
+NETWORK  drivers/net/ethernet/stmicro/stmmac/dwmac-  CONFIG_DWMAC_GENERIC   I2C 
+         generic.c                                                         
+
+GPIO     drivers/gpio/gpio-loongson.c                CONFIG_GPIO_LOONGSON  
+                                                                           DWMAC 
+                                                                           
+
+                                                                            gpio 
+                                                                           
+CAN        drivers/net/can/sja1000/sja1000_platform.c  CONFIG_CAN_SJA1000_PLATFORM  
+                                                       CONFIG_SPI_LS                SJA1000
+SPI        drivers/spi/spi-ls.c                        CONFIG_MTD_SPI_NOR           
+                                                       CONFIG_MTD_NAND_LS
+SPI FLASH  drivers/mtd/spi-nor/core.c                  CONFIG_PWM_LS                 spi 
+                                                       CONFIG_RTC_DRV_LS2X          
+NAND       drivers/mtd/nand/raw/ls-nand.c              CONFIG_LOONGSON2_WDT
+                                                       CONFIG_LEDS_PWM               spi-
+PWM        drivers/pwm/pwm-ls.c                        CONFIG_LEDS_GPIO             nor 
+                                                       CONFIG_KEYBOARD_GPIO_POLLED
+RTC        drivers/rtc/rtc-ls2x.c                                                    nand
+                                                                                    
+WATCHDOG drivers/watchdog/loongson2_wdt.c
+                                                                                     pwm
+LED        drivers/leds/leds-pwm.c                                                  
+KEYS       drivers/leds/leds-gpio.c
+           drivers/input/keyboard/gpio_keys_polled.c                                 RTC 
+                                                                                    
+
+                                                                                    2K
+                                                                                    watchdog
+                                                                                    
+
+                                                                                     pwm
+                                                                                     led 
+
+                                                                                     gpio 
+                                                                                    led 
+
+                                                                                     gpio
+                                                                                    
+
+
+12.1. busybox
+
+busyboxbuildrootbuildrootbuildroot
+5.3.2. 12.2. 
+busyboxsystemdsystemd
+/root/boot_run.sh/etc/profile
+/usr/lib/systemd/system/boot_run.serviceExec_start
+systemd
+boot_run.sh
+
+
+   systemctl disable boot_run
+
+boot_ru.sh
+
+   systemctl enable boot_run
+
+/etc/systemd/system/multi-user.target.wants
+boot_run.service/usr/lib/systemd/system/boot_run.service
+
+boot_run.servicetypeforking&
+&boot_run.servicesystemd-analyze
+
+busyboxboot_run.sh
+ export QT_QPA_FB_TSLIB=1 ls2k1000ls2k500lvds
+tslibls2k500LCDtslibQttslib
+5.3.5.1. Qttslib
+boot_run.sh
+psplash-writepsplashpsplashboot_run.sh
+
+
+   psplash-write "MSG Welcome to Loongson-gd"
+
+Welcome to Loongson-gdSystem banner
+buildrootBR2_TARGET_GENERIC_ISSUE
+
+   psplash-write "PROGRESS 100"
+   psplash-write "QUIT"
+
+100%100%
+(clear
+)
+
+
+   if [ -z "$(cat /proc/cmdline | grep ubifs)" ]; then
+          sleep 5
+
+   fi
+
+SSDboot_run.shQt
+Qt5s
+NANDQtSSDQt
+
+NANDNAND5s
+
+
+   cd /root/logo_player && ./logo_player &
+
+logologo.gifcd
+logo.gif(/root/logo_player)
+
+gif
+buildrootBR2_PACKAGE_QT_MOVIE_AUTOBOOT
+
+12.2. 
+
+12.2.1. buildroot
+
+busyboxbuildrootbuildroot
+
+busybox
+buildroot
+x86ubuntu18.04apt
+12.2.1.1. buildroot
+
+buildroot
+buildroot
+
+
+                                            12-1 buildroot
+
+           
+
+board      
+configs    ./board/loongson
+dl         
+
+output     
+
+package    
+           
+loongson-
+custom     
+           ./output/imagerootfs.tar.gzrootfs.ubiSSD
+           NAND
+
+           (.mk)Kconfig(Config.in
+           )
+
+           .hash
+
+           LA
+           config.guessconfig.sub
+
+           LAroot
+12.2.1.2. buildroot
+
+
+
+sudo apt install gcc cmake tcl libtool g++ make cpio build-essential binutils libncurses5-dev hgsvn
+
+
+ make list-configs 
+
+$ make list-configs
+1.
+
+                         
+
+loongson2k1000_jinlong_defconfig         ls2k1000mips
+
+ls2k1000mips                             ls2k1000LAls2k1000LA
+
+loongson2k1000la_jinlong_defconfig       ls2k5002
+                                         ls2k5002
+
+
+loongson2k500_defconfig
+
+loongson2k500_mini_dp_defconfig
+
+2.
+
+                         
+
+loongson2k1000_jinlong_mini_defconfig       ls2k1000mips
+                                            ls2k1000LA
+ls2k1000mips                                ls2k5002
+                                            ls2k5002
+loongson2k1000la_jinlong_mini_defconfig
+
+ls2k1000LA
+
+loongson2k500_mini_defconfig
+
+
+loongson2k500_mini_dp_mini_defconfig
+
+
+
+3.ramdisk
+
+                         
+
+loongson2k1000la_jinlong_ramdisk_defconfig  ls2k1000LA
+ls2k1000LAramdisk                           ls2k500ramdisk2
+
+loongson2k500_ramdisk_defconfig
+
+
+
+4.
+
+                         
+
+loongson2k1000la_jinlong_fastboot_defconfig ls2k1000LA
+
+ls2k1000LA
+
+loongson2k500_fastboot_defconfig            ls2k5002
+
+
+
+loongson2k500_mini_dp_fastboot_defconfig ls2k5002
+
+
+
+5.busybox(:8.9M)
+
+                         
+
+loongson2k1000la_jinlong_pure_busybox_defconfig ls2k1000LA
+
+ls2k1000LA
+
+loongson2k500_pure_busybox_defconfig        ls2k5002
+
+
+
+6.python3
+             
+
+loongson2k1000la_jinlong_py3_defconfig    ls2k1000LA
+                                          ls2k500python32
+ls2k1000LApython3
+
+loongson2k500_mini_dp_py3_defconfig
+
+
+
+loongson2k1000la_jinlong_defconfig
+
+
+make loongson2k1000la_jinlong_defconfig
+
+
+
+make menuconfig
+
+
+
+
+make -j4
+
+
+4CPUCPU
+
+
+12.2.1.2.1. make menuconfig
+make menuconfig
+
+Target optionsBuild optionsbuildroot
+
+
+                                      12-3 make menuconfig
+
+           
+                
+Target          CPU
+options         buildroot
+Build options   
+                
+Toolchain       
+                
+System          
+configuration
+Kernel          
+Target          
+packages        
+Filesystem      
+images
+Bootloaders
+Host utilities
+Legacy config
+options
+
+Toolchain
+
+
+12.2.1.2.1.1. System configuration
+System configuration
+System hostname
+
+System banner
+
+Init Systemsystemd
+Root passwdroot
+Run a getty (login prompt) after bootshell
+all getty auto login as root after boot
+TTY port 
+Root filesystem overlay directories 
+
+board/loongson/ls2k1000-jinlong/LA/rootfs_overlay
+/etcprofile
+/etc/profileprofile
+
+
+
+
+"?"(shift + /)
+
+12.2.1.2.1.2. Target packages
+Target packagesssh
+
+
+ssh"/"ssh
+
+openssh
+(3)3
+
+
+Loongson board sofeware
+
+loongson buildroot system autorun script after boot
+
+boot_run.sh
+
+
+driver testcase loongson/root
+
+
+/root/loongson_test_case
+build Qt versionQt version auto run after bootQt
+Qt
+loongson buildroot system autorun script after bootQt version auto run
+after bootdriver_case.serivceboot_run.shQt
+
+Qt/root/loongson_test_case/driver_testcase
+Qt version use tslibtslibQtls2k500
+ls2k1000ls2k1000USB HMItslib
+generate git info in rootfsbuildroot
+gitfs_git_info_lsgd/etc/git_info_ls
+
+mdio sofewaremdiophy
+
+
+qtperfqtperf
+
+qt movie demologo_playerqt movie auto run agter boot
+logo_playerQt version auto run after bootlogo_player
+driver_testcase
+
+lvgl demo sofewarelvgl 8.2demolvgl-demo
+
+touch screen xy map logic enabletouch screen x map max valuetouch screen y map
+max valuexyinput_event
+/etc/lvgl_config
+
+loongson default config eth devipeth dev name listeth dev ip list
+ipsystemdNetworkManger
+busybox/etc/network/interfacesip
+
+
+12.2.1.2.1.3. Filesystem images
+
+ls2k1000NANDSSD
+NANDubifsSSDext4.tar.gz
+
+
+NAND128Mubifs
+board/loongson/ubinize.cfg
+
+
+Exit
+
+ExitYes
+
+NANDUBI
+12.2.1.2.2. 
+buildroot
+
+make -j4
+
+4CPUCPU
+
+
+PC3
+buildroot12G
+
+./output/image
+
+rootfs.tar.gzSSDrootfs.ubirootfs-
+ubifs-ze.imgNAND
+
+
+12.2.1.3 buildroot
+
+builrootbuildroot(16)https://buildroot.or
+g/downloads/manual/manual.html
+
+buildroot
+
+      ./package/git_info_lsgd 
+      ./package/driver_testcase cmakemakeQt
+      ./package/mdio 
+
+      autotools-package(configure)
+
+buildrootgit_info_lsgd
+
+package
+
+./package/git_info_lsgd
+
+Config.in.mk
+
+
+
+                                  12-4 ./package/*
+
+           
+Config.in  Config.in
+.mk        .mk
+12.2.1.3.1 Config.in
+Config.inmake menuconfigConfig.in
+.mk
+
+buildroot
+Config.in
+.mk
+git_info_lsgdConfig.in
+
+BR2_PACKAGE_GIT_INFO_LSGDmake menuconfig
+default yhelp
+boolboolbuildroot
+
+BR2_PACKAGE_GIT_INFO_LSGDBR2_PACKAGEGIT_INFO_LSGD
+BR2_PACKAGE_
+
+
+depends on./package/driver_testcase/Config.in
+depends onmake menuconfig
+BR2_PACKAGE_DRIVER_TESTCASE_QTQt5
+n
+Config.inmake menuconfig./package/Config.in
+menuLoongson board sofeware
+sourceConfig.inmake menuconfig
+12.2.1.3.2 .mk
+
+Config.in.mk
+
+
+BR2_PACKAGE_.mkbuildrootmake
+
+
+                                               12-5 .mk
+                      
+SITE
+
+SITE_METHOD
+          
+                      18.6.2
+_EXTRACT_CMDS
+_BUILD_CMDS           
+                      
+_INSTALL_TARGET_CMDS
+target
+               
+TARGET
+                      
+host
+                       host
+
+$(@D)                 ./output/host
+                      ./output/build$(@D)
+$(TARGET)             
+$(TOPDIR)             ./output/target 
+                      buildroot
+
+.mk
+
+git_info_lsgddefine+
+buildroot
+
+1-5
+
+7-8buildroot
+./dl/git_info_lsgd/git_info_lsgd.tar.gzSITE_METHODfile
+driver_testcase18.6.2
+
+GIT_INFO_LSGD_SITE=$(TOPDIR)/dl/git_info_lsgd/git_info_lsgd.tar.gz
+GIT_INFO_LSGD_SITE_METHOD=file
+
+10-12$(@D)./output/build/
+./output/build/git_info_lsgd
+
+define GIT_INFO_LSGD_EXTRACT_CMDS
+       tar -zxf $(GIT_INFO_LSGD_SITE) -C $(@D)
+
+endef
+
+14-17
+gitfs_git_info_lsgd
+
+define GIT_INFO_LSGD_BUILD_CMDS
+       cd $(@D) && chmod a+x git-info-get.sh && ./git-info-get.sh
+       cd $(@D) && chmod a+x fs_git_info_lsgd
+
+endef
+19-22git_info_lsgit-info-get.sh
+fs_git_info_lsgdGIT_INFO_LSGD_BUILD_CMDS
+./usr/binfs_git_info_lsgdgit
+$(TARGET_DIR)./output/target
+
+   define GIT_INFO_LSGD_INSTALL_TARGET_CMDS
+          cd $(@D) && cp git_info_ls $(TARGET_DIR)/etc
+          cd $(@D) && cp fs_git_info_lsgd $(TARGET_DIR)/usr/bin
+
+   endef
+
+buildroot
+7-8makefile
+Cmakeautotools
+
+BUILD_CMDSINSTALL_TARGET_CMDSbuildroot
+$(eval $(autotools-package))./configure make
+make install18.7. Infrastructure for autotools-based packages
+
+   $(eval $(generic-package))
+
+git_info_lsgd
+
+
+
+   >>> git_info_lsgd Extracting
+   tar -zxf /home/loongson/datab1/work-tao/buildroot/ls2k1000-LA/buildroot-
+   2021.02/dl/git_info_lsgd/git_info_lsgd.tar.gz -C /home/loongson/datab1/work-
+   tao/buildroot/ls2k1000-LA/buildroot-2021.02/output/build/git_info_lsgd
+   >>> git_info_lsgd Patching
+   >>> git_info_lsgd Configuring
+   >>> git_info_lsgd Building
+   cd /home/loongson/datab1/work-tao/buildroot/ls2k1000-LA/buildroot-
+   2021.02/output/build/git_info_lsgd && chmod a+x git-info-get.sh && ./git-info-
+   get.sh
+   ++ rev parse commit id is:
+   e1c8eae9036e0743c30d138868f8ddcf44e50a82
+   ++ commit time is:
+   Fri Sep 2 09:43:58 2022 +0800
+   ++ commit messgae is:
+   ubifs:adjust size to 230M(ori is 200M)
+   format info to file
+   cd /home/loongson/datab1/work-tao/buildroot/ls2k1000-LA/buildroot-
+   2021.02/output/build/git_info_lsgd && chmod a+x fs_git_info_lsgd
+   >>> git_info_lsgd Installing to target
+   cd /home/loongson/datab1/work-tao/buildroot/ls2k1000-LA/buildroot-
+   2021.02/output/build/git_info_lsgd && cp git_info_ls /home/loongson/datab1/work-
+   tao/buildroot/ls2k1000-LA/buildroot-2021.02/output/target/etc
+   cd /home/loongson/datab1/work-tao/buildroot/ls2k1000-LA/buildroot-
+   2021.02/output/build/git_info_lsgd && cp fs_git_info_lsgd
+   /home/loongson/datab1/work-tao/buildroot/ls2k1000-LA/buildroot-
+   2021.02/output/target/usr/bin
+
+
+driver_testcase.stamp_xxx
+
+git_info_lsgd.stamp_xxxmake
+buildroot
+
+12.2.2 OpenWrt 
+
+OpenWrtGNU/Linux 
+OpenWrt Linux
+ 
+OpenWrt, 
+ OpenWrt
+; 
+
+OpenWrthttps://openwrt.org
+OpenWrtGithttps://github.com/openwrt/openwrt
+12.2.2.1. 
+
+BSP OpenWrt 
+
+   ##2k5002k1000
+   ##2k500loongson_2k500_config
+   ##2k1000loongson_2k1000_config
+   ##2k500
+   $ cp configs/loongson_2k500_config .config
+
+   $ make -j24
+
+ V=sc  log:
+
+   $ make V=sc -j24
+
+ bin/target/loongson/ls2k500  openwrt-loongson-ls2k500-
+loongson_gd_ls2k500_mini-ubifs-root.ubi  rootfs-ubifs-ze.img 
+
+config
+
+   $ cp .config .configs/xxx_config
+
+
+./scripts/feeds 
+
+   $ ./scripts/feeds update -a
+   $ ./scripts/feeds install -a
+
+12.2.2.2. 
+
+12.2.2.2.1 UBIFS
+NAND UBIFS 
+
+   1. 
+       target/linux/loongson/image  .mk  BLOCKSIZEPAGESIZE
+      SUBPAGESIZEUBIFS_OPTS 
+
+        2K64NAND:
+
+    PAGESIZE = SUBPAGESIZE = 2048(2k)
+
+    BLOCKSIZE = PAGESIZE * 64 = 128k
+
+    UBIFS_OPTS -m = PAGESIZE = 2048(2k)
+
+    UBIFS_OPTS -e = LEBSIZE = PAGESIZE * 62 = 0x1f000 (124k)
+
+    UBIFS_OPTS -c = 230M / LEBSIZE = 1900
+
+   UBIFS_OPTS := -m 2048 -e 0x1f000 -c 1600
+
+   define Device/loongson_gd_ls2k500_mini
+       DEVICE_VENDOR := Loongson(GD)
+       DEVICE_MODEL := LS2K500 Mini
+       SOC := ls2k500
+   UBOOT_DEVICE_NAME := ls2k500_mini_dp
+   IMAGE/sysupgrade.img.gz := boot-common | boot-script ls2k500_mini | gzip |
+append-metadata
+   IMAGES := root.ubi
+   IMAGE/root.ubi := append-ubi
+   BLOCKSIZE := 128k
+   PAGESIZE := 2048
+   SUBPAGESIZE := 2048
+   FILESYSTEMS += ubifs
+endef
+
+   2. 
+
+UBIFS
+
+make menuconfig  Target Images -> ubifs -> Nand Page Size 
+
+ config/Config-images.in  "Nand Page Size" Choice 
+
+$ vim config/Config-images.in
+
+...
+
+198  choice
+
+199          prompt "Nand Page Size"
+
+200          depends on TARGET_ROOTFS_UBIFS
+
+201          help
+
+202                            Select Nand page size
+
+203
+
+204          config NAND_PAGE_SIZE_2K
+
+205                            bool "2KiB"
+
+206
+
+207          config NAND_PAGE_SIZE_4K
+
+208                            bool "4KiB"
+
+209  endchoice
+
+...
+
+12.2.2.2.2  LAN IP
+
+ LOONGSON_LAN_IPADDR 
+
+   1. openwrt  /etc/config/network 
+   2. /etc/config/network  /etc/board.d/02_network  /bin/config_generate 
+
+      
+   3. /etc/board.d/02_network  ucidef_set_interface_lan  lan 
+
+       ucidef_set_interface_wan  wan  ucidef_set_interfaces_lan_wan  lan
+      wan 
+   4. /bin/config_generate  generate_network  IP
+
+12.2.2.2.3 CPU
+
+   1. CPU target/linux/loongson/Makefile  SUBTARGET 
+      CPU ls2k2000
+
+       ls2k2000  image/ls2k2000.mk 
+
+$ git diff
+diff --git a/target/linux/loongson/Makefile b/target/linux/loongson/Makefile
+   index 8442e19f..740a94c9 100644
+   --- a/target/linux/loongson/Makefile
+   +++ b/target/linux/loongson/Makefile
+   @@ -6,7 +6,7 @@ ARCH:=loongarch64
+
+     BOARD:=loongson
+     BOARDNAME:=Loongson
+     FEATURES:=ext4 usb display rootfs-part boot-part ubifs
+   -SUBTARGETS:=ls2k500 ls2k1000
+   +SUBTARGETS:=ls2k500 ls2k1000 ls2k2000
+
+     KERNEL_PATCHVER=5.10
+
+   $ mkdir target/linux/loongson/ls2k2000
+   $ touch target/linux/loongson/image/ls2k2000.mk
+
+   2.  target/linux/loongson/ls2k2000  target.mk config-5.10 base-file
+
+target.mk  menuconfig 
+
+config-5.10  linux-5.10 
+
+base-file  openwrt 
+
+   $ cat target.mk
+   BOARDNAME:=LS2K2000 boards (64 bit)
+   CPU_TYPE :=ls2k2000
+
+   define Target/Description
+       Build firmware image for Loongson(GD) LS2K2000 devices.
+       This firmware features a 64 bit kernel.
+
+   endef
+   $ cp <ls2k2000-linux-5.10-source-dir>/.config config-5.10
+   $ cp -r ../ls2k1000/base-files ./
+
+   3.  target/linux/loongson/image  ls2k2000.mk 
+      FILESYSTEMS += ubifs  ubifs 
+
+   4. make menuconfig  Subtarget  Target Profile 
+
+12.2.2.2.4 
+
+ ./scripts/feeds update -a ./scripts/feeds install -a 
+menuconfig 
+
+ feeds 
+
+12.3. ext4
+
+busyboxSSDrootfs.tar.gz
+
+
+
+test
+
+cd test
+
+()
+
+
+tar -zcf ../rootfs.tar.gz *
+
+()
+
+
+rootfs.tar.gzSSD
+
+12.4. UBI
+
+busyboxNANDrootfs-ubifs-ze.img
+UBI
+ubinizemkfs.ubfsubuntu18.04
+
+
+sudo apt install e2fsprogs liblzo2-2 liblzo2-dev zlib1g-dev mtd-utils
+
+UBI
+217MBUBI
+
+
+
+chmod a+x rootfs-ubifs.sh
+
+
+   #! /bin/sh
+
+   #
+   rootfs_dir="./test"
+   #
+   rootfs_img_name="rootfs-ubifs-ze.img"
+
+   make_img()
+   {
+
+          #
+          # -r $1 
+          # -m    (NAND)  2048
+          # -e   
+          # NAND 642048  (64-2)* 2048 = 126976
+          # -c  
+          #   (-e)*  ==
+   ubinize.cfgvol size
+          # vol_size = 217MB 217*1024*1024/126976 = 1792
+          #  1620.23   1621
+          #   1024*1024  126976   
+   31MB  31MB*7=217MB
+          # -o rootfs-ubifs.dat 
+          mkfs.ubifs -r $1 -m 2048 -e 126976 -c 1792 -o rootfs-ubifs.dat
+
+          #
+          # -o $2 
+          # -m    2048  2KiB  (NAND)
+          # -p    64 * 2048 = 128KiB  (NAND)
+          # -s  -m 
+          # ubinize.cfg 
+
+          ubinize -o $2 -m 2KiB -p 128KiB -s 2048 ubinize.cfg
+   }
+
+   make_img $rootfs_dir $rootfs_img_name
+
+vol_sizeNAND256MBNAND14MB
+242MB242MB
+242MB217MiB-c1934
+256MBNANDbuildroot1900230MiB
+230MiB-c1900
+rootfs_dir
+
+ubinize.cfg
+
+   [ubifs]
+   mode=ubi
+   image=rootfs-ubifs.dat
+   vol_id=0
+   vol_size=217MiB
+   vol_type=dynamic
+   vol_alignment=1
+   vol_name=rootfs
+   vol_flags=autoresize
+
+testrootfs_dirtest
+
+NAND
+rootfs-ubifs.sh
+
+
+./rootfs-ubifs.sh
+
+rootfs-ubifs-ze.imgNAND
+NAND
+
+12.5. 
+
+/buildroot
+
+12.5.1 ext4
+
+ext4rootfs.tar.gz
+rootfs.tar.gz
+
+   1. rootfs.tar.gzA
+   2. A
+   3. Arootfs.tar.gz
+
+rootfs()rootfs.tar.gz
+(rootfs.tar.gz)
+
+rootfs.tar.gzrootfs
+   tar -zxf rootfs.tar.gz -C ./rootfs
+
+rootfs
+rootfsrootfs.tar.gz
+rootfs()
+
+   tar -zcf ../rootfs.tar.gz *
+rootfs.tar.gzrootfs-bak.tar.gz()
+rootfs.tar.gzrootfs
+rootfs*
+
+
+12.5.2 UBI
+
+buildrootrootfs.tar.gzrootfs-ubifs-ze.img
+UBI:
+
+   1. rootfs.tar.gz
+   2. /etc/fstab
+   3. /
+   4. UBI
+fstab
+fstabrootfs.tar.gzSSDramdisk.gz
+fstab
+
+rootfs-ubifs-ze.imgnandfstabfstab
+rootfs-ubifs-ze.img
+
+fstab
+
+rootfs-ubifs-ze.imgfstab
+
+# <file system> <mount pt>  <type> <options>  <dump> <pass>
+
+/dev/root  /                ext2 rw,noauto    0  1
+
+proc       /proc            proc defaults     0  0
+
+devpts     /dev/pts         devpts defaults,gid=5,mode=620,ptmxmode=0666 0
+
+       0
+
+tmpfs      /dev/shm         tmpfs mode=0777   0  0
+
+tmpfs      /tmp             tmpfs mode=1777   0  0
+
+tmpfs      /run             tmpfs mode=0755,nosuid,nodev 0   0
+
+sysfs      /sys             sysfs defaults    0  0
+
+UBI12.4 UBI
+
+rootfs.tar.gzrootfs-ubifs-
+ze.img
+
+rootfs.tar.gzrootfs-ubifs-ze.img
+transfer_system.tar.gz
+
+fstab-nandfstab
+rootfs-ubifs.sh
+
+   #! /bin/bash
+   #
+   rootfs_dir="./rootfs"
+   #
+   rootfs_img_name="rootfs-ubifs-ze.img"
+   make_img()
+   {
+          mkfs.ubifs -r $1 -m 2048 -e 126976 -c 1900 -o rootfs-ubifs.dat
+          ubinize -o $2 -m 2KiB -p 128KiB -s 2048 ubinize.cfg
+
+   }
+
+   make_img $rootfs_dir $rootfs_img_name
+
+12.4256MB204864
+nand(nand12.4 UBI)
+230MB
+s_1_unzip_rootfs_tar_gz.sh
+
+   #! /bin/bash
+
+   rootfs_name="rootfs.tar.gz"
+   temp_dir="rootfs"
+
+   mkdir -p $temp_dir
+   echo " $rootfs_name"
+   tar -zxf $rootfs_name -C $temp_dir
+   cp fstab-nand $temp_dir/etc/fstab
+   sync
+
+   echo " $rootfs_name "
+   echo "rootfs"
+   echo "  s_2_rootfs_ubifs.sh rootfs-ubifs-ze.img"
+
+s_2_rootfs_ubifs.sh
+
+   #! /bin/bash
+
+   ubifs_zip_sh="rootfs-ubifs.sh"
+   ubifs_cfg_file="ubinize.cfg"
+
+   if [ ! -f $ubifs_zip_sh ]; then
+          echo " rootfs-ubifs.sh 12.4"
+
+   fi
+
+   if [ ! -f $ubifs_cfg_file ]; then
+          echo " $ubifs_cfg_file 12.4"
+
+   fi
+
+   echo " rootfs-ubifs-ze.img"
+   ./$ubifs_zip_sh
+
+   if [ $? -eq 0 ]; then
+          echo ""
+
+   else
+          echo ""
+
+   fi
+ubinize.cfg
+   [ubifs]
+   mode=ubi
+   image=rootfs-ubifs.dat
+   vol_id=0
+   vol_size=230MiB
+   vol_type=dynamic
+   vol_alignment=1
+   vol_name=rootfs
+   vol_flags=autoresize
+
+ubinize.cfgrootfs-ubifs.sh12.4 UBI
+s_1_unzip_rootfs_tar_gz.sh12
+
+   1. rootfs.tar.gz
+   2. /etc/fstab
+s_2_rootfs_ubifs4
+   4. UBI
+rootfs.tar.gzrootfs-ubifs-ze.img
+rootfs.tar.gztransfer_system(transfer_system.tar.gz)
+
+
+:
+   ./s_1_unzip_rootfs_tar_gz.sh
+
+:
+   ./s_2_rootfs_ubifs.sh
+
+rootfs-ubifs-ze.img
+

@@ -13,5 +13,12 @@ myos-boot = { path = "../../boot"}
 
 myos-mm = { path = "../../mm"}
 
+[features]
+# 默认平台为 QEMU virt,保持 riscv64 无平台参数即可构建。
+# 显式启用 platform-visionfive2 时优先生效(见 platform/mod.rs)。
+default = ["platform-qemu-virt"]
+platform-qemu-virt = []
+platform-visionfive2 = []
+
 [lints]
 workspace = true

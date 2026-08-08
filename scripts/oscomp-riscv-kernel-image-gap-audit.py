@@ -4,7 +4,7 @@ import pathlib, re, sys
 
 root = pathlib.Path(__file__).resolve().parents[1]
 linker_rs = (root / "kernel/src/linker.rs").read_text(encoding="utf-8")
-linker_ld = (root / "arch/riscv64/linker.ld").read_text(encoding="utf-8")
+linker_ld = (root / "arch/riscv64/src/platform/qemu_virt/linker.ld").read_text(encoding="utf-8")
 
 checks: list[tuple[str, bool]] = []
 

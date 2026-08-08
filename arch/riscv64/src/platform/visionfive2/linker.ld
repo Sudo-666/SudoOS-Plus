@@ -1,0 +1,205 @@
+OUTPUT_ARCH(riscv)
+ENTRY(_start)
+
+/* VisionFive 2 (JH7110): DDR 基址 0x40000000,U-Boot 加载内核到 0x40200000。 */
+BOOT_PHYS_BASE   = 0x40200000;
+KERNEL_PHYS_BASE = 0x40400000;
+KERNEL_VIRT_BASE = 0xffffffff80000000;
+
+BOOT_STACK_SIZE = 64K;
+SMP_BOOT_STACKS_SIZE = 512K;
+
+SECTIONS
+{
+    /*
+     * 第一阶段启动代码。
+     *
+     * VMA 和 LMA 都是低物理地址，因此 U-Boot 可以直接跳入。
+     */
+    . = BOOT_PHYS_BASE;
+
+    __boot_phys_start = .;
+
+    .boot.text : ALIGN(4K)
+{
+    KEEP(*(.boot.text.entry))
+    *(.boot.text .boot.text.*)
+}
+
+.boot.rodata : ALIGN(4K)
+{
+    KEEP(*(.boot.rodata .boot.rodata.*))
+}
+
+.boot.data : ALIGN(4K)
+{
+    *(.boot.data .boot.data.*)
+}
+
+.boot.bss (NOLOAD) : ALIGN(4K)
+{
+    __boot_bss_start = .;
+
+    *(.boot.bss .boot.bss.*)
+
+    . = ALIGN(4K);
+    __boot_bss_end = .;
+}
+
+    __boot_phys_end = .;
+
+    /*
+     * Secondary harts enter with satp=0.  Keep a single supervisor-only
+     * identity-mapped trampoline page separate from the discarded boot map,
+     * so the instruction immediately following the satp write remains valid.
+     */
+    ASSERT(__boot_phys_end <= 0x40300000, "RISC-V boot image overlaps SMP trampoline")
+    . = 0x40300000;
+
+    .smp_trampoline : ALIGN(4K)
+    {
+        __smp_trampoline_start = .;
+        KEEP(*(.smp.trampoline))
+        . = ALIGN(4K);
+        __smp_trampoline_end = .;
+        ASSERT(__smp_trampoline_end - __smp_trampoline_start <= 4K,
+               "RISC-V SMP trampoline exceeds one page")
+    }
+
+    /*
+     * 正式高半内核。
+     *
+     * VMA 从 0xffffffff80000000 开始，
+     * LMA 从物理地址 0x40400000 开始。
+     */
+    . = KERNEL_VIRT_BASE;
+
+    __kernel_start = .;
+
+    .text : AT(
+    KERNEL_PHYS_BASE
+    + (ADDR(.text) - KERNEL_VIRT_BASE)
+)
+{
+    __text_start = .;
+
+    KEEP(*(.text.high_entry))
+    *(.text .text.*)
+
+    . = ALIGN(4K);
+    __text_end = .;
+}
+
+    .rodata : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.rodata) - KERNEL_VIRT_BASE)
+    ) ALIGN(4K)
+    {
+        __rodata_start = .;
+
+        *(.rodata .rodata.*) *(.srodata .srodata.*) *(.srodata.cst* .srodata.cst.*) *(.sdata2 .sdata2.*) *(.data.rel.ro .data.rel.ro.*) *(.gnu.linkonce.r.*)
+
+        . = ALIGN(4K); __rodata_end = .;
+    }
+
+    . = ALIGN(0x1000); /* OSKernel2026: page-align first writable RISC-V PT_LOAD */
+    .data : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.data) - KERNEL_VIRT_BASE)
+    )
+    {
+        __data_start = .;
+
+        *(.data .data.*)
+
+        . = ALIGN(16);
+
+        /*
+         * RISC-V small-data global pointer。
+         */
+        PROVIDE(__global_pointer$ = . + 0x800);
+
+        *(.sdata .sdata.*)
+        *(.got .got.*)
+
+        . = ALIGN(4K);
+        __data_end = .;
+    }
+
+    .bss (NOLOAD) : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.bss) - KERNEL_VIRT_BASE)
+    )
+    {
+        __bss_start = .;
+
+        *(.sbss .sbss.*)
+        *(.bss .bss.*)
+        *(COMMON)
+
+        . = ALIGN(4K);
+        __bss_end = .;
+    }
+
+    .boot_stack (NOLOAD) : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.boot_stack) - KERNEL_VIRT_BASE)
+    )
+    {
+        __boot_stack_bottom = .;
+
+        . += BOOT_STACK_SIZE;
+
+        . = ALIGN(4K);
+        __boot_stack_top = .;
+    }
+
+    .smp_boot_stacks (NOLOAD) : AT(
+        KERNEL_PHYS_BASE
+        + (ADDR(.smp_boot_stacks) - KERNEL_VIRT_BASE)
+    )
+    {
+        __smp_boot_stack_bottom = .;
+
+        . += SMP_BOOT_STACKS_SIZE;
+
+        . = ALIGN(4K);
+        __smp_boot_stack_top = .;
+    }
+
+    . = ALIGN(4K);
+
+    __kernel_end = .;
+
+    /*
+     * 正式高半段对应的低物理范围。
+     */
+    __text_phys_start = LOADADDR(.text);
+    __text_phys_end =
+        LOADADDR(.text) + SIZEOF(.text);
+
+    __rodata_phys_start = LOADADDR(.rodata);
+    __rodata_phys_end =
+        LOADADDR(.rodata) + SIZEOF(.rodata);
+
+    __rw_phys_start = LOADADDR(.data);
+    __rw_phys_end =
+        LOADADDR(.smp_boot_stacks)
+        + SIZEOF(.smp_boot_stacks);
+
+    /*
+     * 内存分配器必须保留完整范围：
+     *
+     * .boot
+     * 0x402... 到 0x404... 的间隙
+     * 正式高半内核的所有 LMA
+     */
+    __kernel_phys_start = BOOT_PHYS_BASE;
+    __kernel_phys_end = __rw_phys_end;
+
+    /DISCARD/ :
+    {
+        *(.eh_frame .eh_frame.*)
+        *(.comment)
+    }
+}

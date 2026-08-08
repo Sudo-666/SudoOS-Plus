@@ -14,9 +14,25 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
 
     let linker_script = match target_arch.as_str() {
-        "riscv64" => project_root.join("arch/riscv64/linker.ld"),
+        "riscv64" => {
+            // 根据 Cargo 的 Feature 环境变量,动态选择对应的链接脚本
+            if env::var("CARGO_FEATURE_PLATFORM_VISIONFIVE2").is_ok() {
+                project_root.join("arch/riscv64/src/platform/visionfive2/linker.ld")
+            } else {
+                project_root.join("arch/riscv64/src/platform/qemu_virt/linker.ld")
+            }
+        }
 
-        "loongarch64" => project_root.join("arch/loongarch64/linker.ld"),
+        "loongarch64" => {
+            // 根据 Cargo 的 Feature 环境变量，动态选择对应的链接脚本
+            if env::var("CARGO_FEATURE_PLATFORM_LS2K1000").is_ok() {
+                project_root.join("arch/loongarch64/src/platform/ls2k1000/linker.ld")
+            } else if env::var("CARGO_FEATURE_PLATFORM_QEMU_VIRT").is_ok() {
+                project_root.join("arch/loongarch64/src/platform/qemu_virt/linker.ld")
+            } else {
+                panic!("For loongarch64, a platform feature must be enabled (e.g., 'platform-ls2k1000').");
+            }
+        }
 
         unsupported => {
             panic!("unsupported target architecture: {unsupported}");

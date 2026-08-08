@@ -7,6 +7,18 @@ pub struct BootContext {
 }
 
 impl BootContext {
+    pub(crate) const fn new(raw_args: [usize; 3]) -> Self {
+        Self {
+            raw_args,
+            device_tree: None,
+        }
+    }
+
+    pub(crate) const fn with_device_tree(mut self, address: usize) -> Self {
+        self.device_tree = Some(address);
+        self
+    }
+
     pub const fn raw_args(&self) -> &[usize; 3] {
         &self.raw_args
     }
@@ -31,18 +43,7 @@ impl BootContext {
     }
 }
 
-/// OpenSBI 启动约定：
-///
-/// - a0：hart ID
-/// - a1：FDT 地址
-/// - a2：当前阶段保留
-pub const fn from_raw(hart_id: usize, device_tree: usize, reserved: usize) -> BootContext {
-    BootContext {
-        raw_args: [hart_id, device_tree, reserved],
-        device_tree: non_null_address(device_tree),
-    }
-}
-
-const fn non_null_address(address: usize) -> Option<usize> {
-    if address == 0 { None } else { Some(address) }
+/// 由所选择的平台按各自启动约定解析原始寄存器参数。
+pub fn from_raw(arg0: usize, arg1: usize, arg2: usize) -> BootContext {
+    crate::platform::boot_context(arg0, arg1, arg2)
 }
