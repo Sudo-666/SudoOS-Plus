@@ -134,30 +134,13 @@ impl KernelGlobalAllocator {
         let Some(heap) = slot.as_mut() else {
             /*
              * LS2K1000 真机调试：堆 Option 为 None——要么从未安装，要么
-             * GLOBAL_HEAP 静态被写坏。打印调用方返回地址（可 addr2line 解析）、
-             * 堆句柄地址、安装标志以及原始内存字，区分“未安装”与“损坏”。
+             * GLOBAL_HEAP 静态被写坏。此时不再返回 null 走 handle_alloc_error
+             * （其 println 可能被控制台锁吞掉），而是裸写 UART 输出致命信息后停机。
+             * 其他平台保持原语义（返回 null）。
              */
             #[cfg(feature = "platform-ls2k1000")]
-            {
-                let field = &GLOBAL_HEAP.heap as *const _ as usize;
-                let words =
-                    unsafe { core::slice::from_raw_parts(field as *const usize, 12) };
-                crate::println!(
-                    "HEAP-NONE-ALLOC n={} size={} align={} zeroed={} caller={:#x} field={:#x}",
-                    LS2K_ALLOC_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                    layout.size(),
-                    layout.align(),
-                    zeroed,
-                    caller,
-                    field,
-                );
-                crate::println!(
-                    "HEAP-NONE installed={} words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-                    LS2K_HEAP_INSTALLED.load(core::sync::atomic::Ordering::Relaxed),
-                    words[0], words[1], words[2], words[3], words[4], words[5],
-                    words[6], words[7], words[8], words[9], words[10], words[11],
-                );
-            }
+            return Self::ls2k_fatal_heap_none(layout, zeroed, caller);
+            #[cfg(not(feature = "platform-ls2k1000"))]
             return null_mut();
         };
 
@@ -165,28 +148,95 @@ impl KernelGlobalAllocator {
             Ok(pointer) => pointer.as_ptr(),
             Err(error) => {
                 /*
-                 * LS2K1000 真机调试：分配失败时打印具体原因与分配器状态。
-                 * 错误路径不会再次分配，打印也不会分配，因此可安全执行；
-                 * 其他平台此代码不参与编译。
+                 * LS2K1000 真机调试：分配失败时裸写 UART 输出具体原因并停机，
+                 * 不再返回 null。错误路径不分配、不使用 println（控制台锁可能
+                 * 在持锁上下文中被重入），信息直接进入串口、无法被截断吞掉。
+                 * 其他平台保持原语义（返回 null → handle_alloc_error panic）。
                  */
                 #[cfg(feature = "platform-ls2k1000")]
-                {
-                    crate::println!(
-                        "HEAP-ALLOC-FAIL n={} size={} align={} zeroed={} caller={:#x} error={:?}",
-                        LS2K_ALLOC_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                        layout.size(),
-                        layout.align(),
-                        zeroed,
-                        caller,
-                        error,
-                    );
-                    crate::println!(
-                        "HEAP-ALLOC-FAIL free-pages={:?}",
-                        crate::page_alloc::total_free_pages(),
-                    );
-                }
+                return Self::ls2k_fatal_alloc_error(layout, zeroed, caller, error);
+                #[cfg(not(feature = "platform-ls2k1000"))]
                 null_mut()
             }
+        }
+    }
+
+    #[cfg(feature = "platform-ls2k1000")]
+    fn ls2k_fatal_alloc_error(
+        layout: Layout,
+        zeroed: bool,
+        caller: usize,
+        error: HeapError<GlobalPageAllocatorError>,
+    ) -> ! {
+        /*
+         * 裸串口致命输出：绕过 println / CONSOLE_WRITE_LOCK，确保 error 值
+         * 落在 panic 流之外且物理上不可被串口截断。先关中断屏蔽中断源，
+         * 防止输出期间定时器/IPI 再次分配造成递归。
+         */
+        crate::arch::interrupt::disable();
+        crate::arch::interrupt::mask_all_sources();
+
+        use core::fmt::Write;
+        let mut writer = crate::console::raw::Writer;
+
+        // 176B/align≤256 → slab class 256；超出 2048 上限 → large 路径(class=0)。
+        let class = myos_mm::SizeClass::for_layout(layout)
+            .map(|size_class| size_class.size())
+            .unwrap_or(0);
+
+        let _ = write!(
+            &mut writer,
+            "HEAP_FATAL n={} size={} align={} zeroed={} caller={:#x} class={} error={:?}",
+            LS2K_ALLOC_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+            layout.size(),
+            layout.align(),
+            zeroed,
+            caller,
+            class,
+            error,
+        );
+        let _ = write!(
+            &mut writer,
+            " free_pages={:?}\n",
+            crate::page_alloc::total_free_pages(),
+        );
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[cfg(feature = "platform-ls2k1000")]
+    fn ls2k_fatal_heap_none(layout: Layout, zeroed: bool, caller: usize) -> ! {
+        crate::arch::interrupt::disable();
+        crate::arch::interrupt::mask_all_sources();
+
+        use core::fmt::Write;
+        let mut writer = crate::console::raw::Writer;
+
+        let field = &GLOBAL_HEAP.heap as *const _ as usize;
+        let words = unsafe { core::slice::from_raw_parts(field as *const usize, 12) };
+
+        let _ = write!(
+            &mut writer,
+            "HEAP_FATAL-NONE n={} size={} align={} zeroed={} caller={:#x} field={:#x} installed={}",
+            LS2K_ALLOC_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+            layout.size(),
+            layout.align(),
+            zeroed,
+            caller,
+            field,
+            LS2K_HEAP_INSTALLED.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        let _ = write!(
+            &mut writer,
+            " words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
+            words[0], words[1], words[2], words[3], words[4], words[5],
+            words[6], words[7], words[8], words[9], words[10], words[11],
+        );
+
+        loop {
+            core::hint::spin_loop();
         }
     }
 }

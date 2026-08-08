@@ -437,31 +437,75 @@ struct Scheduler {
 
 impl Scheduler {
     fn new(discovered_cpus: usize) -> Self {
+        /*
+         * LS2K1000 真机调试：Scheduler::new 分阶段裸串口检查点。每个阶段
+         * 用 raw::puts 直接写 UART（绕过 println/控制台锁），一次上板即可
+         * 定位失败发生在 tasks 表 / 哪个 run_queue / CPU1 idle 栈 / retired 表。
+         */
+        #[cfg(feature = "platform-ls2k1000")]
+        {
+            crate::console::raw::puts("TASK00 enter discovered=");
+            crate::console::raw::putdec(discovered_cpus);
+            crate::console::raw::puts("\n");
+        }
+
         assert!((1..=MAX_CPUS).contains(&discovered_cpus));
+
+        #[cfg(feature = "platform-ls2k1000")]
+        crate::console::raw::puts("TASK01 before-tasks\n");
 
         let mut tasks = Vec::with_capacity(MAX_TASKS);
         tasks.push(Some(Task::boot()));
         assert!(tasks.capacity() >= MAX_TASKS);
 
-        let mut cpus = core::array::from_fn(|_| CpuScheduler::new());
+        #[cfg(feature = "platform-ls2k1000")]
+        crate::console::raw::puts("TASK02 after-tasks\n");
+
+        let mut cpus = core::array::from_fn(|logical| {
+            #[cfg(feature = "platform-ls2k1000")]
+            {
+                crate::console::raw::puts("TASK03 rq cpu=");
+                crate::console::raw::putdec(logical);
+                crate::console::raw::puts("\n");
+            }
+            CpuScheduler::new()
+        });
         cpus[CpuId::BOOT.get()].current = Some(TaskId(0));
         cpus[CpuId::BOOT.get()].idle = Some(TaskId(0));
 
         for logical in 1..discovered_cpus {
             let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+            #[cfg(feature = "platform-ls2k1000")]
+            {
+                crate::console::raw::puts("TASK19 idle-stack cpu=");
+                crate::console::raw::putdec(logical);
+                crate::console::raw::puts(" begin\n");
+            }
             let stack = KernelStack::allocate().unwrap_or_else(|error| {
                 panic!(
                     "unable to allocate idle stack for CPU {}: {error:?}",
                     cpu.get(),
                 );
             });
+            #[cfg(feature = "platform-ls2k1000")]
+            crate::console::raw::puts("TASK20 idle-stack cpu=");
+            #[cfg(feature = "platform-ls2k1000")]
+            crate::console::raw::putdec(logical);
+            #[cfg(feature = "platform-ls2k1000")]
+            crate::console::raw::puts(" done\n");
             let id = TaskId(tasks.len());
             tasks.push(Some(Task::idle(id, cpu, stack)));
             cpus[cpu.get()].idle = Some(id);
         }
 
+        #[cfg(feature = "platform-ls2k1000")]
+        crate::console::raw::puts("TASK21 retired-table\n");
+
         let retired_tasks = Vec::with_capacity(MAX_TASKS);
         assert!(retired_tasks.capacity() >= MAX_TASKS);
+
+        #[cfg(feature = "platform-ls2k1000")]
+        crate::console::raw::puts("TASK22 scheduler-ready\n");
 
         Self {
             tasks,
