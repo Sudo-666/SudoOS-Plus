@@ -54,10 +54,10 @@ help:
 # stale kernel binaries / uImages after a rebuild. The judge's `make all`
 # goes through oscomp-all -> scripts/oscomp-build.sh and is unaffected.
 .PHONY: ls2k1000-mkimage kernel-ls2k1000 kernel-ls2k1000.elf \
-        kernel-ls2k1000.bin kernel-ls2k1000.uImage \
+        kernel-ls2k1000.bin kernel-ls2k1000.uImage check-ls2k1000-image \
         uImage kernel.bin
 ls2k1000-mkimage kernel-ls2k1000 kernel-ls2k1000.elf \
-kernel-ls2k1000.bin kernel-ls2k1000.uImage \
+kernel-ls2k1000.bin kernel-ls2k1000.uImage check-ls2k1000-image \
 uImage kernel.bin:
 	@$(MAKE) -f Makefile.project $@
 

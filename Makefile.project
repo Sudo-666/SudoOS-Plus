@@ -41,7 +41,7 @@ export M5_RELEASE_SOAK_LOOPS
 # Competition submission targets
 # ============================================================================
 .PHONY: all kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 \
-        ls2k1000-mkimage
+        ls2k1000-mkimage check-ls2k1000-image
 all: kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 uImage uImage-vf2
 	@echo "=== Competition artifacts ==="
 	@ls -lh kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 uImage uImage-vf2 2>/dev/null || true
@@ -80,6 +80,12 @@ kernel-ls2k1000.bin: kernel-ls2k1000
 kernel-ls2k1000.uImage: kernel-ls2k1000 ls2k1000-mkimage
 	@python3 scripts/elf-to-uimage.py --platform ls2k1000 -n "SudoOS-LS2K1000" kernel-ls2k1000 $@
 	@ls -lh $@
+
+check-ls2k1000-image: kernel-ls2k1000.elf kernel-ls2k1000.bin kernel-ls2k1000.uImage
+	@python3 scripts/check-ls2k1000-image.py \
+	    --elf kernel-ls2k1000.elf \
+	    --bin kernel-ls2k1000.bin \
+	    --image kernel-ls2k1000.uImage
 
 # 别名（板卡更新菜单 / 'go' 命令沿用旧名）
 .PHONY: kernel.bin uImage
