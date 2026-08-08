@@ -258,6 +258,45 @@ bits[63:40]=0xFF 合法），其顶层 PGD 索引（bits[47:39]）仍是 511，�
 `setup_ptwalker` 固定 9 位顶层即证明）之上。若真机上出现 TLB refill 类故障，
 备选方案是把顶层改为 bit39 宽 1（`PWCH.Dir3_width` 9→1 + `indices()` 顶层掩 1 位）。
 
+### 3.10 真机发现：LA264 的 STLBPS 未实现（写被忽略、读回 0）（2026-08-08）
+
+**现象**：VALEN=40 修复后再次上板，bootm 跑完整个初始化链（memory→buddy→
+heap→trap→irq→time）后在 `vm.rs:128` 换一个 panic：
+
+```
+panicked at kernel/src/vm.rs:128:13:
+unable to activate runtime page table: HardwarePaging(
+    RegisterMismatch { register: "STLBPS", expected: 12, actual: 0 })
+```
+
+**根因**：`activate()` 写 `STLBPS = PAGE_SHIFT (12)` 后读回校验，但 **LA264
+不实现 STLBPS**（CSR 0x1E，手册标注 STLB/Static TLB 域）：写入被忽略、读回
+恒为 0。关键旁证：**同一次运行里 PGDL/PGDH/PWCL/PWCH 的回读校验全部通过**，
+说明 LA264 的 CSR 表与 QEMU 完全一致，唯独 STLBPS 是"手册有、硅片无"。
+
+**为什么不影响正确性**（依据 QEMU [CSR_STLBPS 补丁系列]
+(https://patchew.org/QEMU/20250903084827.3085911-1-maobibo@loongson.cn/20250903084827.3085911-6-maobibo@loongson.cn/)）：
+
+- STLBPS 只是**硬件 STLB（单页大小 TLB）缓存**的页大小配置。refill 时页大小
+  等于 STLBPS 的条目进 STLB，否则进 MTLB。STLBPS 无效时条目照常进 MTLB，
+  无正确性问题，仅失去一点缓存收益。
+- 本内核的 TLB 项**全部**来自 refill 路径（`refill.S` 的 `ldpte`/`tlbfill`，
+  页大小取自 refill 期间硬件维护的 `TLBREHI.PS`），软件从不直接 `TLBWR`，
+  因此 `TLBREHI.PS` 软件写值是否回读同样无关紧要。
+- Linux 也写 STLBPS 但从不在写后回读校验，所以真机上该差异对 Linux 无感；
+  本内核的 `verify_register` 自我校验是唯一暴露点。
+
+**修复（cfg 隔离，qemu_virt 不动）**：`memory/paging/hardware.rs` 把 STLBPS
+与 TLBREHI.PS 的回读校验抽成 `verify_page_size_registers()`：
+
+- 非 ls2k1000（QEMU LA464）：保持原样校验（LA464 这两项是普通 R/W，回读一致）。
+- ls2k1000：跳过两项回读校验（STLBPS 写保持——对 LA264 是无害空操作，对 QEMU
+  仍启用 STLB）。
+
+**注意**：LA264 的 `TLBREHI.PS` 是硬件在 refill 异常时维护的字段，即便本次
+没在校验点暴露，也不代表软件写值会被硬件采用——页大小以 refill 时硬件写入
+的为准（本内核恒为 4K，PS=12），无需软件干预。
+
 ## 4. 当前调试状态（2026-08-08 真机）
 
 | 路径 | 结果 |
@@ -265,7 +304,7 @@ bits[63:40]=0xFF 合法），其顶层 PGD 索引（bits[47:39]）仍是 511，�
 | `go` + 最小诊断代码（虚拟 UART） | ✅ 打印 `MYOSX` |
 | `go` + 完整内核（旧，无 -ual） | ❌ U-Boot `CPU0 exception!`（未对齐 `ld.w` → AddressNotAligned，见 §8）|
 | **`go` + 完整内核（-ual 修复后）** | ✅ **跑通到 FDT 解析**：print_boot_info 全输出 → `kernel_main` → `BOOT00` → `verify_loongarch_high_mapping()` 通过（DMW0/DMW1 正确、high execution verified）→ 在 `main.rs:226` 因 `go` 传入的 argv 指针非 FDT 而 panic（**预期**）|
-| `bootm` + 厂商 mkimage uImage + minimal DTB | ✅ **跑通到激活运行时页表**：FDT 识别 → $a3 传参 → BOOT00 → DMW 校验 → FDT 解析（/cpus 修复后 cpu count=2）→ 内存初始化 → buddy → heap → trap/irq/time 全部完成 → 卡在 `vm.rs:128` **VALEN=40**（已修复，见 §3.9，重新上板验证） |
+| `bootm` + 厂商 mkimage uImage + minimal DTB | ✅ **跑通到激活运行时页表**：FDT 识别 → $a3 传参 → BOOT00 → DMW 校验 → FDT 解析（/cpus 修复后 cpu count=2）→ 内存初始化 → buddy → heap → trap/irq/time 全部完成 → 卡在 `vm.rs:128` **VALEN=40**（已修复 §3.9）→ 再卡 **STLBPS 未实现**（已修复 §3.10，重新上板验证，预期通过寄存器校验并继续 virtio/device/fs） |
 
 **真机串口输出（-ual 修复后，`go` 路径）关键片段：**
 
@@ -355,7 +394,7 @@ uImage / kernel.bin       # 旧名别名（板卡更新菜单 / go）
 - [x] **LA264 VALEN=40 页表适配（§3.9，2026-08-08 已实现并两平台编译通过）**：
       内核页表区搬到 bit39 符号扩展地址、用户区缩到 [0, 2^39)、能力检查 48→40，
       全部 cfg 隔离，qemu_virt 不变
-- [ ] **`bootm` 完整启动（真机，重新上板验证 VALEN=40 修复）**：
+- [ ] **`bootm` 完整启动（真机，重新上板验证 VALEN=40 + STLBPS 两处修复）**：
       `sf probe; fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage;
       fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb;
       iminfo 0x9000000002000000; bootm 0x9000000002000000 - 0x900000000a000000`

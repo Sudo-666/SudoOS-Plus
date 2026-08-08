@@ -158,6 +158,10 @@ pub unsafe fn activate(root: PhysFrame) -> Result<PagingHardwareState, HardwareP
         write_csr::<CSR_PGDH>(root_address);
         write_csr::<CSR_PWCL>(PWCL_VALUE);
         write_csr::<CSR_PWCH>(PWCH_VALUE);
+        /*
+         * STLBPS 在 LA264 (2K1000) 上未实现：写入被忽略、读回恒为 0。
+         * 这里仍写入以在 QEMU (LA464) 上启用 STLB；对 LA264 是无害空操作。
+         */
         write_csr::<CSR_STLBPS>(PAGE_SHIFT);
 
         let old_tlbrehi = read_csr::<CSR_TLBREHI>();
@@ -175,20 +179,8 @@ pub unsafe fn activate(root: PhysFrame) -> Result<PagingHardwareState, HardwareP
     verify_register("PGDH", CSR_PGDH, root_address)?;
     verify_register("PWCL", CSR_PWCL, PWCL_VALUE)?;
     verify_register("PWCH", CSR_PWCH, PWCH_VALUE)?;
-    verify_register("STLBPS", CSR_STLBPS, PAGE_SHIFT)?;
+    verify_page_size_registers()?;
     verify_register("TLBRENTRY", CSR_TLBRENTRY, refill_entry.get())?;
-
-    // SAFETY: reading a paging CSR — pure register read, no side effects on memory.
-    let tlbrehi = unsafe { read_csr::<CSR_TLBREHI>() } & TLBREHI_PAGE_SIZE_MASK;
-    let expected_tlbrehi = PAGE_SHIFT << TLBREHI_PAGE_SIZE_SHIFT;
-
-    if tlbrehi != expected_tlbrehi {
-        return Err(HardwarePagingError::RegisterMismatch {
-            register: "TLBREHI.PS",
-            expected: expected_tlbrehi,
-            actual: tlbrehi,
-        });
-    }
 
     Ok(PagingHardwareState {
         root,
@@ -343,6 +335,40 @@ fn refill_entry_physical_address() -> Result<PhysAddr, HardwarePagingError> {
     }
 
     Ok(physical_address)
+}
+
+/// Verify the page-size TLB CSRs echo back the written value.
+///
+/// QEMU's LA464 implements STLBPS and TLBREHI.PS as plain R/W fields, so both
+/// are checked here.  LA264 (LS2K1000) 不实现 STLBPS：写入被忽略、读回恒为 0；
+/// TLBREHI.PS 在 TLB refill 异常时由硬件维护，软件写值同样不回读。这两项是否
+/// 回读都不影响正确性——本内核的 TLB 项全部来自 refill 路径（LDPTE/TLBFILL
+/// 使用 TLBREHI.PS，refill 期间由硬件写入），软件从不直接执行 TLBWR。STLBPS
+/// 只决定硬件 STLB（单页大小缓存）是否启用，页大小不匹配时条目照常进入 MTLB。
+#[cfg(not(feature = "platform-ls2k1000"))]
+fn verify_page_size_registers() -> Result<(), HardwarePagingError> {
+    verify_register("STLBPS", CSR_STLBPS, PAGE_SHIFT)?;
+
+    // SAFETY: reading a paging CSR — pure register read, no side effects on memory.
+    let tlbrehi = unsafe { read_csr::<CSR_TLBREHI>() } & TLBREHI_PAGE_SIZE_MASK;
+    let expected_tlbrehi = PAGE_SHIFT << TLBREHI_PAGE_SIZE_SHIFT;
+
+    if tlbrehi != expected_tlbrehi {
+        return Err(HardwarePagingError::RegisterMismatch {
+            register: "TLBREHI.PS",
+            expected: expected_tlbrehi,
+            actual: tlbrehi,
+        });
+    }
+
+    Ok(())
+}
+
+/// LA264 (2K1000) 不实现 STLBPS 且 TLBREHI.PS 由硬件维护，均不回读软件写值，
+/// 因此跳过回读校验（正确性论证见非 ls2k1000 版本函数文档）。
+#[cfg(feature = "platform-ls2k1000")]
+fn verify_page_size_registers() -> Result<(), HardwarePagingError> {
+    Ok(())
 }
 
 fn verify_register(
