@@ -1,0 +1,63 @@
+menu "Loongson setup"
+choice 
+	prompt "Loongson soc family select"
+	default SOC_LS2K500
+	depends on ARCH_LA_LOONGSON
+
+config SOC_LS2K500
+	bool "Support for LS2K500 family SoCs"
+	depends on SUPPORTS_CPU_LOONGARCH64
+	select LOONGARCH_L1_CACHE_SHIFT_6
+
+config SOC_LS2K1000
+	bool "Support for LS2K1000 family SoCs"
+	depends on SUPPORTS_CPU_LOONGARCH64
+	select LOONGARCH_L1_CACHE_SHIFT_6
+
+endchoice
+
+choice
+	prompt "Board select"
+
+config TARGET_LS2K500_EVB
+	bool "LS2K500 EVB Board"
+	depends on SOC_LS2K500
+	help
+	  This supports Loongson 2K500 EVB board.
+
+config TARGET_LS2K500_MINI_DP
+	bool "LS2K500 MINI_DP Board"
+	depends on SOC_LS2K500
+	help
+	  This supports Loongson 2K500 MINI_DP board.
+
+config TARGET_LS2K500_HUOLONG_MB
+	bool "LS_GD 2K500 MB Board"
+	depends on SOC_LS2K500
+	help
+	  This supports Loongson GD 2K500 HuoLong MB board.
+
+config TARGET_LS2K1000_JINLONG_MB
+	bool "LS_GD 2K1000 JinLong MB Board"
+	depends on SOC_LS2K1000
+	help
+	  This supports Loongson GD 2k1000 JinLong MB board.
+
+config TARGET_LS2K1000_DP
+	bool "LS_GD 2K1000 DP Board"
+	depends on SOC_LS2K1000
+	help
+	  This supports Loongson GD 2k1000 DP board.
+
+endchoice
+
+config SYS_CPU
+	default "LA264" if SOC_LS2K500 || SOC_LS2K1000
+
+config SYS_SOC
+	default "ls2k500" if SOC_LS2K500
+	default "ls2k1000" if SOC_LS2K1000
+
+source "board/loongson/Kconfig"
+
+endmenu

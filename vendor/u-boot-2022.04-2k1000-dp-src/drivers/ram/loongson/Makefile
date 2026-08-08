@@ -1,0 +1,1 @@
+obj-$(CONFIG_LOONGSON_DDR) += ls_ddr.o ls_ddr_param.o

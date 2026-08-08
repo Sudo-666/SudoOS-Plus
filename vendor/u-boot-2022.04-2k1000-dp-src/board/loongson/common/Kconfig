@@ -1,0 +1,21 @@
+menu "Loongson common options"
+
+config LOONGSON_COMPAT
+    bool "Loongson multi-boards compatibility support"
+    default n
+    depends on MACH_LOONGSON
+    select FIT
+    select MULTI_DTB_FIT
+    select DTB_RESELECT
+
+config LOONGSON_BOOT_FIXUP
+    bool "Fixup Loongson boot param before boot kernel."
+    default y
+    depends on MACH_LOONGSON
+
+config LOONGSON_RECOVER
+    bool "Enable the featrue Recovering system from usb/mmc/sata."
+    default n
+    depends on MACH_LOONGSON
+
+endmenu

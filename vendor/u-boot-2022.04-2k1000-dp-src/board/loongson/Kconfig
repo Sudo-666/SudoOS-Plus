@@ -1,0 +1,31 @@
+config MACH_LOONGSON
+	bool
+	default y if ARCH_LA_LOONGSON || ARCH_MIPS_LOONGSON
+	select LAST_STAGE_INIT
+	select SPL_BOARD_INIT if SPL
+
+config SYS_VENDOR
+	default "loongson"
+
+if SOC_LS2K500
+config SYS_BOARD
+	default "ls2k500"
+
+config SYS_CONFIG_NAME
+	default "loongson_2k500_hl" if TARGET_LS2K500_HUOLONG_MB
+	default "loongson_2k500_evb" if TARGET_LS2K500_EVB
+	default "loongson_2k500_mini_dp" if TARGET_LS2K500_MINI_DP
+
+endif
+
+if SOC_LS2K1000
+config SYS_BOARD
+	default "ls2k1000"
+
+config SYS_CONFIG_NAME
+	default "loongson_2k1000" if TARGET_LS2K1000_JINLONG_MB
+	default "loongson_2k1000_dp" if TARGET_LS2K1000_DP
+
+endif
+
+source "board/loongson/common/Kconfig"

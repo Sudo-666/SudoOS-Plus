@@ -1,0 +1,323 @@
+#include "ls2k500.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/power-domain/ls2k500-power-domain.h>
+
+/ {
+	model = "loongson-2k500";
+
+	chosen {
+		stdout-path = "serial2:115200n8";
+		bootargs = "earlycon";
+	};
+
+	sysinfo-smbios {
+		compatible = "u-boot,sysinfo-smbios";
+		u-boot,dm-pre-reloc;
+
+		smbios {
+			system {
+				manufacturer = "Loongson";
+				product = "LS2K500";
+			};
+
+			baseboard {
+				manufacturer = "Loongson";
+				product = "LS2K500-HL-MB";
+			};
+
+			chassis {
+				manufacturer = "Loongson";
+				product = "LS2K500-HL-MB";
+			};
+		};
+	};
+
+	memory {
+		name = "memory";
+		device_type = "memory";
+		reg =  <0x90000000 0x00000000 0 0x10000000
+			0x90000000 0x90000000 0 0x30000000>;
+		u-boot,dm-pre-reloc;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		bootparam: bootparam_region {
+			reg = <0x90000000 0x0f000000 0x0 0x1000000>;
+			no-map;
+		};
+	};
+
+	mc0: ram@0 {
+		compatible = "loongson,ls2k500-ddr";
+		u-boot,dm-pre-reloc;
+
+		soc-config-reg = <0x1fe10100>;
+		mc-disable-offs = <11>;
+		mc-default-offs = <12>;
+
+		sdram-type = "ddr3";	// ddr2/ddr3
+		dimm-type = "udimm";	// rdimm/udimm/sodimm
+
+		cs-map = <0x1>;		// bit map: 	bit0 -- cs0
+					// 		bit1 -- cs1
+					//		bit2 -- cs2
+					//		bit3 -- cs3
+
+		data-width = <32>;	// 16/32/64
+		sdram-width = <16>;	// 8/16
+		sdram-banks = <8>;	// 2/4/8
+		sdram-rows = <15>;
+		sdram-cols = <10>;
+
+		clk-latency = <0x20>; // 300MHz 0x10 400MHz 0x20
+		rd-latency = <0x7>; // 300MHz 0xc 400MHz 0x7
+		wr-latency = <0x4>; // 300MHz 0x3 400MHz 0x4
+		cmd-timing-mode = <1>;	// 0: 1T mode; 1(default): 2T mode; 2: 3T mode.
+
+		// To enable the feature below, uncomment it.
+		/* ecc-enable; */
+		/* addr-mirror; */
+		/* multi-channel; */
+		/* reset-revert; */
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		LED_DIG8_A {
+			label = "LED_DIG8_A";
+			gpios = <&tca6424 0 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_B {
+			label = "LED_DIG8_B";
+			gpios = <&tca6424 1 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_C {
+			label = "LED_DIG8_C";
+			gpios = <&tca6424 2 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_D {
+			label = "LED_DIG8_D";
+			gpios = <&tca6424 3 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_E {
+			label = "LED_DIG8_E";
+			gpios = <&tca6424 4 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_F {
+			label = "LED_DIG8_F";
+			gpios = <&tca6424 5 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_G {
+			label = "LED_DIG8_G";
+			gpios = <&tca6424 6 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_DIG8_DP {
+			label = "LED_DIG8_DP";
+			gpios = <&tca6424 7 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_BLUE_0 {
+			label = "LED_BLUE_0";
+			gpios = <&tca6424 12 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_BLUE_1 {
+			label = "LED_BLUE_1";
+			gpios = <&tca6424 13 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_BLUE_2 {
+			label = "LED_BLUE_2";
+			gpios = <&tca6424 14 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		LED_BLUE_3 {
+			label = "LED_BLUE_3";
+			gpios = <&tca6424 15 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+	};
+
+	vdd_fan: regulator-fan{
+		compatible = "regulator-gpio";
+		regulator-name = "vdd-fan";
+		regulator-min-microvolt = <0>;
+		regulator-max-microvolt = <12000000>;
+		regulator-init-microvolt = <12000000>;
+		regulator-type = "voltage";
+		regulator-boot-on;
+		regulator-always-on;
+		enable-active-high;
+		states = <0 0x0 12000000 0x1>;
+		gpios = <&tca6424 16 GPIO_ACTIVE_HIGH>;
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+
+		button_0 {
+			label = "button_0";
+			gpios = <&tca6424 8 GPIO_ACTIVE_LOW>;
+		};
+
+		button_1 {
+			label = "button_1";
+			gpios = <&tca6424 9 GPIO_ACTIVE_LOW>;
+		};
+
+		button_2 {
+			label = "button_2";
+			gpios = <&tca6424 10 GPIO_ACTIVE_LOW>;
+		};
+
+		button_3 {
+			label = "button_3";
+			gpios = <&tca6424 11 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	panel_lvds: panel-lvds {
+		compatible = "simple-panel";
+		backlight = <&panel_bkl>;
+
+		display-timings {
+			native-mode = <&timing0>;
+
+			timing0: 1028x800p32 {
+				clock-frequency = <71000000>;
+				hactive = <1280>;
+				vactive = <800>;
+				hsync-len = <32>;
+				hfront-porch = <8>;
+				hback-porch = <10>;
+				vfront-porch = <3>;
+				vback-porch = <3>;
+				vsync-len = <6>;
+				de-active = <1>;
+				hsync-active = <0>;
+				vsync-active = <0>;
+				pixelclk-active = <0>;
+			};
+		};
+	};
+
+#if 0
+	panel_bkl: pwm-bkl {
+		compatible = "pwm-backlight";
+		pwms = <&pwm2 0 5000000>;
+
+		brightness-levels = <0 4 8 16 32 64 128 256 511>;
+		default-brightness-level = <8>;
+
+		enable-gpios = <&gpio1 1 GPIO_ACTIVE_HIGH>;
+	};
+#else
+	panel_bkl: backlight {
+		compatible = "gpio-backlight";
+		gpios = <&gpio1 1 GPIO_ACTIVE_LOW>;
+		// default-on;
+	};
+#endif
+
+};
+
+&spi0 {
+	status = "okay";
+
+	spi-flash@0 {
+		compatible = "jedec,spi-nor";
+		spi-max-frequency = <25000000>; /* input clock */
+		reg = <0>; /* CS0 */
+		u-boot,dm-pre-reloc;
+	};
+};
+
+&i2c0 {
+    status = "okay";
+
+    eeprom@57 {
+        compatible = "atmel,24c32";
+        reg = <0x57>;
+        pagesize = <32>;
+    };
+
+	tca6424: gpio@22 {
+		compatible = "ti,tca6424";
+		reg = <0x22>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		interrupt-parent = <&extioiic>;
+		interrupts = <22>;
+	};
+};
+
+&nand {
+	status = "okay";
+};
+
+&gmac0 {
+	status = "okay";
+	max-speed = <100>;
+};
+
+&gmac1 {
+	status = "okay";
+	max-speed = <100>;
+};
+
+&dvo0 {
+	status = "okay";
+	connector-type = "panel";	// panel, vga, hdmi
+	connector = <&panel_lvds>;
+	pix-fmt = "rgb565";
+};
+
+&dvo1 {
+	status = "okay";
+	connector-type = "vga";		// panel, vga, hdmi
+	pix-fmt = "rgb565";
+};
+
+&dpm {
+	domain_pci {
+		offset = <LS2K500_DPM_PCI>;
+		mask = <0x30>;
+		value = <LS2K500_DPM_TGT_CLKOFF>;
+		dpm_en = <0x1>;
+	};
+	domain_gpu {
+		offset = <LS2K500_DPM_GPU>;
+		mask = <0x300>;
+		value = <LS2K500_DPM_TGT_POWEROFF>;
+		dpm_en = <0x1>;
+	};
+	domain_print {
+		offset = <LS2K500_DPM_PRINT>;
+		mask = <0x3000000>;
+		value = <LS2K500_DPM_TGT_CLKOFF>;
+		dpm_en = <0x1>;
+	};
+};

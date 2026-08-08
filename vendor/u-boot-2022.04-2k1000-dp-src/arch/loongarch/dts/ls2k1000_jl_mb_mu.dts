@@ -1,0 +1,221 @@
+#include "ls2k1000.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "loongson-2k1000";
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		bootargs = "earlycon";
+	};
+
+	sysinfo-smbios {
+		compatible = "u-boot,sysinfo-smbios";
+		u-boot,dm-pre-reloc;
+
+		smbios {
+			system {
+				manufacturer = "Loongson";
+				product = "LS2K1000";
+			};
+
+			baseboard {
+				manufacturer = "Loongson";
+				product = "LS2K1000-JL-MB-MU";
+			};
+
+			chassis {
+				manufacturer = "Loongson";
+				product = "LS2K1000-JL-MB-MU";
+			};
+		};
+	};
+
+	memory {
+		name = "memory";
+		device_type = "memory";
+		reg =  <0x90000000 0x00000000 0 0x10000000
+			0x90000000 0x90000000 0 0x70000000>;
+		u-boot,dm-pre-reloc;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		bootparam: bootparam_region {
+			reg = <0x90000000 0x0f000000 0x0 0x1000000>;
+			no-map;
+		};
+	};
+
+	mc0: ram@0 {
+		compatible = "loongson,ls2k1000-ddr";
+		u-boot,dm-pre-reloc;
+
+		soc-config-reg = <0x1fe00424>;
+		mc-disable-offs = <8>;
+		mc-default-offs = <9>;
+
+		sdram-type = "ddr3";	// ddr2/ddr3
+		dimm-type = "udimm";	// rdimm/udimm/sodimm
+
+		cs-map = <0x1>;		// bit map: 	bit0 -- cs0
+					// 		bit1 -- cs1
+					//		bit2 -- cs2
+					//		bit3 -- cs3
+
+		data-width = <64>;	// 16/32/64
+		sdram-width = <16>;	// 8/16
+		sdram-banks = <8>;	// 2/4/8
+		sdram-rows = <15>;
+		sdram-cols = <10>;
+
+		clk-latency = <0x30>;
+		rd-latency = <0x9>;
+		wr-latency = <0x4>;
+		cmd-timing-mode = <1>;	// 0: 1T mode; 1(default): 2T mode; 2: 3T mode.
+
+		// To enable the feature below, uncomment it.
+		/* ecc-enable; */
+		/* addr-mirror; */
+		/* multi-channel; */
+		reset-revert;
+	};
+
+	vdd_fan: regulator-fan {
+		compatible = "regulator-gpio";
+		regulator-name = "vdd-fan";
+		regulator-min-microvolt = <0>;
+		regulator-max-microvolt = <12000000>;
+		regulator-init-microvolt = <12000000>;
+		regulator-type = "voltage";
+		regulator-boot-on;
+		regulator-always-on;
+		enable-active-high;
+		states = <0 0x0 12000000 0x1>;
+		gpios = <&gpio_ext0 0 GPIO_ACTIVE_HIGH>;
+	};
+
+	panel_lvds: panel-lvds {
+		compatible = "simple-panel";
+		backlight = <&panel_bkl>;
+
+		display-timings {
+			native-mode = <&timing0>;
+
+			timing0: 1028x800p32 {
+				clock-frequency = <71000000>;
+				hactive = <1280>;
+				vactive = <800>;
+				hsync-len = <32>;
+				hfront-porch = <8>;
+				hback-porch = <10>;
+				vfront-porch = <3>;
+				vback-porch = <3>;
+				vsync-len = <6>;
+				de-active = <1>;
+				hsync-active = <0>;
+				vsync-active = <0>;
+				pixelclk-active = <0>;
+			};
+		};
+	};
+
+	panel_bkl: backlight {
+		compatible = "gpio-backlight";
+		gpios = <&gpio_ext0 5 GPIO_ACTIVE_LOW>;
+		default-on;
+		status = "okay";
+	};
+};
+
+&ls2k1000_LA_soc {
+	usb_config_type = <1>;
+};
+
+&spi0 {
+	status = "okay";
+
+	spi-flash@0 {
+		compatible = "jedec,spi-nor";
+		spi-max-frequency = <25000000>; /* input clock */
+		reg = <0>; /* CS0 */
+	};
+};
+
+&i2c0 {
+    status = "okay";
+
+    eeprom@57 {
+        compatible = "atmel,24c32";
+        reg = <0x57>;
+        pagesize = <32>;
+    };
+};
+
+&i2c1 {
+	status = "okay";
+
+	gpio_ext0: gpio@20 {
+		compatible = "nxp,pca9555";
+		reg = <0x20>;
+		gpio-controller;
+		#gpio-cells = <2>;
+
+		lvds-shtdn {
+		    gpio-hog;
+		    gpios = <4 GPIO_ACTIVE_HIGH>;
+		    output-high;
+		    line-name = "lvds_shtdn";
+		};
+	};
+
+	gpio_ext1: gpio@21 {
+		compatible = "nxp,pca9555";
+		reg = <0x21>;
+		gpio-controller;
+		#gpio-cells = <2>;
+
+		gpio_ext0-int {
+		    gpio-hog;
+		    gpios = <7 GPIO_ACTIVE_HIGH>;
+		    input;
+		    line-name = "gpio_ext0_int";
+		};
+	};
+
+	sii9022a: hdmi-bridge@39 {
+		compatible = "latticesemi,sii9022a";
+		reg = <0x39>;
+		reset_gpios = <&gpio_ext1 6 GPIO_ACTIVE_HIGH>;
+		ddc-i2c-bus = <&i2c1>;
+	};
+};
+
+&nand {
+	status = "okay";
+};
+
+&gmac0 {
+	status = "okay";
+};
+
+&gmac1 {
+	status = "okay";
+};
+
+&dvo0 {
+	status = "okay";
+	connector-type = "panel";	// panel, vga, hdmi
+	connector = <&panel_lvds>;
+	pix-fmt = "rgb888";
+};
+
+&dvo1 {
+	status = "okay";
+	connector-type = "bridge";		// panel, vga, hdmi
+	pix-fmt = "rgb888";
+	connector = <&sii9022a>;
+};

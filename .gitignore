@@ -52,9 +52,6 @@ core
 ._*
 __MACOSX/
 
-# Board analysis reference: 2K1000 U-Boot BSP source (145 MB, not part of kernel)
-/vendor/u-boot-*/
-
 # Accidental Windows toolchain junk directory (fullwidth-character name)
 /D*nightly-2025-01-18-x86_64-pc-windows-msvc*/
 

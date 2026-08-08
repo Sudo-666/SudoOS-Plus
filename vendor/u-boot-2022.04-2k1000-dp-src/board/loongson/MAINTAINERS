@@ -1,0 +1,7 @@
+Loongson EVB_LS2K500 BOARD
+M:      Jianhui Wang <wangjianhui@loongson.cn>, Xiaochuan Mao <maoxiaochuan@loongson.cn>
+S:      Maintained
+F:      board/loongson/
+F:      include/configs/loongson_la_common.h
+F:      configs/loongson-la_defconfig
+F:      arch/loongarch/
