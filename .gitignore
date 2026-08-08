@@ -23,6 +23,8 @@ core
 
 # LS2K1000 board build artifacts (generated binaries / uImages)
 /kernel-ls2k1000
+/kernel-ls2k1000.elf
+/kernel-ls2k1000.bin
 /kernel-ls2k1000.uImage
 /kernel.bin
 /uImage

@@ -4,12 +4,28 @@
 
 用法:
     python3 scripts/elf-to-uimage.py kernel-ls2k1000 [output.uImage]
+    python3 scripts/elf-to-uimage.py --platform ls2k1000 kernel-ls2k1000 kernel-ls2k1000.uImage
+    python3 scripts/elf-to-uimage.py --raw kernel-ls2k1000 kernel.bin
 
-依赖: Python 3.6+ (仅标准库，无需 mkimage)
+两种生成路径:
+
+1. 非 ls2k1000 平台（默认）: 纯 Python 构造 64 字节 legacy uImage 头。
+   依赖: Python 3.6+ (仅标准库，无需 mkimage)。
+
+2. ls2k1000 平台 (`--platform ls2k1000`): 交给厂商 U-Boot 的 mkimage 生成。
+   LS2K1000 板载 U-Boot (2022.04-v2.1.0 BSP) 使用"位置枚举"，LoongArch 是
+   IH_ARCH_LA = 27（紧跟 RISCV=26），只有厂商 mkimage 认识这个编号。
+   脚本负责: ELF→kernel.bin → 校验(非空/32 位范围) → 调用厂商 mkimage
+   → mkimage -l 回读校验。不再由 Python 手工拼 uImage 头。
+
+   厂商 mkimage 定位优先级:
+     LS2K1000_MKIMAGE 环境变量
+     build/host-tools/ls2k1000/mkimage (由 scripts/build-ls2k1000-mkimage.sh 生成)
 
 生成的 uImage 可以直接在 LS2K1000 U-Boot 中使用:
-    tftp 0x90000000 kernel.uImage
-    bootm 0x90000000
+    fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+    iminfo  0x9000000002000000
+    bootm   0x9000000002000000 - ${fdt_addr}
 """
 
 import struct
@@ -17,6 +33,8 @@ import sys
 import os
 import time
 import zlib
+import tempfile
+import subprocess
 from pathlib import Path
 
 # ── uImage 常量 ─────────────────────────────────────────────
@@ -48,6 +66,13 @@ IH_COMP_NONE = 0                # 无压缩
 # ih_load(4) ih_ep(4) ih_dcrc(4) ih_os(1) ih_arch(1)
 # ih_type(1) ih_comp(1) ih_name(32)
 HEADER_FMT = '>IIIII I I BB BB 32s'  # big-endian, 64 bytes total
+
+# legacy uImage 头的 load/entry 字段是 32 位
+UINT32_MAX = 0xFFFFFFFF
+
+# 厂商 mkimage 默认构建产物（scripts/build-ls2k1000-mkimage.sh）
+DEFAULT_VENDOR_MKIMAGE = Path(__file__).resolve().parent.parent / \
+    'build' / 'host-tools' / 'ls2k1000' / 'mkimage'
 
 
 def read_elf_info(elf_path):
@@ -116,17 +141,42 @@ def read_elf_info(elf_path):
     return e_entry, lowest_paddr, segments
 
 
-def extract_raw_kernel(elf_path, segments):
-    """从 ELF 提取内核原始二进制，去除段间空隙。"""
-    # 计算需要的二进制大小
-    min_offset = min(s['offset'] for s in segments)
-    max_offset = max(s['offset'] + s['filesz'] for s in segments)
+def extract_raw_bytes(elf_path, load_addr=None):
+    """
+    从 ELF 提取内核原始二进制（去除段间空隙、按加载地址铺平）。
 
+    返回 (raw, load_addr, entry_paddr)：
+      raw         : 铺平后的二进制字节串
+      load_addr   : 载荷应加载到的物理地址
+      entry_paddr : 加载后的物理入口地址
+
+    AT() 链接脚本下：最低 LOAD 段 AT 地址即 load；ELF e_entry 是低物理符号，
+    physical_entry_address() 把它换算成相对 load 的物理入口。
+    """
+    vma_entry, lowest_paddr, segments = read_elf_info(elf_path)
+
+    if load_addr is None:
+        load_addr = lowest_paddr
+
+    entry_paddr = physical_entry_address(vma_entry, load_addr, lowest_paddr)
+
+    total_size = 0
+    for s in segments:
+        end = s['paddr'] - load_addr + s['memsz']
+        if end > total_size:
+            total_size = end
+
+    raw = bytearray(total_size)
     with open(elf_path, 'rb') as f:
-        f.seek(min_offset)
-        raw = f.read(max_offset - min_offset)
+        for s in segments:
+            offset = s['paddr'] - load_addr
+            size = s['filesz']
+            if size > 0:
+                f.seek(s['offset'])
+                data = f.read(size)
+                raw[offset:offset + size] = data
 
-    return raw, min_offset
+    return bytes(raw), load_addr, entry_paddr
 
 
 def uimage_crc32(data):
@@ -167,39 +217,17 @@ def build_raw(elf_path, output_path, load_addr=None):
       => go 0x90000000
     """
     print(f"[1/3] Reading ELF: {elf_path}")
-    vma_entry, lowest_paddr, segments = read_elf_info(elf_path)
-
-    if load_addr is None:
-        load_addr = lowest_paddr
-
-    entry_paddr = physical_entry_address(vma_entry, load_addr, lowest_paddr)
+    raw, load_addr, entry_paddr = extract_raw_bytes(elf_path, load_addr)
 
     print(f"    Load address : 0x{load_addr:016x}")
     print(f"    Entry point  : 0x{entry_paddr:016x}")
 
     print(f"[2/3] Extracting raw binary...")
-    total_size = 0
-    for s in segments:
-        end = s['paddr'] - load_addr + s['memsz']
-        if end > total_size:
-            total_size = end
-
-    raw = bytearray(total_size)
-    with open(elf_path, 'rb') as f:
-        for s in segments:
-            offset = s['paddr'] - load_addr
-            size = s['filesz']
-            if size > 0:
-                f.seek(s['offset'])
-                data = f.read(size)
-                raw[offset:offset + size] = data
-                print(f"    segment: paddr=0x{s['paddr']:x} offset=0x{offset:x} size=0x{size:x}")
-
     print(f"    Binary size : {len(raw)} bytes ({len(raw) / 1024:.1f} KiB)")
 
     print(f"[3/3] Writing raw binary: {output_path}")
     with open(output_path, 'wb') as f:
-        f.write(bytes(raw))
+        f.write(raw)
 
     print()
     print(f"✅ Raw binary created: {output_path}")
@@ -209,9 +237,156 @@ def build_raw(elf_path, output_path, load_addr=None):
     print(f"  => go 0x{entry_paddr:08x}")
 
 
+def find_vendor_mkimage():
+    """
+    定位厂商 mkimage。优先级:
+      1. LS2K1000_MKIMAGE 环境变量
+      2. build/host-tools/ls2k1000/mkimage (构建脚本默认产物)
+    返回绝对路径；找不到返回 None。
+    """
+    candidates = []
+    env_mkimage = os.environ.get('LS2K1000_MKIMAGE')
+    if env_mkimage:
+        candidates.append(env_mkimage)
+    candidates.append(str(DEFAULT_VENDOR_MKIMAGE))
+
+    for c in candidates:
+        p = Path(c)
+        if p.is_file() and os.access(p, os.X_OK):
+            return str(p)
+    return None
+
+
+def check_32bit(label, addr):
+    """校验地址能放进 legacy uImage 的 32 位 load/entry 字段。"""
+    if addr < 0 or addr > UINT32_MAX:
+        raise ValueError(
+            f"{label} address 0x{addr:x} does not fit in the 32-bit "
+            f"legacy uImage header (IH_LOAD/IH_EP are uint32)"
+        )
+
+
+def check_vendor_image(mkimage, uimage_path, load_addr, entry_addr):
+    """
+    用同一个厂商 mkimage -l 回读校验产物。
+    mkimage -l 会验证 magic / header CRC / data CRC，并打印内容。
+    """
+    proc = subprocess.run([mkimage, '-l', uimage_path],
+                          capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+
+    checks = {
+        'LoongArch in Image Type': 'LoongArch' in out,
+        f'load == 0x{load_addr:08x}': f'Load Address: {load_addr:08x}' in out,
+        f'entry == 0x{entry_addr:08x}': f'Entry Point: {entry_addr:08x}',
+    }
+    failures = [k for k, ok in checks.items() if not ok]
+
+    if proc.returncode != 0 or failures:
+        print("    vendor mkimage -l output:")
+        for line in out.splitlines():
+            print(f"      {line}")
+        raise RuntimeError(
+            "vendor mkimage readback check failed: "
+            + (", ".join(failures) if failures else f"exit {proc.returncode}")
+        )
+
+    # mkimage -l 已校验两个 CRC；打印内容供人核对
+    for line in out.splitlines():
+        if line.startswith('Image Type') or line.startswith('Load Address') \
+           or line.startswith('Entry Point') or line.startswith('Data Size'):
+            print(f"    {line}")
+
+
+def build_uimage_vendor(elf_path, output_path, load_addr=None, entry_addr=None,
+                        name="SudoOS-LS2K1000"):
+    """
+    LS2K1000: 用厂商 mkimage 生成 uImage，不再手工拼头。
+
+    流程: ELF → kernel.bin（临时文件） → 厂商 mkimage → mkimage -l 回读。
+    """
+    # ── 1. 定位厂商 mkimage ──
+    mkimage = find_vendor_mkimage()
+    if mkimage is None:
+        raise RuntimeError(
+            "vendor mkimage not found. Build it first with:\n"
+            "    ./scripts/build-ls2k1000-mkimage.sh\n"
+            "or point LS2K1000_MKIMAGE=<path> at an existing vendor mkimage."
+        )
+    print(f"    vendor mkimage: {mkimage}")
+
+    # ── 2. ELF → raw 二进制 ──
+    print(f"[1/4] Reading ELF: {elf_path}")
+    raw, load_addr, entry_paddr = extract_raw_bytes(elf_path, load_addr)
+    if entry_addr is None:
+        entry_addr = entry_paddr
+    print(f"    Load address : 0x{load_addr:016x}")
+    print(f"    Entry point  : 0x{entry_addr:016x}")
+    print(f"    Binary size  : {len(raw)} bytes ({len(raw) / 1024:.1f} KiB)")
+
+    # ── 3. 校验 ──
+    print(f"[2/4] Validating inputs...")
+    if len(raw) == 0:
+        raise ValueError("kernel payload is empty")
+    check_32bit('load', load_addr)
+    check_32bit('entry', entry_addr)
+    print("    32-bit load/entry: OK")
+
+    # ── 4. 调用厂商 mkimage ──
+    print(f"[3/4] Running vendor mkimage (-A loongarch ...)...")
+    with tempfile.NamedTemporaryFile(prefix='kernel-ls2k1000-',
+                                     suffix='.bin', delete=False) as tf:
+        tf.write(raw)
+        data_path = tf.name
+    try:
+        cmd = [
+            mkimage,
+            '-A', 'loongarch',
+            '-O', 'linux',
+            '-T', 'kernel',
+            '-C', 'none',
+            '-a', f'0x{load_addr:x}',
+            '-e', f'0x{entry_addr:x}',
+            '-n', name,
+            '-d', data_path,
+            output_path,
+        ]
+        print(f"    cmd: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # 失败时完整输出错误
+            if proc.stdout:
+                print(proc.stdout)
+            if proc.stderr:
+                print(proc.stderr, file=sys.stderr)
+            raise RuntimeError(
+                f"vendor mkimage failed with exit code {proc.returncode}"
+            )
+        # 打印 mkimage 的确认信息（包含校验和）
+        if proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                print(f"    {line}")
+    finally:
+        os.unlink(data_path)
+
+    # ── 5. 回读校验 ──
+    print(f"[4/4] Verifying with vendor mkimage -l ...")
+    check_vendor_image(mkimage, output_path, load_addr, entry_addr)
+
+    total_size = os.path.getsize(output_path)
+    print(f"    Total size  : {total_size} bytes ({total_size / 1024:.1f} KiB)")
+    print()
+    print(f"✅ uImage created: {output_path}")
+    print()
+    print("U-Boot usage (bootm, stash at low memory to avoid overlap):")
+    print(f"  => fatload usb 0:1 0x9000000002000000 {os.path.basename(output_path)}")
+    print(f"  => iminfo  0x9000000002000000")
+    print(f"  => bootm   0x9000000002000000 - ${{fdt_addr}}")
+
+
 def build_uimage(elf_path, output_path, load_addr=None, entry_addr=None, name="MyOS-2K1000", ih_arch=36):
     """
-    将 LoongArch ELF 转换为 uImage。
+    将 LoongArch ELF 转换为 uImage（纯 Python 路径，供非 ls2k1000 平台使用）。
 
     工作流程:
     1. 读取 ELF 获取物理地址和段布局
@@ -347,6 +522,9 @@ def main():
     parser.add_argument('-a', '--load-addr', help="Override load address (hex)")
     parser.add_argument('-e', '--entry', help="Override entry point (hex)")
     parser.add_argument('-n', '--name', default="MyOS-2K1000", help="Image name")
+    parser.add_argument('--platform', default='auto', choices=['auto', 'ls2k1000'],
+                        help="ls2k1000: use the vendor U-Boot mkimage (loongarch, arch=27); "
+                             "auto: pure-Python header (default)")
     parser.add_argument('--arch', default='loongarch',
                         choices=['riscv', 'loongarch', 'mips64', 'mips'],
                         help="Architecture: riscv (26), loongarch (27), mips64 (6), mips (5) [U-Boot 2022.04]")
@@ -360,18 +538,25 @@ def main():
         print(f"Error: {elf_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    arch_map = {'riscv': 26, 'loongarch': 27, 'mips64': 6, 'mips': 5}
-    ih_arch = arch_map[args.arch]
-
     load_addr = int(args.load_addr, 0) if args.load_addr else None
     entry_addr = int(args.entry, 0) if args.entry else None
 
     if args.raw:
         output_path = args.output or str(elf_path.with_suffix('.bin'))
         build_raw(str(elf_path), output_path, load_addr)
+        return
+
+    output_path = args.output or str(elf_path.with_suffix('.uImage'))
+
+    if args.platform == 'ls2k1000':
+        # 厂商 mkimage 路径：loongarch 架构名由厂商工具自己解析，不用 arch_map
+        build_uimage_vendor(str(elf_path), output_path, load_addr, entry_addr,
+                            args.name)
     else:
-        output_path = args.output or str(elf_path.with_suffix('.uImage'))
-        build_uimage(str(elf_path), output_path, load_addr, entry_addr, args.name, ih_arch)
+        arch_map = {'riscv': 26, 'loongarch': 27, 'mips64': 6, 'mips': 5}
+        ih_arch = arch_map[args.arch]
+        build_uimage(str(elf_path), output_path, load_addr, entry_addr,
+                     args.name, ih_arch)
 
 
 if __name__ == '__main__':

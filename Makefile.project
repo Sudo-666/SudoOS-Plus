@@ -40,7 +40,8 @@ export M5_RELEASE_SOAK_LOOPS
 # ============================================================================
 # Competition submission targets
 # ============================================================================
-.PHONY: all kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2
+.PHONY: all kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 \
+        ls2k1000-mkimage
 all: kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 uImage uImage-vf2
 	@echo "=== Competition artifacts ==="
 	@ls -lh kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 uImage uImage-vf2 2>/dev/null || true
@@ -54,7 +55,7 @@ kernel-la:
 	@ARCH=loongarch64 PLATFORM=qemu-virt PROFILE=release ./scripts/build.sh
 	@cp build/loongarch64/cargo/loongarch64-unknown-none-softfloat/release/myos-kernel kernel-la
 
-kernel-ls2k1000:
+kernel-ls2k1000: ls2k1000-mkimage
 	@ARCH=loongarch64 PLATFORM=ls2k1000 PROFILE=release ./scripts/build.sh
 	@cp build/loongarch64/cargo/loongarch64-unknown-none-softfloat/release/myos-kernel kernel-ls2k1000
 
@@ -62,13 +63,31 @@ kernel-visionfive2:
 	@ARCH=riscv64 PLATFORM=visionfive2 PROFILE=release ./scripts/build.sh
 	@cp build/riscv64/cargo/riscv64imac-unknown-none-elf/release/myos-kernel kernel-visionfive2
 
-kernel.bin: kernel-ls2k1000
+# LS2K1000 host mkimage: build or reuse the vendor U-Boot mkimage.
+# Override with: LS2K1000_MKIMAGE=/path/to/mkimage make kernel-ls2k1000
+.PHONY: ls2k1000-mkimage
+ls2k1000-mkimage:
+	@./scripts/build-ls2k1000-mkimage.sh
+
+# LS2K1000 产物链: kernel ELF -> kernel.bin -> 厂商 mkimage -> uImage -> check
+kernel-ls2k1000.elf: kernel-ls2k1000
+	@cp kernel-ls2k1000 $@
+
+kernel-ls2k1000.bin: kernel-ls2k1000
 	@python3 scripts/elf-to-uimage.py --raw kernel-ls2k1000 $@
 	@ls -lh $@
 
-uImage: kernel-ls2k1000
-	@python3 scripts/elf-to-uimage.py kernel-ls2k1000 $@
+kernel-ls2k1000.uImage: kernel-ls2k1000 ls2k1000-mkimage
+	@python3 scripts/elf-to-uimage.py --platform ls2k1000 -n "SudoOS-LS2K1000" kernel-ls2k1000 $@
 	@ls -lh $@
+
+# 别名（板卡更新菜单 / 'go' 命令沿用旧名）
+.PHONY: kernel.bin uImage
+kernel.bin: kernel-ls2k1000.bin
+	@cp kernel-ls2k1000.bin $@
+
+uImage: kernel-ls2k1000.uImage
+	@cp kernel-ls2k1000.uImage $@
 
 # VisionFive 2 (riscv64): uImage 供 U-Boot 'bootm' (arch=26, load=entry=0x40200000)
 uImage-vf2: kernel-visionfive2
