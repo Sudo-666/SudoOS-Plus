@@ -4,7 +4,7 @@
 > 更新时间：2026-08-08
 > 目标板：龙芯 2K1000LA 星云板（LS2K1000-DP-FACTORY，CPU LA264，2GB DDR：256MB@0x0 + 1792MB@0x90000000）
 > Bootloader：U-Boot 2022.04-v2.1.0 BSP（板内 Linux 系统自带的 U-Boot）
-> 状态：**真机 `go` 路径已跑通到 FDT 解析**（对齐异常已修复），`bootm` 完整启动待验证
+> 状态：**真机 `go` 路径已跑通到 FDT 解析**（对齐异常已修复）；厂商 mkimage 已接入（uImage 生成 + 镜像检查），`bootm` 完整启动待验证
 
 ## 1. 项目背景与目标
 
@@ -180,6 +180,31 @@ rustflags = ["-C", "target-feature=-ual"]
 反汇编验证：print_boot_info 中旧版的 `ld.w $sp,225 / st.w $sp,105` 等未对齐访问
 全部改为对齐的 `st.d` + `st.b`，崩溃消除。
 
+### 3.8 厂商 mkimage 与 legacy uImage 协议核对（2026-08-08 源码确认）
+
+引入 `vendor/u-boot-2022.04-2k1000-dp-src` 后，从厂商源码核对镜像协议，结论：
+
+| 项 | 结论 | 厂商源码依据 |
+|----|------|--------------|
+| 架构名 | `-A loongarch`（显示名 `LoongArch`） | `boot/image.c` uimage_arch 表 |
+| 编号 | `IH_ARCH_LA` = **27**（紧跟 RISCV=26，位置枚举） | `include/image.h` |
+| 32 位 load/entry | legacy 头 `ih_load`/`ih_ep` 是 `uint32_t`；mkimage 用 `strtoull` 读入但 `image_set_hdr_l` 写入时**截断** → 必须传 `0x90000000` 这类 32 位物理值，不能把 `0x9000000090000000` 塞进头 | `include/image.h`、`tools/default_image.c` |
+| 0x90000000 → cached | `boot_jump_linux` 用 `map_to_sysmem(ep)`；`0x90000000` ∈ HIGH_MEM_WIN `[0x80000000, 0x100000000)` → `PHYS_TO_CACHED` = `0x9000000090000000` | `arch/loongarch/lib/bootm.c`、`mach-loongson/mapmem.h` |
+| legacy 额外校验 | magic(`0x27051956`) → hcrc → dcrc(verify) → `image_check_target_arch`（`IH_ARCH_DEFAULT=IH_ARCH_LA`，非 LoongArch 镜像拒绝启动） | `boot/bootm.c`、`arch/loongarch/include/asm/u-boot.h` |
+
+**⚠️ 关键发现（超出 mkimage 范围，影响 bootm 完整启动）**：
+`CONFIG_LOONGSON_BOOT_FIXUP` 对 MACH_LOONGSON `default y`，厂商 bootm 走
+`kernel(linux_argc, linux_argv, bootparam, fdt)`，**FDT 在 $a3**（源：env `fdt_addr`，
+经 `fdt_check_header` 校验）。而我们 entry.S 只存 a0/a1/a2、boot.rs 把 $a1 当 FDT
+（主线上游 bootm 的约定是 `kernel(-2, ft_addr, 0, 0)`，FDT 在 $a1）。
+因此 bootm 路径会在 FDT 解析处不匹配——但 **BOOT00 在其之前**，不影响本镜像方案的验收。
+完整 bootm 启动需在 kernel 侧：entry.S 保存 $a3 + boot.rs 优先按 FDT magic 识别 $a1/$a3。
+
+**bootm 搬运行为**（`bootm_load_os`）：`IH_COMP_NONE` + `IH_TYPE_KERNEL` 会
+`memmove_wd` 把 payload 从暂存处搬到 `load` 地址。若把 uImage 直接 fatload 到
+load 地址本身（`0x9000000090000000`），源==目标做自搬移，虽能工作但依赖 memmove 语义；
+更稳妥是**暂存到低内存**（与目标不重叠，见 §4 命令）。
+
 ## 4. 当前调试状态（2026-08-08 真机）
 
 | 路径 | 结果 |
@@ -187,7 +212,7 @@ rustflags = ["-C", "target-feature=-ual"]
 | `go` + 最小诊断代码（虚拟 UART） | ✅ 打印 `MYOSX` |
 | `go` + 完整内核（旧，无 -ual） | ❌ U-Boot `CPU0 exception!`（未对齐 `ld.w` → AddressNotAligned，见 §8）|
 | **`go` + 完整内核（-ual 修复后）** | ✅ **跑通到 FDT 解析**：print_boot_info 全输出 → `kernel_main` → `BOOT00` → `verify_loongarch_high_mapping()` 通过（DMW0/DMW1 正确、high execution verified）→ 在 `main.rs:226` 因 `go` 传入的 argv 指针非 FDT 而 panic（**预期**）|
-| `bootm` + uImage(arch=27) | ⏳ 待真机验证（U-Boot 从 SPI Flash 读 DTB 传给内核） |
+| `bootm` + 厂商 mkimage uImage | ⏳ 待真机验证（uImage 已由厂商 mkimage 生成并通过 `check-ls2k1000-image`；需按下方命令暂存低内存） |
 
 **真机串口输出（-ual 修复后，`go` 路径）关键片段：**
 
@@ -213,11 +238,15 @@ KERNEL PANIC at kernel/src/main.rs:226: unable to map FDT physical address
 fatload usb 0:1 0x9000000090000000 kernel.bin
 go 0x9000000090000000
 
-# ── 完整启动：bootm（厂商从 SPI Flash 读 DTB 传 $a1，需 uImage 在存储上）──
+# ── 完整启动：bootm（厂商 mkimage 生成的 uImage；暂存低内存，与目标不重叠）──
+#    uImage 暂存物理地址 0x02000000（cached VA 0x9000000002000000）
+#    kernel 目标物理地址 0x90000000（cached VA 0x9000000090000000）
+#    两者不重叠；DTB（env fdt_addr）在 0x0a000000，也与暂存区分开
 sf probe
 sf read ${fdt_addr} dtb
-fatload usb 0:1 ${loadaddr} uImage     # loadaddr=0x9000000098000000
-bootm
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+iminfo  0x9000000002000000             # 应显示 LoongArch + 两个 CRC OK
+bootm   0x9000000002000000 - ${fdt_addr}
 
 # ── 或 TFTP（tftp 不做 LMB 检查，裸地址即可）──
 tftp 0x90000000 kernel.bin
@@ -226,40 +255,50 @@ go 0x90000000
 
 ## 5. 构建方法（WSL Ubuntu）
 
-前置：rustup nightly-2025-01-18 + `loongarch64-unknown-none-softfloat` target，Python3。
-**必选：`-C target-feature=-ual` 已写入 cargo 配置（见 §3.7），构建命令无需额外参数。**
+前置：rustup nightly-2025-01-18 + `loongarch64-unknown-none-softfloat` target，Python3，
+gcc/make（WSL 内，厂商 mkimage 需要）。
+**必选：`-C target-feature=-ual` 已写入 cargo 配置（见 §3.7）；uImage 必须由厂商
+mkimage 生成（见 §3.8），不能手工拼头或使用系统 mkimage。**
 
 ```bash
-# 1. 编译 ls2k1000 内核 ELF
+# 1. 构建/复用厂商 mkimage（首次约 1-2 分钟，之后秒回）
+make ls2k1000-mkimage
+
+# 2. 编译 ls2k1000 内核 ELF（自动依赖厂商 mkimage）
 make kernel-ls2k1000
 
-# 2. 生成 uImage（board 更新菜单认这个名字）
-make uImage
+# 3. 产物链：kernel ELF -> kernel.bin -> 厂商 mkimage -> uImage
+make kernel-ls2k1000.bin
+make kernel-ls2k1000.uImage
 
-# 3. 生成 raw bin（go 命令用）
-make kernel.bin
+# 4. 镜像检查（ELF/uImage/CRC/arch/payload/暂存不重叠）
+make check-ls2k1000-image
 
-# 产物
-kernel-ls2k1000        # 内核 ELF
-uImage                 # U-Boot uImage (arch=27, load=0x90000000)
-kernel.bin             # raw 二进制
+# 产物（build/ 目录已被 .gitignore 忽略）
+kernel-ls2k1000.elf       # 内核 ELF
+kernel-ls2k1000.bin       # raw 二进制（go 命令用）
+kernel-ls2k1000.uImage    # 厂商 mkimage uImage（bootm 用, arch=27, load=entry=0x90000000）
+uImage / kernel.bin       # 旧名别名（板卡更新菜单 / go）
 ```
 
-验证产物地址：
-
-```bash
-python3 scripts/elf-to-uimage.py kernel-ls2k1000 uImage   # 应打印 load=0x0000000090000000 entry=0x0000000090000000
-python3 scripts/elf-to-uimage.py --raw kernel-ls2k1000 kernel.bin
-```
+- 手动覆盖 mkimage：`LS2K1000_MKIMAGE=/path/to/mkimage make kernel-ls2k1000`
+- 厂商 mkimage 构建产物：`build/host-tools/ls2k1000/mkimage`（不安装到 /usr/bin）
+- 非 ls2k1000 平台（riscv/qemu）仍走纯 Python 头路径（不带 `--platform ls2k1000`）
 
 ## 6. 待办事项（TODO）
 
 - [x] 真机验证 DDR 基址引导（`go` 路径已通；`bootm` 待验证）
 - [x] 编译器 `-ual` 问题：**已在构建侧禁用 `ual`**（§3.7），内核不再触发未对齐异常
-- [ ] **`bootm` 完整启动**：`sf probe; sf read ${fdt_addr} dtb; fatload usb 0:1 ${loadaddr} uImage; bootm`
-      —— 验证板载 U-Boot 把 SPI Flash DTB 通过 `$a1` 传给内核，走通完整内核初始化
-- [ ] 验证 `$a1` 传 FDT；若 bootm 也不传有效 FDT，需在 ls2k1000 平台提供内存布局兜底
-      （用 `PHYS_MEMORY_BASE`/`PHYS_MEMORY_SIZE` 合成 minimal FDT 或直接填 BootInfo）
+- [x] 厂商 mkimage 接入：`build-ls2k1000-mkimage.sh` + `elf-to-uimage.py --platform ls2k1000`
+      + `check-ls2k1000-image`（§3.8/§5）
+- [ ] **`bootm` 完整启动（真机）**：
+      `sf probe; sf read ${fdt_addr} dtb; fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage;
+      iminfo 0x9000000002000000; bootm 0x9000000002000000 - ${fdt_addr}`
+      —— 验收三层：iminfo 显示 LoongArch + 两个 CRC 正确；bootm 显示镜像验证/加载成功；
+      内核出早期串口日志并进入 BOOT00
+- [ ] **kernel 侧 FDT 传参适配（§3.8 发现）**：厂商 BSP `CONFIG_LOONGSON_BOOT_FIXUP` 把 FDT 放 $a3
+      （来自 env `fdt_addr`，cached VA），而我们假设 $a1=FDT（主线上游约定）。
+      需 entry.S 保存 $a3 + boot.rs 按 FDT magic 识别 $a1/$a3，并把 cached VA 剥成物理地址
 - [ ] **用户态 ALE 异常处理**：OSCOMP 用户程序用 GCC/musl 编译（其 LoongArch 默认开 ual），
       可能产生未对齐访问触发 ALE；内核 `trap.rs` 需为 user mode 加 Ecode 0x09 处理
 - [ ] 副核 SMP 启动（`secondary.S`、`rust_main_secondary` 桩）
@@ -271,8 +310,11 @@ python3 scripts/elf-to-uimage.py --raw kernel-ls2k1000 kernel.bin
 arch/loongarch64/src/platform/ls2k1000/    # 平台代码（新增）
 arch/loongarch64/src/platform/qemu_virt/   # qemu 平台启动文件（拆分）
 arch/loongarch64/src/memory/layout.rs      # 平台化内存布局
-Makefile.project                           # 三平台切换
+Makefile.project                           # 三平台切换 + 厂商 mkimage 链路
 scripts/build.sh                           # PLATFORM 透传
-scripts/elf-to-uimage.py                   # uImage 转换脚本（新增，支持 AT() ELF）
+scripts/build-ls2k1000-mkimage.sh          # 厂商 mkimage 构建（新增）
+scripts/elf-to-uimage.py                   # ELF→uImage 转换（--platform ls2k1000 走厂商 mkimage）
+scripts/check-ls2k1000-image.py            # uImage 镜像检查（新增）
+vendor/u-boot-2022.04-2k1000-dp-src/       # 厂商 U-Boot BSP 源码（新增，参考）
 ls2k1000_manual.txt                        # 开发板手册文字提取（参考）
 ```
