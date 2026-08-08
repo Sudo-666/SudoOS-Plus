@@ -61,6 +61,24 @@ cat > "${DTS_SRC}" <<'EOF'
         reg = <0x0 0x90000000 0x0 0x70000000>;
     };
 
+    /* LA264 双核；内核要求 /cpus 节点，cpu 子节点用 reg 给硬件 ID。 */
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        cpu@0 {
+            device_type = "cpu";
+            compatible = "loongarch";
+            reg = <0>;
+        };
+
+        cpu@1 {
+            device_type = "cpu";
+            compatible = "loongarch";
+            reg = <1>;
+        };
+    };
+
     soc {
         compatible = "simple-bus";
         #address-cells = <2>;
