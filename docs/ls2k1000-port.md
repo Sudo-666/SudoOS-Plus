@@ -212,6 +212,52 @@ rustflags = ["-C", "target-feature=-ual"]
 load 地址本身（`0x9000000090000000`），源==目标做自搬移，虽能工作但依赖 memmove 语义；
 更稳妥是**暂存到低内存**（与目标不重叠，见 §4 命令）。
 
+### 3.9 真机发现：LA264 只有 40 位虚拟地址 → 内核页表区必须用 bit39 符号扩展地址（2026-08-08）
+
+**现象**：bootm 跑通 FDT 解析后，内核在激活运行时页表时 panic：
+
+```
+panicked at kernel/src/vm.rs:128:13:
+unable to activate runtime page table: HardwarePaging(
+    VirtualAddressBitsTooSmall { available: 40, required: 48 })
+```
+
+**根因**：QEMU 的 LA464 核 VALEN=48，而板载 **LA264 核 VALEN=40**（CPUCFG0
+bits[15:12]+1 = 40）。`read_capabilities()` 硬编码要求 48 位虚拟地址。
+
+**LA264 的 40 位地址空间语义**（依据 Loongson 开发者在 GCC 补丁中的说明 +
+LoongArch 规范 "Virtual Address Reduction Mode" + Linux `setup_ptwalker`）：
+
+- 虚拟地址缩减：合法地址的 bits[63:40] 必须是 **bit39 的符号扩展**。
+  - 用户空间：`[0x0, 0x7f_ffff_ffff]`（bit39=0，即 [0, 2^39)）
+  - 内核空间：`[0xffff_ff80_0000_0000, 0xffff_ffff_ffff_ffff]`（bit39=1，符号扩展到 64 位）
+- **DMW 窗口（0x8000…/0x9000…）不依赖 VALEN**，内核镜像跑在 DMW1
+  `0x9000_0000_9020_0000` 因此不受影响——这也是内核能跑到这步的原因。
+- PGD 选择：用户（bit39=0）→ PGDL，内核（bit39=1）→ PGDH，与现设计一致。
+- 页表遍历：Linux 的 `setup_ptwalker()` 用 `pgd_i = PGDIR_SHIFT(=39)`、
+  `pgd_w = PAGE_SHIFT-3(=9)`，顶层 PGD 取 **bits[47:39]**。40 位内核地址
+  符号扩展后 bits[47:39] = 0x1FF = 511，落在 PGD[511]——与 QEMU 平台
+  48 位高半区的 PGD 索引**完全一致**，页表几何无需改动。
+
+**修复（cfg 隔离，qemu_virt 不动）**：改动只在 `arch/loongarch64` 内，
+全部 `#[cfg(feature = "platform-ls2k1000")]` 门控：
+
+| 文件 | 改动 |
+|------|------|
+| `memory/layout.rs` | `USER_RANGE` → `[0, 0x80_0000_0000)`；`VMALLOC` → `[0xffff_ff80_0000_0000, 0xffff_ffc0_0000_0000)`；`MODULES` → `[0xffff_ffc0_0000_0000, 0xffff_ffc1_0000_0000)`；`FIXMAP` 不变（0xffff_fffe… 在 40 位范围内同样合法） |
+| `memory/paging/geometry.rs` | `VIRTUAL_ADDRESS_BITS` 48→40（仅打印元数据；GEOMETRY/PWCL/PWCH/refill.S 全部不变） |
+| `memory/paging/hardware.rs` | `REQUIRED_VIRTUAL_ADDRESS_BITS`、`REQUIRED_PHYSICAL_ADDRESS_BITS` 48→40 |
+| `memory/paging/entry.rs` | PTE 物理地址掩码 `PHYSICAL_ADDRESS_BITS` 48→40（匹配 PALEN） |
+
+**为什么页表几何不用变**：内核页表区从 48 位负地址（0xffff8000…，在 LA264 上
+bits[63:40]=0xFFFF80 不是合法符号扩展）搬到 bit39 符号扩展地址（0xffff_ff80…，
+bits[63:40]=0xFF 合法），其顶层 PGD 索引（bits[47:39]）仍是 511，与硬件遍历
+行为一致。用户区缩到 [0, 2^39)，bit39=0 → PGD[0]。
+
+**注意**：上述结论建立在"LA264 页表遍历使用完整 64 位符号扩展地址"（Linux
+`setup_ptwalker` 固定 9 位顶层即证明）之上。若真机上出现 TLB refill 类故障，
+备选方案是把顶层改为 bit39 宽 1（`PWCH.Dir3_width` 9→1 + `indices()` 顶层掩 1 位）。
+
 ## 4. 当前调试状态（2026-08-08 真机）
 
 | 路径 | 结果 |
@@ -219,7 +265,7 @@ load 地址本身（`0x9000000090000000`），源==目标做自搬移，虽能�
 | `go` + 最小诊断代码（虚拟 UART） | ✅ 打印 `MYOSX` |
 | `go` + 完整内核（旧，无 -ual） | ❌ U-Boot `CPU0 exception!`（未对齐 `ld.w` → AddressNotAligned，见 §8）|
 | **`go` + 完整内核（-ual 修复后）** | ✅ **跑通到 FDT 解析**：print_boot_info 全输出 → `kernel_main` → `BOOT00` → `verify_loongarch_high_mapping()` 通过（DMW0/DMW1 正确、high execution verified）→ 在 `main.rs:226` 因 `go` 传入的 argv 指针非 FDT 而 panic（**预期**）|
-| `bootm` + 厂商 mkimage uImage | ⏳ 待真机验证（uImage 已由厂商 mkimage 生成并通过 `check-ls2k1000-image`；需按下方命令暂存低内存） |
+| `bootm` + 厂商 mkimage uImage + minimal DTB | ✅ **跑通到激活运行时页表**：FDT 识别 → $a3 传参 → BOOT00 → DMW 校验 → FDT 解析（/cpus 修复后 cpu count=2）→ 内存初始化 → buddy → heap → trap/irq/time 全部完成 → 卡在 `vm.rs:128` **VALEN=40**（已修复，见 §3.9，重新上板验证） |
 
 **真机串口输出（-ual 修复后，`go` 路径）关键片段：**
 
@@ -304,12 +350,16 @@ uImage / kernel.bin       # 旧名别名（板卡更新菜单 / go）
       + `check-ls2k1000-image`（§3.8/§5）
 - [x] **kernel 侧 FDT 传参适配（§3.8 发现）**：entry.S 保存 $a3、`rust_entry`/`from_raw` 增第 4 参、
       `boot_context` 按 FDT magic 识别 $a1/$a3 并剥 cached 前缀（2026-08-08 已实现并编译通过）
-- [ ] **`bootm` 完整启动（真机）**：
+- [x] **minimal DTB 补 /cpus 节点**：内核 SMP 发现要求读 `/cpus/cpu@*/reg`，否则
+      `MissingRequiredNode("/cpus")` panic；已加 cpu@0/1（commit 39e49668，离线 myos-fdt 验证通过）
+- [x] **LA264 VALEN=40 页表适配（§3.9，2026-08-08 已实现并两平台编译通过）**：
+      内核页表区搬到 bit39 符号扩展地址、用户区缩到 [0, 2^39)、能力检查 48→40，
+      全部 cfg 隔离，qemu_virt 不变
+- [ ] **`bootm` 完整启动（真机，重新上板验证 VALEN=40 修复）**：
       `sf probe; fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage;
       fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb;
       iminfo 0x9000000002000000; bootm 0x9000000002000000 - 0x900000000a000000`
-      —— 验收三层：iminfo 显示 LoongArch + 两个 CRC 正确；bootm 显示镜像验证/加载成功；
-      内核出早期串口日志并进入 BOOT00
+      —— 预期过页表激活（`kernel vm:` / `runtime pgtbl` / `address bits VA=40 PA=40`）继续初始化
 - [ ] 验证 FDT 内存解析：minimal DTB 声明 [0x90000000, 0x100000000) 1792MiB，
       内核应打印该 RAM 区域并完成内存初始化（如需要再调整 DTB 内存节点）
 - [ ] **用户态 ALE 异常处理**：OSCOMP 用户程序用 GCC/musl 编译（其 LoongArch 默认开 ual），

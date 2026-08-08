@@ -20,15 +20,29 @@ pub const XKPRANGE_START: usize = 0x8000_0000_0000_0000;
 pub const XKVRANGE_START: usize = 0xc000_0000_0000_0000;
 
 /// 当前 MyOS 选择 4 KiB、四级页表。
+///
+/// QEMU virt (LA464) 提供 48 位虚拟地址；LS2K1000 的 LA264 核只有
+/// 40 位（CPUCFG0 VALEN=40）。LA264 上内核页表区必须位于 bit39
+/// 符号扩展地址（bits[63:40] = 0xFF），因此下列区域按平台区分。
+#[cfg(not(feature = "platform-ls2k1000"))]
 pub const PAGE_TABLE_VA_BITS: usize = 48;
+
+#[cfg(feature = "platform-ls2k1000")]
+pub const PAGE_TABLE_VA_BITS: usize = 40;
 
 /// 当前编译配置允许的最大用户虚拟地址范围。
 ///
 /// 之后读取 CPUCFG1.VABITS 后，实际用户范围还应取：
 ///
 /// min(PAGE_TABLE_VA_BITS, cpu_vabits)
+#[cfg(not(feature = "platform-ls2k1000"))]
 pub const USER_RANGE: VirtRange =
     VirtRange::from_bounds(0x0000_0000_0000_0000, 0x0001_0000_0000_0000);
+
+/// LS2K1000 (LA264, VALEN=40)：合法用户地址的 bit39 必须为 0，即 [0, 2^39)。
+#[cfg(feature = "platform-ls2k1000")]
+pub const USER_RANGE: VirtRange =
+    VirtRange::from_bounds(0x0000_0000_0000_0000, 0x0000_0080_0000_0000);
 
 /// 强序 uncached 直接映射。
 pub const UNCACHED_DIRECT_MAP: VirtRange =
@@ -39,10 +53,23 @@ pub const CACHED_DIRECT_MAP: VirtRange =
     VirtRange::from_bounds(0x9000_0000_0000_0000, 0x9001_0000_0000_0000);
 
 /// 页表映射的动态内核虚拟地址区域。
+#[cfg(not(feature = "platform-ls2k1000"))]
 pub const VMALLOC: VirtRange = VirtRange::from_bounds(0xffff_8000_0000_0000, 0xffff_c000_0000_0000);
 
+/// LS2K1000：内核页表区位于 bit39 符号扩展的 40 位空间
+/// (bits[63:40] = 0xFF)。其顶层 PGD 索引（bits[47:39] = 511）与 QEMU
+/// 平台的 48 位高半区一致，页表几何无需改变。
+#[cfg(feature = "platform-ls2k1000")]
+pub const VMALLOC: VirtRange = VirtRange::from_bounds(0xffff_ff80_0000_0000, 0xffff_ffc0_0000_0000);
+
+#[cfg(not(feature = "platform-ls2k1000"))]
 pub const MODULES: VirtRange = VirtRange::from_bounds(0xffff_c000_0000_0000, 0xffff_c100_0000_0000);
 
+#[cfg(feature = "platform-ls2k1000")]
+pub const MODULES: VirtRange = VirtRange::from_bounds(0xffff_ffc0_0000_0000, 0xffff_ffc1_0000_0000);
+
+/// FIXMAP 地址 0xffff_fffe_0000_0000 在 40 位符号扩展范围内同样合法，
+/// 两个平台保持一致。
 pub const FIXMAP: VirtRange = VirtRange::from_bounds(0xffff_fffe_0000_0000, 0xffff_ffff_0000_0000);
 
 /// 最终运行地址使用 cached DMW 高地址别名。

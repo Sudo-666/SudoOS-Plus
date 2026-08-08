@@ -23,8 +23,24 @@ const CPUCFG_VALEN_MASK: usize = 0xff << CPUCFG_VALEN_SHIFT;
 const CPUCFG_READ_INHIBIT: usize = 1 << 21;
 const CPUCFG_EXECUTE_INHIBIT: usize = 1 << 22;
 
+/*
+ * LA264 (LS2K1000) 只有 40 位虚拟/物理地址（CPUCFG0 VALEN/PALEN = 40）；
+ * QEMU virt 的 LA464 提供 48 位。能力检查按平台放宽。
+ *
+ * 页表结构（四级、顶层 bits[47:39]）两个平台一致——LA264 上内核地址
+ * 为 bit39 符号扩展，bits[47:39] 恒为 0x1FF，落在 PGD[511]。
+ */
+#[cfg(not(feature = "platform-ls2k1000"))]
 const REQUIRED_VIRTUAL_ADDRESS_BITS: u8 = 48;
+
+#[cfg(feature = "platform-ls2k1000")]
+const REQUIRED_VIRTUAL_ADDRESS_BITS: u8 = 40;
+
+#[cfg(not(feature = "platform-ls2k1000"))]
 const REQUIRED_PHYSICAL_ADDRESS_BITS: u8 = 48;
+
+#[cfg(feature = "platform-ls2k1000")]
+const REQUIRED_PHYSICAL_ADDRESS_BITS: u8 = 40;
 
 const PT_BASE: usize = PAGE_SHIFT;
 const PT_WIDTH: usize = 9;

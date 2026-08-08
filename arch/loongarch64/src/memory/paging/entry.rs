@@ -27,7 +27,15 @@ const PRESENT: u64 = 1 << 7;
 const WRITE: u64 = 1 << 8;
 const MODIFIED: u64 = 1 << 9;
 
+/*
+ * PTE 中的物理地址字段宽度需匹配硬件 PALEN。
+ * QEMU virt (LA464) 为 48 位；LS2K1000 的 LA264 为 40 位。
+ */
+#[cfg(not(feature = "platform-ls2k1000"))]
 const PHYSICAL_ADDRESS_BITS: usize = 48;
+
+#[cfg(feature = "platform-ls2k1000")]
+const PHYSICAL_ADDRESS_BITS: usize = 40;
 
 const PHYSICAL_PAGE_MASK: u64 = ((1_u64 << PHYSICAL_ADDRESS_BITS) - 1) & !((PAGE_SIZE as u64) - 1);
 

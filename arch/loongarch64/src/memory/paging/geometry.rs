@@ -3,7 +3,22 @@ use myos_mm::{PageTableGeometry, PageTableIndex, VirtAddr};
 use crate::memory::layout;
 
 pub const LEVELS: usize = 4;
+
+/*
+ * 页表顶层 PGD 索引取地址 bits[47:39]，两个平台都成立：
+ *
+ * - QEMU virt (VALEN=48)：高半内核区为 48 位符号扩展，PGD 索引 256..511。
+ * - LS2K1000 (VALEN=40)：内核区为 bit39 符号扩展，bits[47:39] = 0x1FF，
+ *   因此内核映射落在 PGD[511]，与 QEMU 的高半区一致。
+ *
+ * 所以 GEOMETRY 不随平台改变，只有用于打印的 VIRTUAL_ADDRESS_BITS 不同。
+ */
+#[cfg(not(feature = "platform-ls2k1000"))]
 pub const VIRTUAL_ADDRESS_BITS: u8 = 48;
+
+#[cfg(feature = "platform-ls2k1000")]
+pub const VIRTUAL_ADDRESS_BITS: u8 = 40;
+
 pub const ENTRIES_PER_TABLE: usize = 512;
 
 const GEOMETRY: PageTableGeometry<LEVELS> =
