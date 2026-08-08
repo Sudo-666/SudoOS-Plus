@@ -192,13 +192,20 @@ rustflags = ["-C", "target-feature=-ual"]
 | 0x90000000 → cached | `boot_jump_linux` 用 `map_to_sysmem(ep)`；`0x90000000` ∈ HIGH_MEM_WIN `[0x80000000, 0x100000000)` → `PHYS_TO_CACHED` = `0x9000000090000000` | `arch/loongarch/lib/bootm.c`、`mach-loongson/mapmem.h` |
 | legacy 额外校验 | magic(`0x27051956`) → hcrc → dcrc(verify) → `image_check_target_arch`（`IH_ARCH_DEFAULT=IH_ARCH_LA`，非 LoongArch 镜像拒绝启动） | `boot/bootm.c`、`arch/loongarch/include/asm/u-boot.h` |
 
-**⚠️ 关键发现（超出 mkimage 范围，影响 bootm 完整启动）**：
+**⚠️ 关键发现（已修复 2026-08-08）**：
 `CONFIG_LOONGSON_BOOT_FIXUP` 对 MACH_LOONGSON `default y`，厂商 bootm 走
 `kernel(linux_argc, linux_argv, bootparam, fdt)`，**FDT 在 $a3**（源：env `fdt_addr`，
-经 `fdt_check_header` 校验）。而我们 entry.S 只存 a0/a1/a2、boot.rs 把 $a1 当 FDT
-（主线上游 bootm 的约定是 `kernel(-2, ft_addr, 0, 0)`，FDT 在 $a1）。
-因此 bootm 路径会在 FDT 解析处不匹配——但 **BOOT00 在其之前**，不影响本镜像方案的验收。
-完整 bootm 启动需在 kernel 侧：entry.S 保存 $a3 + boot.rs 优先按 FDT magic 识别 $a1/$a3。
+是 cached 窗口 VA）。而我们原本把 $a1 当 FDT（主线上游 bootm 的约定是
+`kernel(-2, ft_addr, 0, 0)`，FDT 在 $a1）。
+**修复**：entry.S 保存 $a3 到 BOOT_ARGS[3]；`rust_entry`/`from_raw` 增第 4 参
+（riscv64 忽略）；ls2k1000 `boot_context` 按 FDT magic（0xd00dfeed）识别 $a1/$a3，
+并把 cached 窗口前缀剥成物理地址再传给 `with_device_tree`。
+
+**板上 SPI dtb 分区内容不是有效 DTB**（真机 2026-08-08 实测）：
+`bootm ... - ${fdt_addr}` 报 `Could not find a valid device tree`，`genimg_get_format`
+两个 magic 都不匹配。需要用 `scripts/build-ls2k1000-dtb.sh` 生成 minimal DTB
+（物理地址形式，U-Boot 运行时 DTS 的内存节点是 cached 窗口地址、会被内核
+48 位掩码拒绝）从 USB 加载，见 §4 命令。
 
 **bootm 搬运行为**（`bootm_load_os`）：`IH_COMP_NONE` + `IH_TYPE_KERNEL` 会
 `memmove_wd` 把 payload 从暂存处搬到 `load` 地址。若把 uImage 直接 fatload 到
@@ -238,15 +245,19 @@ KERNEL PANIC at kernel/src/main.rs:226: unable to map FDT physical address
 fatload usb 0:1 0x9000000090000000 kernel.bin
 go 0x9000000090000000
 
-# ── 完整启动：bootm（厂商 mkimage 生成的 uImage；暂存低内存，与目标不重叠）──
-#    uImage 暂存物理地址 0x02000000（cached VA 0x9000000002000000）
-#    kernel 目标物理地址 0x90000000（cached VA 0x9000000090000000）
-#    两者不重叠；DTB（env fdt_addr）在 0x0a000000，也与暂存区分开
+# ── 完整启动：bootm（厂商 mkimage uImage + minimal DTB；都暂存低内存）──
+#    uImage 暂存物理 0x02000000（cached 0x9000000002000000）
+#    kernel 目标物理 0x90000000（cached 0x9000000090000000），两者不重叠
+#    minimal DTB 加载到物理 0x0a000000（cached 0x900000000a000000），与暂存区分开
+#    注意：板上 SPI dtb 分区不是有效 DTB，别用 `sf read ${fdt_addr} dtb`；
+#    用 build-ls2k1000-dtb.sh 生成 ls2k1000-minimal.dtb 从 USB 加载
 sf probe
-sf read ${fdt_addr} dtb
 fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
 iminfo  0x9000000002000000             # 应显示 LoongArch + 两个 CRC OK
-bootm   0x9000000002000000 - ${fdt_addr}
+bootm   0x9000000002000000 - 0x900000000a000000
+# 或省略第三参数，靠 BOOT_FIXUP 读 env fdt_addr（此时已指向 valid minimal DTB）：
+# bootm   0x9000000002000000
 
 # ── 或 TFTP（tftp 不做 LMB 检查，裸地址即可）──
 tftp 0x90000000 kernel.bin
@@ -291,14 +302,16 @@ uImage / kernel.bin       # 旧名别名（板卡更新菜单 / go）
 - [x] 编译器 `-ual` 问题：**已在构建侧禁用 `ual`**（§3.7），内核不再触发未对齐异常
 - [x] 厂商 mkimage 接入：`build-ls2k1000-mkimage.sh` + `elf-to-uimage.py --platform ls2k1000`
       + `check-ls2k1000-image`（§3.8/§5）
+- [x] **kernel 侧 FDT 传参适配（§3.8 发现）**：entry.S 保存 $a3、`rust_entry`/`from_raw` 增第 4 参、
+      `boot_context` 按 FDT magic 识别 $a1/$a3 并剥 cached 前缀（2026-08-08 已实现并编译通过）
 - [ ] **`bootm` 完整启动（真机）**：
-      `sf probe; sf read ${fdt_addr} dtb; fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage;
-      iminfo 0x9000000002000000; bootm 0x9000000002000000 - ${fdt_addr}`
+      `sf probe; fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage;
+      fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb;
+      iminfo 0x9000000002000000; bootm 0x9000000002000000 - 0x900000000a000000`
       —— 验收三层：iminfo 显示 LoongArch + 两个 CRC 正确；bootm 显示镜像验证/加载成功；
       内核出早期串口日志并进入 BOOT00
-- [ ] **kernel 侧 FDT 传参适配（§3.8 发现）**：厂商 BSP `CONFIG_LOONGSON_BOOT_FIXUP` 把 FDT 放 $a3
-      （来自 env `fdt_addr`，cached VA），而我们假设 $a1=FDT（主线上游约定）。
-      需 entry.S 保存 $a3 + boot.rs 按 FDT magic 识别 $a1/$a3，并把 cached VA 剥成物理地址
+- [ ] 验证 FDT 内存解析：minimal DTB 声明 [0x90000000, 0x100000000) 1792MiB，
+      内核应打印该 RAM 区域并完成内存初始化（如需要再调整 DTB 内存节点）
 - [ ] **用户态 ALE 异常处理**：OSCOMP 用户程序用 GCC/musl 编译（其 LoongArch 默认开 ual），
       可能产生未对齐访问触发 ALE；内核 `trap.rs` 需为 user mode 加 Ecode 0x09 处理
 - [ ] 副核 SMP 启动（`secondary.S`、`rust_main_secondary` 桩）
@@ -313,6 +326,7 @@ arch/loongarch64/src/memory/layout.rs      # 平台化内存布局
 Makefile.project                           # 三平台切换 + 厂商 mkimage 链路
 scripts/build.sh                           # PLATFORM 透传
 scripts/build-ls2k1000-mkimage.sh          # 厂商 mkimage 构建（新增）
+scripts/build-ls2k1000-dtb.sh              # minimal 内核 DTB 构建（新增）
 scripts/elf-to-uimage.py                   # ELF→uImage 转换（--platform ls2k1000 走厂商 mkimage）
 scripts/check-ls2k1000-image.py            # uImage 镜像检查（新增）
 vendor/u-boot-2022.04-2k1000-dp-src/       # 厂商 U-Boot BSP 源码（新增，参考）
