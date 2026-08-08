@@ -51,6 +51,7 @@ _start:
     or      $s0, $a0, $zero
     or      $s1, $a1, $zero
     or      $s2, $a2, $zero
+    or      $s3, $a3, $zero
 
     /* ── 2. 关中断 ── */
     li.w    $t0, 0x4
@@ -101,6 +102,7 @@ _start:
     st.d    $s0, $t0, 0
     st.d    $s1, $t0, 8
     st.d    $s2, $t0, 16
+    st.d    $s3, $t0, 24
 
     /* ── 8. 设置栈指针 ── */
     la.global $sp, __boot_stack_top
@@ -121,6 +123,7 @@ _start:
     or      $a0, $s0, $zero
     or      $a1, $s1, $zero
     or      $a2, $s2, $zero
+    or      $a3, $s3, $zero
     bl      rust_entry
 
 .Lunexpected_return:

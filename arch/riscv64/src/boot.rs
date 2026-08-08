@@ -44,6 +44,7 @@ impl BootContext {
 }
 
 /// 由所选择的平台按各自启动约定解析原始寄存器参数。
-pub fn from_raw(arg0: usize, arg1: usize, arg2: usize) -> BootContext {
+/// RISC-V 协议只定义 a0/a1/a2，arg3 在本架构不参与启动约定。
+pub fn from_raw(arg0: usize, arg1: usize, arg2: usize, _arg3: usize) -> BootContext {
     crate::platform::boot_context(arg0, arg1, arg2)
 }

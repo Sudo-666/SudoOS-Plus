@@ -28,6 +28,7 @@ core
 /kernel-ls2k1000.uImage
 /kernel.bin
 /uImage
+/ls2k1000-minimal.dtb
 /uImage.fit
 /uImage-*
 /uImage-test/

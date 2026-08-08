@@ -92,7 +92,7 @@ const _: () = {
     assert!(size_of::<EfiSystemTable>() == 120);
 };
 
-pub(crate) fn boot_context(arg0: usize, arg1: usize, arg2: usize) -> BootContext {
+pub(crate) fn boot_context(arg0: usize, arg1: usize, arg2: usize, _arg3: usize) -> BootContext {
     /*
      * QEMU LoongArch direct boot：
      *

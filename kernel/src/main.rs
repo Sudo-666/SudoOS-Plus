@@ -64,10 +64,13 @@ pub(crate) use arch_loongarch64 as arch;
 compile_error!("unsupported target architecture");
 
 /// 所有架构最终进入的公共 Rust 入口。
+///
+/// 四个参数按各架构启动约定传递（riscv64/loongarch64 qemu 只用前三个；
+/// LS2K1000 厂商 bootm 的 `CONFIG_LOONGSON_BOOT_FIXUP` 把 FDT 放 $a3）。
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_entry(arg0: usize, arg1: usize, arg2: usize) -> ! {
+pub extern "C" fn rust_entry(arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> ! {
     arch::smp::set_current_cpu_id(smp::CpuId::BOOT.get());
-    let boot = arch::boot::from_raw(arg0, arg1, arg2).into_boot_info();
+    let boot = arch::boot::from_raw(arg0, arg1, arg2, arg3).into_boot_info();
 
     print_boot_info(&boot);
 

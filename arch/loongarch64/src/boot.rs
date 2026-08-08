@@ -70,6 +70,6 @@ impl BootContext {
     }
 }
 
-pub fn from_raw(arg0: usize, arg1: usize, arg2: usize) -> BootContext {
-    crate::platform::boot_context(arg0, arg1, arg2)
+pub fn from_raw(arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> BootContext {
+    crate::platform::boot_context(arg0, arg1, arg2, arg3)
 }
