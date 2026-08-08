@@ -1860,6 +1860,9 @@ pub fn initialize() {
     let discovered = crate::smp::discovered_cpu_count();
     let scheduler = Scheduler::new(discovered);
 
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("after-sched-new");
+
     {
         let mut slot = SCHEDULER.lock();
 
@@ -1872,11 +1875,18 @@ pub fn initialize() {
 
     spawn_system_thread(task_reaper_main, Some(CpuId::BOOT), Some(CpuId::BOOT));
 
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("after-reaper");
+
     #[cfg(debug_assertions)]
     wait_queue::verify_local();
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("pre-sched-print");
     crate::println!("kernel scheduler:");
     crate::println!("  policy          : preemptive per-CPU FIFO round-robin");
     crate::println!("  kernel stack    : 64 KiB plus guard pages");
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("after-kstack");
     crate::println!("  bootstrap CPUs  : 1");
     crate::println!("  configured CPUs : {}", discovered);
     crate::println!(
@@ -1886,6 +1896,8 @@ pub fn initialize() {
     crate::println!("  wait queues     : blocking wakeup enabled");
     crate::println!("  task reaper     : dedicated kernel thread");
     crate::println!("  migration       : runnable tasks may move across CPUs");
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("after-sched-print");
 }
 
 pub fn irq_enter() {

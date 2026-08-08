@@ -62,6 +62,20 @@ impl KernelGlobalAllocator {
 
         *heap = Some(HeapAllocator::new(KernelPageProvider));
 
+        /*
+         * LS2K1000 真机调试：记录安装完成标志并打印全局分配器与堆句柄的
+         * 静态地址，供后续 HEAP-STATE/HEAP-NONE-ALLOC 对照。仅 ls2k1000 编译。
+         */
+        #[cfg(feature = "platform-ls2k1000")]
+        {
+            LS2K_HEAP_INSTALLED.store(true, core::sync::atomic::Ordering::Release);
+            crate::println!(
+                "HEAP-INSTALLED global={:#x} field={:#x}",
+                &GLOBAL_HEAP as *const _ as usize,
+                &GLOBAL_HEAP.heap as *const _ as usize,
+            );
+        }
+
         Ok(())
     }
 
@@ -102,15 +116,77 @@ impl KernelGlobalAllocator {
             return null_mut();
         }
 
+        #[cfg(feature = "platform-ls2k1000")]
+        let caller: usize = {
+            let mut value: usize;
+            // SAFETY: 读取当前调用方返回地址，不改动任何机器状态。
+            unsafe {
+                core::arch::asm!("or {}, $ra, $zero", out(reg) value, options(nomem, nostack));
+            }
+            value
+        };
+
+        #[cfg(feature = "platform-ls2k1000")]
+        LS2K_ALLOC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
         let mut slot = self.heap.lock();
 
         let Some(heap) = slot.as_mut() else {
+            /*
+             * LS2K1000 真机调试：堆 Option 为 None——要么从未安装，要么
+             * GLOBAL_HEAP 静态被写坏。打印调用方返回地址（可 addr2line 解析）、
+             * 堆句柄地址、安装标志以及原始内存字，区分“未安装”与“损坏”。
+             */
+            #[cfg(feature = "platform-ls2k1000")]
+            {
+                let field = &GLOBAL_HEAP.heap as *const _ as usize;
+                let words =
+                    unsafe { core::slice::from_raw_parts(field as *const usize, 12) };
+                crate::println!(
+                    "HEAP-NONE-ALLOC n={} size={} align={} zeroed={} caller={:#x} field={:#x}",
+                    LS2K_ALLOC_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                    layout.size(),
+                    layout.align(),
+                    zeroed,
+                    caller,
+                    field,
+                );
+                crate::println!(
+                    "HEAP-NONE installed={} words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                    LS2K_HEAP_INSTALLED.load(core::sync::atomic::Ordering::Relaxed),
+                    words[0], words[1], words[2], words[3], words[4], words[5],
+                    words[6], words[7], words[8], words[9], words[10], words[11],
+                );
+            }
             return null_mut();
         };
 
         match heap.allocate(layout, zeroed) {
             Ok(pointer) => pointer.as_ptr(),
-            Err(_) => null_mut(),
+            Err(error) => {
+                /*
+                 * LS2K1000 真机调试：分配失败时打印具体原因与分配器状态。
+                 * 错误路径不会再次分配，打印也不会分配，因此可安全执行；
+                 * 其他平台此代码不参与编译。
+                 */
+                #[cfg(feature = "platform-ls2k1000")]
+                {
+                    crate::println!(
+                        "HEAP-ALLOC-FAIL n={} size={} align={} zeroed={} caller={:#x} error={:?}",
+                        LS2K_ALLOC_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                        layout.size(),
+                        layout.align(),
+                        zeroed,
+                        caller,
+                        error,
+                    );
+                    crate::println!(
+                        "HEAP-ALLOC-FAIL free-pages={:?}",
+                        crate::page_alloc::total_free_pages(),
+                    );
+                }
+                null_mut()
+            }
         }
     }
 }
@@ -133,7 +209,14 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
         unsafe {
             core::arch::asm!("mv {}, ra", out(reg) caller, options(nomem, nostack, preserves_flags));
         }
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(target_arch = "loongarch64")]
+        let caller: usize;
+        #[cfg(target_arch = "loongarch64")]
+        // SAFETY: reading the return-address register does not alter machine state.
+        unsafe {
+            core::arch::asm!("or {}, $ra, $zero", out(reg) caller, options(nomem, nostack));
+        }
+        #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
         let caller = 0_usize;
         let Some(pointer) = NonNull::new(pointer) else {
             fatal_heap_corruption();
@@ -159,6 +242,50 @@ unsafe impl GlobalAlloc for KernelGlobalAllocator {
 
 #[global_allocator]
 static GLOBAL_HEAP: KernelGlobalAllocator = KernelGlobalAllocator::new();
+
+/*
+ * LS2K1000 真机调试统计：分配次数计数与“堆已安装”标志。
+ * 仅 ls2k1000 平台参与编译，qemu_virt/riscv64 不受影响。
+ */
+#[cfg(feature = "platform-ls2k1000")]
+static LS2K_ALLOC_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "platform-ls2k1000")]
+static LS2K_HEAP_INSTALLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/*
+ * LS2K1000 真机调试：在启动关键点输出堆句柄的原始内存与可加锁状态，
+ * 用于定位 GLOBAL_HEAP.heap 的 Option 被写坏/丢失的时刻。
+ *
+ * - try-lock=1 表示能取到堆锁，is-some 是 Option 的真实判别值；
+ * - try-lock=0 表示锁被占用或 owner 字段损坏（自身即是损坏信号）；
+ * - words 是堆句柄内存的前 96 字节指纹，用于跨检查点比较是否被改写。
+ *
+ * 不分配内存、不长时间持锁，可在任意任务上下文安全调用。
+ */
+#[cfg(feature = "platform-ls2k1000")]
+pub fn dump_heap_state(tag: &'static str) {
+    let field = &GLOBAL_HEAP.heap as *const _ as usize;
+    let words = unsafe { core::slice::from_raw_parts(field as *const usize, 12) };
+    let lock_state = GLOBAL_HEAP.heap.try_lock();
+    let is_some = lock_state.as_ref().is_some_and(|guard| guard.is_some());
+
+    crate::println!(
+        "HEAP-STATE[{}] field={:#x} try-lock={} is-some={}",
+        tag,
+        field,
+        if lock_state.is_some() { 1 } else { 0 },
+        is_some,
+    );
+    crate::println!(
+        "HEAP-STATE[{}] words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+        tag,
+        words[0], words[1], words[2], words[3], words[4], words[5],
+        words[6], words[7], words[8], words[9], words[10], words[11],
+    );
+}
 
 pub fn shrink() {
     GLOBAL_HEAP.shrink();

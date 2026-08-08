@@ -403,8 +403,14 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     time::verify_periodic();
 
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("pre-task-init");
     task::initialize();
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("post-task-init");
     smp::start_secondaries();
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("post-secondaries");
     task::finalize_cpu_bringup();
     println!("BOOT11 all-ap-online");
     workqueue::initialize();
