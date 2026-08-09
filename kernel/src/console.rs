@@ -85,8 +85,11 @@ pub mod raw {
         let mut buffer = [0u8; 16];
         let mut length = 0;
         let mut found = false;
-        for shift in (0..64).rev().step_by(4) {
-            let digit = ((value >> shift) & 0xf) as usize;
+        // 按 nibble 递减移位：shift 序列为 60,56,...,4,0（64 位）。此前用
+        // `(0..64).rev().step_by(4)` 生成 63,59,...,3，step_by 取索引 0,4,...
+        // 恒跳过 shift 0 —— 最低 4 bit 丢失（0x1234 被输出为 0x123）。
+        for nibble in (0..core::mem::size_of::<usize>() * 2).rev() {
+            let digit = ((value >> (nibble * 4)) & 0xf) as usize;
             if digit != 0 {
                 found = true;
             }
