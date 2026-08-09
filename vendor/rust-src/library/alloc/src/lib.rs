@@ -212,9 +212,6 @@ mod macros;
 
 mod raw_vec;
 
-// PR-2: scalar allocation-trace hooks for real-hardware OOM diagnostics.
-mod trace;
-
 // Heaps provided for low-level allocation strategies
 
 pub mod alloc;

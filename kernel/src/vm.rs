@@ -284,8 +284,6 @@ pub fn vmalloc(size: usize, alignment: usize) -> Result<KernelVmAllocation, Kern
     }
 
     let reservation = reserve_vmalloc(size, alignment)?;
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::console::raw::puts("VM00 reserve\n");
     let page_count = pages_for_size(reservation.usable().size())?;
 
     let mut pages = Vec::new();
@@ -293,8 +291,6 @@ pub fn vmalloc(size: usize, alignment: usize) -> Result<KernelVmAllocation, Kern
     pages
         .try_reserve(page_count)
         .map_err(|_| KernelVmError::MetadataOutOfMemory)?;
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::console::raw::puts("VM01 metadata\n");
 
     for _ in 0..page_count {
         match crate::page_alloc::allocate(
@@ -309,21 +305,12 @@ pub fn vmalloc(size: usize, alignment: usize) -> Result<KernelVmAllocation, Kern
             }
         }
     }
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::console::raw::puts("VM02 pages-ready\n");
 
     let mut mapped_pages = 0;
 
     let map_result = with_kernel_page_table(|page_table| {
         for (index, physical_page) in pages.iter().enumerate() {
             let virtual_page = reservation_page(reservation, index)?;
-
-            #[cfg(feature = "platform-ls2k1000")]
-            {
-                crate::console::raw::puts("VM03 map page=");
-                crate::console::raw::putdec(index);
-                crate::console::raw::puts("\n");
-            }
 
             page_table.map_page(
                 virtual_page,
