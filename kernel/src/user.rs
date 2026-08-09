@@ -190,15 +190,17 @@ const EAGAIN: isize = crate::syscall::errno::EAGAIN;
 const ENOMEM: isize = crate::syscall::errno::ENOMEM;
 const EFAULT: isize = crate::syscall::errno::EFAULT;
 const EINVAL: isize = crate::syscall::errno::EINVAL;
+const EINTR: isize = crate::syscall::errno::EINTR;
 const ENOSYS: isize = crate::syscall::errno::ENOSYS;
 const ERANGE: isize = 34;
 
 const MAX_USER_COPY: usize = 4096;
 const MAX_BULK_IO_COPY: usize = 256 * 1024;
 const MAX_USER_PATH: usize = 256;
-const MAX_EXEC_STRING: usize = 64 * 1024;
-const MAX_EXEC_ARGS: usize = 256;
-const MAX_EXEC_ENVS: usize = 256;
+const MAX_EXEC_STRING: usize = 128 * 1024;
+const MAX_EXEC_ARGS: usize = 4096;
+const MAX_EXEC_ENVS: usize = 4096;
+const MAX_EXEC_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 const USER_MESSAGE: &[u8] = b"hello user\n";
 const AT_FDCWD: usize = usize::MAX - 99;
 const AT_REMOVEDIR: usize = 0x200;
@@ -2764,16 +2766,63 @@ fn final_buildstorm_safe_watchdog() {
     }
     final_buildstorm_safe_watchdog_dump("first-90s", true);
     crate::timer::sleep(core::time::Duration::from_secs(60));
-    if BUILDSTORM_SAFE_ACTIVE.load(Ordering::Acquire) {
-        final_buildstorm_safe_watchdog_dump("next-60s", false);
+    if !BUILDSTORM_SAFE_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    final_buildstorm_safe_watchdog_dump("next-60s", false);
+    // Continuous 60s snapshots to track build progress.
+    // First 20 ticks: full syscall histogram dump.
+    // After tick 20: lightweight heartbeat only (thread count + elapsed).
+    // Hard cap at 240 ticks (4 h, matching evaluator timeout).
+    let mut tick = 0u32;
+    while BUILDSTORM_SAFE_ACTIVE.load(Ordering::Acquire) {
+        crate::timer::sleep(core::time::Duration::from_secs(60));
+        if !BUILDSTORM_SAFE_ACTIVE.load(Ordering::Acquire) {
+            break;
+        }
+        tick += 1;
+        let elapsed = 3 + tick;
+        if tick <= 20 {
+            crate::println!(
+                "buildstorm-watchdog: tick={} elapsed_m={}",
+                tick, elapsed,
+            );
+            final_buildstorm_safe_watchdog_dump(
+                &alloc::format!("tick-{}", tick),
+                true, // reset counters to get per-interval deltas
+            );
+        } else {
+            // Lightweight heartbeat: thread count + elapsed only.
+            // Avoids flooding the log while keeping visibility.
+            let thread_summary = crate::task::thread_count_summary();
+            crate::println!(
+                "buildstorm-heartbeat: tick={} elapsed_m={} {}",
+                tick, elapsed, thread_summary,
+            );
+        }
+        if tick >= 240 {
+            crate::println!("buildstorm-watchdog: tick-cap reached (4 h), stopping");
+            break;
+        }
     }
 }
 
 fn final_buildstorm_late_snapshot() {
     crate::timer::sleep(core::time::Duration::from_secs(300));
-    if BUILDSTORM_LATE_SNAPSHOT_ACTIVE.load(Ordering::Acquire) {
-        crate::println!("buildstorm-late-snapshot: elapsed_s=300");
+    for elapsed in [300_u64, 301, 302, 360, 420] {
+        if !BUILDSTORM_LATE_SNAPSHOT_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        crate::println!("buildstorm-late-snapshot: elapsed_s={}", elapsed);
         crate::task::print_task_debug_dump();
+        let delay = if elapsed < 302 {
+            1
+        } else if elapsed == 302 {
+            58
+        } else {
+            60
+        };
+        crate::timer::sleep(core::time::Duration::from_secs(delay));
     }
 }
 
@@ -3169,22 +3218,14 @@ if test ! -x "$real"; then
     exit 127
 fi
 
-run_logged() {
-    # Preserve the evaluator's streaming output and avoid writing every byte
-    # twice through tmpfs. The official script already tees the scored run.
-    "$@"
-}
-
 case "${1-}" in
     arceos|axloader|axvisor|starry|board)
         alias_name="$1"; shift
-        run_logged "$xtask" "$alias_name" "$@"
-        exit $?
+        exec "$xtask" "$alias_name" "$@"
         ;;
     xtask)
         shift
-        run_logged "$xtask" "$@"
-        exit $?
+        exec "$xtask" "$@"
         ;;
 esac
 
@@ -3208,14 +3249,12 @@ if test "$pkg" = tg-xtask; then
                 if test "$1" = --; then shift; break; fi
                 shift
             done
-            run_logged "$xtask" "$@"
-            exit $?
+            exec "$xtask" "$@"
             ;;
     esac
 fi
 
-run_logged "$real" "$@"
-exit $?
+exec "$real" "$@"
 EOF
 chmod 755 "$bindir/cargo"
 printf '%s\n' "$real_cargo" > "$bindir/real-cargo-path"
@@ -3559,14 +3598,12 @@ exit 0
         "CARGO=/tmp/sudoos-buildstorm-bin/cargo",
         "RUSTUP_TOOLCHAIN=nightly-2026-05-28",
         "CARGO_NET_OFFLINE=true",
-        "CARGO_BUILD_JOBS=1", // SUDOOS_BUILDSTORM_CARGO_JOBS1_V1
         // SUDOOS_BUILDSTORM_HOST_GNU_LINKER_ENV_V1
         // Native minibuild uses the GNU host target; the later ArceOS build
         // keeps using the existing musl CC wrapper/custom musl target.
         "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/riscv64-linux-gnu-gcc",
         "CARGO_TARGET_LOONGARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/loongarch64-linux-gnu-gcc",
         "CARGO_INCREMENTAL=0",
-        "CARGO_TERM_QUIET=true",
         "CARGO_TERM_COLOR=never",
         "CARGO_TERM_PROGRESS_WHEN=never",
         "TMPDIR=/tmp",
@@ -3606,181 +3643,13 @@ exit 0
     }
     // SUDOOS_BUILDSTORM_XTASK_TMPFS_V3: prepare/reuse the real xtask in tmpfs.
     prepare_buildstorm_xtask_bootstrap(&environment);
-    // SUDOOS_BUILDSTORM_CARGO_PROCESS_SNAPSHOT_V2
-    let cargo_process_snapshot_probe_v2 = r#"
-echo "SUDOOS_CARGO_SNAPSHOT_V2_BEGIN"
-echo "SUDOOS_CARGO_SNAPSHOT_V2_MACHINE=$(uname -m 2>/dev/null || echo unknown)"
-echo "SUDOOS_CARGO_SNAPSHOT_V2_JOBS=${CARGO_BUILD_JOBS:-unset}"
-echo "SUDOOS_CARGO_SNAPSHOT_V2_LINKER=${CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER:-unset}"
-echo "SUDOOS_CARGO_SNAPSHOT_V2_CARGO=$(command -v cargo 2>/dev/null || echo missing)"
-echo "SUDOOS_CARGO_SNAPSHOT_V2_RUSTC=$(command -v rustc 2>/dev/null || echo missing)"
-
-mkdir -p /proc
-if [ -r /proc/self/stat ]; then
-    proc_before=1
-else
-    proc_before=0
-fi
-echo "SUDOOS_CARGO_SNAPSHOT_V2_PROC_BEFORE=$proc_before"
-
-mount -t proc proc /proc
-mount_rc=$?
-if [ -r /proc/self/stat ]; then
-    proc_after=1
-else
-    proc_after=0
-fi
-echo "SUDOOS_CARGO_SNAPSHOT_V2_MOUNT_PROC_RC=$mount_rc readable=$proc_after"
-
-if [ "$proc_after" -ne 1 ]; then
-    echo "SUDOOS_CARGO_SNAPSHOT_V2_DONE ok=false stage=procfs"
-    exit 1
-fi
-
-rm -rf /tmp/minibuild /tmp/sudoos-cargo-snapshot-v2.out
-rm_rc=$?
-echo "SUDOOS_CARGO_SNAPSHOT_V2_RM_RC=$rm_rc"
-
-cargo new --vcs none /tmp/minibuild
-new_rc=$?
-echo "SUDOOS_CARGO_SNAPSHOT_V2_NEW_RC=$new_rc"
-
-if [ "$new_rc" -ne 0 ]; then
-    echo "SUDOOS_CARGO_SNAPSHOT_V2_DONE ok=false stage=cargo-new"
-    exit 1
-fi
-
-cd /tmp/minibuild || exit 97
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_BUILD_LAUNCH"
-cargo build -vv >/tmp/sudoos-cargo-snapshot-v2.out 2>&1 &
-cargo_pid=$!
-echo "SUDOOS_CARGO_SNAPSHOT_V2_CARGO_PID=$cargo_pid"
-
-i=0
-while [ "$i" -lt 25 ]; do
-    i=$((i + 1))
-
-    if kill -0 "$cargo_pid" 2>/dev/null; then
-        alive=1
-    else
-        alive=0
-    fi
-
-    cargo_state=missing
-    if [ -r "/proc/$cargo_pid/status" ]; then
-        cargo_state=$(grep '^State:' "/proc/$cargo_pid/status" 2>/dev/null | tr ' \t' '__')
-    fi
-
-    file_count=$(find /tmp/minibuild/target -type f 2>/dev/null | wc -l 2>/dev/null)
-    echo "SUDOOS_CARGO_SNAPSHOT_V2_TICK second=$i cargo_alive=$alive cargo_state=$cargo_state files=${file_count:-0}"
-
-    if [ "$alive" -eq 0 ]; then
-        break
-    fi
-    sleep 1
-done
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_CARGO_OUTPUT_BEGIN"
-cat /tmp/sudoos-cargo-snapshot-v2.out 2>&1 || true
-echo "SUDOOS_CARGO_SNAPSHOT_V2_CARGO_OUTPUT_END"
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_PS_BEGIN"
-ps -ef 2>&1 || true
-echo "----- extended ps -----"
-ps -eo pid,ppid,stat,wchan,etime,comm,args 2>&1 || true
-echo "SUDOOS_CARGO_SNAPSHOT_V2_PS_END"
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_PROC_BEGIN"
-for proc in /proc/[0-9]*; do
-    [ -d "$proc" ] || continue
-    pid=${proc#/proc/}
-
-    comm=""
-    [ -r "$proc/comm" ] && comm=$(cat "$proc/comm" 2>/dev/null)
-    cmd=""
-    [ -r "$proc/cmdline" ] && cmd=$(tr '\000' ' ' <"$proc/cmdline" 2>/dev/null)
-
-    case "$comm $cmd" in
-        *cargo*|*rustc*|*collect2*|*" ld "*|*/ld*|*cc1*|*timeout*|*minibuild*)
-            echo "===== SUDOOS_CARGO_SNAPSHOT_V2_PROC pid=$pid comm=<$comm> cmd=<$cmd> ====="
-
-            if [ -r "$proc/status" ]; then
-                grep -E '^(Name|State|Tgid|Pid|PPid|TracerPid|Threads|SigQ|SigPnd|ShdPnd|SigBlk|SigIgn|SigCgt|voluntary_ctxt_switches|nonvoluntary_ctxt_switches):' \
-                    "$proc/status" 2>&1 || cat "$proc/status" 2>&1 || true
-            fi
-
-            [ -r "$proc/wchan" ] && {
-                printf 'WCHAN='
-                cat "$proc/wchan" 2>&1 || true
-                echo
-            }
-
-            [ -r "$proc/syscall" ] && {
-                printf 'SYSCALL='
-                cat "$proc/syscall" 2>&1 || true
-                echo
-            }
-
-            [ -r "$proc/stack" ] && {
-                echo "STACK_BEGIN"
-                cat "$proc/stack" 2>&1 || true
-                echo "STACK_END"
-            }
-
-            if [ -d "$proc/fd" ]; then
-                echo "FD_BEGIN"
-                for fd in "$proc"/fd/*; do
-                    [ -e "$fd" ] || continue
-                    printf '%s -> ' "$fd"
-                    readlink "$fd" 2>&1 || true
-                done
-                echo "FD_END"
-            fi
-            ;;
-    esac
-done
-echo "SUDOOS_CARGO_SNAPSHOT_V2_PROC_END"
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_TARGET_BEGIN"
-find /tmp/minibuild/target -maxdepth 5 \( -type f -o -type l \) \
-    -exec ls -ln {} \; 2>&1 | sort || true
-echo "SUDOOS_CARGO_SNAPSHOT_V2_TARGET_END"
-
-if [ -r "/proc/$cargo_pid/status" ]; then
-    echo "SUDOOS_CARGO_SNAPSHOT_V2_CARGO_STATUS_BEGIN"
-    cat "/proc/$cargo_pid/status" 2>&1 || true
-    echo "SUDOOS_CARGO_SNAPSHOT_V2_CARGO_STATUS_END"
-fi
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_KILL_BEGIN"
-for proc in /proc/[0-9]*; do
-    [ -d "$proc" ] || continue
-    pid=${proc#/proc/}
-    [ "$pid" = "$$" ] && continue
-
-    comm=""
-    [ -r "$proc/comm" ] && comm=$(cat "$proc/comm" 2>/dev/null)
-    cmd=""
-    [ -r "$proc/cmdline" ] && cmd=$(tr '\000' ' ' <"$proc/cmdline" 2>/dev/null)
-
-    case "$comm $cmd" in
-        *cargo*|*rustc*|*collect2*|*" ld "*|*/ld*|*cc1*|*timeout*)
-            echo "SUDOOS_CARGO_SNAPSHOT_V2_KILL pid=$pid comm=<$comm>"
-            kill -KILL "$pid" 2>/dev/null || true
-            ;;
-    esac
-done
-kill -KILL "$cargo_pid" 2>/dev/null || true
-echo "SUDOOS_CARGO_SNAPSHOT_V2_KILL_END"
-
-echo "SUDOOS_CARGO_SNAPSHOT_V2_DONE ok=true"
-exit 0
-"#;
-
+    // SUDOOS_BUILDSTORM_RESTORE_PRODUCTION_V2
+    // The scoring branch must execute the evaluator script from the mounted
+    // final image.  Snapshot/supervisor probes belong only on diagnostic
+    // branches and otherwise cap BuildStorm at the toolchain smoke score.
     let buildstorm_result = run_rootfs_program_with_cwd(
         "/bin/sh",
-        &["sh", "-c", cargo_process_snapshot_probe_v2],
+        &["sh", script],
         &environment,
         Some("/"),
     );
@@ -6712,10 +6581,16 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             if number == SYS_EXIT_GROUP {
                 let thread = crate::task::current_user_thread()
                     .expect("exit_group arrived without a current user Thread");
+                // Publish only for the real exit_group ABI.  execve also
+                // requests sibling teardown, but must remain able to create
+                // threads in the replacement image.
+                let group_status = thread
+                    .process()
+                    .begin_group_exit(arguments[0] as isize);
                 crate::task::request_process_thread_exit(
                     thread.process().id(),
                     thread.id(),
-                    arguments[0] as isize,
+                    group_status,
                 );
             }
             return_to_kernel(frame, arguments[0] as isize);
@@ -8543,16 +8418,29 @@ fn sys_clone_canonical(
         let child_thread =
             match parent.create_thread(current_thread.entry(), current_thread.user_stack()) {
                 Ok(thread) => thread,
-                Err(_) => return -ENOMEM,
+                Err(error) => {
+                    crate::println!(
+                        "clone-fail: phase=thread flags={:#x} error={error:?} free_pages={} live_processes={} live_threads={}",
+                        flags,
+                        crate::page_alloc::total_free_pages().unwrap_or(0),
+                        crate::process::live_process_count(),
+                        crate::process::live_thread_count(),
+                    );
+                    return -ENOMEM;
+                }
             };
         (Arc::clone(&parent), child_thread)
     } else if wants_vm_share {
         let child = match parent.fork_child_shared_mm(wants_vfork) {
             Ok(child) => child,
             Err(error) => {
-                if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
-                    crate::println!("buildstorm-clone-enomem: phase=shared-process error={error:?}");
-                }
+                crate::println!(
+                    "clone-fail: phase=shared-process flags={:#x} error={error:?} free_pages={} live_processes={} live_threads={}",
+                    flags,
+                    crate::page_alloc::total_free_pages().unwrap_or(0),
+                    crate::process::live_process_count(),
+                    crate::process::live_thread_count(),
+                );
                 return -ENOMEM;
             }
         };
@@ -8561,9 +8449,13 @@ fn sys_clone_canonical(
         {
             Ok(thread) => thread,
             Err(error) => {
-                if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
-                    crate::println!("buildstorm-clone-enomem: phase=shared-thread error={error:?}");
-                }
+                crate::println!(
+                    "clone-fail: phase=shared-thread flags={:#x} error={error:?} free_pages={} live_processes={} live_threads={}",
+                    flags,
+                    crate::page_alloc::total_free_pages().unwrap_or(0),
+                    crate::process::live_process_count(),
+                    crate::process::live_thread_count(),
+                );
                 return -ENOMEM;
             }
         };
@@ -8572,18 +8464,26 @@ fn sys_clone_canonical(
         let child_mm = match parent.mm().fork_clone_eager() {
             Ok(mm) => mm,
             Err(error) => {
-                if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
-                    crate::println!("buildstorm-clone-enomem: phase=eager-mm error={error:?}");
-                }
+                crate::println!(
+                    "clone-fail: phase=eager-mm flags={:#x} error={error:?} free_pages={} live_processes={} live_threads={}",
+                    flags,
+                    crate::page_alloc::total_free_pages().unwrap_or(0),
+                    crate::process::live_process_count(),
+                    crate::process::live_thread_count(),
+                );
                 return -ENOMEM;
             }
         };
         let child = match parent.fork_child(child_mm) {
             Ok(child) => child,
             Err(error) => {
-                if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
-                    crate::println!("buildstorm-clone-enomem: phase=eager-process error={error:?}");
-                }
+                crate::println!(
+                    "clone-fail: phase=eager-process flags={:#x} error={error:?} free_pages={} live_processes={} live_threads={}",
+                    flags,
+                    crate::page_alloc::total_free_pages().unwrap_or(0),
+                    crate::process::live_process_count(),
+                    crate::process::live_thread_count(),
+                );
                 return -ENOMEM;
             }
         };
@@ -8592,9 +8492,13 @@ fn sys_clone_canonical(
         {
             Ok(thread) => thread,
             Err(error) => {
-                if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
-                    crate::println!("buildstorm-clone-enomem: phase=eager-thread error={error:?}");
-                }
+                crate::println!(
+                    "clone-fail: phase=eager-thread flags={:#x} error={error:?} free_pages={} live_processes={} live_threads={}",
+                    flags,
+                    crate::page_alloc::total_free_pages().unwrap_or(0),
+                    crate::process::live_process_count(),
+                    crate::process::live_thread_count(),
+                );
                 return -ENOMEM;
             }
         };
@@ -8824,7 +8728,13 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             path,
         );
     }
-    let argv = match copy_user_string_array(arguments[1], MAX_EXEC_ARGS, Some(&raw_path)) {
+    let mut exec_string_budget = MAX_EXEC_TOTAL_BYTES;
+    let argv = match copy_user_string_array(
+        arguments[1],
+        MAX_EXEC_ARGS,
+        Some(&raw_path),
+        &mut exec_string_budget,
+    ) {
         Ok(values) => values,
         Err(errno) => {
             crate::println!(
@@ -8835,7 +8745,12 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             return errno;
         }
     };
-    let envp = match copy_user_string_array(arguments[2], MAX_EXEC_ENVS, None) {
+    let envp = match copy_user_string_array(
+        arguments[2],
+        MAX_EXEC_ENVS,
+        None,
+        &mut exec_string_budget,
+    ) {
         Ok(values) => values,
         Err(errno) => {
             crate::println!(
@@ -8865,13 +8780,17 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     let mut image = match load_exec_image(image_path) {
         Ok(image) => image,
         Err(errno) => {
-            if (BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed))
+            if errno == -ENOMEM
+                || (BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed))
                 || exec_trace_allow()
             {
                 crate::println!(
-                    "execve-fail: phase=target-open path={} errno={}",
+                    "execve-fail: phase=target-open path={} errno={} free_pages={} live_processes={} live_threads={}",
                     exec_path,
                     errno,
+                    crate::page_alloc::total_free_pages().unwrap_or(0),
+                    crate::process::live_process_count(),
+                    crate::process::live_thread_count(),
                 );
             }
             return errno;
@@ -9053,15 +8972,14 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
         Err(ref e @ crate::exec::ExecError::MetadataOutOfMemory)
         | Err(ref e @ crate::exec::ExecError::UserMm(_))
         | Err(ref e @ crate::exec::ExecError::AddressOverflow) => {
-            if (BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed))
-                || exec_trace_allow()
-            {
-                crate::println!(
-                    "execve: path={} failed errno=ENOMEM reason={} detail={e:?}",
-                    exec_path,
-                    e.reason(),
-                );
-            }
+            crate::println!(
+                "execve-fail: phase=prepare path={} errno=ENOMEM reason={} detail={e:?} free_pages={} live_processes={} live_threads={}",
+                exec_path,
+                e.reason(),
+                crate::page_alloc::total_free_pages().unwrap_or(0),
+                crate::process::live_process_count(),
+                crate::process::live_thread_count(),
+            );
             return -ENOMEM;
         }
         Err(ref e) => {
@@ -9075,13 +8993,14 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
 
     let process = current_process();
+    if !process.begin_exec() {
+        return -EAGAIN;
+    }
     if process.thread_count() > 1 {
         crate::task::request_process_thread_exit(process.id(), thread.id(), 0);
         process.wait_until_single_thread();
     }
-    if process.files().close_on_exec().is_err() {
-        return -ENOMEM;
-    }
+    process.files().close_on_exec();
     process.signals().reset_actions_for_exec();
     let old_mm = process.replace_mm(prepared.mm);
     let new_mm = process.mm_arc();
@@ -9094,6 +9013,7 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             "execve: path={} failed errno=EINVAL reason=context-replace",
             exec_path,
         );
+        process.finish_exec();
         return -EINVAL;
     }
     // Always reset TLS for the new process.  The previous process may
@@ -9115,6 +9035,7 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     set_frame_entry(frame, prepared.entry.get());
     set_frame_stack_pointer(frame, prepared.stack_pointer.get());
     process.complete_vfork();
+    process.finish_exec();
     0
 }
 
@@ -9156,7 +9077,13 @@ fn parse_shebang(image: &[u8]) -> Result<Option<(String, Option<String>)>, isize
     Ok(Some((interpreter_path, optional_arg)))
 }
 
+// Small/ordinary executables are read in full.  Large unstripped toolchain
+// binaries are instead truncated after the last load-relevant ELF segment.
+// The final-2026 LoongArch rust-lld is about 167 MiB on disk and its required
+// PT_LOAD prefix ends at about 146 MiB, so using the full-read threshold as the
+// load-prefix ceiling incorrectly returned EOVERFLOW at the final link step.
 const MAX_EXEC_IMAGE: usize = 128 * 1024 * 1024;
+const MAX_EXEC_LOAD_PREFIX: usize = 256 * 1024 * 1024;
 const MAX_EXEC_ELF_HEADERS: usize = 64 * 1024;
 
 fn read_exec_image_file(file: myos_vfs::ArcFile) -> Result<Vec<u8>, isize> {
@@ -9253,7 +9180,7 @@ fn read_exec_image_file(file: myos_vfs::ArcFile) -> Result<Vec<u8>, isize> {
             let end = segment_offset
                 .checked_add(segment_size)
                 .ok_or(myos_vfs::Errno::Eoverflow.to_isize())?;
-            if end > file_size || end > MAX_EXEC_IMAGE {
+            if end > file_size || end > MAX_EXEC_LOAD_PREFIX {
                 return Err(myos_vfs::Errno::Eoverflow.to_isize());
             }
             required = required.max(end);
@@ -9939,32 +9866,34 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
             }
             Ok(None) if !process.has_child(requested) => return -ECHILD,
             Ok(None) if options & WNOHANG != 0 => {
-                // Polling supervisors such as GNU timeout can issue wait4
-                // with WNOHANG in a tight loop.  Preserve the required zero
-                // result, but hand the current run queue to the child first;
-                // this prevents the poller and a freshly spawned Cargo/rustc
-                // task on the same CPU from wasting alternating timer quanta.
-                crate::task::yield_from_user_trap();
                 return 0;
             }
             Ok(None) => {
-                // SUDOOS_WAIT4_BUILDSTORM_COOPERATIVE_POLL_V1
-                //
-                // The final BuildStorm workload can defer the child-exit
-                // notification/reap path long enough for a blocking wait4
-                // caller to remain asleep forever. While that isolated
-                // runner is active, yield and recheck the durable child and
-                // zombie lists instead of depending on a single wakeup.
-                //
-                // Keep the regular atomic WaitQueue path everywhere else.
-                if BUILDSTORM_SAFE_ACTIVE.load(Ordering::Acquire) {
-                    crate::task::yield_from_user_trap();
-                } else {
-                    let _ = crate::task::block_current_on_if_from_user_trap(
-                        process.child_wait_queue(),
-                        || !process.has_zombie_child(requested) && process.has_child(requested),
-                    );
+                // SUDOOS_SIGNAL_INTERRUPTIBLE_WAIT_V2
+                // Only an unblocked, non-ignored signal may interrupt wait4.
+                // In particular, Linux's default SIGCHLD disposition is
+                // ignored: treating the child-exit notification itself as
+                // EINTR races with zombie publication and makes a successful
+                // wait4 fail intermittently under parallel builds.
+                let thread = crate::task::current_user_thread()
+                    .expect("wait4 arrived without a current user Thread");
+                let pending = process.signals().pending() & !thread.blocked_signals();
+                let interrupting = (1_u32..64).any(|signal| {
+                    let bit = 1_u64 << (signal - 1);
+                    if pending & bit == 0 {
+                        return false;
+                    }
+                    let action = process.signals().action(signal).unwrap_or_default();
+                    action.handler != SIG_IGN
+                        && !(action.handler == SIG_DFL && signal == crate::signal::SIGCHLD)
+                });
+                if interrupting {
+                    return -EINTR;
                 }
+                let _ = crate::task::block_current_on_if_from_user_trap(
+                    process.child_wait_queue(),
+                    || !process.has_zombie_child(requested) && process.has_child(requested),
+                );
             }
             Err(_) => return -ECHILD,
         }
@@ -10067,6 +9996,7 @@ impl myos_vfs::FileOperations for EventFd {
                         next,
                     );
                 }
+                notify_epoll_waiters();
                 return Ok(core::mem::size_of::<u64>());
             }
         }
@@ -10135,6 +10065,7 @@ struct EpollRegistration {
 struct EpollState {
     instances: Vec<usize>,
     registrations: Vec<EpollRegistration>,
+    waiters: crate::task::WaitQueue,
 }
 
 static EPOLL_STATE: crate::irq_lock::IrqSpinLock<EpollState> =
@@ -10142,9 +10073,24 @@ static EPOLL_STATE: crate::irq_lock::IrqSpinLock<EpollState> =
         EpollState {
             instances: Vec::new(),
             registrations: Vec::new(),
+            waiters: crate::task::WaitQueue::new(),
         },
         crate::lockdep::LockClass::new("epoll.state", crate::lockdep::LockRank::Vfs, 94),
     );
+static EPOLL_WAKE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Notify epoll after readiness may have changed.  Producers call this after
+/// dropping their own locks, so waking tasks never nests the scheduler lock
+/// inside a VFS/pipe lock.
+pub(crate) fn notify_epoll_waiters() {
+    EPOLL_WAKE_EPOCH.fetch_add(1, Ordering::Release);
+    let waiters_ptr: *const crate::task::WaitQueue = {
+        let state = EPOLL_STATE.lock();
+        &state.waiters as *const _
+    };
+    // SAFETY: EPOLL_STATE is static and its WaitQueue is never moved.
+    unsafe { &*waiters_ptr }.wake_all();
+}
 
 struct EpollFile;
 
@@ -10259,6 +10205,11 @@ fn sys_epoll_ctl(epfd: usize, operation: usize, fd: usize, event_address: usize)
                 data,
                 enabled: true,
             });
+            // Capture the waiters pointer before dropping the lock, then
+            // wake OUTSIDE the lock — wake_all internally acquires the
+            // scheduler lock, which must not nest inside Vfs (lockdep).
+            drop(state);
+            notify_epoll_waiters();
             0
         }
         EPOLL_CTL_DEL => match existing {
@@ -10275,6 +10226,10 @@ fn sys_epoll_ctl(epfd: usize, operation: usize, fd: usize, event_address: usize)
                 state.registrations[index].data = data;
                 // EPOLLONESHOT is explicitly rearmed by MOD.
                 state.registrations[index].enabled = true;
+                // Capture the waiters pointer before dropping the lock
+                // (same lockdep rationale as ADD above).
+                drop(state);
+                notify_epoll_waiters();
                 0
             }
             None => myos_vfs::Errno::Enoent.to_isize(),
@@ -10324,14 +10279,13 @@ fn sys_epoll_pwait(
         Some(core::time::Duration::from_millis(timeout_ms as u64))
     };
     let deadline = timeout.map(crate::time::deadline_after);
-    // The image's precompiled Rust async runtime uses an edge-triggered
-    // eventfd as its executor wake source. Until VFS poll exposes wait queues,
-    // a wake which races registration cannot be attached to this sleeping
-    // task. Give an infinite wait a short timer-backed rescan quantum so the
-    // executor can repoll its runnable queue without a guest busy loop.
+    // The image's Rust runtime uses an infinite epoll wait as part of its
+    // process supervisor but does not notify our compatibility event source
+    // for every child-state transition.  A bounded empty return lets it
+    // rescan wait4 without turning the syscall into a 1 ms busy loop.
     let compatibility_rescan = timeout
         .is_none()
-        .then(|| crate::time::deadline_after(core::time::Duration::from_millis(1)));
+        .then(|| crate::time::deadline_after(core::time::Duration::from_millis(100)));
     if buildstorm_epoll_trace_allow() {
         crate::println!(
             "buildstorm-epoll: wait-enter epfd={} max={} timeout_raw={:#x} timeout={:?}",
@@ -10421,10 +10375,8 @@ fn sys_epoll_pwait(
         if thread.process().signals().pending() & !thread.blocked_signals() != 0 {
             return -(crate::syscall::errno::EINTR);
         }
-        // A common VFS poll wait queue is not available yet. Timer-backed
-        // sleeping still provides proper blocking semantics and prevents a
-        // guest-side epoll busy loop while producers make progress.
-        crate::timer::sleep(core::time::Duration::from_millis(1));
+        crate::task::yield_from_user_trap();
+        crate::timer::sleep(core::time::Duration::from_millis(10));
     }
 }
 
@@ -10845,15 +10797,26 @@ fn sys_futex(
                     return -(crate::syscall::errno::ETIMEDOUT);
                 }
                 let deadline = crate::time::deadline_after(duration);
-                loop {
-                    if queue.wake_sequence.load(Ordering::Acquire) != wake_sequence {
-                        return 0;
-                    }
-                    if crate::time::deadline_reached(crate::time::now(), deadline) {
-                        return -(crate::syscall::errno::ETIMEDOUT);
-                    }
-                    crate::timer::sleep(core::time::Duration::from_millis(1));
+                let thread = crate::task::current_user_thread()
+                    .expect("timed futex wait arrived without a current user Thread");
+                let outcome = queue.waiters.wait_until_deadline(deadline, || {
+                    queue.wake_sequence.load(Ordering::Acquire) != wake_sequence
+                        || thread.forced_exit_status().is_some()
+                });
+                // exit_group/execve sibling teardown wakes the task's current
+                // wait queue.  Surface that wake to the syscall epilogue so
+                // handle_forced_exit() can unwind the user bootstrap instead
+                // of re-entering a millisecond polling sleep until a possibly
+                // far-future pthread deadline.
+                if thread.forced_exit_status().is_some() {
+                    return -(crate::syscall::errno::EINTR);
                 }
+                return match outcome {
+                    crate::task::WaitOutcome::Satisfied => 0,
+                    crate::task::WaitOutcome::TimedOut => {
+                        -(crate::syscall::errno::ETIMEDOUT)
+                    }
+                };
             }
             // The wake sequence closes the check/enqueue race without doing
             // user-memory access while the scheduler lock is held.
@@ -11446,7 +11409,25 @@ fn sys_setitimer(which: usize, new_value: usize, old_value: usize) -> isize {
             return result;
         }
     }
-    // Validate new value pointer and fields without arming a real timer.
+    // Only ITIMER_REAL is supported; ITIMER_VIRTUAL and ITIMER_PROF are
+    // accepted but are no-ops (the contest buildstorm `timeout` only needs
+    // ITIMER_REAL).
+    if which != ITIMER_REAL {
+        if new_value != 0 {
+            let _ = copy_plain_from_user::<KernelItimerval>(new_value);
+        }
+        return 0;
+    }
+
+    let process = current_process();
+    // Step 1: cancel any existing ITIMER_REAL without holding the process
+    // itimer lock across the timer runtime call.
+    let old_handle = process.real_itimer_handle.lock().take();
+    if let Some(handle) = old_handle {
+        let _ = crate::timer::cancel_sync(handle);
+    }
+
+    // Step 2: parse the new value and arm a one-shot kernel timer.
     if new_value != 0 {
         let new = match copy_plain_from_user::<KernelItimerval>(new_value) {
             Ok(v) => v,
@@ -11460,6 +11441,32 @@ fn sys_setitimer(which: usize, new_value: usize, old_value: usize) -> isize {
             || new.interval.usec >= 1_000_000
         {
             return -EINVAL;
+        }
+        // Disarm: it_value == 0.
+        if new.value.sec == 0 && new.value.usec == 0 {
+            return 0;
+        }
+
+        let duration = core::time::Duration::new(
+            new.value.sec as u64,
+            (new.value.usec as u32) * 1000,
+        );
+        let pid_raw = process.id().get();
+        // SAFETY: `real_itimer_callback` receives a raw ProcessId; the
+        // process is kept alive by the `Arc<Process>` that the current
+        // task holds.
+        match crate::timer::arm_after(
+            duration,
+            crate::process::real_itimer_callback,
+            pid_raw,
+        ) {
+            Ok(handle) => {
+                *process.real_itimer_handle.lock() = Some(handle);
+            }
+            Err(_) => {
+                // Timer table full — treat as transient failure.
+                return -EAGAIN;
+            }
         }
     }
     0
@@ -13046,32 +13053,43 @@ fn copy_user_c_string_with_limit(
     address: usize,
     maximum: usize,
 ) -> Result<alloc::string::String, isize> {
-    let mut path = alloc::string::String::new();
+    let mut bytes = Vec::new();
     for offset in 0..maximum {
         let mut byte = [0_u8; 1];
         if copy_from_user(address.checked_add(offset).ok_or(-EFAULT)?, &mut byte).is_err() {
             return Err(-EFAULT);
         }
         if byte[0] == 0 {
-            return Ok(path);
+            return alloc::string::String::from_utf8(bytes).map_err(|_| -EINVAL);
         }
-        if !byte[0].is_ascii() {
-            return Err(-EINVAL);
-        }
-        path.try_reserve(1).map_err(|_| -ENOMEM)?;
-        path.push(byte[0] as char);
+        bytes.try_reserve(1).map_err(|_| -ENOMEM)?;
+        bytes.push(byte[0]);
     }
     Err(-EINVAL)
+}
+
+fn account_exec_string_budget(remaining: &mut usize, value: &str) -> Result<(), isize> {
+    let bytes = value
+        .len()
+        .checked_add(1)
+        .ok_or(-(crate::syscall::errno::E2BIG))?;
+    if bytes > *remaining {
+        return Err(-(crate::syscall::errno::E2BIG));
+    }
+    *remaining -= bytes;
+    Ok(())
 }
 
 fn copy_user_string_array(
     address: usize,
     maximum: usize,
     fallback0: Option<&str>,
+    remaining: &mut usize,
 ) -> Result<Vec<String>, isize> {
     if address == 0 {
         let mut values = Vec::new();
         if let Some(value) = fallback0 {
+            account_exec_string_budget(remaining, value)?;
             values.try_reserve(1).map_err(|_| -ENOMEM)?;
             values.push(String::from(value));
         }
@@ -13092,16 +13110,18 @@ fn copy_user_string_array(
             if values.is_empty()
                 && let Some(value) = fallback0
             {
+                account_exec_string_budget(remaining, value)?;
                 values.try_reserve(1).map_err(|_| -ENOMEM)?;
                 values.push(String::from(value));
             }
             return Ok(values);
         }
         let value = copy_user_c_string_with_limit(pointer, MAX_EXEC_STRING)?;
+        account_exec_string_budget(remaining, &value)?;
         values.try_reserve(1).map_err(|_| -ENOMEM)?;
         values.push(value);
     }
-    Err(-EINVAL)
+    Err(-(crate::syscall::errno::E2BIG))
 }
 
 fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {

@@ -128,6 +128,12 @@ impl FileOperations for PtyMaster {
                     self.shared.output.lock().is_empty()
                         && !self.shared.slave_closed.load(Ordering::Acquire)
                 });
+            if crate::task::current_user_thread()
+                .and_then(|t| t.forced_exit_status())
+                .is_some()
+            {
+                return Err(Errno::Eintr);
+            }
         }
     }
 
@@ -209,6 +215,12 @@ impl FileOperations for PtySlave {
                     self.shared.input.lock().is_empty()
                         && !self.shared.master_closed.load(Ordering::Acquire)
                 });
+            if crate::task::current_user_thread()
+                .and_then(|t| t.forced_exit_status())
+                .is_some()
+            {
+                return Err(Errno::Eintr);
+            }
         }
     }
 

@@ -7,10 +7,10 @@ MODE="buildstorm"
 ARCH="rv"
 DO_BUILD=1
 TIMEOUT="${QEMU_TIMEOUT:-18000}"
-RV_MEM="${RV_MEM:-16G}"
+RV_MEM="${RV_MEM:-8G}"
 RV_CPUS="${RV_CPUS:-8}"
-LA_MEM="${LA_MEM:-36G}"
-LA_CPUS="${LA_CPUS:-12}"
+LA_MEM="${LA_MEM:-8G}"
+LA_CPUS="${LA_CPUS:-8}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,18 +82,78 @@ prepare_image() {
   printf '%s\n' "$img"
 }
 
+validate_buildstorm_record() {
+  local arch="$1" log="$2"
+  local expected_arch expected_cores record
+  if [[ "$arch" == rv ]]; then
+    expected_arch="riscv64"
+    expected_cores="$RV_CPUS"
+  else
+    expected_arch="loongarch64"
+    expected_cores="$LA_CPUS"
+  fi
+
+  # Match the platform judge: the last BUILDSTORM_COMPILE record is decisive.
+  # Then apply the official artifact-size floor and reject malformed timing.
+  record="$(grep -E '^BUILDSTORM_COMPILE[[:space:]]+' "$log" | tail -n 1 | tr -d '\r' || true)"
+  awk -v line="$record" -v expected_arch="$expected_arch" -v expected_cores="$expected_cores" '
+    BEGIN {
+      count = split(line, fields, /[[:space:]]+/)
+      if (count < 2 || fields[1] != "BUILDSTORM_COMPILE") exit 1
+      for (i = 2; i <= count; i++) {
+        split(fields[i], pair, "=")
+        if (length(pair[1]) != 0) kv[pair[1]] = pair[2]
+      }
+      if (kv["mode"] != "multi" || kv["ok"] != "true") exit 1
+      if (kv["arch"] != expected_arch || kv["cores"] != expected_cores) exit 1
+      if (kv["elapsed_s"] !~ /^[0-9]+([.][0-9]+)?$/ || kv["elapsed_s"] + 0 <= 0) exit 1
+      if (kv["bytes"] !~ /^[0-9]+$/ || kv["bytes"] + 0 < 500000) exit 1
+    }
+  '
+}
+
+validate_cagent_records() {
+  local log="$1" spec name bonus_limit
+  local -a specs=(
+    factorial:10000 date:10000 network:12500 cpu:10000 kernel:10000
+    fs-create:12500 fs-readwrite:15000 fs-directory:15000
+    fs-search:17500 fs-usage:12500
+  )
+  for spec in "${specs[@]}"; do
+    name="${spec%%:*}"
+    bonus_limit="${spec##*:}"
+    awk -v wanted="$name" -v limit="$bonus_limit" '
+      $1 == "testcase" && $2 == "cagent" && $3 == wanted {
+        status = $4
+        elapsed = $5
+        sub(/\r$/, "", elapsed)
+        found = 1
+      }
+      END {
+        if (!found || status != "pass") exit 1
+        if (elapsed !~ /^[0-9]+$/ || elapsed + 0 <= 0 || elapsed + 0 >= limit) exit 1
+      }
+    ' "$log" || return 1
+  done
+}
+
 validate() {
-  local mode="$1" log="$2"
+  local arch="$1" mode="$2" log="$3"
   if [[ "$mode" != cagent ]]; then
     grep -Eq '^SUDOOS_BUILDSTORM_BOOTSTRAP_V5 rc=0 .*bytes=[1-9][0-9]*$' "$log" || return 1
-    grep -Eq '^BUILDSTORM_COMPILE mode=multi ok=true .*rc=0 .*bytes=[1-9][0-9]{5,} .*' "$log" || return 1
+    grep -Eq '^BUILDSTORM_TOOLCHAIN ok\r*$' "$log" || return 1
+    grep -Eq '^BUILDSTORM_MINIBUILD ok\r*$' "$log" || return 1
+    validate_buildstorm_record "$arch" "$log" || return 1
     grep -Eq '^#### OS COMP TEST GROUP END buildstorm-glibc ####\r*$' "$log" || return 1
   fi
   if [[ "$mode" != buildstorm ]]; then
+    grep -Eq '^#### OS COMP TEST GROUP START cagent-glibc ####\r*$' "$log" || return 1
     grep -Eq '^#### OS COMP TEST GROUP END cagent-glibc ####\r*$' "$log" || return 1
+    grep -Eq '^sudoos-diag: final-cagent: official script exit=0\r*$' "$log" || return 1
+    validate_cagent_records "$log" || return 1
     grep -Eq '^SMOKE_TEST: PASS\r*$' "$log" || return 1
   fi
-  ! grep -Eq 'KERNEL PANIC|^panicked at |ok=false|BOOTSTRAP_V5 rc=[1-9]|Error code 3850: disk I/O error' "$log"
+  ! grep -Eq 'KERNEL PANIC|^panicked at |ok=false|BOOTSTRAP_V5 rc=[1-9]|Error code 3850: disk I/O error|AsidRollover(InProgress|WithLiveMms)|Cannot allocate memory \(os error 12\)' "$log"
 }
 
 run_one() {
@@ -138,7 +198,7 @@ run_one() {
     last="$(grep -E 'SUDOOS_BUILDSTORM_BOOTSTRAP_V5|BUILDSTORM_COMPILE|Error code 3850|PANIC|panicked' "$log" 2>/dev/null | tail -n 1 || true)"
     echo "[regress-v6] ACTIVE pid=$qpid arch=$arch mode=$mode elapsed_s=$elapsed log_bytes=$bytes last=${last:-<none>}"
 
-    if grep -Eq 'KERNEL PANIC|^panicked at |BUILDSTORM_COMPILE mode=multi ok=false|BOOTSTRAP_V5 rc=[1-9]|Error code 3850: disk I/O error' "$log" 2>/dev/null; then
+    if grep -Eq 'KERNEL PANIC|^panicked at |BUILDSTORM_COMPILE mode=multi ok=false|BOOTSTRAP_V5 rc=[1-9]|Error code 3850: disk I/O error|Cannot allocate memory \(os error 12\)' "$log" 2>/dev/null; then
       kill -TERM "$qpid" 2>/dev/null || true
       wait "$qpid" 2>/dev/null || true
       echo "[regress-v6] FAIL early arch=$arch mode=$mode" >&2
@@ -146,7 +206,7 @@ run_one() {
       return 1
     fi
 
-    if validate "$mode" "$log"; then
+    if validate "$arch" "$mode" "$log"; then
       kill -TERM "$qpid" 2>/dev/null || true
       wait "$qpid" 2>/dev/null || true
       echo "[regress-v6] PASS arch=$arch mode=$mode"
@@ -166,7 +226,7 @@ run_one() {
   done
 
   wait "$qpid" || true
-  if validate "$mode" "$log"; then
+  if validate "$arch" "$mode" "$log"; then
     echo "[regress-v6] PASS arch=$arch mode=$mode"
     return 0
   fi

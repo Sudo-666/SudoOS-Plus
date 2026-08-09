@@ -5,6 +5,7 @@ pub const SIGKILL: u32 = 9;
 pub const SIGSEGV: u32 = 11;
 #[allow(dead_code)]
 pub const SIGPIPE: u32 = 13;
+pub const SIGALRM: u32 = 14;
 pub const SIGTERM: u32 = 15;
 #[allow(dead_code)]
 pub const SIGCHLD: u32 = 17;
@@ -46,6 +47,10 @@ pub fn send_signal(pid: ProcessId, signal: u32) -> Result<(), myos_vfs::Errno> {
     let process = crate::process::lookup_process(pid).ok_or(myos_vfs::Errno::Esrch)?;
     let result = process.signals().add_pending(signal);
     if result.is_ok() {
+        // wait4 sleeps on the process child queue. A caught signal such as
+        // SIGALRM must wake that queue so the syscall can observe EINTR;
+        // SIGCHLD wakeups are harmlessly coalesced with zombie publication.
+        process.child_wait_queue().wake_all();
         crate::net::socket::wake_all_waiters();
     }
     result

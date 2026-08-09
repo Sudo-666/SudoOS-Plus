@@ -7,7 +7,7 @@
 //! 每个 socket fd 由 `sys_socket()` 分配并写入当前进程的 fd 表。
 
 use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use myos_vfs::{
     Errno, File, FileOperations, IoBuffer, MutableIoBuffer, OpenFlags, PollEvents, Stat,
@@ -193,15 +193,27 @@ impl FileOperations for SocketFile {
                     return Ok(0);
                 }
                 let can_wait = !file.flags().contains(OpenFlags::O_NONBLOCK) && !inner.nonblock;
+                // SUDOOS_SOCKET_EPOCH_V1: capture epoch before dropping
+                // SOCKET_TABLE so we can detect if a wake occurred between
+                // table unlock and linking to the wait queue (lost wakeup).
+                let observed_epoch = SOCKET_IO_EPOCH.load(Ordering::Acquire);
                 drop(table);
                 if !can_wait || !scheduler_can_block_current() {
                     return Err(Errno::Eagain);
                 }
                 let _ = crate::task::block_current_on_if_from_user_trap(&SOCKET_IO_WAIT, || {
-                    !current_thread
-                        .as_deref()
-                        .is_some_and(thread_has_unblocked_signal)
+                    SOCKET_IO_EPOCH.load(Ordering::Acquire) == observed_epoch
                 });
+                // SUDOOS_SOCKET_FORCED_EXIT_BREAK_V1
+                // block_current_on_if_from_user_trap returns false without
+                // blocking when forced exit is pending. Break the loop so
+                // the syscall can return and handle_forced_exit can fire.
+                if crate::task::current_user_thread()
+                    .and_then(|t| t.forced_exit_status())
+                    .is_some()
+                {
+                    return Err(Errno::Eintr);
+                }
                 continue;
             }
             let copied = buf.push(&inner.recv_buf);
@@ -216,7 +228,7 @@ impl FileOperations for SocketFile {
         let mut table = SOCKET_TABLE.lock();
         let written = queue_to_peer(&mut table, self.id, buf.as_bytes())?;
         drop(table);
-        SOCKET_IO_WAIT.wake_all();
+        socket_io_wake();
         Ok(written)
     }
 
@@ -284,6 +296,12 @@ static SOCKET_TABLE: IrqSpinLock<BTreeMap<usize, SocketInner>> =
     IrqSpinLock::new_with_class(BTreeMap::new(), SOCKET_TABLE_LOCK);
 static SOCKET_ACCEPT_WAIT: WaitQueue = WaitQueue::new();
 static SOCKET_IO_WAIT: WaitQueue = WaitQueue::new();
+static SOCKET_IO_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn socket_io_wake() {
+    SOCKET_IO_EPOCH.fetch_add(1, Ordering::Release);
+    SOCKET_IO_WAIT.wake_all();
+}
 
 fn allocate_socket_id() -> usize {
     NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed)
@@ -354,12 +372,12 @@ fn close_socket_id(id: usize) {
     table.remove(&id);
     drop(table);
     SOCKET_ACCEPT_WAIT.wake_all();
-    SOCKET_IO_WAIT.wake_all();
+    socket_io_wake();
 }
 
 pub fn wake_all_waiters() {
     SOCKET_ACCEPT_WAIT.wake_all();
-    SOCKET_IO_WAIT.wake_all();
+    socket_io_wake();
 }
 
 fn copy_addr_from_user(ptr: usize) -> Result<SockAddrIn, isize> {
@@ -786,6 +804,12 @@ pub fn sys_accept(fd: usize, addr_ptr: usize, addr_len_ptr: usize) -> isize {
                             )
                         })
                     });
+                if crate::task::current_user_thread()
+                    .and_then(|t| t.forced_exit_status())
+                    .is_some()
+                {
+                    return -(Errno::Eintr as isize);
+                }
                 continue;
             }
             _ => return -(Errno::Einval as isize),
@@ -997,7 +1021,7 @@ pub fn sys_sendto(
         Err(errno) => return errno.to_isize(),
     };
     drop(table);
-    SOCKET_IO_WAIT.wake_all();
+    socket_io_wake();
     sent as isize
 }
 
@@ -1041,16 +1065,20 @@ pub fn sys_recvfrom(
                 return 0;
             }
             let can_wait = flags & MSG_DONTWAIT == 0 && !inner.nonblock;
+            let observed_epoch = SOCKET_IO_EPOCH.load(Ordering::Acquire);
             drop(table);
             if !can_wait || !scheduler_can_block_current() {
                 return -(Errno::Eagain as isize);
             }
-            let current_thread = crate::task::current_user_thread();
             let _ = crate::task::block_current_on_if_from_user_trap(&SOCKET_IO_WAIT, || {
-                !current_thread
-                    .as_deref()
-                    .is_some_and(thread_has_unblocked_signal)
+                SOCKET_IO_EPOCH.load(Ordering::Acquire) == observed_epoch
             });
+            if crate::task::current_user_thread()
+                .and_then(|t| t.forced_exit_status())
+                .is_some()
+            {
+                return -(Errno::Eintr as isize);
+            }
             continue;
         }
 
@@ -1131,7 +1159,7 @@ pub fn sys_sendmsg(fd: usize, msg_ptr: usize, flags: usize) -> isize {
                 }
             }
             drop(table);
-            SOCKET_IO_WAIT.wake_all();
+            socket_io_wake();
             if copied == 0 {
                 break;
             }
@@ -1188,16 +1216,20 @@ pub fn sys_recvmsg(fd: usize, msg_ptr: usize, flags: usize) -> isize {
                 return 0;
             }
             let can_wait = flags & MSG_DONTWAIT == 0 && !inner.nonblock;
+            let observed_epoch = SOCKET_IO_EPOCH.load(Ordering::Acquire);
             drop(table);
             if !can_wait || !scheduler_can_block_current() {
                 return -(Errno::Eagain as isize);
             }
-            let current_thread = crate::task::current_user_thread();
             let _ = crate::task::block_current_on_if_from_user_trap(&SOCKET_IO_WAIT, || {
-                !current_thread
-                    .as_deref()
-                    .is_some_and(thread_has_unblocked_signal)
+                SOCKET_IO_EPOCH.load(Ordering::Acquire) == observed_epoch
             });
+            if crate::task::current_user_thread()
+                .and_then(|t| t.forced_exit_status())
+                .is_some()
+            {
+                return -(Errno::Eintr as isize);
+            }
             continue;
         }
         let total_capacity = (0..iov_len).fold(0_usize, |sum, index| {
@@ -1287,6 +1319,6 @@ pub fn sys_shutdown(fd: usize, _how: usize) -> isize {
         inner.peer_closed = true;
     }
     drop(table);
-    SOCKET_IO_WAIT.wake_all();
+    socket_io_wake();
     0
 }

@@ -149,6 +149,12 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         let _ = crate::task::block_current_on_if_from_user_trap(&TTY_READ_WAIT, || {
             CONSOLE_TTY.lock().len == 0
         });
+        if crate::task::current_user_thread()
+            .and_then(|t| t.forced_exit_status())
+            .is_some()
+        {
+            return Err(Errno::Eintr);
+        }
     }
 }
 

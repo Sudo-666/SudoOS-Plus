@@ -389,6 +389,15 @@ impl<H: Hal, T: Transport> VirtIOBlk<H, T> {
         self.queue.peek_used()
     }
 
+    /// Returns true if there is at least one completed request in the used ring.
+    ///
+    /// This takes `&self` (shared reference), so it can be called without
+    /// exclusive access to the queue. Callers must still pair with
+    /// `complete_read_blocks` or `complete_write_blocks` while holding `&mut self`.
+    pub fn can_pop(&self) -> bool {
+        self.queue.can_pop()
+    }
+
     /// Returns the size of the device's VirtQueue.
     ///
     /// This can be used to tell the caller how many channels to monitor on.

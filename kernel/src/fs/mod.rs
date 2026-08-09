@@ -540,8 +540,9 @@ pub fn install_ext4_path(source: &str, target_path: &str, source_path: &str) -> 
     let device_name = normalize_block_source(source)?;
     let device = crate::block::open_device(device_name).ok_or(Errno::Enodev)?;
     verify_ext4_superblock(&device)?;
-    let snapshot = crate::ext4::load_path_snapshot(device, source_path).map_err(ext4_errno)?;
-    let node = ext4_snapshot_node(snapshot)?;
+    let fs = Arc::new(crate::ext4::Ext4FileSystem::open(device).map_err(ext4_errno)?);
+    let info = fs.lookup_path_metadata(source_path).map_err(ext4_errno)?;
+    let node = ext4_node(fs, info)?;
     let (parent_path, name) = split_parent(target_path)?;
     let parent = lookup(parent_path)?;
     if is_node_read_only(&parent) {
@@ -1127,22 +1128,22 @@ fn install_ext4_snapshot(
     target: &Arc<Node>,
     device: Arc<dyn crate::block::BlockDevice>,
 ) -> Result<(), Errno> {
-    let snapshot = crate::ext4::load_root_snapshot(device).map_err(ext4_errno)?;
-    let mut children = Vec::new();
-    let crate::ext4::Ext4SnapshotKind::Directory(entries) = snapshot.kind else {
+    let fs = Arc::new(crate::ext4::Ext4FileSystem::open(device).map_err(ext4_errno)?);
+    let root = fs.root_info().map_err(ext4_errno)?;
+    if root.kind != crate::ext4::Ext4NodeKind::Directory {
         return Err(Errno::Enotdir);
-    };
-    children
-        .try_reserve(entries.len())
-        .map_err(|_| Errno::Enomem)?;
-    for entry in entries {
-        validate_component(&entry.name)?;
-        let node = ext4_snapshot_node(entry.node)?;
-        node.parent_ino.store(target.ino, Ordering::Release);
-        children.push((entry.name, node));
     }
-    target.read_only.store(true, Ordering::Release);
-    *target.state.lock() = NodeState::Directory(children);
+    // Lazy overlay: children populated on first access via populate_ext4_directory().
+    // Matches mount_ext4_overlay() — no eager data loading.
+    target.read_only.store(false, Ordering::Release);
+    *target.state.lock() = NodeState::Ext4Directory {
+        fs,
+        ino: root.ino,
+        populated: false,
+        children: Vec::new(),
+        whiteouts: Vec::new(),
+        negative: Vec::new(),
+    };
     Ok(())
 }
 
@@ -1151,63 +1152,24 @@ fn install_ext4_path_snapshot(
     device: Arc<dyn crate::block::BlockDevice>,
     source_path: &str,
 ) -> Result<(), Errno> {
-    let snapshot = crate::ext4::load_path_snapshot(device, source_path).map_err(ext4_errno)?;
-    let mut children = Vec::new();
-    let crate::ext4::Ext4SnapshotKind::Directory(entries) = snapshot.kind else {
+    let fs = Arc::new(crate::ext4::Ext4FileSystem::open(device).map_err(ext4_errno)?);
+    let info = fs.lookup_path_metadata(source_path).map_err(ext4_errno)?;
+    if info.kind != crate::ext4::Ext4NodeKind::Directory {
         return Err(Errno::Enotdir);
-    };
-    children
-        .try_reserve(entries.len())
-        .map_err(|_| Errno::Enomem)?;
-    for entry in entries {
-        validate_component(&entry.name)?;
-        let node = ext4_snapshot_node(entry.node)?;
-        node.parent_ino.store(target.ino, Ordering::Release);
-        children.push((entry.name, node));
     }
-    target.read_only.store(true, Ordering::Release);
-    *target.state.lock() = NodeState::Directory(children);
+    // Lazy overlay: children populated on first access via populate_ext4_directory().
+    target.read_only.store(false, Ordering::Release);
+    *target.state.lock() = NodeState::Ext4Directory {
+        fs,
+        ino: info.ino,
+        populated: false,
+        children: Vec::new(),
+        whiteouts: Vec::new(),
+        negative: Vec::new(),
+    };
     Ok(())
 }
 
-fn ext4_snapshot_node(snapshot: crate::ext4::Ext4SnapshotNode) -> Result<Arc<Node>, Errno> {
-    let declared_size = snapshot.size;
-    let state = match snapshot.kind {
-        crate::ext4::Ext4SnapshotKind::Directory(entries) => {
-            let mut children = Vec::new();
-            children
-                .try_reserve(entries.len())
-                .map_err(|_| Errno::Enomem)?;
-            for entry in entries {
-                validate_component(&entry.name)?;
-                let node = ext4_snapshot_node(entry.node)?;
-                children.push((entry.name, node));
-            }
-            NodeState::Directory(children)
-        }
-        crate::ext4::Ext4SnapshotKind::Regular(data) => {
-            if data.len() as u64 != declared_size {
-                return Err(Errno::Eoverflow);
-            }
-            NodeState::Regular(data)
-        }
-        crate::ext4::Ext4SnapshotKind::Symlink(target) => NodeState::Symlink(target),
-    };
-    let node = Arc::new(Node {
-        ino: snapshot.ino,
-        parent_ino: AtomicU64::new(0),
-        nlink: AtomicU64::new(1),
-        mode: FileMode::from_bits(snapshot.mode),
-        read_only: AtomicBool::new(true),
-        state: IrqSpinLock::new_with_class(state, NODE_LOCK),
-    });
-    if let NodeState::Directory(children) = &*node.state.lock() {
-        for (_, child) in children {
-            child.parent_ino.store(node.ino, Ordering::Release);
-        }
-    }
-    Ok(node)
-}
 
 fn is_node_read_only(node: &Arc<Node>) -> bool {
     node.read_only.load(Ordering::Acquire)

@@ -17,6 +17,7 @@ use myos_mm::{VirtAddr, VirtRange};
 use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::task::{Completion, TaskId, WaitQueue};
+use crate::timer::TimerHandle;
 use crate::user_mm::{UserMm, UserMmRuntimeError};
 
 pub const PROCESS_MAX_FDS: usize = 128;
@@ -27,6 +28,9 @@ const THREAD_RUNNING: u8 = 2;
 const THREAD_EXITING: u8 = 3;
 const THREAD_EXITED: u8 = 4;
 const NO_FORCED_EXIT: isize = isize::MIN;
+const GROUP_EXIT_NONE: usize = 0;
+const GROUP_EXIT_PUBLISHING: usize = 1;
+const GROUP_EXIT_ACTIVE: usize = 2;
 // SUDOOS_SIGNAL_PENDING_SIGSUSPEND_FIX_V1
 // unblockable signal bits are always removed from a legal mask, therefore
 // u64::MAX is a safe out-of-band value for "no saved sigsuspend mask".
@@ -43,6 +47,7 @@ const PROCESS_FILE_TABLE_LOCK: LockClass =
 const PROCESS_FS_LOCK: LockClass = LockClass::new("process.fs", LockRank::Process, 3);
 const PROCESS_RELATION_LOCK: LockClass = LockClass::new("process.relation", LockRank::Process, 4);
 const PROCESS_REGISTRY_LOCK: LockClass = LockClass::new("process.registry", LockRank::Process, 5);
+const PROCESS_ITIMER_LOCK: LockClass = LockClass::new("process.itimer", LockRank::Process, 6);
 
 static NEXT_PROCESS_ID: AtomicUsize = AtomicUsize::new(1);
 static LIVE_PROCESSES: AtomicUsize = AtomicUsize::new(0);
@@ -152,27 +157,28 @@ impl FileTable {
         self.table.lock().file_flags(fd)
     }
 
-    pub fn close_on_exec(&self) -> Result<(), myos_vfs::Errno> {
-        let mut files = Vec::new();
-        files
-            .try_reserve(PROCESS_MAX_FDS)
-            .map_err(|_| myos_vfs::Errno::Enomem)?;
-        self.table.lock().take_close_on_exec(&mut files);
-        drop(files);
-        Ok(())
+    pub fn close_on_exec(&self) {
+        for fd in 0..PROCESS_MAX_FDS {
+            let file = {
+                let mut table = self.table.lock();
+                if table.fd_flags(fd).ok() == Some(1) {
+                    table.take_fd(fd).ok()
+                } else {
+                    None
+                }
+            };
+            drop(file);
+        }
     }
 
-    pub fn close_all(&self) -> Result<(), myos_vfs::Errno> {
-        let mut files = Vec::new();
-        files
-            .try_reserve(PROCESS_MAX_FDS)
-            .map_err(|_| myos_vfs::Errno::Enomem)?;
-        self.table.lock().take_all(&mut files);
-        for file in &files {
-            file.process_exit();
+    pub fn close_all(&self) {
+        for fd in 0..PROCESS_MAX_FDS {
+            let file = self.table.lock().take_fd(fd).ok();
+            if let Some(file) = file {
+                file.process_exit();
+                drop(file);
+            }
         }
-        drop(files);
-        Ok(())
     }
 }
 
@@ -452,8 +458,12 @@ pub struct Process {
     session: AtomicIsize,
     thread_group: IrqSpinLock<ThreadGroup>,
     thread_exit: WaitQueue,
+    group_exit_state: AtomicUsize,
+    group_exit_status: AtomicIsize,
+    exec_in_progress: AtomicBool,
     vfork_pending: AtomicBool,
     vfork_done: Completion,
+    pub(crate) real_itimer_handle: IrqSpinLock<Option<TimerHandle>>,
 }
 
 impl Process {
@@ -479,8 +489,12 @@ impl Process {
                 PROCESS_THREAD_GROUP_LOCK,
             ),
             thread_exit: WaitQueue::new(),
+            group_exit_state: AtomicUsize::new(GROUP_EXIT_NONE),
+            group_exit_status: AtomicIsize::new(0),
+            exec_in_progress: AtomicBool::new(false),
             vfork_pending: AtomicBool::new(false),
             vfork_done: Completion::new(),
+            real_itimer_handle: IrqSpinLock::new_with_class(None, PROCESS_ITIMER_LOCK),
         });
         register_process(&process);
         LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
@@ -687,6 +701,69 @@ impl Process {
         &self.fs
     }
 
+    pub(crate) fn begin_group_exit(&self, status: isize) -> isize {
+        loop {
+            match self.group_exit_state.load(Ordering::Acquire) {
+                GROUP_EXIT_NONE => {
+                    if self
+                        .group_exit_state
+                        .compare_exchange(
+                            GROUP_EXIT_NONE,
+                            GROUP_EXIT_PUBLISHING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        self.group_exit_status.store(status, Ordering::Relaxed);
+                        self.group_exit_state
+                            .store(GROUP_EXIT_ACTIVE, Ordering::Release);
+                        return status;
+                    }
+                }
+                GROUP_EXIT_PUBLISHING => core::hint::spin_loop(),
+                GROUP_EXIT_ACTIVE => return self.group_exit_status.load(Ordering::Acquire),
+                state => panic!("invalid process group-exit state: {state}"),
+            }
+        }
+    }
+
+    pub(crate) fn group_exit_status(&self) -> Option<isize> {
+        loop {
+            match self.group_exit_state.load(Ordering::Acquire) {
+                GROUP_EXIT_NONE => return None,
+                GROUP_EXIT_PUBLISHING => core::hint::spin_loop(),
+                GROUP_EXIT_ACTIVE => {
+                    return Some(self.group_exit_status.load(Ordering::Acquire));
+                }
+                state => panic!("invalid process group-exit state: {state}"),
+            }
+        }
+    }
+
+    /// Exclude new thread-group members while exec tears down the old image.
+    ///
+    /// Taking the thread-group lock makes publication atomic with the primary
+    /// create_thread admission check. A clone that already joined the group is
+    /// covered by exec's sibling scan or the scheduler-side late check.
+    pub(crate) fn begin_exec(&self) -> bool {
+        let _group = self.thread_group.lock();
+        self.exec_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn finish_exec(&self) {
+        assert!(
+            self.exec_in_progress.swap(false, Ordering::AcqRel),
+            "finishing an exec that was not in progress",
+        );
+    }
+
+    pub(crate) fn exec_in_progress(&self) -> bool {
+        self.exec_in_progress.load(Ordering::Acquire)
+    }
+
     pub fn thread_count(&self) -> usize {
         self.thread_group.lock().members.len()
     }
@@ -763,7 +840,10 @@ impl Process {
         }
 
         let mut group = self.thread_group.lock();
-        if group.leader.is_none() {
+        if group.leader.is_none()
+            || self.group_exit_status().is_some()
+            || self.exec_in_progress.load(Ordering::Acquire)
+        {
             return Err(ProcessError::ThreadNotReady);
         }
         group
@@ -839,7 +919,7 @@ impl Process {
             // the 2 -> 0 transition. Final detach is the unique process-exit
             // point and must close inherited pipe/jobserver descriptors before
             // the parent observes the zombie.
-            let _ = self.files.close_all();
+            self.files.close_all();
             crate::user::fcntl_release_process_locks(self.id.get());
         }
         self.thread_exit.wake_all();
@@ -883,6 +963,16 @@ pub fn lookup_process(pid: ProcessId) -> Option<Arc<Process>> {
         .as_ref()
         .and_then(|registry| registry.get(&pid))
         .and_then(alloc::sync::Weak::upgrade)
+}
+
+/// Timer callback for ITIMER_REAL expiry.
+///
+/// Runs in hard-IRQ context. Calls `send_signal` which acquires
+/// `PROCESS_REGISTRY` (IrqSpinLock, IRQ-safe) and atomically sets the
+/// SIGALRM pending bit.
+pub(crate) fn real_itimer_callback(arg: usize) {
+    let pid = ProcessId(arg);
+    let _ = crate::signal::send_signal(pid, crate::signal::SIGALRM);
 }
 
 /// Call `f` once for every live process.  Collects a snapshot of

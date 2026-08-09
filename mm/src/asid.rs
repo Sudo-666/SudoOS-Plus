@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::AddressSpaceId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +42,10 @@ impl AsidAllocation {
     pub const fn generation_rolled(self) -> bool {
         self.generation_rolled
     }
+
+    pub const fn requires_global_flush(self) -> bool {
+        self.generation_rolled
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +64,7 @@ pub struct AsidAllocator {
     // to 65536 without wrapping through the reserved kernel ASID 0.
     next: u32,
     generation: u64,
+    free: Vec<u16>,
 }
 
 impl AsidAllocator {
@@ -69,6 +76,7 @@ impl AsidAllocator {
             maximum,
             next: 1,
             generation: 1,
+            free: Vec::new(),
         })
     }
 
@@ -83,11 +91,17 @@ impl AsidAllocator {
     /// True when the next allocation would recycle hardware IDs into a new
     /// generation. M8 uses this to fail closed while any old-generation MM is
     /// still alive; M9 may replace that gate with lazy Linux-style renewal.
-    pub const fn next_allocation_rolls_generation(&self) -> bool {
-        self.next > self.maximum as u32
+    pub fn next_allocation_rolls_generation(&self) -> bool {
+        self.free.is_empty() && self.next > self.maximum as u32
     }
 
     pub fn allocate(&mut self) -> Result<AsidAllocation, AsidAllocatorError> {
+        if let Some(id) = self.free.pop() {
+            return Ok(AsidAllocation {
+                token: AsidToken::new(AddressSpaceId::new(id), self.generation),
+                generation_rolled: false,
+            });
+        }
         let mut rolled = false;
         if self.next > u32::from(self.maximum) {
             self.generation = self
@@ -104,6 +118,19 @@ impl AsidAllocator {
             token: AsidToken::new(AddressSpaceId::new(id), self.generation),
             generation_rolled: rolled,
         })
+    }
+
+    /// Return an inactive MM's hardware ID for reuse in the same generation.
+    /// Destruction is permitted only after every CPU has left the MM and
+    /// flushed this ASID locally, so the returned ID is immediately reusable.
+    pub fn release(&mut self, token: AsidToken) {
+        if !token.is_current(self.generation) || token.id() == AddressSpaceId::KERNEL {
+            return;
+        }
+        let id = token.id().get();
+        assert!(id <= self.maximum, "released ASID exceeds allocator maximum");
+        assert!(!self.free.contains(&id), "ASID released twice");
+        self.free.push(id);
     }
 }
 

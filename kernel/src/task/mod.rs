@@ -618,6 +618,24 @@ impl Scheduler {
             assert!(self.tasks[id.0].is_none());
             self.tasks[id.0] = Some(task);
         }
+
+        // A CLONE_THREAD can join the Process before its scheduler task is
+        // inserted.  Recheck after insertion while holding SCHEDULER so a
+        // concurrent exit_group scan cannot leave that late clone alive.
+        let late_forced_exit = self
+            .task(id)
+            .user_thread
+            .as_ref()
+            .and_then(|thread| {
+                let process = thread.process();
+                process
+                    .group_exit_status()
+                    .or_else(|| process.exec_in_progress().then_some(0))
+                    .map(|status| (Arc::clone(thread), status))
+            });
+        if let Some((thread, status)) = late_forced_exit {
+            thread.request_forced_exit(status);
+        }
         self.enqueue(id, target);
         self.cpus[target.get()].need_resched = true;
         self.live_user_threads = self
@@ -1796,6 +1814,25 @@ pub(crate) fn print_task_lifecycle_summary() {
     );
 }
 
+/// Lightweight heartbeat string for build watchdog: just the live thread/process
+/// counts so we can track progress without flooding the serial log.
+pub(crate) fn thread_count_summary() -> alloc::string::String {
+    let live_processes = crate::process::live_process_count();
+    let live_threads = crate::process::live_thread_count();
+    let live_user: usize = {
+        let slot = SCHEDULER.lock();
+        slot.as_ref()
+            .map(|s| s.live_user_threads)
+            .unwrap_or(0)
+    };
+    alloc::format!(
+        "live_user={} live_processes={} live_threads={}",
+        live_user,
+        live_processes,
+        live_threads,
+    )
+}
+
 pub(crate) fn print_lifecycle_stress_progress(label: &str, iteration: usize) {
     let cpu = crate::smp::current_cpu_id();
     let (boot_sp, current, current_sp) = {
@@ -1838,7 +1875,13 @@ pub(crate) fn print_task_debug_dump() {
                     task.wait_channel,
                     task.queued_on,
                     task.user_thread.as_ref().map(|thread| {
-                        (thread.process().id().get(), thread.id().get())
+                        (
+                            thread.process().id().get(),
+                            thread.id().get(),
+                            thread.schedule_count(),
+                            thread.visited_cpu_mask(),
+                            thread.forced_exit_status(),
+                        )
                     }),
                 )
             })
@@ -3034,7 +3077,20 @@ unsafe extern "C" fn user_thread_bootstrap() -> ! {
     thread
         .mark_running()
         .expect("M9-B user Thread entered an invalid lifecycle state");
-    let result = crate::user::run_scheduled_thread(&thread);
+    // A clone may have joined the Process just before exit_group/exec closes
+    // admission, then become runnable only after the sibling-exit scan. The
+    // scheduler's late check marks it for exit; honor that mark before ever
+    // entering the obsolete user context.
+    let result = if let Some(status) = thread.forced_exit_status() {
+        // clone saves the initial user trap frame before publishing the task.
+        // If exec/exit_group wins before the task's first dispatch, that frame
+        // will never be consumed by run_scheduled_thread; discard it before
+        // Thread::drop validates ownership.
+        let _ = thread.take_trap_frame();
+        status
+    } else {
+        crate::user::run_scheduled_thread(&thread)
+    };
 
     // User return paths intentionally restore a kernel-mode trap frame, and
     // some architectures leave local interrupts disabled at that boundary.
@@ -3120,15 +3176,12 @@ fn idle_until_interrupt() {
     }
 
     let cpu = crate::smp::current_cpu_id();
-    // The permanent task reaper is pinned to the boot CPU. Keep CPU0's
-    // scheduler clockevent active while it is idle so the level-triggered
-    // `need_resched` publication always has a bounded fallback even if a
-    // coalesced reschedule IPI edge is consumed at the WFI boundary. Secondary
-    // CPUs retain full NO_HZ idle behavior (and are the deterministic NO_HZ
-    // verifier targets).
-    if cpu != CpuId::BOOT {
-        crate::time::enter_idle();
-    }
+    // Keep every CPU's scheduler clockevent active while it is idle.  Runnable
+    // user tasks become CPU-affine after their first dispatch, so another CPU
+    // cannot steal a woken task if the target's reschedule IPI is coalesced at
+    // the WFI boundary.  The periodic tick is therefore the level-triggered
+    // fallback which turns an already-published `need_resched` bit into a
+    // context switch instead of leaving that CPU asleep indefinitely.
     #[cfg(debug_assertions)]
     idle_verify::before_arch_wait(cpu);
 

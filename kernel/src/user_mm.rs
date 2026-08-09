@@ -185,7 +185,7 @@ impl UserMm {
         })();
 
         if result.is_err() {
-            release_mm_reservation();
+            release_mm_reservation(asid);
         }
         result
     }
@@ -1187,7 +1187,9 @@ impl UserMm {
         page_table.release_empty()?;
         state.page_table = None;
         LIVE_ROOTS.fetch_sub(1, Ordering::AcqRel);
-        release_mm_reservation();
+        let asid = state.core.asid();
+        drop(state);
+        release_mm_reservation(asid);
         Ok(())
     }
 }
@@ -1298,14 +1300,17 @@ fn retire_range_locked(
         if !range.contains(mapping.page.start_address()) {
             continue;
         }
-        let physical = page_table
-            .translate(mapping.page.start_address())?
-            .ok_or(UserMmRuntimeError::NotMapped)?;
-        assert_eq!(
-            physical,
-            mapping.backing.start().start_address(),
-            "user retirement preflight found a mismatched backing frame",
-        );
+        // PROT_NONE deliberately removes the leaf PTE while retaining both
+        // the VMA and this backing-owner record.  A later MAP_FIXED/munmap of
+        // that range must still retire the owned page; Linux does not reject
+        // the operation merely because there is no present translation.
+        if let Some(physical) = page_table.translate(mapping.page.start_address())? {
+            assert_eq!(
+                physical,
+                mapping.backing.start().start_address(),
+                "user retirement preflight found a mismatched backing frame",
+            );
+        }
     }
 
     let table_capacity = page_table.allocated_runtime_tables();
@@ -1333,14 +1338,14 @@ fn retire_range_locked(
             .page_table
             .as_mut()
             .expect("retirement preflight lost the user page table");
-        let frame = page_table
-            .unmap_page(mapping.page)
-            .expect("retirement preflight accepted a missing user leaf");
-        assert_eq!(
-            frame,
-            mapping.backing.start(),
-            "user unmap returned a different backing frame",
-        );
+        if page_table.translate(mapping.page.start_address())?.is_some() {
+            let frame = page_table.unmap_page(mapping.page)?;
+            assert_eq!(
+                frame,
+                mapping.backing.start(),
+                "user unmap returned a different backing frame",
+            );
+        }
         page_table
             .reclaim_empty_tables(mapping.page, &mut tables)
             .expect("user page-table reclamation violated the reviewed topology");
@@ -1509,7 +1514,11 @@ fn reserve_asid_for_mm() -> Result<AsidToken, UserMmRuntimeError> {
         if will_roll && LIVE_MMS.load(Ordering::Acquire) != 0 {
             return Err(UserMmRuntimeError::AsidRolloverWithLiveMms);
         }
-        if will_roll {
+        let allocation = match allocator.allocate() {
+            Ok(allocation) => allocation,
+            Err(error) => return Err(error.into()),
+        };
+        if allocation.requires_global_flush() {
             assert_eq!(
                 ASID_ROLLOVER_IN_PROGRESS.compare_exchange(
                     false,
@@ -1518,33 +1527,18 @@ fn reserve_asid_for_mm() -> Result<AsidToken, UserMmRuntimeError> {
                     Ordering::Acquire,
                 ),
                 Ok(false),
-                "ASID rollover gate changed while holding the allocator lock",
+                "ASID reuse gate changed while holding the allocator lock",
             );
         }
-        let allocation = match allocator.allocate() {
-            Ok(allocation) => allocation,
-            Err(error) => {
-                if will_roll {
-                    assert!(
-                        ASID_ROLLOVER_IN_PROGRESS.swap(false, Ordering::AcqRel),
-                        "ASID rollover gate disappeared after allocation failure",
-                    );
-                }
-                return Err(error.into());
-            }
-        };
-        if !allocation.generation_rolled() {
-            LIVE_MMS.fetch_add(1, Ordering::AcqRel);
-        }
+        LIVE_MMS.fetch_add(1, Ordering::AcqRel);
         allocation
     };
 
-    if allocation.generation_rolled() {
+    if allocation.requires_global_flush() {
         // Do not hold the Vm-ranked allocator lock while entering the lower
         // CrossCpu-ranked shootdown serializer. The atomic gate prevents any
         // new-generation token from becoming visible before the global flush.
         crate::tlb::shootdown_kernel_all();
-        LIVE_MMS.fetch_add(1, Ordering::AcqRel);
         assert!(
             ASID_ROLLOVER_IN_PROGRESS.swap(false, Ordering::AcqRel),
             "ASID rollover gate was cleared before publication",
@@ -1553,7 +1547,13 @@ fn reserve_asid_for_mm() -> Result<AsidToken, UserMmRuntimeError> {
     Ok(allocation.token())
 }
 
-fn release_mm_reservation() {
+fn release_mm_reservation(asid: AsidToken) {
+    {
+        let mut slot = ASID_ALLOCATOR.lock();
+        slot.as_mut()
+            .expect("releasing an ASID before allocator initialization")
+            .release(asid);
+    }
     let old = LIVE_MMS.fetch_sub(1, Ordering::AcqRel);
     assert_ne!(old, 0, "M8-B3 MM reservation counter underflow");
 }

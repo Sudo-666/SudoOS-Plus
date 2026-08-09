@@ -66,6 +66,16 @@ impl Pipe {
                 let _ = crate::task::block_current_on_if_from_user_trap(&self.read_wait, || {
                     self.read_epoch.load(Ordering::Acquire) == observed_epoch
                 });
+                // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25
+                // block_current_on_if_from_user_trap returns false without
+                // blocking when forced exit is pending.  Break the loop so
+                // the syscall can return and handle_forced_exit can fire.
+                if crate::task::current_user_thread()
+                    .and_then(|t| t.forced_exit_status())
+                    .is_some()
+                {
+                    return Err(Errno::Eintr);
+                }
                 continue;
             }
 
@@ -98,6 +108,13 @@ impl Pipe {
             }
             if state.len == PIPE_CAPACITY {
                 if copied != 0 {
+                    // SUDOOS_PIPE_WRITE_WAKE_READERS_V1
+                    // The buffer is full and we already wrote some bytes.
+                    // Wake readers before returning so they can consume the
+                    // data and free buffer space; otherwise a reader blocked
+                    // on read_wait may sleep forever (lost wakeup).
+                    drop(state);
+                    self.wake_readers();
                     return Ok(copied);
                 }
                 if file.flags().contains(OpenFlags::O_NONBLOCK)
@@ -111,6 +128,13 @@ impl Pipe {
                 let _ = crate::task::block_current_on_if_from_user_trap(&self.write_wait, || {
                     self.write_epoch.load(Ordering::Acquire) == observed_epoch
                 });
+                // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25
+                if crate::task::current_user_thread()
+                    .and_then(|t| t.forced_exit_status())
+                    .is_some()
+                {
+                    return Err(Errno::Eintr);
+                }
                 continue;
             }
 
@@ -204,6 +228,10 @@ struct PipeReader {
 }
 
 impl FileOperations for PipeReader {
+    fn serialize_operations(&self) -> bool {
+        false
+    }
+
     fn read(&self, _file: &File, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         self.pipe.read(_file, buf)
     }
@@ -237,6 +265,10 @@ struct PipeWriter {
 }
 
 impl FileOperations for PipeWriter {
+    fn serialize_operations(&self) -> bool {
+        false
+    }
+
     fn write(&self, _file: &File, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
         self.pipe.write(_file, buf)
     }

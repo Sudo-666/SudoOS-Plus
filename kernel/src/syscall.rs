@@ -157,6 +157,7 @@ pub mod errno {
     pub const ESRCH: isize = 3;
     pub const EINTR: isize = 4;
     pub const ECHILD: isize = 10;
+    pub const E2BIG: isize = 7;
     pub const EAGAIN: isize = 11;
     pub const ENOMEM: isize = 12;
     pub const EFAULT: isize = 14;

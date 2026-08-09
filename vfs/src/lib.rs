@@ -435,6 +435,14 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 }
 
 pub trait FileOperations: Send + Sync + 'static {
+    /// Whether the VFS should serialize whole operations on this open-file
+    /// description. Blocking stream implementations must return false: they
+    /// provide their own state locking and wait queues, and sleeping while
+    /// holding File::operation would make concurrent readers spin forever.
+    fn serialize_operations(&self) -> bool {
+        true
+    }
+
     fn read(&self, _file: &File, _buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         Err(Errno::Einval)
     }
@@ -547,16 +555,24 @@ impl File {
         if !self.flags().access_mode().is_readable() {
             return Err(Errno::Ebadf);
         }
-        let _operation = self.operation.lock();
-        self.ops.read(self, buf)
+        if self.ops.serialize_operations() {
+            let _operation = self.operation.lock();
+            self.ops.read(self, buf)
+        } else {
+            self.ops.read(self, buf)
+        }
     }
 
     pub fn write(&self, buf: &IoBuffer<'_>) -> Result<usize, Errno> {
         if !self.flags().access_mode().is_writable() {
             return Err(Errno::Ebadf);
         }
-        let _operation = self.operation.lock();
-        self.ops.write(self, buf)
+        if self.ops.serialize_operations() {
+            let _operation = self.operation.lock();
+            self.ops.write(self, buf)
+        } else {
+            self.ops.write(self, buf)
+        }
     }
 
     pub fn seek(&self, offset: i64, whence: SeekWhence) -> Result<u64, Errno> {

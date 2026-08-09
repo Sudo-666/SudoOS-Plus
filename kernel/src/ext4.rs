@@ -80,7 +80,12 @@ const MAX_EXT4_DEPTH: usize = 16;
 const MAX_EXTENT_TREE_DEPTH: usize = 5;
 // BUILDSTORM_EXT4_CACHE_V16
 const EXT4_DATA_CACHE_CHUNK_SIZE: usize = 1024 * 1024;
-const EXT4_DATA_CACHE_CAPACITY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+// The official BuildStorm VM has 8 GiB.  Compilation outputs live in the
+// in-memory writable overlay, and eight concurrent rustc processes also have
+// large resident sets.  A 2 GiB immutable-input cache can therefore starve a
+// late exec even though plenty of source data is merely re-readable.  512 MiB
+// keeps the rustc/loader hot set while reserving memory for live build state.
+const EXT4_DATA_CACHE_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ext4Error {
@@ -159,12 +164,6 @@ pub fn list_directory(
     let mut entries = alloc::vec::Vec::new();
     fs.read_dir_entries_for_ino(ino, &mut entries)?;
     Ok(entries)
-}
-
-pub fn load_root_snapshot(device: Arc<dyn BlockDevice>) -> Result<Ext4SnapshotNode, Ext4Error> {
-    let fs = Ext4FileSystem::open(device)?;
-    let mut budget = NodeBudget::new(MAX_EXT4_NODES);
-    fs.load_inode_tree(EXT4_ROOT_INO, 0, &mut budget)
 }
 
 pub fn load_path_snapshot(
@@ -446,6 +445,13 @@ impl Ext4FileSystem {
 
     pub fn lookup_child_info(&self, parent: u32, name: &str) -> Result<Ext4NodeInfo, Ext4Error> {
         let ino = self.lookup_child_ino(parent, name)?;
+        self.inode_info(ino)
+    }
+
+    /// Walk a path and return metadata without loading any file data.
+    /// Returns (ino, kind, size, mode) for the target.
+    pub fn lookup_path_metadata(&self, path: &str) -> Result<Ext4NodeInfo, Ext4Error> {
+        let ino = self.lookup_path_ino(path)?;
         self.inode_info(ino)
     }
 
