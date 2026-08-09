@@ -604,4 +604,82 @@ TASK00 enter ...
 |------|------|
 | *(本次)* | PR-4:trap vector 页对齐(伪 OOM 根因)+ TRAP-VECTOR/BREAKPOINT-TRAP/TIMER-IRQ-FIRST 标记 |
 
-*Co-Authored-By: Claude <noreply@anthropic.com>*
+---
+
+# SudoOS 2026-08-09 更新(五)— 固化 LS2K1000 稳定基线(阶段 1/2/3)
+
+分支 `ls2k-stabilize`,基于 PR-4(异常向量页对齐)根因修复后的收尾固化。
+
+## 阶段一:清理诊断代码,建立稳定基线
+
+| 提交 | 内容 |
+|------|------|
+| `c714ef59` | **修复 raw::puthex 移位错误**:`(0..64).rev().step_by(4)` 生成 63,59,...,3,step_by 取索引 0,4,... 恒跳过 shift 0 → 最低 4 bit 丢失(`0x1234` 打成 `0x123`)。改为 nibble*4 移位。ls2k 专属代码 |
+| `09659ad7` | **恢复标准分配器**:删除非法 align 钳制、ls2k realloc 覆写、OOM 栈快照/代码字扫描、PR-2 vendored alloc 追踪环、heap 原始 words 读取、PROBE176/HEAPDxx/TASKxx/TINITxx/VMxx 检查点。保留最小化 raw UART OOM(size/align+停机)、HEAP-STATE 类型安全统计接口、HEAP_FATAL 哨兵。vendored alloc hook 无条件,故 kernel-la 同样缩小 |
+| `438e478e` | **固化异常向量修复**:TRAP-VECTOR 检查失败 → 关中断停机(不再继续误导启动);breakpoint 自测移入 opt-in `boot-selftest` 特性(build.sh 新增 `EXTRA_FEATURES` hook,默认空)。.text.trap_entry 独立段/4KiB 对齐/链接 ASSERT/EENTRY 回读/ECFG.VS==0 永久保留 |
+
+## 阶段二:定时器与调度器生命周期
+
+| 提交 | 内容 |
+|------|------|
+| `95adcc16` | **重排启动顺序**:BSP trap → 构造/发布/注册 Scheduler → `time::start_periodic`(启动定时器+开中断)→ 标记 BSP active → 孵化 reaper → 启动 CPU1 → 等 online → 用户态。`task::initialize()` 只做构造/发布/注册,新增 `task::start_boot_scheduler()` 在 start_periodic 之后标记 active 并 spawn reaper(因 Scheduler::spawn 断言目标 CPU 已 active)。**调度定时器绝不在 Scheduler 发布前启动**。同时把一次性全局 AtomicBool 标记换成 per-CPU 计数器:`TIMER_IRQ_COUNT`(trap.rs)、`IPI_SEND_COUNT`(ipi.rs)、IPI 接收复用 ipi.rs 的 per-CPU `interrupt_count`,并新增启动期 `CPU-COUNTERS` 检查(等每个在线 CPU 收到 timer IRQ,打印 timer/ipi 计数并断言) |
+
+## 阶段三:稳定性测试协议
+
+| 提交 | 内容 |
+|------|------|
+| `1e7f57c8` | `docs/ls2k-stability-test.md`:9 项测试矩阵(冷启动×20/60min 双核/SMP/IPI/进程/VM/IPC 压力/内存回收/错误检查)+ run-15 bootm 序列 + 启动判读表 + `ls2k-core-v0.1` 打标签命令。`scripts/ls2k_package.sh` 生成 elf/bin/uImage/buildinfo |
+
+## 隔离与产物验证
+
+- kernel-la(qemu_virt)二进制**零 ls2k 标记**(`scripts/ls2k_la_check.py` 全 0);`sudoos_alloc_trace` 已随 vendored hook 删除。
+- `boot-selftest` 门控验证:开启版含 `BREAKPOINT-TRAP`,默认版不含;两版均含永久 `TRAP-VECTOR`。
+- 确定性:同源重建 hash 一致;buildinfo `git_dirty_files=0`。
+- QEMU 冒烟说明:本环境无 loongarch UEFI 固件,kernel-la 在 QEMU `-kernel` 直启下收不到 EFI system table/FDT(panic 于 main.rs:217 未改代码处)——预存在环境限制,非本轮改动回归。启动顺序正确性以断言链 + 真机验证为准。
+
+## run-15 上板(产物 hash 见 `kernel-ls2k1000.buildinfo`)
+
+```text
+sf probe
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
+iminfo  0x9000000002000000
+bootm   0x9000000002000000 - 0x900000000a000000
+```
+
+**期望输出**(阶段 1/2 后的新判读表):
+
+```text
+TRAP-VECTOR expected=0x...1000 installed=0x...1000 vs=0 PASS   ← 永久检查(失败即停机)
+HEAP-STATE[pre-task-init] initialized=true stats=...
+CPU-CNTR cpu=0 timer=N ipi_recv=M ipi_send=K                    ← per-CPU 计数
+CPU-CNTR cpu=1 timer=N ipi_recv=M ipi_send=K
+CPU-COUNTERS PASS
+BOOT11 all-ap-online
+BOOT14 user-entry
+SMOKE_TEST: PASS
+```
+
+通过 20 次冷启动 + 60 分钟双核运行后打标签:
+
+```bash
+git tag -a ls2k-core-v0.1 -m "LS2K1000 core platform stable"
+```
+
+## 待办(后续阶段)
+
+- 阶段四:initramfs/BusyBox 启动真实用户环境(验证真实 ELF/libc/系统调用/用户态启动)。
+- 阶段五:完整 DTB 解析、PCI host、真实块设备、ext4、磁盘 `/sbin/init`、oscomp runner。
+- 外设顺序:RTC → reboot/shutdown → GMAC 网络 → USB → 其他板级设备。
+
+## 提交历史(本轮)
+
+| 提交 | 说明 |
+|------|------|
+| `c714ef59` | fix: ls2k raw puthex dropped the low nibble |
+| `09659ad7` | refactor: strip ls2k fake-OOM diagnostics; restore stock allocator |
+| `438e478e` | harden: fail-stop on trap-vector check; gate breakpoint self-test |
+| `95adcc16` | sched: start periodic timer only after Scheduler is published |
+| `1e7f57c8` | docs: LS2K1000 stability test protocol for ls2k-core-v0.1 |
+
+*Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>*
