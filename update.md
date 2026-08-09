@@ -660,6 +660,41 @@ BOOT14 user-entry
 SMOKE_TEST: PASS
 ```
 
+## run-15 真机结果(2026-08-09):tickless idle 与副核 timer 的矛盾
+
+bootm 首次完整跑通到 CPU-COUNTERS 检查(TRAP-VECTOR PASS、HEAP-STATE 干净、
+CPU0 timer=62),但 **CPU1 timer=0** → `kernel/src/main.rs:487` panic
+`timer IRQ did not reach every online CPU`。
+
+**根因**(非隐藏硬件 bug,是检查与 NO_HZ 设计矛盾):
+
+1. 副核 `kernel_secondary_entry` 确实调用 `arm_periodic_secondary()` 装好定时器;
+2. 但紧接着 `idle_thread_bootstrap` → `idle_until_interrupt`,**副核是非 BOOT CPU,
+   走 `time::enter_idle()`**:清 `SCHEDULER_TICK_ACTIVE`,本地无软件定时器时
+   `reprogram_local(None)` 走 `shutdown()` → **TCFG=0 停掉硬件定时器**;
+3. CPU0 因 `cpu != BOOT` 跳过(共享 idle 路径注释明确:secondary 保留完整 NO_HZ),
+   保持 tick → 62 次;CPU1 从此只被 IPI 唤醒,`ls2k_timer_irq_count(1)` 恒 0。
+
+这是共享 idle 路径的**有意设计**,阶段 2 的检查假定 idle 副核也收 timer IRQ,
+与真实模型矛盾,首次真机跑通才暴露。
+
+**修复**(`main.rs` CPU-COUNTERS 块,仍全在 `#[cfg(feature="platform-ls2k1000")]` 内,
+qemu_virt/riscv64 零改动):boot 核保留 timer IRQ 验证;副核改用**真实
+reschedule IPI 往返**验证(`interrupt_count(cpu) > 0`)——唤醒 idle → trap entry
+→ ECODE_INTERRUPT → IPI 分发 → acknowledge,与 timer IRQ 走完全同一条 trap 路径。
+
+**run-16 新判读表**(`cpu=1 timer=0` 是预期,`ipi_recv>0` 证明副核中断路径):
+
+```text
+TRAP-VECTOR ... PASS
+CPU-CNTR cpu=0 timer=N ipi_recv=M ipi_send>=1
+CPU-CNTR cpu=1 timer=0 ipi_recv>=1 ipi_send=0     ← idle 副核:无 timer=预期,有 IPI 接收
+CPU-COUNTERS PASS
+BOOT11 all-ap-online
+BOOT14 user-entry
+SMOKE_TEST: PASS
+```
+
 通过 20 次冷启动 + 60 分钟双核运行后打标签:
 
 ```bash
