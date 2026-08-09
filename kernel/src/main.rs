@@ -368,13 +368,24 @@ fn kernel_main(boot: BootInfo) -> ! {
         if expected & 0xfff == 0 && installed == expected && vs == 0 {
             crate::console::raw::puts(" PASS\n");
         } else {
+            /*
+             * 异常向量仍错位：这是板上不可恢复的致命状态。继续启动会像伪 OOM
+             * 一样产生误导性故障，因此关中断后直接停机。
+             */
             crate::console::raw::puts(" FAIL\n");
+            crate::arch::interrupt::disable();
+            loop {
+                crate::arch::cpu::wait_for_interrupt();
+            }
         }
 
-        // 共享 trap body 的 breakpoint 往返：若 EENTRY 仍错位，这里会立即崩溃，
-        // 提供一个比第一个 timer IRQ 更早的失败信号。
-        crate::arch::trap::trigger_breakpoint();
-        crate::console::raw::puts("BREAKPOINT-TRAP PASS\n");
+        // 共享 trap body 的 breakpoint 自测：只在诊断构建（boot-selftest 特性）
+        // 启用，稳定基线不执行。
+        #[cfg(feature = "boot-selftest")]
+        {
+            crate::arch::trap::trigger_breakpoint();
+            crate::console::raw::puts("BREAKPOINT-TRAP PASS\n");
+        }
     }
     irq::initialize();
     time::initialize(firmware_timer_frequency);

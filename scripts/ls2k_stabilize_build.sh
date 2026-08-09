@@ -11,10 +11,11 @@ export PATH=/root/.rustup/toolchains/nightly-2025-01-18-x86_64-unknown-linux-gnu
 cd /mnt/d/oskernel2026-0xdeadbeef
 
 PLATFORM="${1:-ls2k1000}"
+EXTRA="${2:-}"
 case "$PLATFORM" in
   ls2k1000) ART=kernel-ls2k1000 ;;
   qemu-virt) ART=kernel-la ;;
-  *) echo "usage: $0 ls2k1000|qemu-virt" >&2; exit 2 ;;
+  *) echo "usage: $0 ls2k1000|qemu-virt [extra-features]" >&2; exit 2 ;;
 esac
 
 # ---- invalidate stale build-std alloc rlib if vendored source moved ----
@@ -28,8 +29,8 @@ if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null || true)" != "$CUR_HASH" ]
     echo "$CUR_HASH" > "$STAMP"
 fi
 
-echo "== build $PLATFORM =="
-ARCH=loongarch64 PLATFORM=$PLATFORM PROFILE=release ./scripts/build.sh
+echo "== build $PLATFORM${EXTRA:+ (+$EXTRA)} =="
+EXTRA_FEATURES="${EXTRA:-}" ARCH=loongarch64 PLATFORM=$PLATFORM PROFILE=release ./scripts/build.sh
 cp build/loongarch64/cargo/loongarch64-unknown-none-softfloat/release/myos-kernel "$ART"
 
 echo "== artifact =="

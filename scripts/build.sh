@@ -266,6 +266,12 @@ main() {
     select_architecture
     select_profile
     select_platform_features
+    # 可选追加特性（诊断构建用，如 EXTRA_FEATURES=boot-selftest）。
+    # 默认空，不影响正常构建。
+    if [ -n "${EXTRA_FEATURES:-}" ]; then
+        CARGO_PLATFORM_ARGS+=(--features "${EXTRA_FEATURES}")
+        echo "  extra features: ${EXTRA_FEATURES}"
+    fi
     check_environment
     build_kernel
 }

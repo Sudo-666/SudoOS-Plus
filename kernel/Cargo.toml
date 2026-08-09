@@ -22,6 +22,9 @@ platform-qemu-virt = [
 ]
 platform-ls2k1000 = ["arch-loongarch64/platform-ls2k1000"]
 platform-visionfive2 = ["arch-riscv64/platform-visionfive2"]
+# 诊断构建专用：启用共享 trap body 的 breakpoint 自测等上板自检。
+# 稳定构建不开启（默认行为），仅排障时显式 --features boot-selftest 使用。
+boot-selftest = []
 
 [dependencies]
 myos-boot = { path = "../boot"}
