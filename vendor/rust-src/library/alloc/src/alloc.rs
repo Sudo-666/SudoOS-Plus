@@ -88,6 +88,7 @@ pub use std::alloc::Global;
 #[inline]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub unsafe fn alloc(layout: Layout) -> *mut u8 {
+    crate::trace::trace(crate::trace::T_ALLOC_FN, layout.size());
     unsafe {
         // Make sure we don't accidentally allow omitting the allocator shim in
         // stable code until it is actually stabilized.
@@ -185,11 +186,15 @@ impl Global {
     #[inline]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     fn alloc_impl(&self, layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
+        crate::trace::trace(crate::trace::T_ALLOC_IMPL_ENTER, layout.size());
         match layout.size() {
             0 => Ok(NonNull::slice_from_raw_parts(layout.dangling(), 0)),
             // SAFETY: `layout` is non-zero in size,
             size => unsafe {
                 let raw_ptr = if zeroed { alloc_zeroed(layout) } else { alloc(layout) };
+                // PR-2: record the shim's raw return BEFORE NonNull::new — a 0
+                // here is the null the kernel ALLOC_RING never saw.
+                crate::trace::trace(crate::trace::T_ALLOC_IMPL_AFTER, raw_ptr as usize);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
                 Ok(NonNull::slice_from_raw_parts(ptr, size))
             },
@@ -223,6 +228,9 @@ impl Global {
                 hint::assert_unchecked(new_size >= old_layout.size());
 
                 let raw_ptr = realloc(ptr.as_ptr(), old_layout, new_size);
+                // PR-2: realloc returning null also bypasses the kernel ALLOC_RING
+                // (ring records allocate(), not realloc()). Record it here.
+                crate::trace::trace(crate::trace::T_REALLOC_NULL, raw_ptr as usize);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
                 if zeroed {
                     raw_ptr.add(old_size).write_bytes(0, new_size - old_size);
@@ -345,6 +353,7 @@ unsafe impl Allocator for Global {
 #[inline]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 unsafe fn exchange_malloc(size: usize, align: usize) -> *mut u8 {
+    crate::trace::trace(crate::trace::T_EXCHANGE_MALLOC, size);
     let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
     match Global.allocate(layout) {
         Ok(ptr) => ptr.as_mut_ptr(),
@@ -399,6 +408,7 @@ pub const fn handle_alloc_error(layout: Layout) -> ! {
 
     #[inline]
     fn rt_error(layout: Layout) -> ! {
+        crate::trace::trace(crate::trace::T_HANDLE_OOM, layout.size());
         unsafe {
             __rust_alloc_error_handler(layout.size(), layout.align());
         }

@@ -319,4 +319,197 @@ bootm   0x9000000002000000 - 0x900000000a000000
 |------|------|
 | *(本次)* | heap: add OOM_STACK_SNAP entry snapshot + run-10 code-words analysis |
 
+---
+
+# SudoOS 2026-08-09 更新(二)— PR-0 可复现构建 + PR-1 检查点 + PR-3 探针
+
+## 核心结论(评审确认 + 新证据)
+
+评审与取证达成一致:**这次 OOM 排除了"物理内存不足"和"slab 直接返回错误"**。
+
+- 启动链全部通过(BOOT05 buddy / BOOT06 heap / BOOT12 virtio / BOOT13 rootfs),`DMA32 free: 454461 pages`(~1.73 GiB 空闲)。
+- 176B 请求未进入 `KernelGlobalAllocator::allocate()`(ring 停在 count=89,无 R[089])→ null 在内核分配器之上被制造。
+- 未进入 `Scheduler::new()`(无 `TASK00 enter discovered=2`)→ 停止范围精确到 `dump_heap_state("pre-task-init")` 收尾 → `task::initialize()` 入口。
+
+### 新证据:非法 align 位移 0x808 = 新增 BSS 变量
+
+| run | align | 地址 |
+|---|---|---|
+| 8/9/10 | `0x90000000905aa9d0` | `lockdep::MAX_IRQ_OFF_CYCLES`(nm 验证) |
+| 10(新快照版) | `0x90000000905ab1d8` | `MAX_IRQ_OFF_CYCLES` + **`0x808`** |
+
+`0x905ab1d8 - 0x905aa9d0 = 0x808` = `OOM_STACK_SNAP[256]`(256×8 = 0x800)+ `OOM_STACK_SNAP_SP`(0x8)。**新增 BSS 变量把 `MAX_IRQ_OFF_CYCLES` 整体后移,非法 align 跟着精确移动** —— 这不是随机损坏,而是某条错误路径把此前用过的静态地址当成 `Layout.align`。当前最强调用链:
+
+```
+dump_heap_state() → IrqSpinLockGuard::drop() → IrqSaveGuard::drop()
+    → record_irq_off() → update_max(&MAX_IRQ_OFF_CYCLES, ...)
+         ↑ 该静态地址成为活跃寄存器值
+随后某条 cold/error 路径 → 构造/传递 Layout 时 align 字段取到该寄存器
+    → handle_alloc_error(Layout { size:176, align:静态地址 })
+```
+
+### 评审纠正的三点(已接受)
+
+1. **raw_a0/raw_a1 不代表函数入口寄存器**:inline asm 在普通 Rust 函数内、函数序言之后执行,编译器可能已移动参数/复用 a0/a1。故"双 swap 后 raw_a0/a1 = 原始 Layout"不能作为独立证据——但 **0x808 位移证据独立成立**,不依赖寄存器捕获时序。
+2. **2048B 快照不是纯调用栈**:handler 序言已分配局部帧,快照里大量 0x902072e0 是 fmt 指针/局部变量/陈旧栈,不是可靠返回链。
+3. **镜像不可由当前分支复现(最严重)**:见 PR-0。
+
+## PR-0:可复现构建(最高优先级,已完成)
+
+### 事实纠正:Round-2 补丁从未进入 repo
+
+`diff` 证实:
+- **WSL sysroot 的 alloc.rs 有 `sanitize_layout` + assert_unchecked 移除(手工补丁,未入库)**;raw_vec.rs 移除 4 处 assert_unchecked。
+- **repo `vendor/rust-src` 是 pristine nightly-2025-01-18**(alloc.rs 2 处 / raw_vec.rs 4 处 assert_unchecked 与原始源码一致)。
+- 旧 `oscomp-prepare-rust-src.sh` 第 42-44 行"目录完整就 exit 0"→ **sysroot 的补丁从未被回退,每次上板镜像都构建自未入库的手改 sysroot**。
+- **第 8/9/10 轮是带 sanitize+assert-移除的 sysroot 构建的,仍逐字节同失败** → 失败发生在 `__rust_alloc` 的 sanitize 之上的路径(RawVec 的 `Allocator::allocate` 走 trait 方法,绕过 global shim 的 sanitize),与 ring"未进内核 allocate()"证据自洽。
+
+### 修复
+
+1. **`oscomp-prepare-rust-src.sh` 强制按差异同步**:`diff -rq` 比较 vendor/ 与 sysroot 全树,任一文件内容/存在性不同 → `rm -rf` + `cp -a` 全量重装;并输出 vendored alloc.rs / raw_vec.rs 的 SHA256。
+2. **`scripts/build.sh` 写 `<elf>.buildinfo`**:记录 git commit / branch / dirty 文件数、rustc / cargo 版本、release profile(opt-level=3 lto=thin codegen-units=1 panic=abort overflow-checks)、vendored alloc.rs/raw_vec.rs SHA256、ELF SHA256/大小。
+3. **`Makefile.project` 新增 `kernel-ls2k1000.buildinfo`**:复制 buildinfo 并追加 uImage SHA256,产物四件套 ELF / uImage / buildinfo(/.map 可选)。
+4. **`scripts/ls2k_*.sh` 去硬编码**:`ls2k_addr2line.sh` / `ls2k_verify_build.sh` / `ls2k_verify_la.sh` / `ls2k_handler_strings.py` 改为从 argv 接收 ELF 路径(默认 `./kernel-ls2k1000`),不再写死 `/mnt/d/oskernel...`。
+5. **sysroot 已回退 pristine**:本轮构建经 force-sync 把 sysroot 恢复为与 vendored 一致的原始 nightly 源码,上板镜像 = repo + 文档化 toolchain。
+
+## PR-1:定位 dump_heap_state guard 析构 vs Scheduler::new(已完成)
+
+裸串口检查点(全 raw UART,绕过 println/控制台锁):
+
+```
+MAIN40 before-preheap        PROBE176-A
+  HEAPD00 enter
+  HEAPD01 locked             ← 获取 heap 锁后
+    → 持锁拷贝 12 words + is_some(volatile 读)
+    → drop(lock_state) 显式析构(此处 IrqSaveGuard::drop → MAX_IRQ_OFF_CYCLES)
+  HEAPD02 guard-dropped      ← 显式析构完成,未触发故障
+    → 打印 line 1(已释放 heap 锁,打印不持锁)
+  HEAPD03 line1-done
+    → 打印 line 2
+  HEAPD04 done
+MAIN41 after-preheap         PROBE176-B
+  TINIT00 entry
+  TINIT01 discovered=2
+  TASK00 enter discovered=2  (已有,Scheduler::new 内)
+  TASK01..TASK20             (已有,分阶段)
+```
+
+判读表:
+
+| 最后输出 | 故障位置 |
+|---|---|
+| `HEAPD01` | heap guard / lockdep / IrqSaveGuard 析构 |
+| `HEAPD02/03` | line1/line2 打印(控制台锁死锁) |
+| `HEAPD04` | `dump_heap_state()` 返回过程 |
+| `MAIN41` | `task::initialize()` 入口 |
+| `TINIT01` | `Scheduler::new()` 调用或函数序言 |
+| `TASK01/03/19` | 对应 Vec / run_queue / idle 栈分配 |
+
+关键改进:**显式 `drop(lock_state)`** + **拷贝后释放锁再打印**(不持 heap 锁获取 console 锁、不做长格式化)。
+
+## PR-3:PROBE176-A/B 隔离探针(已完成)
+
+`dump_heap_state` 前后各一次,直接调 `GLOBAL_HEAP.alloc(Layout(176,8))` → 填满 176 字节 → 逐字节校验 → 释放,raw UART 输出:
+
+```
+PROBE176-A PASS          ← 分配器本身健康
+PROBE176-B PASS          ← guard 析构后分配器仍健康
+```
+
+- 探针绕过 RawVec/`__rust_alloc` shim(不构造可疑的 2 字 Layout 跨函数传参),只验证**分配器能否满足 176B**。
+- 若 PASS 而真实 176B 仍 OOM → 故障在 Layout/RawVec 构造层(align 损坏),不在 slab/buddy。
+
+## UB 修复:ALLOC_RING 静态写(已完成)
+
+`ALLOC_RING_RA/SIZE` 原是 `static [usize; 128]` 经 `as_ptr() as *mut` + `write_volatile` 改写 → **修改非 UnsafeCell 的 immutable static 是 UB**,编译器可假定数组永不变化。改为:
+
+```rust
+static ALLOC_RING_RA: [AtomicUsize; 128] =
+    [const { AtomicUsize::new(0) }; 128];
+// 写: ALLOC_RING_RA[slot].store(caller, Relaxed)
+// 读: ALLOC_RING_RA[slot].load(Relaxed)
+```
+
+Relaxed 原子保持 hot path 零开销、对 OOM handler 可见,消除 UB。`OOM_STACK_SNAP` 已是 `static mut`(每 boot 单次进入,无并发),保留。
+
+## 本轮上板产物
+
+- kernel-ls2k1000(ELF)、kernel-ls2k1000.uImage、kernel-ls2k1000.buildinfo(git/toolchain/alloc 哈希/ELF/uImage 哈希)。
+- sysroot = pristine nightly-2025-01-18 == vendored == repo(可复现)。
+
+## 上板指令(同前)
+
+```
+sf probe
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
+iminfo  0x9000000002000000
+bootm   0x9000000002000000 - 0x900000000a000000
+```
+
+**本次重点**:最后 ~40 行,看 `PROBE176-A/B PASS`、`MAIN40/41`、`HEAPD00-04`、`TINIT00/01`、`TASK00/01/02` 走到哪一行停 —— 直接判定故障在 guard 析构还是 `Scheduler::new` 边界。若仍 OOM,`stack-snapshot` 段的 `OOM code-words` 应为非 fmt 的真实调用链。
+
+# SudoOS 2026-08-09 更新(三)— PR-2:alloc crate 层标量追踪环
+
+## 动机
+
+PR-0 已证实失败分配从未进入内核 `allocate()`(ring 停在 count=89 无 R[089]),结论是"null 在 alloc crate 层被制造"。但那是推论——没有直接证据指出具体是哪一层、shim 到底返回了什么。PR-2 在 vendored alloc 内部插入标量追踪 hook,下一趟上板直接回答:
+
+1. 失败分配(176B)是否到达 alloc crate 的 `alloc()` / `alloc_impl` / shim?
+2. shim 返回了什么——`0`(制造 null)还是**垃圾非零**(制造坏指针,与 0x808 位移同源)?
+
+## 实现
+
+`vendor/rust-src/library/alloc/src/trace.rs`(已提交,可复现)定义 16 项标量追踪环 + last-trace,全部 relaxed atomic——无分配、无格式化、无 UART、无固定地址。hook 点(与内核 `ls2k_trace_tag_name` 一一对应):
+
+| tag | 名称 | 位置 | value 含义 |
+|-----|------|------|-----------|
+| 1 | ALLOC_FN | `alloc()` 入口 | size |
+| 2 | ALLOC_IMPL_ENTER | `Global::alloc_impl` 入口 | size |
+| 3 | ALLOC_IMPL_AFTER | `alloc_impl` 拿到 shim 返回值后 | **raw_ptr(0=null!)** |
+| 4 | EXCHANGE_MALLOC | Box `exchange_malloc` | size |
+| 5 | HANDLE_OOM | `handle_alloc_error` rt_error | size |
+| 6 | CAP_OVERFLOW | raw_vec `capacity_overflow` | 0 |
+| 7 | RAW_ALLOC_OK | raw_vec `try_allocate_in` Ok | size |
+| 8 | RAW_ALLOC_ERR | raw_vec `try_allocate_in` Err | size |
+| 9 | REALLOC_NULL | `Global::grow_impl` realloc 返回 null | new_size |
+
+`#[no_mangle]` 导出 6 个 getter(`sudoos_alloc_trace_count/last_tag/last_val/ring_len/ring_tag/ring_val`)。内核 `ls2k_alloc_error_handler`(cfg-gated)在 OOM 时新增两处输出:
+
+- **早期哨兵 `TRALL0 tag=N val=X`**:裸 `putdec`,在 disable/mask 之前落地 last-trace,即使后续格式化崩溃也先抓到。
+- **`TRALL count=N len=16` + 尾部 16 条 `TR[i] tag=NAME val=...`**:RING dump 之后打印,与内核 ALLOC_RING 对照。
+
+## 隔离
+
+trace.rs 只写 in-crate atomics,注释已中性化(不含 ls2k 字面量,避免 debuginfo 污染 ELF)。qemu_virt kernel-la 共享同一 alloc crate,但无人安装 reader → 每分配多几次 relaxed atomic store,零行为变化。Kernel 侧 extern/getter/打印全部 `#[cfg(feature = "platform-ls2k1000")]`。
+
+## 判读表(下板看 TRALL 末条 + 176B 的 val)
+
+| 末条 tag | 结论 | 下一步 |
+|----------|------|--------|
+| ALLOC_IMPL_AFTER val=0 | **shim 制造 null**:内核 `allocate()` 对合法 layout 返回 0 | 查内核堆 Option/锁/buddy/slab 为何 null |
+| ALLOC_IMPL_AFTER val=垃圾非零 | **shim 返回坏指针** | 与 0x808 BSS 位移一致,查返回路径地址损坏 |
+| RAW_ALLOC_ERR | RawVec 层拿到 AllocError 未走 shim | 查 `alloc_guard` / layout 计算 |
+| CAP_OVERFLOW | 容量算术溢出 | 与 align 损坏同源?查 LoongArch 溢出 |
+| REALLOC_NULL | realloc 返回 null(ring 不记录 realloc) | 查内核 realloc 覆写路径 |
+| HANDLE_OOM | 失败分配确认到达 abort 入口 | 链完整,聚焦 shim 之上 |
+
+## 上板指令(同前)
+
+```
+sf probe
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
+iminfo  0x9000000002000000
+bootm   0x9000000002000000 - 0x900000000a000000
+```
+
+**判读顺序**:`PROBE176-A/B` → `HEAPD00-04` → `TINIT00/01` → `TASK00..`;若 OOM,`TRALL0` 一行给出 last-trace,`TRALL` 段尾部 16 条给出失败瞬间的 crate 层事件流,与 `RING total` 对照即得完整结论。
+
+## 提交历史
+
+| 提交 | 说明 |
+|------|------|
+| *(本次)* | PR-0 reproducible sysroot/buildinfo + PR-1 checkpoints + PR-3 probes + PR-2 alloc trace ring + ring UB fix |
+
 *Co-Authored-By: Claude <noreply@anthropic.com>*

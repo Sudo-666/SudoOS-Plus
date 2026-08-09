@@ -39,19 +39,36 @@ fi
 DEST="$SYSROOT/lib/rustlib/src/rust/library"
 DEST_PARENT="$(dirname "$DEST")"
 
-if library_complete "$DEST"; then
-  echo "[oscomp-rust-src] sysroot rust-src already complete"
-  exit 0
-fi
+# PR-0 (reproducible build): never skip a divergent sysroot. The previous
+# check only tested "library complete" and exited 0, so hand-edits to the
+# sysroot's alloc/core (e.g. the LS2K1000 assert_unchecked/sanitize_layout
+# experiments) were silently kept and every board image was built from a
+# source tree that did not match vendor/rust-src. Now any content or
+# presence divergence between vendor/ and the sysroot forces a full
+# reinstall, so build-std always compiles exactly the vendored (committed)
+# sources.
+sync_needed() {
+  if ! library_complete "$DEST"; then
+    return 0
+  fi
+  # diff -rq: report only whether any file differs in content or presence.
+  if diff -rq "$SRC" "$DEST" >/dev/null 2>&1; then
+    return 1 # identical -> no sync
+  fi
+  return 0
+}
 
-# Important: remove partial/corrupt installs. A previous script could leave
-# Cargo.lock without core/alloc/std, which tricks build-std into using a broken
-# sysroot. Always replace the whole library directory if any required member is
-# missing.
-echo "[oscomp-rust-src] installing complete vendored rust-src into sysroot"
-mkdir -p "$DEST_PARENT"
-rm -rf "$DEST"
-cp -a "$SRC" "$DEST"
+if sync_needed; then
+  # Always replace the whole library directory: a partial/corrupt install
+  # (Cargo.lock present without core/alloc/std) tricks build-std into using
+  # a broken sysroot.
+  echo "[oscomp-rust-src] syncing vendored rust-src -> sysroot (tree differs or incomplete)"
+  mkdir -p "$DEST_PARENT"
+  rm -rf "$DEST"
+  cp -a "$SRC" "$DEST"
+else
+  echo "[oscomp-rust-src] sysroot rust-src matches vendored (no sync)"
+fi
 
 if ! library_complete "$DEST"; then
   echo "[oscomp-rust-src] ERROR: sysroot rust-src install is still incomplete" >&2
@@ -63,4 +80,8 @@ if ! library_complete "$DEST"; then
   exit 1
 fi
 
-echo "[oscomp-rust-src] sysroot rust-src installed"
+# PR-0: emit the exact alloc/core sources that will be compiled, so a board
+# image can be tied back to the source that produced it.
+echo "[oscomp-rust-src] vendored alloc.rs   sha256: $(sha256sum "$SRC/alloc/src/alloc.rs" | cut -d' ' -f1)"
+echo "[oscomp-rust-src] vendored raw_vec.rs sha256: $(sha256sum "$SRC/alloc/src/raw_vec.rs" | cut -d' ' -f1)"
+echo "[oscomp-rust-src] sysroot rust-src ready"

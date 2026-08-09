@@ -26,6 +26,8 @@ core
 /kernel-ls2k1000.elf
 /kernel-ls2k1000.bin
 /kernel-ls2k1000.uImage
+/kernel-ls2k1000.buildinfo
+/kernel-la.buildinfo
 /kernel.bin
 /uImage
 /ls2k1000-minimal.dtb

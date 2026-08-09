@@ -22,6 +22,9 @@ mod tests;
 #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
 #[track_caller]
 fn capacity_overflow() -> ! {
+    // PR-2: capacity-overflow panic is a distinct failure mode from an
+    // allocator null — trace it so the OOM dump can tell them apart.
+    crate::trace::trace(crate::trace::T_CAP_OVERFLOW, 0);
     panic!("capacity overflow");
 }
 
@@ -470,8 +473,17 @@ impl<A: Allocator> RawVecInner<A> {
             AllocInit::Zeroed => alloc.allocate_zeroed(layout),
         };
         let ptr = match result {
-            Ok(ptr) => ptr,
-            Err(_) => return Err(AllocError { layout, non_exhaustive: () }.into()),
+            Ok(ptr) => {
+                // PR-2: raw_vec-layer success (fresh RawVec allocation).
+                crate::trace::trace(crate::trace::T_RAW_ALLOC_OK, layout.size());
+                ptr
+            }
+            Err(_) => {
+                // PR-2: raw_vec-layer AllocError — the null manufactured here
+                // never reaches the kernel ALLOC_RING.
+                crate::trace::trace(crate::trace::T_RAW_ALLOC_ERR, layout.size());
+                return Err(AllocError { layout, non_exhaustive: () }.into());
+            }
         };
 
         // Allocators currently return a `NonNull<[u8]>` whose length

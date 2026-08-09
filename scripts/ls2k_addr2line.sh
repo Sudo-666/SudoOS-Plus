@@ -1,7 +1,13 @@
 #!/bin/sh
-# Resolve ring + stack return addresses from the 6th board run (full VA).
-ELF=/mnt/d/oskernel2026-0xdeadbeef/kernel-ls2k1000.elf
+# Resolve ring + stack return addresses from a board run (full VA).
+# Usage: ./scripts/ls2k_addr2line.sh [kernel-ls2k1000-elf] [addr...]
+# Default ELF: ./kernel-ls2k1000.elf ; addresses below are from run 6.
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ELF="${1:-$SCRIPT_DIR/kernel-ls2k1000.elf}"
 A2L=loongarch64-linux-gnu-addr2line
+command -v "$A2L" >/dev/null 2>&1 || A2L="llvm-addr2line"
+[ -f "$ELF" ] || { echo "error: $ELF not found" >&2; exit 1; }
+shift 2>/dev/null || true
 
 ADDRS="0x90000000902d7b9c 0x90000000902d7c44 0x90000000902d7d0c 0x90000000902d7db4 0x90000000902d7e48 0x90000000902d7ee0 0x90000000902d7f78 0x90000000902d8010 0x90000000902d80a4 0x90000000902d8140 \
 0x900000009022afac 0x900000009022af54 0x900000009020138c 0x9000000090201334 0x90000000902451bc 0x9000000090241b80 0x90000000902d8e2c 0x90000000902d8e54 0x90000000902d8f0c 0x90000000902d8f50 \
@@ -10,6 +16,11 @@ ADDRS="0x90000000902d7b9c 0x90000000902d7c44 0x90000000902d7d0c 0x90000000902d7d
 0x90000000902443fc 0x9000000090244500 0x9000000090244580 0x90000000902445a0 0x90000000902445cc 0x9000000090244654 0x9000000090244744 \
 0x90000000902050c0 0x9000000090207880 0x90000000902fc840 0x90000000902fc440 0x90000000902e7e94 0x900000009021c500 0x90000000902fccb0 0x9000000090318b30 0x9000000090207200 0x90000000902047e4 \
 0x90000000902e7e80 0x90000000902e7780 0x9000000090250d00 0x9000000090250fe0"
+
+# Extra addresses from argv override the historical snapshot (pass them after the ELF path).
+if [ $# -gt 0 ]; then
+  ADDRS="$*"
+fi
 
 for a in $ADDRS; do
   echo "== $a"

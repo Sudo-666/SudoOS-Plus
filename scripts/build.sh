@@ -214,9 +214,52 @@ build_kernel() {
     printf '%s\n' "${KERNEL_ELF}" \
         > "${architecture_dir}/kernel.path"
 
+    write_buildinfo "${KERNEL_ELF}"
+
     echo
     echo "Build completed"
     echo "  kernel ELF: ${KERNEL_ELF}"
+}
+
+# PR-0 (reproducible build): write a .buildinfo file next to the kernel ELF
+# recording the exact source/toolchain that produced it (git commit, rustc /
+# cargo versions, release profile settings, vendored alloc hashes, ELF hash).
+# A board image can then always be tied back to the committed sources.
+write_buildinfo() {
+    local elf="$1"
+    local info="${elf}.buildinfo"
+    local vendored="${ROOT_DIR}/vendor/rust-src/library"
+    # Full-tree `git status` walks the huge vendor/rust-src tree over the 9p
+    # mount and times out (10-20 s+), which previously produced a silently
+    # WRONG "git_dirty_files=0". Restrict the walk to the actual build-input
+    # paths (returns in ~7 s) and record `UNKNOWN(timeout)` when even that
+    # exceeds the timeout, so the field is never a misleading "clean".
+    local dirty dirty_list out
+    if out="$(timeout 15 git -C "${ROOT_DIR}" status --porcelain --untracked-files=no -- \
+            kernel mm arch scripts vendor/rust-src/library/alloc Makefile.project Cargo.toml .cargo/config.toml 2>/dev/null)"; then
+        dirty="$(printf '%s\n' "$out" | grep -c . || true)"
+        dirty_list="$(printf '%s\n' "$out" | awk '{print $2}' | paste -sd, -)"
+        [ -n "$dirty_list" ] || dirty_list="clean"
+    else
+        dirty="UNKNOWN(timeout)"
+        dirty_list="UNKNOWN(timeout)"
+    fi
+    {
+        echo "SudoOS buildinfo"
+        echo "git_commit=$(timeout 10 git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+        echo "git_branch=$(timeout 10 git -C "${ROOT_DIR}" branch --show-current 2>/dev/null || echo unknown)"
+        echo "git_dirty_files=${dirty}"
+        echo "git_dirty_list=${dirty_list}"
+        echo "rustc=$(rustc -Vv 2>/dev/null | tr '\n' ' ')"
+        echo "cargo=$(cargo -V 2>/dev/null)"
+        echo "target=${TARGET} profile=${PROFILE} platform=${PLATFORM:-default}"
+        echo "release_profile=$(grep -A8 '^\[profile.release\]' "${ROOT_DIR}/Cargo.toml" 2>/dev/null | grep -E 'opt-level|lto|codegen-units|panic|overflow-checks' | tr '\n' ';')"
+        echo "vendor_alloc_rs_sha256=$(sha256sum "${vendored}/alloc/src/alloc.rs" 2>/dev/null | cut -d' ' -f1)"
+        echo "vendor_raw_vec_rs_sha256=$(sha256sum "${vendored}/alloc/src/raw_vec.rs" 2>/dev/null | cut -d' ' -f1)"
+        echo "kernel_elf_sha256=$(sha256sum "${elf}" 2>/dev/null | cut -d' ' -f1)"
+        echo "kernel_elf_size=$(stat -c %s "${elf}" 2>/dev/null || echo 0)"
+    } > "${info}"
+    echo "buildinfo: ${info}"
 }
 
 main() {

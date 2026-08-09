@@ -143,17 +143,11 @@ impl KernelGlobalAllocator {
         {
             let ring_pos = ALLOC_RING_POS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let slot = ring_pos % ALLOC_RING_CAP;
-            // SAFETY: slot 落在 [0, ALLOC_RING_CAP)，静态数组固定大小。
-            unsafe {
-                core::ptr::write_volatile(
-                    ALLOC_RING_RA.as_ptr().add(slot) as *mut usize,
-                    caller,
-                );
-                core::ptr::write_volatile(
-                    ALLOC_RING_SIZE.as_ptr().add(slot) as *mut usize,
-                    layout.size(),
-                );
-            }
+            // slot 落在 [0, ALLOC_RING_CAP)，数组固定大小；Relaxed 原子写对
+            // OOM handler 可见且 hot path 零开销（不再对 immutable static
+            // 做 write_volatile 的 UB 改写）。
+            ALLOC_RING_RA[slot].store(caller, core::sync::atomic::Ordering::Relaxed);
+            ALLOC_RING_SIZE[slot].store(layout.size(), core::sync::atomic::Ordering::Relaxed);
         }
 
         /*
@@ -503,15 +497,55 @@ static OOM_STACK_SNAP_SP: core::sync::atomic::AtomicUsize =
 #[cfg(feature = "platform-ls2k1000")]
 const ALLOC_RING_CAP: usize = 128;
 
+// AtomicUsize ring (not `static [usize]` written via write_volatile on an
+// `as_ptr()` cast): writing a non-UnsafeCell immutable static is UB and lets
+// the compiler assume the array never changes. Relaxed atomics keep the hot
+// path lock-free and make the writes visible to the OOM handler.
 #[cfg(feature = "platform-ls2k1000")]
-static ALLOC_RING_RA: [usize; ALLOC_RING_CAP] = [0; ALLOC_RING_CAP];
+static ALLOC_RING_RA: [core::sync::atomic::AtomicUsize; ALLOC_RING_CAP] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; ALLOC_RING_CAP];
 
 #[cfg(feature = "platform-ls2k1000")]
-static ALLOC_RING_SIZE: [usize; ALLOC_RING_CAP] = [0; ALLOC_RING_CAP];
+static ALLOC_RING_SIZE: [core::sync::atomic::AtomicUsize; ALLOC_RING_CAP] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; ALLOC_RING_CAP];
 
 #[cfg(feature = "platform-ls2k1000")]
 static ALLOC_RING_POS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/*
+ * PR-2：vendored alloc crate 层标量追踪环读取接口。
+ * 实现在 vendor/rust-src/library/alloc/src/trace.rs（已提交、可复现）。
+ * 该环独立于本文件上面的内核 ALLOC_RING：后者记录 shim allocate() 入口，
+ * 前者记录 alloc crate 内部每一层事件。OOM 时两者对照，即可确定 176B 失败
+ * 到底有没有到达 shim、shim 返回了 0（制造 null）还是垃圾非零（制造坏指针）。
+ */
+#[cfg(feature = "platform-ls2k1000")]
+unsafe extern "C" {
+    fn sudoos_alloc_trace_count() -> usize;
+    fn sudoos_alloc_trace_last_tag() -> usize;
+    fn sudoos_alloc_trace_last_val() -> usize;
+    fn sudoos_alloc_trace_ring_len() -> usize;
+    fn sudoos_alloc_trace_ring_tag(i: usize) -> usize;
+    fn sudoos_alloc_trace_ring_val(i: usize) -> usize;
+}
+
+/// PR-2: trace tag 数字到名称（与 trace.rs 的 T_ALLOC_* 常量一一对应）。
+#[cfg(feature = "platform-ls2k1000")]
+fn ls2k_trace_tag_name(tag: usize) -> &'static str {
+    match tag {
+        1 => "ALLOC_FN",
+        2 => "ALLOC_IMPL_ENTER",
+        3 => "ALLOC_IMPL_AFTER",
+        4 => "EXCHANGE_MALLOC",
+        5 => "HANDLE_OOM",
+        6 => "CAP_OVERFLOW",
+        7 => "RAW_ALLOC_OK",
+        8 => "RAW_ALLOC_ERR",
+        9 => "REALLOC_NULL",
+        _ => "?",
+    }
+}
 
 /*
  * LS2K1000 真机调试：自定义 alloc_error_handler。
@@ -582,6 +616,14 @@ fn ls2k_alloc_error_handler(layout: Layout) -> ! {
     // 第二动作裸串口哨兵：即使后续读取 $sp 栈指纹触发异常也能确认到达。
     crate::console::raw::puts("OOM-HANDLER\n");
 
+    // PR-2 早期哨兵：alloc crate 层最后一次追踪事件。用裸 putdec（无 fmt、
+    // 无分配），即使后续 disable/mask/格式化崩溃也先落地这一条。
+    crate::console::raw::puts("TRALL0 tag=");
+    crate::console::raw::putdec(unsafe { sudoos_alloc_trace_last_tag() });
+    crate::console::raw::puts(" val=");
+    crate::console::raw::putdec(unsafe { sudoos_alloc_trace_last_val() });
+    crate::console::raw::puts("\n");
+
     crate::arch::interrupt::disable();
     crate::arch::interrupt::mask_all_sources();
 
@@ -611,14 +653,36 @@ fn ls2k_alloc_error_handler(layout: Layout) -> ! {
     let ring_start = ring_total.saturating_sub(ALLOC_RING_CAP);
     for index in ring_start..ring_total {
         let slot = index % ALLOC_RING_CAP;
-        // SAFETY: slot 在 [0, CAP)，静态数组固定大小。
-        let entry_ra = unsafe { core::ptr::read_volatile(ALLOC_RING_RA.as_ptr().add(slot)) };
-        let entry_size =
-            unsafe { core::ptr::read_volatile(ALLOC_RING_SIZE.as_ptr().add(slot)) };
+        let entry_ra = ALLOC_RING_RA[slot].load(core::sync::atomic::Ordering::Relaxed);
+        let entry_size = ALLOC_RING_SIZE[slot].load(core::sync::atomic::Ordering::Relaxed);
         let _ = write!(
             &mut writer,
             "R[{:03}] sz={} ra={:#x}\n",
             index, entry_size, entry_ra,
+        );
+    }
+
+    // PR-2：alloc crate 层标量追踪环转储（独立于上面的内核 ALLOC_RING）。
+    // 尾部 16 条即失败前最后一小段事件流。判读：
+    //   - 末条 tag=ALLOC_IMPL_AFTER val=0        → shim 制造了 null（内核 allocate() 返回 0）
+    //   - 末条 tag=ALLOC_IMPL_AFTER val=垃圾非零 → shim 返回了坏指针
+    //   - 末条 tag=RAW_ALLOC_ERR                 → RawVec 层拿到 AllocError（未走 shim）
+    //   - 末条 tag=CAP_OVERFLOW                  → 容量算术溢出（完全不同的 bug）
+    //   - 末条 tag=REALLOC_NULL                  → realloc 返回 null（ring 不记录 realloc）
+    let tr_count = unsafe { sudoos_alloc_trace_count() };
+    let tr_len = unsafe { sudoos_alloc_trace_ring_len() };
+    let _ = write!(&mut writer, "TRALL count={} len={}\n", tr_count, tr_len);
+    let tr_start = tr_count.saturating_sub(tr_len);
+    for index in tr_start..tr_count {
+        let tag = unsafe { sudoos_alloc_trace_ring_tag(index) };
+        let val = unsafe { sudoos_alloc_trace_ring_val(index) };
+        let _ = write!(
+            &mut writer,
+            "TR[{:03}] tag={} ({}) val={:#x}\n",
+            index,
+            tag,
+            ls2k_trace_tag_name(tag),
+            val,
         );
     }
 
@@ -691,24 +755,116 @@ fn ls2k_alloc_error_handler(layout: Layout) -> ! {
  */
 #[cfg(feature = "platform-ls2k1000")]
 pub fn dump_heap_state(tag: &'static str) {
+    /*
+     * PR-1 (localize dump_heap_state guard-drop vs Scheduler::new): staged
+     * raw-UART checkpoints, every step bracketed so the last visible line
+     * names the faulting stage.
+     *
+     * Rationale: the 176B OOM's corrupt align is the address of
+     * lockdep::MAX_IRQ_OFF_CYCLES, which IrqSaveGuard::drop writes (heap
+     * lock -> record_irq_off -> update_max). The previous implicit drop of
+     * `lock_state` ran at function-exit, so we could not tell whether the
+     * fault was in that drop / a subsequent cold path or in Scheduler::new.
+     * Making the drop explicit and printing HEAPD02 *after* it localizes
+     * either way.
+     *
+     * Order:
+     *   HEAPD00 enter
+     *   HEAPD01 locked
+     *     -> copy the 12 raw words while holding the heap lock
+     *     -> drop(lock_state) EXPLICIT (IrqSaveGuard::drop here touches
+     *        MAX_IRQ_OFF_CYCLES via record_irq_off)
+     *   HEAPD02 guard-dropped
+     *     -> print line 1 (heap lock NOT held while printing)
+     *   HEAPD03 line1-done
+     *     -> print line 2
+     *   HEAPD04 done
+     */
+    crate::console::raw::puts("HEAPD00 enter\n");
     let field = &GLOBAL_HEAP.heap as *const _ as usize;
-    let words = unsafe { core::slice::from_raw_parts(field as *const usize, 12) };
     let lock_state = GLOBAL_HEAP.heap.try_lock();
+    crate::console::raw::puts("HEAPD01 locked\n");
     let is_some = lock_state.as_ref().is_some_and(|guard| guard.is_some());
+    // Copy the 12 raw words while holding the heap lock (volatile reads), so
+    // the prints below can run without the lock.
+    let mut words_copy = [0usize; 12];
+    for (i, slot) in words_copy.iter_mut().enumerate() {
+        // SAFETY: field points at the IrqSpinLock's own words; pre-task-init is
+        // single-CPU (secondaries not yet started). Same access the old code did.
+        *slot = unsafe { core::ptr::read_volatile((field as *const usize).add(i)) };
+    }
+    let field_copy = field;
+    let is_some_copy = is_some;
+    drop(lock_state); // explicit: IrqSaveGuard::drop -> lockdep record_irq_off
+    crate::console::raw::puts("HEAPD02 guard-dropped\n");
 
     crate::println!(
-        "HEAP-STATE[{}] field={:#x} try-lock={} is-some={}",
+        "HEAP-STATE[{}] field={:#x} try-lock=1 is-some={}",
         tag,
-        field,
-        if lock_state.is_some() { 1 } else { 0 },
-        is_some,
+        field_copy,
+        is_some_copy,
     );
+    crate::console::raw::puts("HEAPD03 line1-done\n");
     crate::println!(
         "HEAP-STATE[{}] words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
         tag,
-        words[0], words[1], words[2], words[3], words[4], words[5],
-        words[6], words[7], words[8], words[9], words[10], words[11],
+        words_copy[0], words_copy[1], words_copy[2], words_copy[3], words_copy[4], words_copy[5],
+        words_copy[6], words_copy[7], words_copy[8], words_copy[9], words_copy[10], words_copy[11],
     );
+    crate::console::raw::puts("HEAPD04 done\n");
+}
+
+/*
+ * PR-3 (isolate allocator from the corrupt-layout path): allocate a
+ * 176-byte, 8-aligned block DIRECTLY through the global allocator, fill it,
+ * verify every byte, and free it. Raw-UART output, no heap lock held while
+ * printing. If this passes, the allocator itself is healthy and the 176B OOM
+ * must be in the Layout/RawVec construction above it (stale align), not in
+ * slab/buddy.
+ */
+#[cfg(feature = "platform-ls2k1000")]
+pub fn probe176(label: &'static str) {
+    let layout = match core::alloc::Layout::from_size_align(176, 8) {
+        Ok(l) => l,
+        Err(_) => {
+            crate::console::raw::puts("PROBE176-");
+            crate::console::raw::puts(label);
+            crate::console::raw::puts(" BAD-LAYOUT\n");
+            return;
+        }
+    };
+    // SAFETY: layout is valid (176, 8); the allocation is immediately checked
+    // for null and later freed with the same layout.
+    let ptr = unsafe { GLOBAL_HEAP.alloc(layout) };
+    if ptr.is_null() {
+        crate::console::raw::puts("PROBE176-");
+        crate::console::raw::puts(label);
+        crate::console::raw::puts(" NULL\n");
+        return;
+    }
+    // fill + verify (no calls that allocate or lock the heap)
+    for i in 0..176usize {
+        // SAFETY: ptr covers layout.size() == 176 bytes, 8-aligned.
+        unsafe { core::ptr::write_volatile(ptr.add(i), (i & 0xff) as u8) };
+    }
+    let mut ok = true;
+    for i in 0..176usize {
+        // SAFETY: same range as the fill above.
+        let byte = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+        if byte != (i & 0xff) as u8 {
+            ok = false;
+            break;
+        }
+    }
+    // SAFETY: dealloc with the same (176, 8) layout the block was allocated with.
+    unsafe { GLOBAL_HEAP.dealloc(ptr, layout) };
+    crate::console::raw::puts("PROBE176-");
+    crate::console::raw::puts(label);
+    if ok {
+        crate::console::raw::puts(" PASS\n");
+    } else {
+        crate::console::raw::puts(" FAIL-VERIFY\n");
+    }
 }
 
 pub fn shrink() {

@@ -405,7 +405,15 @@ fn kernel_main(boot: BootInfo) -> ! {
     time::verify_periodic();
 
     #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::probe176("A");
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::console::raw::puts("MAIN40 before-preheap\n");
+    #[cfg(feature = "platform-ls2k1000")]
     crate::heap::dump_heap_state("pre-task-init");
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::console::raw::puts("MAIN41 after-preheap\n");
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::probe176("B");
     task::initialize();
     #[cfg(feature = "platform-ls2k1000")]
     crate::heap::dump_heap_state("post-task-init");

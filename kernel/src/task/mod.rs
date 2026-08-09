@@ -1901,7 +1901,15 @@ pub(crate) fn print_task_debug_dump() {
 }
 
 pub fn initialize() {
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::console::raw::puts("TINIT00 entry\n");
     let discovered = crate::smp::discovered_cpu_count();
+    #[cfg(feature = "platform-ls2k1000")]
+    {
+        crate::console::raw::puts("TINIT01 discovered=");
+        crate::console::raw::putdec(discovered);
+        crate::console::raw::puts("\n");
+    }
     let scheduler = Scheduler::new(discovered);
 
     #[cfg(feature = "platform-ls2k1000")]

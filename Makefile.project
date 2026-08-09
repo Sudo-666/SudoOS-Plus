@@ -81,6 +81,14 @@ kernel-ls2k1000.uImage: kernel-ls2k1000 ls2k1000-mkimage
 	@python3 scripts/elf-to-uimage.py --platform ls2k1000 -n "SudoOS-LS2K1000" kernel-ls2k1000 $@
 	@ls -lh $@
 
+# PR-0: board image buildinfo (git commit / toolchain / vendored alloc hashes /
+# ELF hash). Copy next to the other board artifacts and append the uImage hash
+# so the exact image can always be tied back to the committed sources.
+kernel-ls2k1000.buildinfo: kernel-ls2k1000.uImage
+	@cp build/loongarch64/cargo/loongarch64-unknown-none-softfloat/release/myos-kernel.buildinfo $@
+	@echo "uImage_sha256=$$(python3 -c "import hashlib; print(hashlib.sha256(open('kernel-ls2k1000.uImage','rb').read()).hexdigest())")" >> $@
+	@cat $@
+
 check-ls2k1000-image: kernel-ls2k1000.elf kernel-ls2k1000.bin kernel-ls2k1000.uImage
 	@python3 scripts/check-ls2k1000-image.py \
 	    --elf kernel-ls2k1000.elf \
