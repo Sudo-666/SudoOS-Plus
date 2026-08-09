@@ -132,3 +132,20 @@ _start:
     b .Lunexpected_return
 
 .size _start, . - _start
+
+/* ── 板级异常向量 (EENTRY) ──
+ *
+ * LoongArch 硬件把 EENTRY[11:0] 强制清零：异常入口必须 4 KiB 对齐。
+ * 共享 trap/entry.S 的 __loongarch_trap_entry 落在普通 .text 中，无法保证
+ * 页对齐——此前第一个 timer IRQ 会跳进页首（恰是 allocator shim），表现为
+ * 伪 OOM。此 trampoline 独占一个 4 KiB 页（由 ls2k1000/linker.ld 的
+ * .text.trap_entry 段保证），EENTRY 指向它，再分支到共享 trap body。
+ * 裸分支不修改任何 GPR，与直接进入共享入口完全等价。
+ */
+.section .text.trap_entry, "ax", @progbits
+.balign 4096
+.globl __loongarch_trap_entry_ls2k
+.type __loongarch_trap_entry_ls2k, @function
+__loongarch_trap_entry_ls2k:
+    b __loongarch_trap_entry
+.size __loongarch_trap_entry_ls2k, . - __loongarch_trap_entry_ls2k

@@ -143,6 +143,8 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Read, true)
         }
         ECODE_INTERRUPT => {
+            #[cfg(feature = "platform-ls2k1000")]
+            ls2k_mark_first_timer_irq(frame);
             crate::irq::enter();
             let pending = frame.pending_interrupts();
             let unknown = pending & !SUPPORTED_INTERRUPT_BITS;
@@ -192,6 +194,24 @@ fn validate_trap_frame(frame: &crate::arch::trap::TrapFrame) {
 
 fn mark_breakpoint_reached() {
     BREAKPOINT_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+/// 板级 (platform-ls2k1000)：第一个异常中断到达时的原始 ESTAT 标记。
+///
+/// 用于在真机上确认异常向量已修复——修复前第一个 timer IRQ 会因 EENTRY 低
+/// 12 位被清零而直接跳进 allocator shim 打印伪 OOM，这条标记永远不会有输出；
+/// 修复后第一个 timer IRQ 正常进入本处理器，打印 ESTAT 位图与 era。
+#[cfg(feature = "platform-ls2k1000")]
+fn ls2k_mark_first_timer_irq(frame: &crate::arch::trap::TrapFrame) {
+    static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    crate::console::raw::puts("TIMER-IRQ-FIRST pending=");
+    crate::console::raw::puthex(frame.pending_interrupts());
+    crate::console::raw::puts(" era=");
+    crate::console::raw::puthex(frame.era);
+    crate::console::raw::puts("\nTIMER-IRQ-FIRST DONE\n");
 }
 
 #[cfg(target_arch = "riscv64")]

@@ -513,3 +513,95 @@ bootm   0x9000000002000000 - 0x900000000a000000
 | *(本次)* | PR-0 reproducible sysroot/buildinfo + PR-1 checkpoints + PR-3 probes + PR-2 alloc trace ring + ring UB fix |
 
 *Co-Authored-By: Claude <noreply@anthropic.com>*
+
+---
+
+# SudoOS 2026-08-09 更新(四)— 根因定性:LoongArch 异常向量页对齐错误(伪 OOM)
+
+## 定性:176B "OOM" 是伪 OOM
+
+不是 heap / slab / 真实 176B 分配失败。根因是 **LoongArch EENTRY 安装地址低 12 位被硬件清零**,而共享 `__loongarch_trap_entry` 未页对齐——第一个 timer IRQ 直接跳进它所在页的**页首**,而页首恰好是 `__rust_alloc_error_handler`(allocator shim),于是把现场寄存器误当成 OOM 参数打印:
+
+```text
+size = 176 = 0xb0   ← 正是 CRMD(CSR 0x0)当前映射模式值
+align = 0x9000...5b3ad8  ← lockdep 静态地址(MAX_IRQ_OFF_CYCLES 一族)
+```
+
+## ELF 实证(run-12 上板产物)
+
+```
+9000000090200000 T __text_start
+9000000090201000 T __rust_alloc_error_handler    ← 页首 = shim
+9000000090201ba0 T __loongarch_trap_entry        ← & 0xfff = 0xba0,未页对齐!
+```
+
+`EENTRY[11:0]` 硬件恒为 0,所以 EENTRY=0x...1000(页首)= `__rust_alloc_error_handler` 首指令。这完整解释:为什么没有任何 alloc trace、为什么直接进 OOM handler、为什么参数是 CRMD/lockdep、为什么总在 `time::start_periodic()` 后 ~10ms、为什么之前改 slab/RawVec/Layout 都无效。
+
+## 修复(PR-4)
+
+`platform/ls2k1000` 独立页对齐 trampoline(不改共享 `.text` 布局,保持 kernel-la 隔离):
+
+| 文件 | 改动 |
+|------|------|
+| `platform/ls2k1000/entry.S` | `.text.trap_entry` 段 + `.balign 4096` + `__loongarch_trap_entry_ls2k: b __loongarch_trap_entry`(裸分支零 GPR 扰动,与直接进入共享 trap body 等价) |
+| `platform/ls2k1000/linker.ld` | `.text` 内为 `.text.trap_entry` 独占一个 4 KiB 页;`ASSERT(__loongarch_trap_entry_ls2k == __trap_vector_start)` + `ASSERT(段 ≤ 4K)` 构建期保护 |
+| `trap/mod.rs` | EENTRY 源按 `#[cfg(feature = "platform-ls2k1000")]` 选择 trampoline,其余平台编译产物逐字节不变;新增 cfg-gated `ls2k_eentry_expected/installed/ecfg` 读取 |
+| `kernel/main.rs` | 修复后 `trap::initialize()` 后打印 `TRAP-VECTOR expected=... installed=... vs=... PASS/FAIL` + `BREAKPOINT-TRAP PASS`(错位立即崩溃,早于第一个 IRQ 暴露) |
+| `kernel/trap.rs` | 第一个 `ECODE_INTERRUPT` 打印 `TIMER-IRQ-FIRST pending=0x... era=0x...` + `TIMER-IRQ-FIRST DONE`(证明 timer IRQ 真正进入处理器) |
+
+## 修复后布局验证(本次构建)
+
+```
+9000000090200000 T __text_start
+9000000090201000 T __loongarch_trap_entry_ls2k   ← 页对齐(低 12 位=0)
+9000000090201004 T __trap_vector_end             ← 4 字节分支
+9000000090202000 T __rust_alloc_error_handler    ← shim 移到第 2 页
+9000000090202e40 T __loongarch_trap_entry        ← 共享 trap body
+EENTRY install(两处): pcalau12i -116/-218 → 0x...201000 → csrwr $r12,0xc  ✓
+```
+
+## 隔离(强制约束)
+
+- qemu_virt kernel-la:`.text/.rodata/.data/.bss` **逐字节不变**(与 stash 掉 trap/mod.rs 的对照构建逐段 diff 为空;整体 ELF hash 仅 `.debug_*` 行号表不同)。EENTRY install 仍是原 `la.pcrel __loongarch_trap_entry` 三指令。
+- `ls2k_verify_la.sh` ZERO 标记复核:OOM-HANDLER/HEAP-FATAL/ls2k/LS2K/TASK00/... 全 0(`memory allocation of`=1 为共享 vendored alloc 既有运行时字符串,两镜像一致,非泄漏)。
+- 确定性:同源重建两次 hash 一致(150433f3)。
+
+## 上板指令(run-14,同前)
+
+```
+sf probe
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
+iminfo  0x9000000002000000
+bootm   0x9000000002000000 - 0x900000000a000000
+```
+
+**期望输出(判读顺序)**:
+
+```text
+TRAP-VECTOR expected=0x...1000 installed=0x...1000 vs=0 PASS   ← 修复确认
+BREAKPOINT-TRAP PASS
+TIMER-IRQ-FIRST pending=0x800 era=...
+TIMER-IRQ-FIRST DONE                                           ← 第一个 timer IRQ 进入真处理器
+PROBE176-A PASS
+HEAPD00..04 / MAIN40/41
+PROBE176-B PASS
+TINIT00/01
+TASK00 enter ...
+```
+
+若 `TRAP-VECTOR ... FAIL` 或 `BREAKPOINT-TRAP` 后崩溃 → 向量仍未对齐(回查链接 ASSERT 与安装目标)。若正常链一直走到 `TASK00` 之后再次中断 → 那才是真正的分配问题,再回到 PR-2 TRALL 判读表。
+
+## 待办(修复确认后)
+
+- 删除 OOM 的非法 align 钳制、栈快照、`IrqSpinLock` 原始 words 读取等误导性诊断;
+- heap 状态检查改成类型安全统计接口;
+- 保留 buildinfo、ELF/uImage hash 与 EENTRY 链接检查。
+
+## 提交历史
+
+| 提交 | 说明 |
+|------|------|
+| *(本次)* | PR-4:trap vector 页对齐(伪 OOM 根因)+ TRAP-VECTOR/BREAKPOINT-TRAP/TIMER-IRQ-FIRST 标记 |
+
+*Co-Authored-By: Claude <noreply@anthropic.com>*

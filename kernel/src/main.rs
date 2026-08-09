@@ -351,6 +351,31 @@ fn kernel_main(boot: BootInfo) -> ! {
      */
     trap::initialize();
     println!("BOOT07 bsp-trap-ready");
+    #[cfg(feature = "platform-ls2k1000")]
+    {
+        // 真机确认异常向量已页对齐：expected 必须 4 KiB 对齐、installed 回读
+        // 必须等于 expected（硬件把 EENTRY[11:0] 清零）、ECFG.VS 必须为 0。
+        // 修复前这里会打印 installed 与 expected 不同的错位地址。
+        let expected = crate::arch::trap::ls2k_eentry_expected();
+        let installed = crate::arch::trap::ls2k_eentry_installed();
+        let vs = (crate::arch::trap::ls2k_ecfg() >> 16) & 0x7;
+        crate::console::raw::puts("TRAP-VECTOR expected=");
+        crate::console::raw::puthex(expected);
+        crate::console::raw::puts(" installed=");
+        crate::console::raw::puthex(installed);
+        crate::console::raw::puts(" vs=");
+        crate::console::raw::putdec(vs);
+        if expected & 0xfff == 0 && installed == expected && vs == 0 {
+            crate::console::raw::puts(" PASS\n");
+        } else {
+            crate::console::raw::puts(" FAIL\n");
+        }
+
+        // 共享 trap body 的 breakpoint 往返：若 EENTRY 仍错位，这里会立即崩溃，
+        // 提供一个比第一个 timer IRQ 更早的失败信号。
+        crate::arch::trap::trigger_breakpoint();
+        crate::console::raw::puts("BREAKPOINT-TRAP PASS\n");
+    }
     irq::initialize();
     time::initialize(firmware_timer_frequency);
     timer::initialize();

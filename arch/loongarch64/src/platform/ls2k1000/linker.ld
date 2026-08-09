@@ -77,6 +77,26 @@ SECTIONS
         ASSERT(. - __text_start <= 4K, "LoongArch TLB refill exceeds one page")
         . = __text_start + 4K;
 
+        /*
+         * 板级异常向量 (EENTRY) 独占一个 4 KiB 页。LoongArch 硬件把
+         * EENTRY[11:0] 清零，异常入口必须页对齐；否则第一个 timer IRQ 会
+         * 跳进本页页首 —— 此前恰好是 allocator shim，打印出伪 OOM。
+         * trampoline 定义于 platform/ls2k1000/entry.S 的 .text.trap_entry。
+         */
+        . = ALIGN(4K);
+        __trap_vector_start = .;
+        KEEP(*(.text.trap_entry))
+        __trap_vector_end = .;
+        ASSERT(
+            __loongarch_trap_entry_ls2k == __trap_vector_start,
+            "board trap entry is not page-aligned"
+        )
+        ASSERT(
+            __trap_vector_end - __trap_vector_start <= 4K,
+            "board trap entry exceeds one page"
+        )
+
+        . = ALIGN(4K);
         *(.text .text.*)
 
         . = ALIGN(4K);
