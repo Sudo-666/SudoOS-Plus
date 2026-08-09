@@ -1,5 +1,6 @@
 #![feature(let_chains)]
 #![feature(unsigned_is_multiple_of)]
+#![feature(alloc_error_handler)]
 #![no_std]
 #![no_main]
 

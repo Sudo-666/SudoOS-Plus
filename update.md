@@ -243,4 +243,80 @@ memory allocation of 176 bytes failed
 - 次核 SMP — 当前 `rust_main_secondary` 为存根(仅驻留),`start_secondaries` 会超时;
 - 外设驱动轮询适配。
 
+---
+
+# SudoOS 2026-08-09 更新 — LS2K1000 176B OOM 第 10 轮取证:Round-2 补丁无效,根因收敛到 codegen
+
+## 当前状态
+
+- **Round-2 补丁**(移除 alloc crate 全部 `assert_unchecked` + 2048B 栈 dump + `OOM code-words` 扫描)已上板(18:45 uImage),第 10 轮真机结果:**OOM 签名与第 8/9 轮逐字节一致,补丁无效**。
+- 新增 `OOM code-words` 诊断 + addr2line 全量解析,首次拿到失败布局与调用链指纹。
+- 新增 `OOM_STACK_SNAP` 入口快照(run 11 准备),解决 handler 自身 fmt 帧污染栈的问题。
+
+## 第 10 轮真机证据
+
+### OOM 签名(三轮不变)
+
+```
+OOM-HANDLER size=176 align=10376293543883483600(=0x90000000905aa9d0)
+ra=0x90000000902e8514 raw_a0=0x90000000905aa9d0 raw_a1=0xb0 count=89
+```
+
+- `align=0x90000000905aa9d0` = `lockdep::MAX_IRQ_OFF_CYCLES` 的 BSS cached-VA(nm 验证)。跨第 8/9/10 三轮完全一致 → 确定性寄存器残留值。
+- Round-2 后 `__rg_oom` 从 0x902e8360 移到 0x902e8500(证明新二进制在跑),但失败行为逐字节相同。
+
+### code-words 解析(新证据)
+
+- `KernelGlobalAllocator::allocate`(sp+0x4d8)、`finish_grow`(sp+0x5a8):**最后成功分配 R[088] 的陈旧帧**,非失败路径。
+- `reprogram_local`(sp+0x688)、`kernel_main`(sp+0x778):更早的陈旧帧。
+- 结论:2048B 实时栈 dump 的 ~70% 是 handler 打印 89 行 ring 时的 fmt 帧(`bool`/`usize`/`LowerHex` fmt),真正触发 OOM 的调用者帧被埋在 sp+0x400 以下未暴露。
+
+### 反汇编确认 swap 链
+
+`handle_alloc_error`(0x902014e4)swap a0/a1 → `__rust_alloc_error_handler`(0x90201000)**不**swap → `__rg_oom`(0x902e8500)swap a0/a1。双 swap 净零 → handler 的 raw_a0/a1 = **失败点原始 layout** = (align=0x90000000905aa9d0, size=176)。
+
+### 关键事实:失败分配从未进入我们的分配器
+
+- ring 记录在 `allocate()` 最顶(volatile 写),count=89 停在 R[088],**无 R[089]**。第 90 次分配(176B)未进 `allocate()`。
+- 我们的 `allocate()` 对 size>0 永不返回 null(Err→HEAP_FATAL 停机)。OOM 走了 `handle_alloc_error`,说明 **null 在 alloc crate 层(我们的分配器之上)被制造**。
+
+## 根因假设(已排除两轮,收敛到 codegen)
+
+| 轮次 | 假设 | 结果 |
+|---|---|---|
+| Round-1 | finish_grow `assert_unchecked` UB 消除分配器调用 | 无效(第 9 轮证明) |
+| Round-2 | 移除全部 5 处剩余 `assert_unchecked` | 无效(第 10 轮证明) |
+| 现行 | **LoongArch codegen 把 lockdep static 地址当 align 传** | 待验证 |
+
+现行机制:176B 请求的 align 参数是 `MAX_IRQ_OFF_CYCLES` 的地址(`heap.lock` → lockdep 跟踪时加载进寄存器),形成非法 Layout(align 非 2 的幂)。非法 Layout 的 UB 让优化器在调用点之上消除分配器调用并假定失败 → `handle_alloc_error`。这发生在任何我们可补丁的代码之上,所以 alloc crate 和 heap.rs 的补丁都触达不到。
+
+## Run 11 诊断改进(`OOM_STACK_SNAP`)
+
+- 新增 `OOM_STACK_SNAP[256]`(2048B)+ `OOM_STACK_SNAP_SP` 静态,handler 入口(任何 puts/fmt 之前)用 volatile 逐字拷贝栈顶 2048 字节,打印阶段读快照。
+- 反汇编验证:ldx.d/stx.d 逐元素 volatile 拷贝,在 puts 之前执行。
+- 预期:run 11 的 code-words 将露出 176B 分配点的真实 `$ra`(分配点 → handle_alloc_error 内联 → __rg_oom 帧),addr2line 直接定位。
+
+## 产物与隔离
+
+- kernel-ls2k1000: 7228488 B(uImage 6537280 B,IMAGE CHECK PASS)
+- kernel-la(qemu_virt): 8822064 B,**ZERO** ls2k 标记(隔离保持)
+
+## 上板指令(同前)
+
+```
+sf probe
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
+iminfo  0x9000000002000000
+bootm   0x9000000002000000 - 0x900000000a000000
+```
+
+看 `stack-snapshot` 段的 `OOM code-words`(应为非 fmt 的真实调用链)。
+
+## 提交历史
+
+| 提交 | 说明 |
+|------|------|
+| *(本次)* | heap: add OOM_STACK_SNAP entry snapshot + run-10 code-words analysis |
+
 *Co-Authored-By: Claude <noreply@anthropic.com>*
