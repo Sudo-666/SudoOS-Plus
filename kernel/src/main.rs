@@ -435,14 +435,20 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     trap::verify_breakpoint();
 
+    /*
+     * 调度器生命周期顺序：先构造/发布/注册 Scheduler，再启动周期定时器并
+     * 开启中断，最后标记 BSP scheduler active 并孵化 reaper。调度定时器
+     * 绝不在 Scheduler 发布之前启动。
+     */
+    #[cfg(feature = "platform-ls2k1000")]
+    crate::heap::dump_heap_state("pre-task-init");
+    task::initialize();
     time::start_periodic();
+    task::start_boot_scheduler();
 
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     time::verify_periodic();
 
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::heap::dump_heap_state("pre-task-init");
-    task::initialize();
     #[cfg(feature = "platform-ls2k1000")]
     crate::heap::dump_heap_state("post-task-init");
     smp::start_secondaries();
@@ -450,6 +456,41 @@ fn kernel_main(boot: BootInfo) -> ! {
     crate::heap::dump_heap_state("post-secondaries");
     task::finalize_cpu_bringup();
     println!("BOOT11 all-ap-online");
+    #[cfg(feature = "platform-ls2k1000")]
+    {
+        // 板级 per-CPU 中断计数检查：等每个在线 CPU 至少收到一次 timer IRQ，
+        // 然后打印 timer/IPI 收发计数并断言双核中断路径正常。
+        let discovered = crate::smp::discovered_cpu_count();
+        let mut waits = 0u32;
+        while waits < 50 {
+            let all_ticking = (0..discovered)
+                .all(|logical| crate::trap::ls2k_timer_irq_count(logical) > 0);
+            if all_ticking {
+                break;
+            }
+            crate::arch::cpu::wait_for_interrupt();
+            waits += 1;
+        }
+        for logical in 0..discovered {
+            let cpu = crate::smp::CpuId::new(logical)
+                .expect("discovered CPU exceeds MAX_CPUS");
+            crate::console::raw::puts("CPU-CNTR cpu=");
+            crate::console::raw::putdec(logical);
+            crate::console::raw::puts(" timer=");
+            crate::console::raw::putdec(crate::trap::ls2k_timer_irq_count(logical) as usize);
+            crate::console::raw::puts(" ipi_recv=");
+            crate::console::raw::putdec(crate::ipi::interrupt_count(cpu) as usize);
+            crate::console::raw::puts(" ipi_send=");
+            crate::console::raw::putdec(crate::ipi::ls2k_ipi_send_count(cpu) as usize);
+            crate::console::raw::puts("\n");
+        }
+        assert!(
+            (0..discovered)
+                .all(|logical| crate::trap::ls2k_timer_irq_count(logical) > 0),
+            "timer IRQ did not reach every online CPU",
+        );
+        crate::console::raw::puts("CPU-COUNTERS PASS\n");
+    }
     workqueue::initialize();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     timer::verify();

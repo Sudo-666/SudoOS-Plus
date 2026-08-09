@@ -90,6 +90,21 @@ impl IpiMailbox {
 
 static MAILBOXES: [IpiMailbox; MAX_CPUS] = [const { IpiMailbox::new() }; MAX_CPUS];
 
+/*
+ * 板级 (platform-ls2k1000)：per-CPU IPI 发送计数。
+ *
+ * 每次 send() 入口累计一次（发送方 CPU），供启动后的 CPU-COUNTERS 检查
+ * 确认双核 IPI 双向收发正常。接收侧复用 MAILBOXES[].interrupts（硬件门铃
+ * 确认数）。仅 ls2k1000 平台编译。
+ */
+#[cfg(feature = "platform-ls2k1000")]
+static IPI_SEND_COUNT: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+#[cfg(feature = "platform-ls2k1000")]
+pub fn ls2k_ipi_send_count(cpu: CpuId) -> u64 {
+    IPI_SEND_COUNT[cpu.get()].load(Ordering::Relaxed)
+}
+
 pub fn initialize() {
     // Initialization runs before secondary CPUs are started, so resetting the
     // mailboxes does not race with publishers or handlers.
@@ -104,6 +119,9 @@ pub fn initialize() {
 /// Reschedule traffic is coalesced while synchronous TLB/call-function traffic
 /// always re-kicks the target so completion cannot depend on a stale wakeup.
 pub fn send(cpu: CpuId, message: IpiMessage) {
+    #[cfg(feature = "platform-ls2k1000")]
+    IPI_SEND_COUNT[crate::smp::current_cpu_id().get()].fetch_add(1, Ordering::Relaxed);
+
     assert!(
         crate::smp::is_online(cpu),
         "attempted to send an IPI to an offline CPU",

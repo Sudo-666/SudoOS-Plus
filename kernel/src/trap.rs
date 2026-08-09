@@ -143,10 +143,17 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             handle_loongarch_page_fault(frame, myos_mm::FaultAccess::Read, true)
         }
         ECODE_INTERRUPT => {
-            #[cfg(feature = "platform-ls2k1000")]
-            ls2k_mark_first_timer_irq(frame);
             crate::irq::enter();
             let pending = frame.pending_interrupts();
+            #[cfg(feature = "platform-ls2k1000")]
+            {
+                // 板级 per-CPU 定时器中断计数（取代修复期的一次性 AtomicBool
+                // 标记）：验证每个在线 CPU 的 timer IRQ 都真正进入处理器。
+                if pending & TIMER_INTERRUPT_BIT != 0 {
+                    TIMER_IRQ_COUNT[crate::smp::current_cpu_id().get()]
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
             let unknown = pending & !SUPPORTED_INTERRUPT_BITS;
             if unknown != 0 {
                 crate::irq::handle_unhandled(
@@ -196,22 +203,20 @@ fn mark_breakpoint_reached() {
     BREAKPOINT_COUNT.fetch_add(1, Ordering::AcqRel);
 }
 
-/// 板级 (platform-ls2k1000)：第一个异常中断到达时的原始 ESTAT 标记。
-///
-/// 用于在真机上确认异常向量已修复——修复前第一个 timer IRQ 会因 EENTRY 低
-/// 12 位被清零而直接跳进 allocator shim 打印伪 OOM，这条标记永远不会有输出；
-/// 修复后第一个 timer IRQ 正常进入本处理器，打印 ESTAT 位图与 era。
+/*
+ * 板级 (platform-ls2k1000)：per-CPU 定时器中断计数。
+ *
+ * 取代修复期的一次性全局 AtomicBool 标记：现在按 CPU 累计，供启动后的
+ * CPU-COUNTERS 检查确认每个在线 CPU 的 timer IRQ 都真正进入处理器。
+ * 仅 ls2k1000 平台编译，qemu_virt/riscv64 不受影响。
+ */
 #[cfg(feature = "platform-ls2k1000")]
-fn ls2k_mark_first_timer_irq(frame: &crate::arch::trap::TrapFrame) {
-    static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    crate::console::raw::puts("TIMER-IRQ-FIRST pending=");
-    crate::console::raw::puthex(frame.pending_interrupts());
-    crate::console::raw::puts(" era=");
-    crate::console::raw::puthex(frame.era);
-    crate::console::raw::puts("\nTIMER-IRQ-FIRST DONE\n");
+static TIMER_IRQ_COUNT: [core::sync::atomic::AtomicU64; crate::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+#[cfg(feature = "platform-ls2k1000")]
+pub fn ls2k_timer_irq_count(cpu: usize) -> u64 {
+    TIMER_IRQ_COUNT[cpu].load(core::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(target_arch = "riscv64")]

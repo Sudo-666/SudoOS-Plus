@@ -1871,8 +1871,17 @@ pub fn initialize() {
     }
 
     crate::smp::mark_boot_scheduler_registered();
-    crate::smp::mark_current_scheduler_active();
+}
 
+/// 在周期定时器启动、本地中断开启之后调用：标记 BSP scheduler active 并
+/// 孵化任务回收线程。
+///
+/// 启动顺序：Scheduler 必须已构造、发布、注册（initialize），然后
+/// `time::start_periodic` 启动周期定时器并开启中断，最后本函数把 BSP 标记为
+/// scheduler-active 并创建 reaper。Scheduler::spawn 断言目标 CPU 已
+/// scheduler-active，故 reaper 必须在 mark_current_scheduler_active 之后创建。
+pub fn start_boot_scheduler() {
+    crate::smp::mark_current_scheduler_active();
     spawn_system_thread(task_reaper_main, Some(CpuId::BOOT), Some(CpuId::BOOT));
 
     #[cfg(feature = "platform-ls2k1000")]
@@ -1882,6 +1891,7 @@ pub fn initialize() {
     wait_queue::verify_local();
     #[cfg(feature = "platform-ls2k1000")]
     crate::heap::dump_heap_state("pre-sched-print");
+    let discovered = crate::smp::discovered_cpu_count();
     crate::println!("kernel scheduler:");
     crate::println!("  policy          : preemptive per-CPU FIFO round-robin");
     crate::println!("  kernel stack    : 64 KiB plus guard pages");
