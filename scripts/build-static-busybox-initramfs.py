@@ -39,12 +39,13 @@ INITTAB = (
 )
 
 # /etc/profile is sourced by ash login shells. PATH must cover every applet
-# symlink the kernel installs; PS1 identifies the sudoos root shell.
+# symlink the kernel installs; PS1 embeds ${PWD} so the prompt tracks the
+# current directory (Gate C dynamic prompt).
 PROFILE = (
     b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"
     b"export HOME=/root\n"
     b"export TERM=vt100\n"
-    b"export PS1='sudoos:/# '\n"
+    b"export PS1='sudoos:${PWD}# '\n"
 )
 
 DYNAMIC_MARKERS = [

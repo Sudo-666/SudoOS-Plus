@@ -74,7 +74,7 @@ def check_archive(path: Path) -> list[tuple[str, bool, str]]:
     checks.append(("/bin/sh applet", "bin/sh" in entries and stat.S_ISLNK(entries["bin/sh"][0]), "shell applet symlink present"))
     checks.append(("basic dirs", all(d in entries and stat.S_ISDIR(entries[d][0]) for d in ["dev", "proc", "sys", "tmp", "etc", "bin", "sbin", "usr/bin", "usr/sbin"]), "runtime dirs present"))
     checks.append(("/etc/inittab", "etc/inittab" in entries and stat.S_ISREG(entries["etc/inittab"][0]) and b"SUDOOS_INIT_READY" in entries["etc/inittab"][2] and b"askfirst" in entries["etc/inittab"][2], "init rc script carries ready marker + askfirst shell"))
-    checks.append(("/etc/profile", "etc/profile" in entries and stat.S_ISREG(entries["etc/profile"][0]) and b"export PATH=" in entries["etc/profile"][2] and b"PS1=" in entries["etc/profile"][2], "shell profile exports PATH and PS1"))
+    checks.append(("/etc/profile", "etc/profile" in entries and stat.S_ISREG(entries["etc/profile"][0]) and b"export PATH=" in entries["etc/profile"][2] and b"PS1=" in entries["etc/profile"][2] and b"${PWD}" in entries["etc/profile"][2], "shell profile exports PATH + dynamic dir PS1"))
     checks.append(("/sbin admin symlinks", all(k in entries and stat.S_ISLNK(entries[k][0]) and entries[k][2] == b"../bin/busybox" for k in ["sbin/init", "sbin/reboot", "sbin/poweroff", "sbin/halt"]), "init/reboot/poweroff/halt dispatch applets present"))
     return checks
 

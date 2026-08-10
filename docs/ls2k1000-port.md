@@ -505,7 +505,8 @@ inittab：
 ::restart:/sbin/init
 ```
 
-`profile` 导出 `PATH/HOME/TERM/PS1='sudoos:/# '`。`/init` 是 busybox 的
+`profile` 导出 `PATH/HOME/TERM/PS1='sudoos:${PWD}# '`（动态目录提示符，
+`cd` 后提示符跟随当前目录）。`/init` 是 busybox 的
 symlink，argv[0]=`/init` 触发 busybox init applet。
 
 PID 1 路径（`user::init_supervisor`）：`exec::kernel_execve_from_vfs("/init")`
@@ -547,7 +548,8 @@ SUDOOS_INIT_READY
 Please press Enter to activate this console.
 ```
 
-Gate C（RX 轮询生效后）：按 Enter 出现 `sudoos:/#` 可交互 shell。若 shell 后
+Gate C（RX 轮询生效后）：按 Enter 出现 `sudoos:/#` 可交互 shell（PS1 内嵌
+`${PWD}`，`cd /bin` 后提示符变为 `sudoos:/bin#`）。若 shell 后
 缺系统调用/ioctl，按 `init.debug=1` 观察 `unknown-syscall`、`ioctl-fail`、
 `INIT-EXIT`、`oscomp-la-ale-fail`、`user-exception` 逐项补齐（Commit 4.8），
 不预先实现未观察到的调用。
