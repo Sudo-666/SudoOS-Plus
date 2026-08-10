@@ -392,6 +392,9 @@ static OSCOMP_LA_SXD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 // ls2k1000 ALE (Ecode 0x09) unaligned-access fixup counter (stage-4 Gate A).
 #[cfg(feature = "platform-ls2k1000")]
 static OSCOMP_LA_ALE_FIXUPS: AtomicUsize = AtomicUsize::new(0);
+// Bounded diagnostic budget for ALE emulation failures (rate-limit console).
+#[cfg(feature = "platform-ls2k1000")]
+static OSCOMP_LA_ALE_FAILS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_REAL_EXCEPTION_LOGS: AtomicUsize = AtomicUsize::new(0); // SUDOOS_FINAL_DIRECT_FIX_V1
 #[cfg(target_arch = "loongarch64")]
@@ -6937,6 +6940,15 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
     return_to_kernel(frame, -EFAULT);
 }
 
+// ls2k1000 ALE emulation. The decode table lives in `ale_decode` (pure, no
+// kernel deps) so the host-side `scripts/ale_decode_check.rs` can compile the
+// exact same file standalone.
+#[cfg(feature = "platform-ls2k1000")]
+mod ale_decode;
+
+#[cfg(feature = "platform-ls2k1000")]
+use ale_decode::{AleEmulationError, decode_ale_insn, load_value_from_bytes};
+
 /// Emulate one LoongArch unaligned load/store (ALE, Ecode 0x09) in user mode.
 ///
 /// GCC/musl LoongArch binaries are compiled with ual enabled by default: the
@@ -6946,86 +6958,85 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
 /// uaccess helpers, write back the target register and advance `era` by 4
 /// (every LoongArch instruction is 32 bits wide).
 ///
+/// The access address comes from `badv` (the hardware's recorded fault
+/// address for ALE) rather than re-deriving rj+imm: that avoids the
+/// LDPTR/STPTR si14<<2 rule and the LD/ST si12 sign-extension entirely.
+///
 /// Returns `true` when the instruction was emulated; `false` for unsupported
 /// opcodes (e.g. FP loads, which need the FP register file) or an unmapped
-/// address, so the caller can fall back to the default -EFAULT kill.
+/// address, so the caller can fall back to the default -EFAULT kill. On a
+/// fallback an `oscomp-la-ale-fail` line reports the exact reason.
 ///
 /// ls2k1000-only: qemu_virt keeps its previous fail-fast ALE behaviour.
 #[cfg(feature = "platform-ls2k1000")]
 fn emulate_unaligned_loongarch(frame: &mut crate::arch::trap::TrapFrame) -> bool {
-    // Fetch the faulting instruction (a user VA) through the checked path.
-    let mut insn_bytes = [0u8; 4];
-    if copy_from_user(frame.era, &mut insn_bytes).is_err() {
-        return false;
+    let result = fetch_faulting_insn(frame).and_then(|insn| emulate_unaligned_insn(frame, insn));
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            // Bounded so a pathological process cannot flood the console.
+            let n = OSCOMP_LA_ALE_FAILS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 {
+                crate::println!(
+                    "oscomp-la-ale-fail: era={:#x} badv={:#x} badi={:#x} reason={:?}",
+                    frame.era,
+                    frame.badv,
+                    frame.badi,
+                    error,
+                );
+            }
+            false
+        }
     }
-    let insn = u32::from_le_bytes(insn_bytes);
-    let opcode = insn & 0xfc000000;
-    let rd = (insn & 0x1f) as usize;
-    let rj = ((insn >> 5) & 0x1f) as usize;
+}
 
-    // (is_load, size_bytes, sign_extend, si14_immediate).
-    let (is_load, size, sign, wide_imm) = match opcode {
-        0x0a000000 => (true, 1, true, false),  // ld.b
-        0x12000000 => (true, 1, false, false), // ld.bu
-        0x0b000000 => (true, 2, true, false),  // ld.h
-        0x13000000 => (true, 2, false, false), // ld.hu
-        0x0c000000 => (true, 4, true, false),  // ld.w
-        0x14000000 => (true, 4, false, false), // ld.wu
-        0x0d000000 => (true, 8, false, false), // ld.d
-        0x0e000000 => (false, 1, false, false), // st.b
-        0x0f000000 => (false, 2, false, false), // st.h
-        0x10000000 => (false, 4, false, false), // st.w
-        0x11000000 => (false, 8, false, false), // st.d
-        0x1c000000 => (true, 4, true, true),   // ldptr.w
-        0x1d000000 => (true, 8, false, true),  // ldptr.d
-        0x1e000000 => (false, 4, false, true), // stptr.w
-        0x1f000000 => (false, 8, false, true), // stptr.d
-        _ => return false,
-    };
+/// Fetch the ALE-faulting instruction. BADI carries it on some LoongArch
+/// models; on the LA264 (LS2K1000) it stays 0 for ALE, so fall back to the
+/// checked fetch from ERA (the executing PC is always mapped).
+#[cfg(feature = "platform-ls2k1000")]
+fn fetch_faulting_insn(frame: &crate::arch::trap::TrapFrame) -> Result<u32, AleEmulationError> {
+    if frame.badi != 0 {
+        return Ok(frame.badi as u32);
+    }
+    let mut insn_bytes = [0u8; 4];
+    copy_from_user(frame.era, &mut insn_bytes)
+        .map_err(|_| AleEmulationError::InstructionFetch)?;
+    Ok(u32::from_le_bytes(insn_bytes))
+}
 
-    let raw_imm = if wide_imm {
-        (insn >> 10) & 0x3fff
-    } else {
-        (insn >> 10) & 0xfff
-    };
-    let shift = if wide_imm { 18 } else { 20 };
-    let imm = ((raw_imm << shift) as i32 >> shift) as i64;
-    let address = (frame.gpr[rj] as i64).wrapping_add(imm) as usize;
+#[cfg(feature = "platform-ls2k1000")]
+fn emulate_unaligned_insn(
+    frame: &mut crate::arch::trap::TrapFrame,
+    insn: u32,
+) -> Result<(), AleEmulationError> {
+    let decoded = decode_ale_insn(insn).ok_or(AleEmulationError::UnsupportedOpcode(insn))?;
+
+    // ALE: BADV holds the faulting (final) address; use it directly.
+    let address = frame.badv;
 
     let mut bytes = [0u8; 8];
-    if is_load {
-        if copy_from_user(address, &mut bytes[..size]).is_err() {
-            return false;
+    if decoded.is_load {
+        if copy_from_user(address, &mut bytes[..decoded.size]).is_err() {
+            return Err(AleEmulationError::LoadFault(address));
         }
-        let value = match (size, sign) {
-            (1, true) => bytes[0] as i8 as u64,
-            (1, false) => bytes[0] as u64,
-            (2, true) => u16::from_le_bytes([bytes[0], bytes[1]]) as i16 as u64,
-            (2, false) => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
-            (4, true) => {
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i32 as u64
-            }
-            (4, false) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
-            (8, false) => u64::from_le_bytes(bytes),
-            _ => return false,
-        };
+        let value = load_value_from_bytes(decoded.size, decoded.sign_extend, &bytes);
         // r0 is hard-wired to zero; the trap frame must keep it that way.
-        if rd != 0 {
-            frame.gpr[rd] = value as usize;
+        if decoded.rd != 0 {
+            frame.gpr[decoded.rd] = value as usize;
         }
     } else {
-        let value = frame.gpr[rd];
-        for (index, byte) in value.to_le_bytes().iter().enumerate().take(size) {
+        let value = frame.gpr[decoded.rd];
+        for (index, byte) in value.to_le_bytes().iter().enumerate().take(decoded.size) {
             bytes[index] = *byte;
         }
-        if copy_to_user(address, &bytes[..size]).is_err() {
-            return false;
+        if copy_to_user(address, &bytes[..decoded.size]).is_err() {
+            return Err(AleEmulationError::StoreFault(address));
         }
     }
 
     // Every LoongArch instruction is 32 bits; resume after the faulting one.
     frame.era = frame.era.wrapping_add(4);
-    true
+    Ok(())
 }
 
 fn sys_brk(address: usize) -> isize {

@@ -463,6 +463,20 @@ SMOKE_TEST: PASS
 （`user.rs:999 assertion left == right failed: left: -14`）。qemu_virt 不启用
 该模拟器，保持原有 fail-fast 行为。
 
+**ALE 解码表**（`kernel/src/user/ale_decode.rs`，与独立自检
+`scripts/ale_decode_check.rs` 同一文件）分两组：
+- `ldptr/stptr`（si14）：8 位操作码在 bits[31:24]，mask `0xff00_0000`，
+  `ldptr.w=0x2400_0000`、`stptr.w=0x2500_0000`、`ldptr.d=0x2600_0000`、
+  `stptr.d=0x2700_0000`；
+- `ld/st`（si12）：10 位操作码在 bits[31:22]，mask `0xffc0_0000`，
+  `ld.b=0x2800_0000` … `ld.wu=0x2a80_0000`。
+
+访存地址直接取 `badv`（ALE 时硬件记录的实际故障地址），不重新推导
+rj+si12/si14（避免 si14<<2 规则）。指令从 `badi`（非零时）或 `era` 取回。
+模拟失败时打印 `oscomp-la-ale-fail: era=… badv=… badi=… reason=…`（前 8 次），
+`reason=UnsupportedOpcode(0x…)` 说明缺哪类编码（如 FP 未对齐 ld/st），
+然后进程按 -EFAULT 终止。
+
 ## 7. 相关文件清单
 
 ```
