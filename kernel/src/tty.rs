@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use myos_vfs::{Errno, MutableIoBuffer};
 
 use crate::irq_lock::IrqSpinLock;
@@ -27,6 +29,15 @@ const B38400: u32 = 0x0000_000f;
 
 static CONSOLE_TTY: IrqSpinLock<TtyState> = IrqSpinLock::new_with_class(TtyState::new(), TTY_LOCK);
 static TTY_READ_WAIT: WaitQueue = WaitQueue::new();
+
+// Stage-4 Gate-C diagnostics (bounded so they never flood the console). These
+// are shared TTY instrumentation, not board-specific: they only fire when a
+// process actually blocks on the console or input is fed to it, so qemu_virt's
+// SelfTest boot (no input path) never prints them.
+const TTY_DIAG_LIMIT: usize = 8;
+static TTY_BLOCK_LOG: AtomicUsize = AtomicUsize::new(0);
+static TTY_RX_LOG: AtomicUsize = AtomicUsize::new(0);
+static TTY_READ_LOG: AtomicUsize = AtomicUsize::new(0);
 
 struct TtyState {
     buffer: [u8; TTY_BUFFER],
@@ -100,7 +111,11 @@ pub fn input_byte(byte: u8) {
                 write_output(b"\r\n");
             }
             drop(tty);
-            wake_readers();
+            let woken = wake_readers();
+            let index = TTY_RX_LOG.fetch_add(1, Ordering::Relaxed);
+            if index < TTY_DIAG_LIMIT {
+                crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
+            }
         }
         0x08 | 0x7f => {
             if tty.erase() && tty.echo {
@@ -126,7 +141,11 @@ pub fn input_byte(byte: u8) {
                 write_output(&[byte]);
             }
             drop(tty);
-            wake_readers();
+            let woken = wake_readers();
+            let index = TTY_RX_LOG.fetch_add(1, Ordering::Relaxed);
+            if index < TTY_DIAG_LIMIT {
+                crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
+            }
         }
     }
 }
@@ -140,12 +159,24 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
     loop {
         let mut tty = CONSOLE_TTY.lock();
         if tty.len != 0 {
-            return Ok(tty.pop_into(buf));
+            let n = tty.pop_into(buf);
+            drop(tty);
+            let index = TTY_READ_LOG.fetch_add(1, Ordering::Relaxed);
+            if index < TTY_DIAG_LIMIT {
+                let pid = current_process().map(|p| p.id().get()).unwrap_or(0);
+                crate::println!("TTY-READ: pid={pid} got {n} byte(s)");
+            }
+            return Ok(n);
         }
         if !can_block {
             return Err(Errno::Eagain);
         }
         drop(tty);
+        let index = TTY_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+        if index < TTY_DIAG_LIMIT {
+            let pid = current_process().map(|p| p.id().get()).unwrap_or(0);
+            crate::println!("TTY-READ: pid={pid} blocked");
+        }
         let _ = crate::task::block_current_on_if_from_user_trap(&TTY_READ_WAIT, || {
             CONSOLE_TTY.lock().len == 0
         });
@@ -347,9 +378,11 @@ fn write_output(bytes: &[u8]) {
     crate::console::write_bytes(bytes);
 }
 
-fn wake_readers() {
+fn wake_readers() -> usize {
     if crate::task::scheduler_is_initialized() {
-        TTY_READ_WAIT.wake_all();
+        TTY_READ_WAIT.wake_all()
+    } else {
+        0
     }
 }
 
