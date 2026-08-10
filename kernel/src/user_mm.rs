@@ -656,6 +656,36 @@ impl UserMm {
         finish_retirement(retirement)
     }
 
+    /// Drop resident pages from adjacent anonymous VMAs without removing them.
+    ///
+    /// This implements the observable part of Linux MADV_DONTNEED used by
+    /// jemalloc: a later access faults the page back in as zero-filled.  ELF
+    /// file mappings are eagerly populated by this kernel and cannot yet be
+    /// reconstructed on demand, so callers leave non-anonymous VMAs intact.
+    pub fn discard_anonymous_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
+        let retirement = {
+            let mut state = self.state.lock();
+            let mut cursor = range.start();
+            loop {
+                let area = state
+                    .core
+                    .layout()
+                    .find_area(cursor)
+                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                if !matches!(area.kind(), myos_mm::VmAreaKind::Anonymous) {
+                    return Ok(());
+                }
+                let next = min(area.range().end(), range.end());
+                if next == range.end() {
+                    break;
+                }
+                cursor = next;
+            }
+            retire_range_locked(&mut state, range)?
+        };
+        finish_retirement(retirement)
+    }
+
     pub fn protect_range(
         &self,
         range: VirtRange,
