@@ -81,6 +81,7 @@ enum DeviceKind {
     Null,
     Zero,
     Console,
+    Tty,
     Random,
     Urandom,
     Ptmx,
@@ -113,6 +114,7 @@ pub fn initialize() {
     insert_child(&dev, "zero", device(DeviceKind::Zero)).expect("unable to install /dev/zero");
     insert_child(&dev, "console", device(DeviceKind::Console))
         .expect("unable to install /dev/console");
+    insert_child(&dev, "tty", device(DeviceKind::Tty)).expect("unable to install /dev/tty");
     insert_child(&dev, "random", device(DeviceKind::Random))
         .expect("unable to install /dev/random");
     insert_child(&dev, "urandom", device(DeviceKind::Urandom))
@@ -128,7 +130,7 @@ pub fn initialize() {
     crate::println!("vfs:");
     crate::println!("  root fs       : tmpfs");
     crate::println!(
-        "  devfs         : /dev/null /dev/zero /dev/console /dev/random /dev/urandom /dev/rtc /dev/ptmx /dev/pts + block devices"
+        "  devfs         : /dev/null /dev/zero /dev/console /dev/tty /dev/random /dev/urandom /dev/rtc /dev/ptmx /dev/pts + block devices"
     );
     crate::println!("  fd table      : per-process");
 }
@@ -209,6 +211,12 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<myos_vfs::ArcFile, Errno> {
                 let (master, _slave, _index) = crate::devpts::create_pty_pair(flags)?;
                 // slave 应注册到 /dev/pts/<N>，此处简化处理
                 return Ok(master);
+            }
+            if let DeviceKind::Tty = kind {
+                // /dev/tty only works for processes with a controlling terminal.
+                if !crate::tty::has_controlling_tty() {
+                    return Err(Errno::Enxio);
+                }
             }
             Arc::new(DeviceFile { node, kind })
         }
@@ -1864,7 +1872,7 @@ impl FileOperations for DeviceFile {
     fn read(&self, _file: &File, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         match self.kind {
             DeviceKind::Null => Ok(0),
-            DeviceKind::Console => crate::tty::read_console(buf),
+            DeviceKind::Console | DeviceKind::Tty => crate::tty::read_console(buf),
             DeviceKind::Zero => {
                 let zeros = [0_u8; 64];
                 let mut total = 0;
@@ -1913,7 +1921,7 @@ impl FileOperations for DeviceFile {
             | DeviceKind::Random
             | DeviceKind::Urandom
             | DeviceKind::Rtc => Ok(buf.len()),
-            DeviceKind::Console => Ok(crate::tty::write_console(buf.as_bytes())),
+            DeviceKind::Console | DeviceKind::Tty => Ok(crate::tty::write_console(buf.as_bytes())),
             // Ptmx handled before DeviceFile creation
             _ => Ok(buf.len()),
         }
@@ -1929,7 +1937,7 @@ impl FileOperations for DeviceFile {
 
     fn ioctl(&self, _file: &File, cmd: usize, arg: usize) -> Result<usize, Errno> {
         match self.kind {
-            DeviceKind::Console => crate::tty::ioctl(cmd, arg),
+            DeviceKind::Console | DeviceKind::Tty => crate::tty::ioctl(cmd, arg),
             DeviceKind::Rtc => crate::rtc::ioctl(cmd, arg),
             DeviceKind::Null | DeviceKind::Zero => Err(Errno::Enotty),
             // Ptmx, Random, Urandom — no ioctl support
@@ -1939,7 +1947,7 @@ impl FileOperations for DeviceFile {
 
     fn poll(&self, file: &File, requested: PollEvents) -> PollEvents {
         match self.kind {
-            DeviceKind::Console => {
+            DeviceKind::Console | DeviceKind::Tty => {
                 let mut ready = PollEvents::empty();
                 if file.flags().access_mode().is_readable() && crate::tty::input_ready() {
                     ready = ready.union(PollEvents::IN);

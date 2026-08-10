@@ -97,6 +97,7 @@ const SYS_SETSID: usize = crate::syscall::number::SETSID;
 const SYS_SETPGID: usize = crate::syscall::number::SETPGID;
 const SYS_GETPGID: usize = crate::syscall::number::GETPGID;
 const SYS_GETSID: usize = crate::syscall::number::GETSID;
+const SYS_REBOOT: usize = crate::syscall::number::REBOOT;
 const SYS_RT_SIGACTION: usize = crate::syscall::number::RT_SIGACTION;
 const SYS_RT_SIGPROCMASK: usize = crate::syscall::number::RT_SIGPROCMASK;
 const SYS_RT_SIGTIMEDWAIT: usize = crate::syscall::number::RT_SIGTIMEDWAIT;
@@ -6166,6 +6167,10 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         SYS_SETPGID => set_syscall_result(frame, sys_setpgid(arguments[0], arguments[1])),
         SYS_GETPGID => set_syscall_result(frame, sys_getpgid(arguments[0])),
         SYS_GETSID => set_syscall_result(frame, sys_getsid(arguments[0])),
+        SYS_REBOOT => set_syscall_result(
+            frame,
+            sys_reboot(arguments[0], arguments[1], arguments[2], arguments[3]),
+        ),
         SYS_KILL => set_syscall_result(frame, sys_kill(arguments[0], arguments[1])),
         SYS_TKILL => set_syscall_result(frame, sys_kill(arguments[0], arguments[1])),
         SYS_TGKILL => set_syscall_result(frame, sys_kill(arguments[1], arguments[2])),
@@ -9337,6 +9342,29 @@ fn sys_getsid(pid: usize) -> isize {
         }
     };
     process.session()
+}
+
+fn sys_reboot(magic1: usize, magic2: usize, command: usize, _argument: usize) -> isize {
+    const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;
+    const LINUX_REBOOT_MAGIC2: usize = 0x2812_1969;
+    const LINUX_REBOOT_CMD_CAD_OFF: usize = 0x0;
+    const LINUX_REBOOT_CMD_CAD_ON: usize = 0x89_0123;
+    const LINUX_REBOOT_CMD_RESTART: usize = 0x1234_5678;
+    const LINUX_REBOOT_CMD_HALT: usize = 0xcdef_0123;
+    const LINUX_REBOOT_CMD_POWER_OFF: usize = 0x4321_fedc;
+    if magic1 != LINUX_REBOOT_MAGIC1 || magic2 != LINUX_REBOOT_MAGIC2 {
+        return -crate::syscall::errno::EINVAL;
+    }
+    match command {
+        // BusyBox init disables Ctrl-Alt-Del with CAD_OFF at startup. Accepting
+        // these is all that is required to let init reach the shell.
+        LINUX_REBOOT_CMD_CAD_OFF | LINUX_REBOOT_CMD_CAD_ON => 0,
+        // Real restart/halt/power-off is not wired to the platform yet.
+        LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_HALT | LINUX_REBOOT_CMD_POWER_OFF => {
+            -crate::syscall::errno::EPERM
+        }
+        _ => -crate::syscall::errno::EINVAL,
+    }
 }
 
 fn sys_kill(pid: usize, signal: usize) -> isize {

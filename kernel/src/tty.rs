@@ -17,6 +17,15 @@ pub const TCSETSW: usize = 0x5403;
 pub const TCSETSF: usize = 0x5404;
 pub const TIOCGWINSZ: usize = 0x5413;
 pub const TIOCSWINSZ: usize = 0x5414;
+// termios2 ABI (2026 static glibc uses TCGETS2 for isatty()/tcgetattr())
+pub const TCGETS2: usize = 0x802c_542a;
+pub const TCSETS2: usize = 0x402c_542b;
+pub const TCSETSW2: usize = 0x402c_542c;
+pub const TCSETSF2: usize = 0x402c_542d;
+// controlling terminal
+pub const TIOCSCTTY: usize = 0x540e;
+pub const TIOCNOTTY: usize = 0x5422;
+pub const TIOCGSID: usize = 0x5429;
 
 const NCCS: usize = 19;
 const ECHO: u32 = 0x0000_0008;
@@ -46,7 +55,9 @@ struct TtyState {
     len: usize,
     canonical: bool,
     echo: bool,
+    isig: bool,
     foreground_pgrp: isize,
+    controlling_session: isize,
     rows: u16,
     cols: u16,
 }
@@ -59,7 +70,9 @@ impl TtyState {
             len: 0,
             canonical: true,
             echo: true,
+            isig: true,
             foreground_pgrp: 0,
+            controlling_session: 0,
             rows: 24,
             cols: 80,
         }
@@ -95,6 +108,39 @@ impl TtyState {
         self.len -= 1;
         true
     }
+
+    /// Whether a read() would return right now. Canonical mode waits for a
+    /// complete line (terminated by '\n'); non-canonical mode returns as soon
+    /// as any byte is buffered.
+    fn read_ready(&self) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        if !self.canonical {
+            return true;
+        }
+        let mut index = self.head;
+        for _ in 0..self.len {
+            if self.buffer[index] == b'\n' {
+                return true;
+            }
+            index = (index + 1) % TTY_BUFFER;
+        }
+        false
+    }
+}
+
+/// Whether the current process is a member of the console's controlling
+/// session (Linux semantics for opening /dev/tty).
+pub fn has_controlling_tty() -> bool {
+    let Some(thread) = crate::task::current_user_thread() else {
+        return false;
+    };
+    let session = thread.process_arc().session();
+    if session == 0 {
+        return false;
+    }
+    CONSOLE_TTY.lock().controlling_session == session
 }
 
 pub fn initialize() {
@@ -118,12 +164,12 @@ pub fn input_byte(byte: u8) {
                 crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
             }
         }
-        0x08 | 0x7f => {
+        0x08 | 0x7f if tty.canonical => {
             if tty.erase() && tty.echo {
                 write_output(b"\x08 \x08");
             }
         }
-        0x03 => {
+        0x03 if tty.isig => {
             if tty.echo {
                 write_output(b"^C\r\n");
             }
@@ -141,8 +187,11 @@ pub fn input_byte(byte: u8) {
             if tty.echo {
                 write_output(&[byte]);
             }
+            // canonical mode delivers whole lines: plain bytes never wake a
+            // reader, only the line terminator does.
+            let wake = !tty.canonical;
             drop(tty);
-            let woken = wake_readers();
+            let woken = if wake { wake_readers() } else { 0 };
             let index = TTY_RX_LOG.fetch_add(1, Ordering::Relaxed);
             if index < TTY_DIAG_LIMIT {
                 crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
@@ -159,7 +208,7 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
 
     loop {
         let mut tty = CONSOLE_TTY.lock();
-        if tty.len != 0 {
+        if tty.read_ready() {
             let n = tty.pop_into(buf);
             drop(tty);
             let index = TTY_READ_LOG.fetch_add(1, Ordering::Relaxed);
@@ -179,13 +228,13 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
             crate::println!("TTY-READ: pid={pid} blocked");
         }
         let _ = crate::task::block_current_on_if_from_user_trap(&TTY_READ_WAIT, || {
-            CONSOLE_TTY.lock().len == 0
+            !CONSOLE_TTY.lock().read_ready()
         });
     }
 }
 
 pub fn input_ready() -> bool {
-    CONSOLE_TTY.lock().len != 0
+    CONSOLE_TTY.lock().read_ready()
 }
 
 pub fn write_console(bytes: &[u8]) -> usize {
@@ -224,6 +273,13 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
             copy_to_user(arg, termios.as_bytes())?;
             Ok(0)
         }
+        TCGETS2 => {
+            let tty = CONSOLE_TTY.lock();
+            let termios2 = KernelTermios2::from_tty(&tty);
+            drop(tty);
+            copy_to_user(arg, termios2.as_bytes())?;
+            Ok(0)
+        }
         TCSETS | TCSETSW | TCSETSF => {
             let process = current_process()?;
             let mut termios = KernelTermios::zeroed();
@@ -234,6 +290,20 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
             let mut tty = CONSOLE_TTY.lock();
             tty.canonical = termios.lflag & ICANON != 0;
             tty.echo = termios.lflag & ECHO != 0;
+            tty.isig = termios.lflag & ISIG != 0;
+            Ok(0)
+        }
+        TCSETS2 | TCSETSW2 | TCSETSF2 => {
+            let process = current_process()?;
+            let mut termios2 = KernelTermios2::zeroed();
+            process
+                .mm()
+                .copy_from_user(arg, termios2.as_mut_bytes())
+                .map_err(|_| Errno::Efault)?;
+            let mut tty = CONSOLE_TTY.lock();
+            tty.canonical = termios2.lflag & ICANON != 0;
+            tty.echo = termios2.lflag & ECHO != 0;
+            tty.isig = termios2.lflag & ISIG != 0;
             Ok(0)
         }
         TIOCGPGRP => {
@@ -278,6 +348,49 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
             }
             Ok(0)
         }
+        TIOCSCTTY => {
+            let process = current_process()?;
+            let session = process.session();
+            // Only a session leader without a controlling terminal may claim it.
+            if session == 0 || session != process.id().get() as isize {
+                return Err(Errno::Eperm);
+            }
+            let pgrp = process.process_group();
+            let mut tty = CONSOLE_TTY.lock();
+            if tty.controlling_session != 0 {
+                return Err(Errno::Ebusy);
+            }
+            tty.controlling_session = session;
+            tty.foreground_pgrp = pgrp;
+            drop(tty);
+            if crate::user::oscomp_verbose_user_trace_active() {
+                crate::println!(
+                    "TTY-CTTY: pid={} sid={} pgrp={} acquired",
+                    process.id().get(),
+                    session,
+                    pgrp,
+                );
+            }
+            Ok(0)
+        }
+        TIOCNOTTY => {
+            let process = current_process()?;
+            let mut tty = CONSOLE_TTY.lock();
+            if tty.controlling_session == process.id().get() as isize {
+                // The session leader is releasing the terminal.
+                tty.controlling_session = 0;
+                tty.foreground_pgrp = 0;
+            }
+            Ok(0)
+        }
+        TIOCGSID => {
+            let sid = CONSOLE_TTY.lock().controlling_session;
+            if sid == 0 {
+                return Err(Errno::Enotty);
+            }
+            copy_to_user(arg, &(sid as i32).to_ne_bytes())?;
+            Ok(0)
+        }
         _ => Err(Errno::Enotty),
     }
 }
@@ -309,7 +422,9 @@ impl KernelTermios {
         termios.iflag = ICRNL;
         termios.oflag = OPOST;
         termios.cflag = B38400 | CS8;
-        termios.lflag = ISIG;
+        if tty.isig {
+            termios.lflag |= ISIG;
+        }
         if tty.canonical {
             termios.lflag |= ICANON;
         }
@@ -335,6 +450,78 @@ impl KernelTermios {
 
     fn as_mut_bytes(&mut self) -> &mut [u8] {
         // SAFETY: termios is a repr(C) POD ABI buffer filled immediately.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(*self) as *mut u8,
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+#[repr(C)]
+struct KernelTermios2 {
+    iflag: u32,
+    oflag: u32,
+    cflag: u32,
+    lflag: u32,
+    line: u8,
+    cc: [u8; NCCS],
+    ispeed: u32,
+    ospeed: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<KernelTermios2>() == 44);
+
+impl KernelTermios2 {
+    const fn zeroed() -> Self {
+        Self {
+            iflag: 0,
+            oflag: 0,
+            cflag: 0,
+            lflag: 0,
+            line: 0,
+            cc: [0; NCCS],
+            ispeed: 0,
+            ospeed: 0,
+        }
+    }
+
+    fn from_tty(tty: &TtyState) -> Self {
+        let mut termios2 = Self::zeroed();
+        termios2.iflag = ICRNL;
+        termios2.oflag = OPOST;
+        termios2.cflag = B38400 | CS8;
+        if tty.isig {
+            termios2.lflag |= ISIG;
+        }
+        if tty.canonical {
+            termios2.lflag |= ICANON;
+        }
+        if tty.echo {
+            termios2.lflag |= ECHO;
+        }
+        termios2.cc[0] = 3;
+        termios2.cc[4] = 4;
+        termios2.cc[5] = 0;
+        termios2.cc[6] = 1;
+        termios2.ispeed = 115200;
+        termios2.ospeed = 115200;
+        termios2
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: termios2 is a repr(C) POD ABI buffer copied immediately.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::addr_of!(*self) as *const u8,
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        // SAFETY: termios2 is a repr(C) POD ABI buffer filled immediately.
         unsafe {
             core::slice::from_raw_parts_mut(
                 core::ptr::addr_of_mut!(*self) as *mut u8,

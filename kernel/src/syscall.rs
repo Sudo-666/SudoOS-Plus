@@ -66,6 +66,7 @@ pub mod number {
     pub const TGKILL: usize = 131;
     pub const SETSID: usize = 157;
     pub const SETPGID: usize = 154;
+    pub const REBOOT: usize = 142;
     pub const RT_SIGACTION: usize = 134;
     pub const RT_SIGPROCMASK: usize = 135;
     pub const RT_SIGTIMEDWAIT: usize = 137;

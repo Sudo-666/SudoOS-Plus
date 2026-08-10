@@ -19,6 +19,7 @@ pub enum Errno {
     Esrch = 3,
     Eintr = 4,
     Eio = 5,
+    Enxio = 6,
     Ebadf = 9,
     Echild = 10,
     Eagain = 11,
