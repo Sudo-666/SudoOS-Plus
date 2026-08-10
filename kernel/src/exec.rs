@@ -173,6 +173,18 @@ pub fn kernel_execve_from_initramfs(
     exec_elf(file, config)
 }
 
+/// Exec a user binary that already lives in the kernel VFS (e.g. `/init` from
+/// an unpacked initramfs or `/bin/busybox`). Reads the image through
+/// `load_exec_image_from_vfs` and builds a fresh Process + leader thread with
+/// `/dev/console` wired to fds 0/1/2 via `exec_elf`.
+pub fn kernel_execve_from_vfs(
+    path: &str,
+    config: ExecConfig<'_>,
+) -> Result<ExecImage, ExecError> {
+    let image = load_exec_image_from_vfs(path)?;
+    exec_elf(&image, config)
+}
+
 pub fn exec_elf(image: &[u8], config: ExecConfig<'_>) -> Result<ExecImage, ExecError> {
     let prepared = prepare_elf(image, config)?;
     let process = Process::create(prepared.mm);

@@ -1007,6 +1007,75 @@ fn verify_busybox_rootfs_thread() {
     crate::println!("  /bin/busybox true : verified");
 }
 
+/// Slot for the `/init` thread Arc handed to the PID 1 exit monitor. The
+/// monitor is a bare kernel-thread entry (`KernelThreadEntry = fn()`), so the
+/// Arc is parked here instead of captured by a closure.
+static PID1_EXIT_MONITOR: crate::irq_lock::IrqSpinLock<Option<Arc<Thread>>> =
+    crate::irq_lock::IrqSpinLock::new_with_class(
+        None,
+        crate::lockdep::LockClass::new(
+            "init.pid1",
+            crate::lockdep::LockRank::Process,
+            4,
+        ),
+    );
+
+/// Boot the real `/init` from the unpacked rootfs as PID 1.
+///
+/// Called only from the `rdinit=/init` boot branch, after the scheduler, SMP
+/// bring-up and workqueue are live, in boot-idle context on the boot CPU.
+/// Loads `/init` from the VFS, asserts it became PID 1 (the first `Process`,
+/// since every self-test that would allocate a throwaway PID is skipped),
+/// wires `/dev/console` to fds 0/1/2 (done inside `exec_elf`), publishes the
+/// thread to the scheduler, arms a monitor that prints the status and panics
+/// if PID 1 ever exits, then hands the boot CPU to the idle loop — this
+/// function never returns.
+pub fn init_supervisor(init_path: &str) -> ! {
+    crate::println!("INIT: exec pid=1 path={init_path}");
+    let extra_areas = [VmArea::new(
+        VirtRange::from_bounds(RUNTIME_TLS_PAGE, RUNTIME_TLS_PAGE + PAGE_SIZE),
+        VmAreaFlags::user_rw(),
+        VmAreaKind::Anonymous,
+    )];
+    let exec = crate::exec::kernel_execve_from_vfs(
+        init_path,
+        crate::exec::ExecConfig {
+            argv: &[init_path],
+            envp: &["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=vt100"],
+            stack: VirtRange::from_bounds(RUNTIME_STACK, RUNTIME_STACK_TOP),
+            heap_start: VirtAddr::new(USER_HEAP_START),
+            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+            extra_areas: &extra_areas,
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!("INIT: exec failed path={init_path} reason={:?}", error);
+    });
+
+    assert_eq!(
+        exec.process.id(),
+        crate::process::ProcessId::from_raw_for_kernel(1),
+        "INIT: /init was not created as PID 1",
+    );
+
+    *PID1_EXIT_MONITOR.lock() = Some(Arc::clone(&exec.thread));
+    crate::task::spawn_kernel_thread(pid1_exit_monitor);
+
+    let _init_task = crate::task::spawn_user_thread_on(exec.thread, None);
+    crate::task::boot_idle_loop()
+}
+
+fn pid1_exit_monitor() {
+    let thread = PID1_EXIT_MONITOR
+        .lock()
+        .as_ref()
+        .expect("PID 1 exit monitor armed without an init thread")
+        .clone();
+    let status = thread.wait_for_exit();
+    crate::println!("INIT-EXIT: pid=1 status={status}");
+    panic!("PID 1 (/init) exited — fatal");
+}
+
 pub fn verify_sdcard_sample() {
     if crate::block::open_device("vda").is_none() {
         return;
