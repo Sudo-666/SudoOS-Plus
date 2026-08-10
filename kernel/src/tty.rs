@@ -33,7 +33,12 @@ const ICRNL: u32 = 0x0000_0100;
 const OPOST: u32 = 0x0000_0001;
 const ONLCR: u32 = 0x0000_0004;
 const CS8: u32 = 0x0000_0030;
-const B115200: u32 = 0x0000_1001;
+const NOFLSH: u32 = 0x0000_0080;
+// asm-generic CBAUD layout: B0..B38400 occupy the low nibble (0x0..0xf); the
+// B57600..B4000000 family adds bit 12 (CBAUDEX = 0x1000). 0x1001 is B57600,
+// NOT 115200 (the old constant reported 115200 for what is actually 57600).
+const B57600: u32 = 0x0000_1001;
+const B115200: u32 = 0x0000_1002;
 const CBAUD: u32 = 0x0000_100f;
 // asm-generic termios c_cc[] indexes (VINTR at index 0, etc.)
 const VINTR: usize = 0;
@@ -49,6 +54,9 @@ struct TtyState {
     buffer: [u8; TTY_BUFFER],
     head: usize,
     len: usize,
+    // Set when VEOF (^D) is received on an empty canonical line; the next
+    // read() then returns 0 (end-of-file) so shells exit on ^D.
+    eof_pending: bool,
     // Full termios state so TCSETS* -> TCGETS* round-trips (BusyBox ash saves
     // the settings, switches to raw for line editing, then restores them).
     iflag: u32,
@@ -76,6 +84,7 @@ impl TtyState {
             buffer: [0; TTY_BUFFER],
             head: 0,
             len: 0,
+            eof_pending: false,
             iflag: ICRNL,
             oflag: OPOST | ONLCR,
             cflag: B115200 | CS8,
@@ -103,7 +112,10 @@ impl TtyState {
     }
 
     fn onlcr(&self) -> bool {
-        self.oflag & ONLCR != 0
+        // ONLCR is only honoured while output post-processing (OPOST) is on;
+        // clearing OPOST disables the \n -> \r\n expansion even if the ONLCR
+        // bit is left set in oflag.
+        self.oflag & (OPOST | ONLCR) == OPOST | ONLCR
     }
 
     /// Install a full termios snapshot (all fields, so the next TCGETS*
@@ -132,6 +144,7 @@ impl TtyState {
     fn flush_input(&mut self) {
         self.head = 0;
         self.len = 0;
+        self.eof_pending = false;
     }
 
     fn push(&mut self, byte: u8) {
@@ -144,6 +157,12 @@ impl TtyState {
     }
 
     fn pop_into(&mut self, output: &mut MutableIoBuffer<'_>) -> usize {
+        // VEOF on an empty line: deliver end-of-file (read returns 0). The
+        // flag is consumed here so it only fires once.
+        if self.eof_pending {
+            self.eof_pending = false;
+            return 0;
+        }
         let mut copied = 0;
         while self.len > 0 && output.remaining() > 0 {
             let byte = self.buffer[self.head];
@@ -170,7 +189,7 @@ impl TtyState {
     /// as any byte is buffered.
     fn read_ready(&self) -> bool {
         if self.len == 0 {
-            return false;
+            return self.eof_pending;
         }
         if !self.canonical() {
             return true;
@@ -207,33 +226,92 @@ pub fn initialize() {
 
 pub fn input_byte(byte: u8) {
     let mut tty = CONSOLE_TTY.lock();
+    // VINTR (default ^C): interrupt the foreground group when ISIG is on.
+    // Reads the configured cc[VINTR] so `stty intr` is honoured.
+    if tty.isig() && tty.cc[VINTR] != 0 && byte == tty.cc[VINTR] {
+        if tty.echo() {
+            write_output(b"^C\r\n");
+        }
+        // NOFLSH clear: discard unread input so keystrokes typed before the
+        // interrupt never leak into the next command line.
+        if tty.lflag & NOFLSH == 0 {
+            tty.flush_input();
+        }
+        let pgrp = tty.foreground_pgrp;
+        drop(tty);
+        if pgrp > 0 {
+            // Job-control: interrupt the whole foreground process group
+            // (e.g. `sleep 30 | cat` — both members must receive SIGINT).
+            crate::signal::send_signal_to_process_group(pgrp, crate::signal::SIGINT);
+        }
+        return;
+    }
     match byte {
-        b'\r' | b'\n' => {
+        // VEOF (default ^D) in canonical mode.
+        byte if tty.canonical() && tty.cc[VEOF] != 0 && byte == tty.cc[VEOF] => {
+            if tty.len == 0 {
+                // Empty line: next read() returns 0 (end-of-file) so shells
+                // exit on ^D.
+                tty.eof_pending = true;
+                drop(tty);
+                wake_readers();
+            } else {
+                // Partial line: deliver the pending input immediately (the
+                // VEOF char is neither echoed nor copied into the buffer).
+                tty.push(b'\n');
+                drop(tty);
+                wake_readers();
+            }
+        }
+        // ICRNL: map CR to NL on input, so Enter terminates a line.
+        b'\r' if tty.iflag & ICRNL != 0 => {
             tty.push(b'\n');
             if tty.echo() {
-                write_output(b"\r\n");
+                if tty.onlcr() {
+                    write_output(b"\r\n");
+                } else {
+                    write_output(b"\n");
+                }
             }
             drop(tty);
             wake_readers();
         }
-        0x08 | 0x7f if tty.canonical() => {
+        // ICRNL clear: CR is an ordinary character.
+        b'\r' => {
+            tty.push(b'\r');
+            if tty.echo() {
+                write_output(&[b'\r']);
+            }
+            let wake = !tty.canonical();
+            drop(tty);
+            if wake {
+                wake_readers();
+            }
+        }
+        b'\n' => {
+            tty.push(b'\n');
+            if tty.echo() {
+                if tty.onlcr() {
+                    write_output(b"\r\n");
+                } else {
+                    write_output(b"\n");
+                }
+            }
+            drop(tty);
+            wake_readers();
+        }
+        // ERASE: the configured erase char (default DEL 0x7f), plus 0x08 which
+        // many serial terminals send for Backspace regardless of stty.
+        byte if tty.canonical() && (byte == tty.cc[VERASE] || byte == 0x08) => {
             if tty.erase() && tty.echo() {
                 write_output(b"\x08 \x08");
             }
         }
-        0x03 if tty.isig() => {
-            if tty.echo() {
-                write_output(b"^C\r\n");
-            }
-            let pgrp = tty.foreground_pgrp;
-            drop(tty);
-            if pgrp > 0 {
-                // Job-control: interrupt the whole foreground process group
-                // (e.g. `sleep 30 | cat` — both members must receive SIGINT).
-                crate::signal::send_signal_to_process_group(pgrp, crate::signal::SIGINT);
-            }
-        }
         byte => {
+            // New input cancels a pending VEOF.
+            if tty.eof_pending {
+                tty.eof_pending = false;
+            }
             tty.push(byte);
             if tty.echo() {
                 write_output(&[byte]);
@@ -304,18 +382,38 @@ pub fn release_controlling_session(session: isize) {
 /// the baud (e.g. `stty 115200`), and TCGETS must then report it back.
 fn baud_from_cflag(cflag: u32) -> u32 {
     match cflag & CBAUD {
-        0x1001 => 115200,
-        0x1000 => 57600,
-        0x000f => 38400,
-        0x000e => 19200,
-        0x000d => 9600,
-        0x000c => 4800,
-        0x000b => 2400,
-        0x000a => 1800,
-        0x0009 => 1200,
-        0x0008 => 600,
+        0x0000 => 0, // B0 (hang up)
+        0x0001 => 50,
+        0x0002 => 75,
+        0x0003 => 110,
+        0x0004 => 134,
+        0x0005 => 150,
+        0x0006 => 200,
         0x0007 => 300,
-        0x0000 => 0,
+        0x0008 => 600,
+        0x0009 => 1200,
+        0x000a => 1800,
+        0x000b => 2400,
+        0x000c => 4800,
+        0x000d => 9600,
+        0x000e => 19200,
+        0x000f => 38400,
+        0x1000 => 0, // BOTHER: speed carried in termios2 ispeed/ospeed
+        B57600 => 57600,
+        B115200 => 115200,
+        0x1003 => 230400,
+        0x1004 => 460800,
+        0x1005 => 500000,
+        0x1006 => 576000,
+        0x1007 => 921600,
+        0x1008 => 1000000,
+        0x1009 => 1152000,
+        0x100a => 1500000,
+        0x100b => 2000000,
+        0x100c => 2500000,
+        0x100d => 3000000,
+        0x100e => 3500000,
+        0x100f => 4000000,
         _ => 0,
     }
 }
@@ -672,7 +770,50 @@ pub fn verify() {
     assert_eq!(read_console(&mut output).expect("tty read failed"), 3);
     assert_eq!(output.filled_bytes(), b"ok\n");
 
+    // termios ABI sizes: termios1 = 4*u32 + line:u8 + cc[19] = 36; termios2
+    // adds ispeed/ospeed = 44 (must match asm-generic).
+    assert_eq!(core::mem::size_of::<KernelTermios>(), 36);
+    assert_eq!(core::mem::size_of::<KernelTermios2>(), 44);
+    // Baud decode: low nibble B0..B38400, bit 12 (CBAUDEX) selects the
+    // B57600..B4000000 family. 0x1001 is 57600, 0x1002 is 115200.
+    assert_eq!(baud_from_cflag(0x0000), 0);
+    assert_eq!(baud_from_cflag(0x000d), 9600);
+    assert_eq!(baud_from_cflag(0x000f), 38400);
+    assert_eq!(baud_from_cflag(B57600), 57600);
+    assert_eq!(baud_from_cflag(B115200), 115200);
+    assert_eq!(baud_from_cflag(0x1003), 230400);
+    assert_eq!(baud_from_cflag(0x100f), 4000000);
+    // Only the CBAUD bits participate: unrelated high bits are masked off.
+    assert_eq!(baud_from_cflag(0x000d | 0x10000), 9600);
+    assert_eq!(baud_from_cflag(0x100d), 3000000);
+    // termios2 round-trip: install a full snapshot, read it back unchanged.
+    let mut tty = CONSOLE_TTY.lock();
+    let mut snapshot = [0_u8; NCCS];
+    snapshot[VINTR] = 3;
+    snapshot[VERASE] = 0x7f;
+    snapshot[VEOF] = 4;
+    tty.apply_termios(
+        ICRNL,
+        OPOST | ONLCR,
+        B115200 | CS8,
+        ISIG | ICANON | ECHO,
+        &snapshot,
+        115200,
+        115200,
+    );
+    let read_back = KernelTermios2::from_tty(&tty);
+    drop(tty);
+    assert_eq!(read_back.iflag, ICRNL);
+    assert_eq!(read_back.oflag, OPOST | ONLCR);
+    assert_eq!(read_back.cflag, B115200 | CS8);
+    assert_eq!(read_back.lflag, ISIG | ICANON | ECHO);
+    assert_eq!(read_back.cc, snapshot);
+    assert_eq!(read_back.ispeed, 115200);
+    assert_eq!(read_back.ospeed, 115200);
+    assert_eq!(baud_from_cflag(read_back.cflag), 115200);
+
     crate::println!("M13 TTY gate:");
     crate::println!("  canonical input      : verified");
     crate::println!("  console output       : verified");
+    crate::println!("  termios ABI/semantics : verified");
 }

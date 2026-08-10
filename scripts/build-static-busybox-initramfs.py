@@ -23,6 +23,7 @@ DEFAULT_APPLETS = [
     "chown", "sync", "dd", "hexdump", "more", "grep", "sed", "awk", "ps",
     "kill", "killall", "free", "df", "du", "hostname", "which", "readlink",
     "basename", "dirname", "expr", "printf", "wc", "head", "tail", "sort",
+    "stty", # termios acceptance tool: `stty -a` verifies the console baud/etc.
     # PID 1 / admin applets: /init runs busybox with argv[0]=/init, and the
     # /sbin/{init,reboot,poweroff,halt} symlinks dispatch the same applets.
     "init", "reboot", "poweroff", "halt",
