@@ -8,7 +8,7 @@ use crate::{
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
     smp::{CpuId, MAX_CPUS},
-    task::WaitQueue,
+    task::{InterruptibleWaitOutcome, WaitQueue},
     time::MonotonicInstant,
 };
 
@@ -377,6 +377,38 @@ pub fn sleep_until(deadline: MonotonicInstant) {
         .waiters
         .wait_until(|| context.complete.load(Ordering::Acquire));
     let _ = cancel_sync(handle);
+}
+
+/// Sleep until `deadline`, returning early with `Interrupted` when an
+/// unblocked signal arrives. Used by nanosleep/clock_nanosleep so a blocked
+/// syscall is not left behind when the foreground group is interrupted: the
+/// caller writes the remaining time back (relative sleeps) or skips `remain`
+/// (absolute clock_nanosleep) and returns -EINTR.
+pub fn sleep_interruptible_until(deadline: MonotonicInstant) -> InterruptibleWaitOutcome {
+    assert_initialized();
+    crate::context::might_sleep();
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+    if crate::time::deadline_reached(crate::time::now(), deadline) {
+        // Deadline already passed: the sleep is complete, not interrupted.
+        return InterruptibleWaitOutcome::Ready;
+    }
+
+    let context = SleepContext {
+        complete: AtomicBool::new(false),
+        waiters: WaitQueue::new(),
+    };
+    let handle = arm_at(
+        deadline,
+        sleep_callback,
+        core::ptr::addr_of!(context) as usize,
+    )
+    .unwrap_or_else(|error| panic!("unable to allocate sleep timer: {error:?}"));
+    let outcome = context
+        .waiters
+        .wait_interruptible_from_user_trap(|| context.complete.load(Ordering::Acquire));
+    let _ = cancel_sync(handle);
+    outcome
 }
 
 fn assert_initialized() {

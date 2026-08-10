@@ -24,6 +24,17 @@ pub enum WaitOutcome {
     TimedOut,
 }
 
+/// Outcome of an interruptible wait from the user-trap syscall path. A task
+/// that wakes with `Interrupted` should return -EINTR (or, for partial
+/// transfers, whatever bytes it already committed) so the pending signal is
+/// delivered on the way back to user space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InterruptibleWaitOutcome {
+    Ready,
+    Interrupted,
+    TimedOut,
+}
+
 /// Compact queue head. Waiter linkage lives in `Task`, exactly as Linux keeps
 /// the queue head small and stores a list node in each wait entry.
 ///
@@ -183,6 +194,118 @@ impl WaitQueue {
             WaitOutcome::Satisfied
         } else if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
             WaitOutcome::TimedOut
+        } else {
+            outcome
+        }
+    }
+
+    /// Block on this queue from the user-trap syscall path until `ready`
+    /// becomes true or an unblocked signal is pending. The blocking decision
+    /// atomically checks `!ready() && !current_has_unblocked_signal()` under
+    /// the scheduler lock, so a signal that lands between the check and the
+    /// sleep still wakes the task: 4.8.13's precise signal wake unlinks it
+    /// from this queue and it re-evaluates `ready()` / signal state in the
+    /// loop. Callers turn `Interrupted` into -EINTR (or return the bytes
+    /// already transferred).
+    pub fn wait_interruptible_from_user_trap<F>(&self, ready: F) -> InterruptibleWaitOutcome
+    where
+        F: Fn() -> bool,
+    {
+        crate::context::assert_task_context();
+        loop {
+            if ready() {
+                return InterruptibleWaitOutcome::Ready;
+            }
+            if super::current_has_unblocked_signal() {
+                return InterruptibleWaitOutcome::Interrupted;
+            }
+            let _ = super::block_current_on_if_from_user_trap(self, || {
+                !ready() && !super::current_has_unblocked_signal()
+            });
+        }
+    }
+
+    /// Interruptible wait with a deadline, mirroring `wait_until_deadline`'s
+    /// timeout contract (condition-true-at-expiry wins over TimedOut) while
+    /// additionally returning `Interrupted` when an unblocked signal arrives
+    /// before the deadline.
+    #[allow(dead_code)] // used by 4.8.15+ deadline-bearing blocking syscalls
+    pub fn wait_interruptible_until_deadline_from_user_trap<F>(
+        &self,
+        deadline: MonotonicInstant,
+        ready: F,
+    ) -> InterruptibleWaitOutcome
+    where
+        F: Fn() -> bool,
+    {
+        crate::context::assert_task_context();
+        if ready() {
+            return InterruptibleWaitOutcome::Ready;
+        }
+        if super::current_has_unblocked_signal() {
+            return InterruptibleWaitOutcome::Interrupted;
+        }
+        if crate::time::deadline_reached(crate::time::now(), deadline) {
+            return if ready() {
+                InterruptibleWaitOutcome::Ready
+            } else if super::current_has_unblocked_signal() {
+                InterruptibleWaitOutcome::Interrupted
+            } else {
+                InterruptibleWaitOutcome::TimedOut
+            };
+        }
+
+        let timeout = TimeoutContext {
+            state: AtomicU8::new(TIMEOUT_WAITING),
+            queue: self as *const WaitQueue,
+            task: super::current_task_id(),
+        };
+        let handle = crate::timer::arm_at(
+            deadline,
+            timeout_callback,
+            core::ptr::addr_of!(timeout) as usize,
+        )
+        .unwrap_or_else(|error| panic!("unable to allocate wait timeout: {error:?}"));
+
+        let outcome = loop {
+            if ready() {
+                break InterruptibleWaitOutcome::Ready;
+            }
+            if super::current_has_unblocked_signal() {
+                break InterruptibleWaitOutcome::Interrupted;
+            }
+            if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
+                break if ready() {
+                    InterruptibleWaitOutcome::Ready
+                } else if super::current_has_unblocked_signal() {
+                    InterruptibleWaitOutcome::Interrupted
+                } else {
+                    InterruptibleWaitOutcome::TimedOut
+                };
+            }
+            let _ = super::block_current_on_if_from_user_trap(self, || {
+                !ready()
+                    && !super::current_has_unblocked_signal()
+                    && timeout.state.load(Ordering::Acquire) == TIMEOUT_WAITING
+            });
+        };
+
+        if outcome == InterruptibleWaitOutcome::Ready {
+            let _ = timeout.state.compare_exchange(
+                TIMEOUT_WAITING,
+                TIMEOUT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        let _ = crate::timer::cancel_sync(handle);
+
+        if ready() {
+            InterruptibleWaitOutcome::Ready
+        } else if super::current_has_unblocked_signal() {
+            InterruptibleWaitOutcome::Interrupted
+        } else if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
+            InterruptibleWaitOutcome::TimedOut
         } else {
             outcome
         }

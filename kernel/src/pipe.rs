@@ -63,9 +63,17 @@ impl Pipe {
                 }
                 let observed_epoch = self.read_epoch.load(Ordering::Acquire);
                 drop(state);
-                let _ = crate::task::block_current_on_if_from_user_trap(&self.read_wait, || {
-                    self.read_epoch.load(Ordering::Acquire) == observed_epoch
+                let outcome = self.read_wait.wait_interruptible_from_user_trap(|| {
+                    self.read_epoch.load(Ordering::Acquire) != observed_epoch
                 });
+                if matches!(
+                    outcome,
+                    crate::task::InterruptibleWaitOutcome::Interrupted
+                ) {
+                    // No bytes transferred yet (partial reads return above):
+                    // an unblocked signal interrupts the read.
+                    return Err(Errno::Eintr);
+                }
                 continue;
             }
 
@@ -108,9 +116,17 @@ impl Pipe {
                 }
                 let observed_epoch = self.write_epoch.load(Ordering::Acquire);
                 drop(state);
-                let _ = crate::task::block_current_on_if_from_user_trap(&self.write_wait, || {
-                    self.write_epoch.load(Ordering::Acquire) == observed_epoch
+                let outcome = self.write_wait.wait_interruptible_from_user_trap(|| {
+                    self.write_epoch.load(Ordering::Acquire) != observed_epoch
                 });
+                if matches!(
+                    outcome,
+                    crate::task::InterruptibleWaitOutcome::Interrupted
+                ) {
+                    // 0 bytes written (partial writes return above): an
+                    // unblocked signal interrupts the write.
+                    return Err(Errno::Eintr);
+                }
                 continue;
             }
 

@@ -9942,10 +9942,21 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
                 return 0;
             }
             Ok(None) => {
-                let _ = crate::task::block_current_on_if_from_user_trap(
-                    process.child_wait_queue(),
-                    || !process.has_zombie_child(requested) && process.has_child(requested),
-                );
+                // Interruptible wait: a zombie is reaped on the next loop
+                // iteration before any EINTR, so a signal never steals a
+                // child's exit status. EINTR only fires while children are
+                // still running and none is reaped yet.
+                match process.child_wait_queue().wait_interruptible_from_user_trap(|| {
+                    process.has_zombie_child(requested) || !process.has_child(requested)
+                }) {
+                    crate::task::InterruptibleWaitOutcome::Ready => {}
+                    crate::task::InterruptibleWaitOutcome::Interrupted => {
+                        return -(crate::syscall::errno::EINTR);
+                    }
+                    crate::task::InterruptibleWaitOutcome::TimedOut => {
+                        // No-deadline variant never times out; loop to reap.
+                    }
+                }
             }
             Err(_) => return -ECHILD,
         }
@@ -10452,7 +10463,30 @@ fn sys_nanosleep(request_address: usize, remain_address: usize) -> isize {
     }
     let duration = core::time::Duration::new(request.sec as u64, request.nsec as u32);
     if !duration.is_zero() {
-        crate::timer::sleep(duration);
+        let deadline = crate::time::deadline_after(duration);
+        if crate::timer::sleep_interruptible_until(deadline)
+            == crate::task::InterruptibleWaitOutcome::Interrupted
+        {
+            // A relative sleep writes the remaining time back so the caller
+            // can resume; the pending signal is delivered on syscall return.
+            let now = crate::time::now();
+            let remain = if crate::time::deadline_reached(now, deadline) {
+                core::time::Duration::ZERO
+            } else {
+                deadline.duration_since(now)
+            };
+            if remain_address != 0 {
+                let ts = KernelTimespec {
+                    sec: remain.as_secs() as isize,
+                    nsec: remain.subsec_nanos() as isize,
+                };
+                let result = copy_plain_to_user(remain_address, &ts);
+                if result != 0 {
+                    return result;
+                }
+            }
+            return -(crate::syscall::errno::EINTR);
+        }
     }
     0
 }
@@ -10526,10 +10560,41 @@ fn sys_clock_nanosleep(
         if target_ns > now_ns {
             let delta_ns = target_ns - now_ns;
             let sleep_ns = core::cmp::min(delta_ns, u128::from(u64::MAX));
-            crate::timer::sleep(core::time::Duration::from_nanos(sleep_ns as u64));
+            let deadline =
+                crate::time::deadline_after(core::time::Duration::from_nanos(sleep_ns as u64));
+            if crate::timer::sleep_interruptible_until(deadline)
+                == crate::task::InterruptibleWaitOutcome::Interrupted
+            {
+                // Absolute sleep: POSIX does not write `remain` on EINTR —
+                // the caller re-derives its own absolute deadline.
+                return -(crate::syscall::errno::EINTR);
+            }
         }
     } else if !duration.is_zero() {
-        crate::timer::sleep(duration);
+        let deadline = crate::time::deadline_after(duration);
+        if crate::timer::sleep_interruptible_until(deadline)
+            == crate::task::InterruptibleWaitOutcome::Interrupted
+        {
+            // Relative clock_nanosleep behaves like nanosleep: write back the
+            // remaining time so the caller can resume the sleep.
+            let now = crate::time::now();
+            let remain = if crate::time::deadline_reached(now, deadline) {
+                core::time::Duration::ZERO
+            } else {
+                deadline.duration_since(now)
+            };
+            if remain_address != 0 {
+                let ts = KernelTimespec {
+                    sec: remain.as_secs() as isize,
+                    nsec: remain.subsec_nanos() as isize,
+                };
+                let result = copy_plain_to_user(remain_address, &ts);
+                if result != 0 {
+                    return result;
+                }
+            }
+            return -(crate::syscall::errno::EINTR);
+        }
     }
 
     0

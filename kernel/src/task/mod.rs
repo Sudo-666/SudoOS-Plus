@@ -9,7 +9,7 @@ mod m4c_verify;
 mod stack;
 mod wait_queue;
 
-pub use wait_queue::{Completion, WaitOutcome, WaitQueue};
+pub use wait_queue::{Completion, InterruptibleWaitOutcome, WaitOutcome, WaitQueue};
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 #[cfg(debug_assertions)]
@@ -2414,6 +2414,18 @@ pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .current_user_thread(cpu)
+}
+
+/// True when the current user thread has a pending signal it does not mask.
+/// Read-only (atomics only), so it is safe to evaluate while holding the
+/// scheduler lock — the interruptible-wait block decision uses this under the
+/// same lock that `wake_process_for_signal` takes, closing the check-then-sleep
+/// race: a signal either lands before the check (thread does not block) or
+/// after it (thread is Blocked and precisely woken).
+pub(crate) fn current_has_unblocked_signal() -> bool {
+    current_user_thread().is_some_and(|thread| {
+        thread.process().signals().pending() & !thread.blocked_signals() != 0
+    })
 }
 
 pub(crate) fn scheduler_is_initialized() -> bool {
