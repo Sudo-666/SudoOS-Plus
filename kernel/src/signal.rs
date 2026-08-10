@@ -46,7 +46,11 @@ pub fn send_signal(pid: ProcessId, signal: u32) -> Result<(), myos_vfs::Errno> {
     let process = crate::process::lookup_process(pid).ok_or(myos_vfs::Errno::Esrch)?;
     let result = process.signals().add_pending(signal);
     if result.is_ok() {
-        crate::net::socket::wake_all_waiters();
+        // Precisely wake the best thread of the target process instead of
+        // waking every socket waiter in the system (thundering herd). A woken
+        // thread re-evaluates its blocking syscall and returns EINTR when the
+        // signal is not masked.
+        crate::task::wake_process_for_signal(pid, signal);
     }
     result
 }

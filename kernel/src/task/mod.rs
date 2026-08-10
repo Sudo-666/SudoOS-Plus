@@ -2083,6 +2083,100 @@ pub(super) fn wake_task_on_queue(queue: &WaitQueue, task: TaskId) -> bool {
     woken == 1
 }
 
+/// Wake one thread of `pid` so a newly-pending `signal` can be observed and
+/// delivered promptly. This is the precise counterpart to Linux's signal
+/// wake: instead of waking every socket waiter in the system (thundering
+/// herd), only the single best thread of the target process is nudged.
+///
+/// Candidate priority: Blocked > SwitchingOut > Running > Runnable.
+/// - Blocked: unlinked from its wait queue via `wait_queue_address` and made
+///   runnable, so whichever syscall parked it re-evaluates and returns EINTR
+///   when the signal is not blocked.
+/// - SwitchingOut: claimed via `wake_after_switch`; the switch tail turns it
+///   runnable on commit.
+/// - Running: reschedule IPI to its CPU so it re-enters the kernel soon.
+/// - Runnable: already queued; it will observe the pending signal when
+///   scheduled, so no action is taken.
+///
+/// Threads of the process that mask `signal` are skipped. If every thread
+/// masks it, the pending bit stays set and no thread is woken; the next
+/// sigprocmask or return-to-user delivers it. No heap allocation happens
+/// while the scheduler lock is held (wake unlink is intrusive).
+///
+/// Returns true when a wake or reschedule IPI was issued for the process.
+pub(crate) fn wake_process_for_signal(pid: crate::process::ProcessId, signal: u32) -> bool {
+    let Some(bit) = crate::signal::signal_bit(signal) else {
+        return false;
+    };
+    let (action_taken, targets) = {
+        let mut slot = SCHEDULER.lock();
+        let Some(scheduler) = slot.as_mut() else {
+            return false;
+        };
+
+        // Scan for the highest-priority thread of `pid` that does not mask
+        // `signal`. Ties keep the earliest task id.
+        let mut best: Option<(TaskId, u8)> = None;
+        for task in scheduler.tasks.iter().flatten() {
+            let Some(thread) = task.user_thread.as_ref() else {
+                continue;
+            };
+            if thread.process().id() != pid {
+                continue;
+            }
+            if thread.blocked_signals() & bit != 0 {
+                continue; // this thread masks the signal
+            }
+            let priority = match task.state {
+                TaskState::Blocked => 4,
+                TaskState::SwitchingOut(_) => 3,
+                TaskState::Running(_) => 2,
+                TaskState::Runnable => 1,
+                _ => continue,
+            };
+            if best.map_or(true, |(_, current)| priority > current) {
+                best = Some((task.id, priority));
+            }
+        }
+
+        let Some((id, priority)) = best else {
+            // No unblocked thread of the process is scheduled (or all threads
+            // mask the signal): keep the pending bit, wake nothing.
+            return false;
+        };
+
+        let mut targets = 0_usize;
+        let mut action_taken = false;
+        if priority >= 3 {
+            // Blocked, or mid-block SwitchingOut: wake via its wait queue.
+            let queue_address = scheduler.task(id).wait_queue_address;
+            if let Some(address) = queue_address {
+                // SAFETY: `wait_queue_address` is installed by `link_waiter`
+                // only for a queue whose lifetime outlives the task's sleep
+                // (statics, or objects the blocked file owns). The same
+                // contract is used by `timeout_callback`.
+                let queue = unsafe { &*(address as *const WaitQueue) };
+                let (woken, mask) = scheduler.wake_waiters(queue, 1, Some(id));
+                action_taken = woken == 1;
+                targets |= mask;
+            }
+        } else if priority == 2 {
+            // Running: mark need_resched and IPI its CPU so it re-enters the
+            // kernel and notices the pending signal.
+            if let TaskState::Running(cpu) = scheduler.task(id).state {
+                scheduler.request_reschedule(cpu);
+                targets |= 1_usize << cpu.get();
+                action_taken = true;
+            }
+        }
+        // priority == 1 (Runnable): no action required.
+
+        (action_taken, targets)
+    };
+    send_wakeup_ipis(targets);
+    action_taken
+}
+
 #[cfg(debug_assertions)]
 pub(super) fn waiter_debug_state(channel: usize) -> WaiterDebugState {
     let slot = SCHEDULER.lock();

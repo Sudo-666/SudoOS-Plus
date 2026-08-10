@@ -357,11 +357,6 @@ fn close_socket_id(id: usize) {
     SOCKET_IO_WAIT.wake_all();
 }
 
-pub fn wake_all_waiters() {
-    SOCKET_ACCEPT_WAIT.wake_all();
-    SOCKET_IO_WAIT.wake_all();
-}
-
 fn copy_addr_from_user(ptr: usize) -> Result<SockAddrIn, isize> {
     let process = crate::task::current_user_thread()
         .map(|t| t.process_arc())

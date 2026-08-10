@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use myos_vfs::{Errno, MutableIoBuffer};
 
 use crate::irq_lock::IrqSpinLock;
@@ -49,6 +51,30 @@ const VMIN: usize = 6;
 
 static CONSOLE_TTY: IrqSpinLock<TtyState> = IrqSpinLock::new_with_class(TtyState::new(), TTY_LOCK);
 static TTY_READ_WAIT: WaitQueue = WaitQueue::new();
+
+// Temporary Gate C diagnostic: one Ctrl-C press should produce exactly one
+// VINTR byte, hence one SIGINT broadcast. The budget keeps the trace from
+// spamming the console while it confirms the delivered count per press.
+static TTY_SIGINT_SEQ: AtomicUsize = AtomicUsize::new(1);
+static TTY_SIGINT_BUDGET: AtomicUsize = AtomicUsize::new(64);
+
+fn trace_sigint(session: isize, pgrp: isize, delivered: usize) {
+    let seq = TTY_SIGINT_SEQ.fetch_add(1, Ordering::Relaxed);
+    if TTY_SIGINT_BUDGET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(1)
+        })
+        .is_ok()
+    {
+        crate::println!(
+            "TTY-SIGINT: seq={} sid={} pgrp={} delivered={}",
+            seq,
+            session,
+            pgrp,
+            delivered,
+        );
+    }
+}
 
 struct TtyState {
     buffer: [u8; TTY_BUFFER],
@@ -245,7 +271,12 @@ pub fn input_byte(byte: u8) {
             // (e.g. `sleep 30 | cat` — both members must receive SIGINT). The
             // pgrp must belong to the controlling session; a same-numbered
             // group in another session is not touched.
-            crate::signal::send_signal_to_foreground_group(pgrp, session, crate::signal::SIGINT);
+            let delivered = crate::signal::send_signal_to_foreground_group(
+                pgrp,
+                session,
+                crate::signal::SIGINT,
+            );
+            trace_sigint(session, pgrp, delivered);
         }
         return;
     }
