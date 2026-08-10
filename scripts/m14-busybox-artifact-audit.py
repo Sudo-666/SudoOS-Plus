@@ -42,15 +42,21 @@ def parse_newc(path: Path) -> dict[str, tuple[int, int, bytes]]:
 def check_source(root: Path) -> list[tuple[str, bool, str]]:
     py = root / "scripts/build-static-busybox-initramfs.py"
     sh = root / "scripts/build-static-busybox-initramfs.sh"
+    # The M14/M16 targets live in Makefile.project; the root Makefile has no
+    # busybox references. Audit both so the "make target" check does not
+    # spuriously FAIL when only Makefile.project is present.
     make = root / "Makefile"
+    make_project = root / "Makefile.project"
     checks = []
     py_text = py.read_text() if py.exists() else ""
     sh_text = sh.read_text() if sh.exists() else ""
-    make_text = make.read_text() if make.exists() else ""
+    make_text = (make.read_text() if make.exists() else "") + (
+        make_project.read_text() if make_project.exists() else ""
+    )
     checks.append(("python newc builder", py.exists() and "070701" in py_text and "TRAILER!!!" in py_text, "rootless deterministic cpio builder exists"))
     checks.append(("static busybox guard", "likely_dynamic" in py_text and "DYNAMIC_MARKERS" in py_text, "rejects likely dynamic BusyBox by default"))
     checks.append(("shell wrapper", sh.exists() and "BUSYBOX" in sh_text and "build-static-busybox-initramfs.py" in sh_text, "Make-friendly wrapper exists"))
-    checks.append(("make target", "busybox-initramfs" in make_text and "m14-busybox-artifact-audit" in make_text, "targets wired"))
+    checks.append(("make target", "busybox-initramfs" in make_text and "m14-busybox-artifact-audit" in make_text, "targets wired in Makefile/Makefile.project"))
     return checks
 
 
