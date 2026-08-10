@@ -554,6 +554,54 @@ Gate C（RX 轮询生效后）：按 Enter 出现 `sudoos:/#` 可交互 shell（
 `INIT-EXIT`、`oscomp-la-ale-fail`、`user-exception` 逐项补齐（Commit 4.8），
 不预先实现未观察到的调用。
 
+### Gate C 最终回归（Commit 4.8.12–4.8.16）
+
+一次短按 Ctrl-C 只产生一个 VINTR 字节，串口日志应出现一次
+`TTY-SIGINT: seq=N sid=… pgrp=… delivered=…`（预算 64 条后停止打印）。
+热路径诊断（UART-RX/TTY-READ/TTY-IOCTL/clone-frame/mprotect: ok/
+pipe-create/HEAP-STATE）必须为零。
+
+**A. 动态提示符**
+
+```sh
+cd /bin; pwd      # sudoos:/bin#
+cd /tmp; pwd      # sudoos:/tmp#
+cd /; pwd         # sudoos:/#
+```
+
+**B. 可中断 sleep（nanosleep EINTR + 相对睡眠剩余时间）**
+
+```sh
+start=$(date +%s); sleep 30
+# 一次短按 Ctrl-C
+rc=$?; end=$(date +%s); echo rc=$rc elapsed=$((end-start))
+```
+判读：`rc=130`（128+SIGINT），`elapsed < 3`。
+
+**C. 管道进程组信号（pipe read EINTR）**
+
+```sh
+sh -c 'sleep 30 | cat'
+# 一次短按 Ctrl-C
+ps; echo survived
+```
+判读：`sleep`/`cat` 均退出（无残留），shell 存活并回提示符。
+
+**D. VEOF 边界（partial line 不附加 `\n`）**
+
+```sh
+cat; abc
+# Ctrl-D：输出 abc 且不带换行（read 返回 3 字节 "abc"，不补 '\n'）
+cat
+# 空行 Ctrl-D：read 返回 0，cat 退出
+```
+
+**E. 压力项**
+
+- 长字符串（`printf '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\n'`）连续粘贴 ≥20 次，每次完整无丢字；
+- `exit` → Enter → 重新出现 `Please press Enter to activate this console.` + `sudoos:/#`，循环 20 次；
+- 全程无 `unknown-syscall`、panic、OOM、`oscomp-la-ale-fail`。
+
 ## 7. 相关文件清单
 
 ```
