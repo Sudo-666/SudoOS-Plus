@@ -72,6 +72,24 @@ pub fn send_signal_to_process_group(pgrp: isize, signal: u32) -> usize {
     delivered
 }
 
+/// Deliver `signal` to every process that is both in `pgrp` and in `session`.
+/// Foreground-group semantics for job control: the foreground pgrp recorded on
+/// the console tty must belong to the controlling session, otherwise a
+/// same-numbered group in another session would be interrupted by mistake.
+/// Returns the number of signals accepted.
+pub fn send_signal_to_foreground_group(pgrp: isize, session: isize, signal: u32) -> usize {
+    let mut delivered = 0;
+    crate::process::for_each_process(|process| {
+        if process.process_group() == pgrp
+            && process.session() == session
+            && send_signal(process.id(), signal).is_ok()
+        {
+            delivered += 1;
+        }
+    });
+    delivered
+}
+
 pub fn update_mask(current: u64, how: usize, input: Option<u64>) -> Result<u64, myos_vfs::Errno> {
     let Some(input) = input else {
         return Ok(current);

@@ -238,11 +238,14 @@ pub fn input_byte(byte: u8) {
             tty.flush_input();
         }
         let pgrp = tty.foreground_pgrp;
+        let session = tty.controlling_session;
         drop(tty);
         if pgrp > 0 {
             // Job-control: interrupt the whole foreground process group
-            // (e.g. `sleep 30 | cat` — both members must receive SIGINT).
-            crate::signal::send_signal_to_process_group(pgrp, crate::signal::SIGINT);
+            // (e.g. `sleep 30 | cat` — both members must receive SIGINT). The
+            // pgrp must belong to the controlling session; a same-numbered
+            // group in another session is not touched.
+            crate::signal::send_signal_to_foreground_group(pgrp, session, crate::signal::SIGINT);
         }
         return;
     }

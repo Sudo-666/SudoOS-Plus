@@ -9366,6 +9366,15 @@ fn sys_reboot(magic1: usize, magic2: usize, command: usize, _argument: usize) ->
 }
 
 fn sys_kill(pid: usize, signal: usize) -> isize {
+    // Validate the signal number up front (Linux: invalid -> EINVAL). Signal 0
+    // is the existence probe and skips this check. The usize->u32 round-trip
+    // guard stops a >32-bit value from truncating into a valid small signal.
+    let signal_u32 = signal as u32;
+    if signal != 0
+        && (signal != signal_u32 as usize || crate::signal::signal_bit(signal_u32).is_none())
+    {
+        return -crate::syscall::errno::EINVAL;
+    }
     // sig==0: existence/permission check only.
     if signal == 0 {
         if pid == 0 || pid == usize::MAX {
@@ -9390,22 +9399,30 @@ fn sys_kill(pid: usize, signal: usize) -> isize {
     } else {
         let pid_signed = pid as isize;
         if pid_signed < -1 {
-            // Negative pid: signal the whole process group (-pgid).
+            // Negative pid: signal the whole process group (-pgid). The actual
+            // delivery count is reported: a group that vanishes between the
+            // existence check and delivery returns ESRCH, not a false success.
             let pgrp = (-pid_signed) as isize;
             if !crate::process::process_group_exists(pgrp) {
                 return -(crate::syscall::errno::ESRCH);
             }
-            crate::signal::send_signal_to_process_group(pgrp, signal as u32);
+            let delivered = crate::signal::send_signal_to_process_group(pgrp, signal_u32);
+            if delivered == 0 {
+                return -(crate::syscall::errno::ESRCH);
+            }
             0
         } else if pid_signed == 0 {
             // pid == 0: signal the caller's process group.
             let pgrp = current_process().process_group();
-            crate::signal::send_signal_to_process_group(pgrp, signal as u32);
+            let delivered = crate::signal::send_signal_to_process_group(pgrp, signal_u32);
+            if delivered == 0 {
+                return -(crate::syscall::errno::ESRCH);
+            }
             0
         } else {
             match crate::signal::send_signal(
                 crate::process::ProcessId::from_raw_for_kernel(pid),
-                signal as u32,
+                signal_u32,
             ) {
                 Ok(()) => 0,
                 Err(errno) => errno.to_isize(),
