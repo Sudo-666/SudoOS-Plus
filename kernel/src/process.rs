@@ -900,6 +900,29 @@ pub fn for_each_process(mut f: impl FnMut(&Arc<Process>)) {
     }
 }
 
+/// Whether any live process has the given process-group id.
+pub fn process_group_exists(pgrp: isize) -> bool {
+    let mut found = false;
+    for_each_process(|process| {
+        if !found && process.process_group() == pgrp {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Whether any live process with the given process-group id belongs to the
+/// given session (Linux TIOCSPGRP membership check).
+pub fn process_group_in_session(pgrp: isize, session: isize) -> bool {
+    let mut found = false;
+    for_each_process(|process| {
+        if !found && process.process_group() == pgrp && process.session() == session {
+            found = true;
+        }
+    });
+    found
+}
+
 pub struct Thread {
     id: ThreadId,
     process: Arc<Process>,
@@ -1183,20 +1206,28 @@ impl Drop for Thread {
             .process
             .detach_thread(self.id)
             .expect("M9-B Thread disappeared from its process thread group");
-        if process_became_empty
-            && let Some(parent) = self
+        if process_became_empty {
+            // This is the unique process-exit point. If the exiting process is
+            // a session leader, release its controlling terminal BEFORE the
+            // parent is woken, so a respawned shell can reclaim it with
+            // TIOCSCTTY instead of hitting EBUSY.
+            if self.process.session() == self.process.id().get() as isize {
+                crate::tty::release_controlling_session(self.process.session());
+            }
+            if let Some(parent) = self
                 .process
                 .parent_id()
                 .and_then(crate::process::lookup_process)
-        {
-            let status = self
-                .exit_status()
-                .expect("Thread dropped before publishing an exit status");
-            if parent
-                .mark_child_zombie(Arc::clone(&self.process), status)
-                .is_ok()
             {
-                let _ = parent.signals().add_pending(crate::signal::SIGCHLD);
+                let status = self
+                    .exit_status()
+                    .expect("Thread dropped before publishing an exit status");
+                if parent
+                    .mark_child_zombie(Arc::clone(&self.process), status)
+                    .is_ok()
+                {
+                    let _ = parent.signals().add_pending(crate::signal::SIGCHLD);
+                }
             }
         }
         LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);

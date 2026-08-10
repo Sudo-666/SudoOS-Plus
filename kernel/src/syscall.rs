@@ -74,6 +74,7 @@ pub mod number {
     pub const TIMES: usize = 153;
     pub const GETPGID: usize = 155;
     pub const GETSID: usize = 156;
+    pub const GETGROUPS: usize = 158;
     pub const UNAME: usize = 160;
     pub const UMASK: usize = 166;
     pub const GETTIMEOFDAY: usize = 169;

@@ -98,6 +98,7 @@ const SYS_SETPGID: usize = crate::syscall::number::SETPGID;
 const SYS_GETPGID: usize = crate::syscall::number::GETPGID;
 const SYS_GETSID: usize = crate::syscall::number::GETSID;
 const SYS_REBOOT: usize = crate::syscall::number::REBOOT;
+const SYS_GETGROUPS: usize = crate::syscall::number::GETGROUPS;
 const SYS_RT_SIGACTION: usize = crate::syscall::number::RT_SIGACTION;
 const SYS_RT_SIGPROCMASK: usize = crate::syscall::number::RT_SIGPROCMASK;
 const SYS_RT_SIGTIMEDWAIT: usize = crate::syscall::number::RT_SIGTIMEDWAIT;
@@ -6171,6 +6172,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_reboot(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
+        SYS_GETGROUPS => set_syscall_result(frame, sys_getgroups(arguments[0], arguments[1])),
         SYS_KILL => set_syscall_result(frame, sys_kill(arguments[0], arguments[1])),
         SYS_TKILL => set_syscall_result(frame, sys_kill(arguments[0], arguments[1])),
         SYS_TGKILL => set_syscall_result(frame, sys_kill(arguments[1], arguments[2])),
@@ -9344,6 +9346,18 @@ fn sys_getsid(pid: usize) -> isize {
     process.session()
 }
 
+fn sys_getgroups(size: usize, _list: usize) -> isize {
+    // No supplementary groups exist in this kernel's Credentials model, so a
+    // process always has exactly zero supplemental group IDs. Per Linux:
+    //   getgroups(0, NULL) -> number of groups (0)
+    //   getgroups(size, list) -> 0 (nothing written)
+    //   negative size -> EINVAL
+    if (size as isize) < 0 {
+        return -crate::syscall::errno::EINVAL;
+    }
+    0
+}
+
 fn sys_reboot(magic1: usize, magic2: usize, command: usize, _argument: usize) -> isize {
     const LINUX_REBOOT_MAGIC1: usize = 0xfee1_dead;
     const LINUX_REBOOT_MAGIC2: usize = 0x2812_1969;
@@ -9371,7 +9385,16 @@ fn sys_kill(pid: usize, signal: usize) -> isize {
     // sig==0: existence/permission check only.
     if signal == 0 {
         if pid == 0 || pid == usize::MAX {
-            return 0; // group/broadcast — no process group, accept for compat
+            return 0; // current group / -1 broadcast — accept for compat
+        }
+        let pid_signed = pid as isize;
+        if pid_signed < -1 {
+            // negative pid: process-group existence check
+            let pgrp = (-pid_signed) as isize;
+            if crate::process::process_group_exists(pgrp) {
+                return 0;
+            }
+            return -(crate::syscall::errno::ESRCH);
         }
         match crate::process::lookup_process(crate::process::ProcessId::from_raw_for_kernel(pid)) {
             Some(_) => 0,
@@ -9380,19 +9403,29 @@ fn sys_kill(pid: usize, signal: usize) -> isize {
     } else if pid == usize::MAX {
         // -1 broadcast not supported
         -(crate::syscall::errno::EPERM)
-    } else if pid == 0 {
-        // process group kill — fallback to self for compat
-        match crate::signal::send_signal(current_process().id(), signal as u32) {
-            Ok(()) => 0,
-            Err(errno) => errno.to_isize(),
-        }
     } else {
-        match crate::signal::send_signal(
-            crate::process::ProcessId::from_raw_for_kernel(pid),
-            signal as u32,
-        ) {
-            Ok(()) => 0,
-            Err(errno) => errno.to_isize(),
+        let pid_signed = pid as isize;
+        if pid_signed < -1 {
+            // Negative pid: signal the whole process group (-pgid).
+            let pgrp = (-pid_signed) as isize;
+            if !crate::process::process_group_exists(pgrp) {
+                return -(crate::syscall::errno::ESRCH);
+            }
+            crate::signal::send_signal_to_process_group(pgrp, signal as u32);
+            0
+        } else if pid_signed == 0 {
+            // pid == 0: signal the caller's process group.
+            let pgrp = current_process().process_group();
+            crate::signal::send_signal_to_process_group(pgrp, signal as u32);
+            0
+        } else {
+            match crate::signal::send_signal(
+                crate::process::ProcessId::from_raw_for_kernel(pid),
+                signal as u32,
+            ) {
+                Ok(()) => 0,
+                Err(errno) => errno.to_isize(),
+            }
         }
     }
 }

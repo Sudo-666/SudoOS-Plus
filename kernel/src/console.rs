@@ -102,6 +102,23 @@ pub fn write_bytes(bytes: &[u8]) {
     }
 }
 
+/// Serialize a userspace write with inline `\n` -> `\r\n` translation (ONLCR)
+/// while holding the console write lock once. Used by the console tty so user
+/// output breaks lines correctly; kernel println does this conversion in the
+/// runtime formatter instead.
+pub fn write_bytes_translated(bytes: &[u8], from: u8, to: &[u8]) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
+    for byte in bytes {
+        if *byte == from {
+            for translated in to {
+                crate::arch::early_console::write_byte(*translated);
+            }
+        } else {
+            crate::arch::early_console::write_byte(*byte);
+        }
+    }
+}
+
 #[macro_export]
 macro_rules! print {
     ($($argument:tt)*) => {

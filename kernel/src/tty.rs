@@ -33,8 +33,16 @@ const ICANON: u32 = 0x0000_0002;
 const ISIG: u32 = 0x0000_0001;
 const ICRNL: u32 = 0x0000_0100;
 const OPOST: u32 = 0x0000_0001;
+const ONLCR: u32 = 0x0000_0004;
 const CS8: u32 = 0x0000_0030;
-const B38400: u32 = 0x0000_000f;
+const B115200: u32 = 0x0000_1001;
+const CBAUD: u32 = 0x0000_100f;
+// asm-generic termios c_cc[] indexes (VINTR at index 0, etc.)
+const VINTR: usize = 0;
+const VERASE: usize = 2;
+const VEOF: usize = 4;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
 
 static CONSOLE_TTY: IrqSpinLock<TtyState> = IrqSpinLock::new_with_class(TtyState::new(), TTY_LOCK);
 static TTY_READ_WAIT: WaitQueue = WaitQueue::new();
@@ -53,9 +61,15 @@ struct TtyState {
     buffer: [u8; TTY_BUFFER],
     head: usize,
     len: usize,
-    canonical: bool,
-    echo: bool,
-    isig: bool,
+    // Full termios state so TCSETS* -> TCGETS* round-trips (BusyBox ash saves
+    // the settings, switches to raw for line editing, then restores them).
+    iflag: u32,
+    oflag: u32,
+    cflag: u32,
+    lflag: u32,
+    cc: [u8; NCCS],
+    ispeed: u32,
+    ospeed: u32,
     foreground_pgrp: isize,
     controlling_session: isize,
     rows: u16,
@@ -64,18 +78,72 @@ struct TtyState {
 
 impl TtyState {
     const fn new() -> Self {
+        let mut cc = [0_u8; NCCS];
+        cc[VINTR] = 3;
+        cc[VERASE] = 0x7f;
+        cc[VEOF] = 4;
+        cc[VTIME] = 0;
+        cc[VMIN] = 1;
         Self {
             buffer: [0; TTY_BUFFER],
             head: 0,
             len: 0,
-            canonical: true,
-            echo: true,
-            isig: true,
+            iflag: ICRNL,
+            oflag: OPOST | ONLCR,
+            cflag: B115200 | CS8,
+            lflag: ISIG | ICANON | ECHO,
+            cc,
+            ispeed: 115200,
+            ospeed: 115200,
             foreground_pgrp: 0,
             controlling_session: 0,
             rows: 24,
             cols: 80,
         }
+    }
+
+    fn canonical(&self) -> bool {
+        self.lflag & ICANON != 0
+    }
+
+    fn echo(&self) -> bool {
+        self.lflag & ECHO != 0
+    }
+
+    fn isig(&self) -> bool {
+        self.lflag & ISIG != 0
+    }
+
+    fn onlcr(&self) -> bool {
+        self.oflag & ONLCR != 0
+    }
+
+    /// Install a full termios snapshot (all fields, so the next TCGETS*
+    /// reports exactly what the caller set).
+    fn apply_termios(
+        &mut self,
+        iflag: u32,
+        oflag: u32,
+        cflag: u32,
+        lflag: u32,
+        cc: &[u8; NCCS],
+        ispeed: u32,
+        ospeed: u32,
+    ) {
+        self.iflag = iflag;
+        self.oflag = oflag;
+        self.cflag = cflag;
+        self.lflag = lflag;
+        self.cc = *cc;
+        self.ispeed = ispeed;
+        self.ospeed = ospeed;
+    }
+
+    /// TCSETSF/TCSETSF2 semantics: discard all unread input so a stale
+    /// carriage return can never produce a spurious prompt line.
+    fn flush_input(&mut self) {
+        self.head = 0;
+        self.len = 0;
     }
 
     fn push(&mut self, byte: u8) {
@@ -94,7 +162,7 @@ impl TtyState {
             self.head = (self.head + 1) % TTY_BUFFER;
             self.len -= 1;
             copied += output.push(&[byte]);
-            if self.canonical && byte == b'\n' {
+            if self.canonical() && byte == b'\n' {
                 break;
             }
         }
@@ -116,7 +184,7 @@ impl TtyState {
         if self.len == 0 {
             return false;
         }
-        if !self.canonical {
+        if !self.canonical() {
             return true;
         }
         let mut index = self.head;
@@ -154,7 +222,7 @@ pub fn input_byte(byte: u8) {
     match byte {
         b'\r' | b'\n' => {
             tty.push(b'\n');
-            if tty.echo {
+            if tty.echo() {
                 write_output(b"\r\n");
             }
             drop(tty);
@@ -164,32 +232,31 @@ pub fn input_byte(byte: u8) {
                 crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
             }
         }
-        0x08 | 0x7f if tty.canonical => {
-            if tty.erase() && tty.echo {
+        0x08 | 0x7f if tty.canonical() => {
+            if tty.erase() && tty.echo() {
                 write_output(b"\x08 \x08");
             }
         }
-        0x03 if tty.isig => {
-            if tty.echo {
+        0x03 if tty.isig() => {
+            if tty.echo() {
                 write_output(b"^C\r\n");
             }
             let pgrp = tty.foreground_pgrp;
             drop(tty);
             if pgrp > 0 {
-                let _ = crate::signal::send_signal(
-                    crate::process::ProcessId::from_raw_for_kernel(pgrp as usize),
-                    crate::signal::SIGINT,
-                );
+                // Job-control: interrupt the whole foreground process group
+                // (e.g. `sleep 30 | cat` — both members must receive SIGINT).
+                crate::signal::send_signal_to_process_group(pgrp, crate::signal::SIGINT);
             }
         }
         byte => {
             tty.push(byte);
-            if tty.echo {
+            if tty.echo() {
                 write_output(&[byte]);
             }
             // canonical mode delivers whole lines: plain bytes never wake a
             // reader, only the line terminator does.
-            let wake = !tty.canonical;
+            let wake = !tty.canonical();
             drop(tty);
             let woken = if wake { wake_readers() } else { 0 };
             let index = TTY_RX_LOG.fetch_add(1, Ordering::Relaxed);
@@ -238,8 +305,47 @@ pub fn input_ready() -> bool {
 }
 
 pub fn write_console(bytes: &[u8]) -> usize {
-    write_output(bytes);
+    if CONSOLE_TTY.lock().onlcr() {
+        // ONLCR: expand \n -> \r\n while holding the console write lock once,
+        // so user output breaks lines correctly (kernel println already does
+        // this conversion via the runtime formatter).
+        crate::console::write_bytes_translated(bytes, b'\n', b"\r\n");
+    } else {
+        write_output(bytes);
+    }
     bytes.len()
+}
+
+/// Called when the last thread of a session leader exits: release the
+/// controlling terminal (and its foreground group) so a respawned shell can
+/// reclaim it with TIOCSCTTY instead of hitting EBUSY.
+pub fn release_controlling_session(session: isize) {
+    let mut tty = CONSOLE_TTY.lock();
+    if tty.controlling_session == session {
+        tty.controlling_session = 0;
+        tty.foreground_pgrp = 0;
+    }
+}
+
+/// Decode the CBAUD bits of a termios1 cflag into a real baud rate. termios2
+/// carries ispeed/ospeed explicitly, but a termios1 TCSETS can still change
+/// the baud (e.g. `stty 115200`), and TCGETS must then report it back.
+fn baud_from_cflag(cflag: u32) -> u32 {
+    match cflag & CBAUD {
+        0x1001 => 115200,
+        0x1000 => 57600,
+        0x000f => 38400,
+        0x000e => 19200,
+        0x000d => 9600,
+        0x000c => 4800,
+        0x000b => 2400,
+        0x000a => 1800,
+        0x0009 => 1200,
+        0x0008 => 600,
+        0x0007 => 300,
+        0x0000 => 0,
+        _ => 0,
+    }
 }
 
 pub fn ioctl(cmd: usize, arg: usize) -> Result<usize, Errno> {
@@ -287,10 +393,21 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
                 .mm()
                 .copy_from_user(arg, termios.as_mut_bytes())
                 .map_err(|_| Errno::Efault)?;
+            // termios1 has no explicit ispeed/ospeed: derive them from CBAUD.
+            let baud = baud_from_cflag(termios.cflag);
             let mut tty = CONSOLE_TTY.lock();
-            tty.canonical = termios.lflag & ICANON != 0;
-            tty.echo = termios.lflag & ECHO != 0;
-            tty.isig = termios.lflag & ISIG != 0;
+            tty.apply_termios(
+                termios.iflag,
+                termios.oflag,
+                termios.cflag,
+                termios.lflag,
+                &termios.cc,
+                baud,
+                baud,
+            );
+            if cmd == TCSETSF {
+                tty.flush_input();
+            }
             Ok(0)
         }
         TCSETS2 | TCSETSW2 | TCSETSF2 => {
@@ -301,9 +418,18 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
                 .copy_from_user(arg, termios2.as_mut_bytes())
                 .map_err(|_| Errno::Efault)?;
             let mut tty = CONSOLE_TTY.lock();
-            tty.canonical = termios2.lflag & ICANON != 0;
-            tty.echo = termios2.lflag & ECHO != 0;
-            tty.isig = termios2.lflag & ISIG != 0;
+            tty.apply_termios(
+                termios2.iflag,
+                termios2.oflag,
+                termios2.cflag,
+                termios2.lflag,
+                &termios2.cc,
+                termios2.ispeed,
+                termios2.ospeed,
+            );
+            if cmd == TCSETSF2 {
+                tty.flush_input();
+            }
             Ok(0)
         }
         TIOCGPGRP => {
@@ -313,12 +439,20 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
             Ok(0)
         }
         TIOCSPGRP => {
+            let process = current_process()?;
+            let session = process.session();
             let mut bytes = [0_u8; core::mem::size_of::<i32>()];
-            current_process()?
+            process
                 .mm()
                 .copy_from_user(arg, &mut bytes)
                 .map_err(|_| Errno::Efault)?;
-            CONSOLE_TTY.lock().foreground_pgrp = i32::from_ne_bytes(bytes) as isize;
+            let target = i32::from_ne_bytes(bytes);
+            // Linux: the target pgrp must belong to a process in the caller's
+            // own session; otherwise the request is EPERM.
+            if target <= 0 || !crate::process::process_group_in_session(target as isize, session) {
+                return Err(Errno::Eperm);
+            }
+            CONSOLE_TTY.lock().foreground_pgrp = target as isize;
             Ok(0)
         }
         TIOCGWINSZ => {
@@ -419,22 +553,11 @@ impl KernelTermios {
 
     fn from_tty(tty: &TtyState) -> Self {
         let mut termios = Self::zeroed();
-        termios.iflag = ICRNL;
-        termios.oflag = OPOST;
-        termios.cflag = B38400 | CS8;
-        if tty.isig {
-            termios.lflag |= ISIG;
-        }
-        if tty.canonical {
-            termios.lflag |= ICANON;
-        }
-        if tty.echo {
-            termios.lflag |= ECHO;
-        }
-        termios.cc[0] = 3;
-        termios.cc[4] = 4;
-        termios.cc[5] = 0;
-        termios.cc[6] = 1;
+        termios.iflag = tty.iflag;
+        termios.oflag = tty.oflag;
+        termios.cflag = tty.cflag;
+        termios.lflag = tty.lflag;
+        termios.cc = tty.cc;
         termios
     }
 
@@ -489,24 +612,13 @@ impl KernelTermios2 {
 
     fn from_tty(tty: &TtyState) -> Self {
         let mut termios2 = Self::zeroed();
-        termios2.iflag = ICRNL;
-        termios2.oflag = OPOST;
-        termios2.cflag = B38400 | CS8;
-        if tty.isig {
-            termios2.lflag |= ISIG;
-        }
-        if tty.canonical {
-            termios2.lflag |= ICANON;
-        }
-        if tty.echo {
-            termios2.lflag |= ECHO;
-        }
-        termios2.cc[0] = 3;
-        termios2.cc[4] = 4;
-        termios2.cc[5] = 0;
-        termios2.cc[6] = 1;
-        termios2.ispeed = 115200;
-        termios2.ospeed = 115200;
+        termios2.iflag = tty.iflag;
+        termios2.oflag = tty.oflag;
+        termios2.cflag = tty.cflag;
+        termios2.lflag = tty.lflag;
+        termios2.cc = tty.cc;
+        termios2.ispeed = tty.ispeed;
+        termios2.ospeed = tty.ospeed;
         termios2
     }
 

@@ -56,6 +56,22 @@ pub fn send_signal_to_thread(thread: &Thread, signal: u32) -> Result<(), myos_vf
     send_signal(thread.process().id(), signal)
 }
 
+/// Deliver `signal` to every process whose process-group id equals `pgrp`.
+/// Returns the number of processes that accepted the signal. Used for
+/// job-control: Ctrl-C must interrupt the whole foreground group, not just a
+/// single PID that happens to share the group number.
+pub fn send_signal_to_process_group(pgrp: isize, signal: u32) -> usize {
+    let mut delivered = 0;
+    crate::process::for_each_process(|process| {
+        if process.process_group() == pgrp
+            && send_signal(process.id(), signal).is_ok()
+        {
+            delivered += 1;
+        }
+    });
+    delivered
+}
+
 pub fn update_mask(current: u64, how: usize, input: Option<u64>) -> Result<u64, myos_vfs::Errno> {
     let Some(input) = input else {
         return Ok(current);
