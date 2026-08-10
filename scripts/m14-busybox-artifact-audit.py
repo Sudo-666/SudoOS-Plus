@@ -48,10 +48,12 @@ def check_source(root: Path) -> list[tuple[str, bool, str]]:
     make = root / "Makefile"
     make_project = root / "Makefile.project"
     checks = []
-    py_text = py.read_text() if py.exists() else ""
-    sh_text = sh.read_text() if sh.exists() else ""
-    make_text = (make.read_text() if make.exists() else "") + (
-        make_project.read_text() if make_project.exists() else ""
+    # Read with an explicit UTF-8 codec: the Makefiles contain CJK comments,
+    # and Windows Python otherwise decodes them as GBK and throws.
+    py_text = py.read_text(encoding="utf-8") if py.exists() else ""
+    sh_text = sh.read_text(encoding="utf-8") if sh.exists() else ""
+    make_text = (make.read_text(encoding="utf-8") if make.exists() else "") + (
+        make_project.read_text(encoding="utf-8") if make_project.exists() else ""
     )
     checks.append(("python newc builder", py.exists() and "070701" in py_text and "TRAILER!!!" in py_text, "rootless deterministic cpio builder exists"))
     checks.append(("static busybox guard", "likely_dynamic" in py_text and "DYNAMIC_MARKERS" in py_text, "rejects likely dynamic BusyBox by default"))
@@ -70,7 +72,10 @@ def check_archive(path: Path) -> list[tuple[str, bool, str]]:
     checks.append(("/init symlink", "init" in entries and stat.S_ISLNK(entries["init"][0]) and entries["init"][2] == b"bin/busybox", "init handoff exists"))
     checks.append(("/bin/busybox", "bin/busybox" in entries and stat.S_ISREG(entries["bin/busybox"][0]) and entries["bin/busybox"][1] > 0, "busybox binary present"))
     checks.append(("/bin/sh applet", "bin/sh" in entries and stat.S_ISLNK(entries["bin/sh"][0]), "shell applet symlink present"))
-    checks.append(("basic dirs", all(d in entries and stat.S_ISDIR(entries[d][0]) for d in ["dev", "proc", "sys", "tmp", "etc", "bin"]), "runtime dirs present"))
+    checks.append(("basic dirs", all(d in entries and stat.S_ISDIR(entries[d][0]) for d in ["dev", "proc", "sys", "tmp", "etc", "bin", "sbin", "usr/bin", "usr/sbin"]), "runtime dirs present"))
+    checks.append(("/etc/inittab", "etc/inittab" in entries and stat.S_ISREG(entries["etc/inittab"][0]) and b"SUDOOS_INIT_READY" in entries["etc/inittab"][2] and b"askfirst" in entries["etc/inittab"][2], "init rc script carries ready marker + askfirst shell"))
+    checks.append(("/etc/profile", "etc/profile" in entries and stat.S_ISREG(entries["etc/profile"][0]) and b"export PATH=" in entries["etc/profile"][2] and b"PS1=" in entries["etc/profile"][2], "shell profile exports PATH and PS1"))
+    checks.append(("/sbin admin symlinks", all(k in entries and stat.S_ISLNK(entries[k][0]) and entries[k][2] == b"../bin/busybox" for k in ["sbin/init", "sbin/reboot", "sbin/poweroff", "sbin/halt"]), "init/reboot/poweroff/halt dispatch applets present"))
     return checks
 
 

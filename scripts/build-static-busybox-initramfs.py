@@ -23,7 +23,28 @@ DEFAULT_APPLETS = [
     "chown", "sync", "dd", "hexdump", "more", "grep", "sed", "awk", "ps",
     "kill", "killall", "free", "df", "du", "hostname", "which", "readlink",
     "basename", "dirname", "expr", "printf", "wc", "head", "tail", "sort",
+    # PID 1 / admin applets: /init runs busybox with argv[0]=/init, and the
+    # /sbin/{init,reboot,poweroff,halt} symlinks dispatch the same applets.
+    "init", "reboot", "poweroff", "halt",
 ]
+
+# BusyBox init(1) reads /etc/inittab. The sysinit action emits the readiness
+# marker the board log greps for; askfirst attaches an interactive ash to the
+# console; restart keeps init alive after a shell exits.
+INITTAB = (
+    b"::sysinit:/bin/echo SUDOOS_INIT_READY\n"
+    b"::askfirst:-/bin/sh\n"
+    b"::restart:/sbin/init\n"
+)
+
+# /etc/profile is sourced by ash login shells. PATH must cover every applet
+# symlink the kernel installs; PS1 identifies the sudoos root shell.
+PROFILE = (
+    b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"
+    b"export HOME=/root\n"
+    b"export TERM=vt100\n"
+    b"export PS1='sudoos:/# '\n"
+)
 
 DYNAMIC_MARKERS = [
     b"/lib/ld-musl-", b"/lib64/ld-linux", b"/lib/ld-linux", b"ld.so.1", b"PT_INTERP",
@@ -132,7 +153,14 @@ def build_entries(busybox: Path, applets: list[str]) -> list[Entry]:
         symlink_entry("init", "bin/busybox"),
         file_entry("etc/passwd", b"root:x:0:0:root:/root:/bin/sh\n"),
         file_entry("etc/group", b"root:x:0:\n"),
-        file_entry("etc/profile", b"export PATH=/bin:/sbin:/usr/bin:/usr/sbin\n"),
+        file_entry("etc/inittab", INITTAB, 0o644),
+        file_entry("etc/profile", PROFILE, 0o644),
+        # /sbin admin applets used by init(1) reboot/poweroff paths. The link
+        # target is relative so the archive is position-independent.
+        symlink_entry("sbin/init", "../bin/busybox"),
+        symlink_entry("sbin/reboot", "../bin/busybox"),
+        symlink_entry("sbin/poweroff", "../bin/busybox"),
+        symlink_entry("sbin/halt", "../bin/busybox"),
     ])
 
     seen = {"busybox"}
