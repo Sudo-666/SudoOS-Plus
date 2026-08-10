@@ -477,6 +477,81 @@ rj+si12/si14（避免 si14<<2 规则）。指令从 `badi`（非零时）或 `er
 `reason=UnsupportedOpcode(0x…)` 说明缺哪类编码（如 FP 未对齐 ld/st），
 然后进程按 -EFAULT 终止。
 
+## 6.6 Stage-4：rdinit 启动 + PID 1（Gate B/C，Commit 4.4~4.7）
+
+Gate A 通过后，内核支持两种 userland 启动模式，由 `/chosen/bootargs` 分流
+（`kernel/src/main.rs` 的 `UserlandBootMode`，在 `user::verify()` 之前分流，
+避免测试进程抢先消耗 PID 1）：
+
+- **SelfTest**（无 `rdinit=`）：保持原有 M8/M9/M10 + BusyBox true + oscomp
+  自检序列 —— qemu_virt（kernel-la）与 stage-4 DTB 回归基线不受影响；
+- **InitramfsInit**（`rdinit=/init`）：跳过全部会创建测试进程的自检，
+  直接启动真正的 `/init` 作为 PID 1。
+
+四个提交的职责：
+
+| Commit | 内容 | 文件 |
+| --- | --- | --- |
+| 4.4 | initramfs 增 `/etc/inittab`、`/etc/profile`、`/sbin/{init,reboot,poweroff,halt}` | `scripts/build-static-busybox-initramfs.py`、`scripts/m14-busybox-artifact-audit.py` |
+| 4.5 | rdinit 启动模式 + `ls2k1000-stage4-init.dtb` | `kernel/src/main.rs`、`scripts/build-ls2k1000-dtb.sh`、`Makefile.project` |
+| 4.6 | 真 PID 1：VFS exec + `init_supervisor` | `kernel/src/exec.rs`、`kernel/src/user.rs` |
+| 4.7 | UART RX 轮询（10ms delayed work） | `arch/.../ls2k1000/console.rs`、`arch/.../qemu_virt/console.rs`、`kernel/src/console.rs` |
+
+inittab：
+
+```text
+::sysinit:/bin/echo SUDOOS_INIT_READY
+::askfirst:-/bin/sh
+::restart:/sbin/init
+```
+
+`profile` 导出 `PATH/HOME/TERM/PS1='sudoos:/# '`。`/init` 是 busybox 的
+symlink，argv[0]=`/init` 触发 busybox init applet。
+
+PID 1 路径（`user::init_supervisor`）：`exec::kernel_execve_from_vfs("/init")`
+→ 断言 PID==1（`NEXT_PROCESS_ID` 从 1 开始，InitramfsInit 下首个进程）→
+`exec_elf` 已把 `/dev/console` 装到 fd 0/1/2 → spawn 用户线程 →
+另起 kernel thread 监控 PID 1 退出（`INIT-EXIT` 后 panic）→ 内核进
+`boot_idle_loop`。
+
+UART RX：ls2k1000 console 读 NS16550 LSR bit 0（DR）→ `try_read_console_byte()`；
+qemu_virt 恒返回 None。kernel 的 `console::start_uart_input_poller()` 用
+workqueue `queue_delayed(10ms)` 自续轮询，每 tick 最多 64 字节喂给
+`tty::input_byte`（回显、唤醒 /dev/console 读、Ctrl-C 投 SIGINT）。仅在
+rdinit 模式启用；qemu_virt 编译为空操作。
+
+新 DTB（保留 stage-4 作 Gate A 回归基线）：
+
+```bash
+make -f Makefile.project ls2k1000-stage4-init.dtb
+#   bootargs = "console=ttyS0,115200n8 rdinit=/init init.debug=1"
+```
+
+上板序列与 Gate A 相同，只换 DTB：
+
+```text
+usb reset
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-stage4-init.dtb
+fatload usb 0:1 0x900000000b000000 busybox-loongarch64.cpio
+bootm 0x9000000002000000 - 0x900000000a000000
+```
+
+Gate B 判读（UART RX 未接通前按键无响应属预期）：
+
+```text
+userland boot: rdinit=/init
+tty: uart rx poller active (10 ms delayed work)
+INIT: exec pid=1 path=/init
+SUDOOS_INIT_READY
+Please press Enter to activate this console.
+```
+
+Gate C（RX 轮询生效后）：按 Enter 出现 `sudoos:/#` 可交互 shell。若 shell 后
+缺系统调用/ioctl，按 `init.debug=1` 观察 `unknown-syscall`、`ioctl-fail`、
+`INIT-EXIT`、`oscomp-la-ale-fail`、`user-exception` 逐项补齐（Commit 4.8），
+不预先实现未观察到的调用。
+
 ## 7. 相关文件清单
 
 ```

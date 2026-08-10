@@ -8,6 +8,49 @@ use crate::lockdep::{LockClass, LockRank};
 const CONSOLE_WRITE_CLASS: LockClass = LockClass::new("console.write", LockRank::Console, 3);
 static CONSOLE_WRITE_LOCK: IrqSpinLock<()> = IrqSpinLock::new_with_class((), CONSOLE_WRITE_CLASS); // SUDOOS_FINAL_DIRECT_FIX_V1
 
+/// Stage-4 UART RX poller (LS2K1000 board only).
+///
+/// A self-rescheduling delayed-work item drains up to 64 pending UART bytes
+/// into the console TTY each tick and then rearms itself. Workqueue callbacks
+/// run in a sleepable system-worker context, so the TTY echo, waitqueue
+/// wakeups and signal delivery inside `tty::input_byte` are legal. This is the
+/// phase-4 stand-in for the stage-5 UART IRQ path.
+#[cfg(feature = "platform-ls2k1000")]
+mod uart_input {
+    use core::time::Duration;
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const MAX_DRAIN_PER_TICK: usize = 64;
+
+    fn poll_uart_console(_argument: usize) {
+        let mut drained = 0;
+        while drained < MAX_DRAIN_PER_TICK {
+            match crate::arch::early_console::try_read_byte() {
+                Some(byte) => {
+                    crate::tty::input_byte(byte);
+                    drained += 1;
+                }
+                None => break,
+            }
+        }
+        let _ = crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0);
+    }
+
+    pub fn start() {
+        let _ = crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0);
+        crate::println!("tty: uart rx poller active (10 ms delayed work)");
+    }
+}
+
+/// Start feeding the platform UART RX into the console TTY.
+///
+/// Only the LS2K1000 board has a real input path; on every other platform this
+/// is a no-op, keeping the `rdinit=/init` boot branch platform-neutral.
+pub fn start_uart_input_poller() {
+    #[cfg(feature = "platform-ls2k1000")]
+    uart_input::start();
+}
+
 /// 将当前架构的早期控制台适配到公共格式化设施。
 struct EarlyConsole;
 

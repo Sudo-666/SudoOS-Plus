@@ -11,6 +11,7 @@ const UART_DAT: usize = UART0_BASE + 0x00; // 数据寄存器
 const UART_LSR: usize = UART0_BASE + 0x05; // 线路状态寄存器
 
 const LSR_TX_IDLE: u8 = 1 << 5; // 发送保持寄存器为空
+const LSR_RX_READY: u8 = 1 << 0; // 接收数据寄存器有数据
 
 pub struct Uart;
 
@@ -28,6 +29,19 @@ impl Uart {
             }
             // 写入字符
             core::ptr::write_volatile(UART_DAT as *mut u8, c);
+        }
+    }
+
+    /// 从 UART 读取一个字节;若 RX FIFO 无数据则返回 None (轮询方式)。
+    ///
+    /// LSR bit 0 (DR) 为 1 表示接收数据寄存器已有数据,读 DAT 消费之。
+    pub fn try_read_byte(&mut self) -> Option<u8> {
+        unsafe {
+            let lsr = core::ptr::read_volatile(UART_LSR as *const u8);
+            if lsr & LSR_RX_READY == 0 {
+                return None;
+            }
+            Some(core::ptr::read_volatile(UART_DAT as *const u8))
         }
     }
 }
@@ -53,6 +67,14 @@ pub fn console_putchar(c: u8) {
 /// 内核早期控制台要求的接口名称
 pub(crate) fn write_console_byte(byte: u8) {
     console_putchar(byte);
+}
+
+/// 平台控制台输入轮询接口:返回一个已就绪的 RX 字节,无数据则 None。
+///
+/// 供 `arch::early_console::try_read_byte` 转发;kernel 的 UART RX 轮询
+/// (workqueue delayed work) 每 tick 调用本函数最多 64 次。
+pub(crate) fn try_read_console_byte() -> Option<u8> {
+    Uart::new().try_read_byte()
 }
 
 pub fn init() {

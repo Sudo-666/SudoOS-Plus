@@ -39,3 +39,9 @@ fn read_line_status() -> u8 {
     // 指针来自架构 MMIO 映射接口。
     unsafe { read_volatile(register) }
 }
+
+/// qemu_virt has no UART RX path; the placeholder keeps the platform console
+/// interface uniform with the LS2K1000 board. Returns `None` unconditionally.
+pub(crate) fn try_read_console_byte() -> Option<u8> {
+    None
+}
