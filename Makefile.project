@@ -95,6 +95,23 @@ check-ls2k1000-image: kernel-ls2k1000.elf kernel-ls2k1000.bin kernel-ls2k1000.uI
 	    --bin kernel-ls2k1000.bin \
 	    --image kernel-ls2k1000.uImage
 
+# SUDOOS_LS2K_STAGE4_V1: external initramfs bundle (kernel uImage + BusyBox
+# cpio + DTB carrying linux,initrd-start/end). The vendor U-Boot has no raw
+# initrd support, so the kernel locates the archive through /chosen instead of
+# images->initrd_start/end.
+.PHONY: ls2k1000-stage4.dtb check-ls2k1000-stage4 ls2k1000-stage4-bundle
+ls2k1000-stage4.dtb: busybox-initramfs-loongarch64
+	@test -s build/initramfs/busybox-loongarch64.cpio || (echo "error: initramfs build failed" >&2; exit 2)
+	@INITRD=build/initramfs/busybox-loongarch64.cpio INITRD_PHYS_ADDR=0x0b000000 scripts/build-ls2k1000-dtb.sh
+	@cp build/host-tools/ls2k1000/ls2k1000-stage4.dtb $@
+	@ls -lh $@
+
+check-ls2k1000-stage4: kernel-ls2k1000.uImage ls2k1000-stage4.dtb
+	@python3 scripts/m14-busybox-artifact-audit.py build/initramfs/busybox-loongarch64.cpio
+	@echo "LS2K1000 stage-4 bundle OK"
+
+ls2k1000-stage4-bundle: kernel-ls2k1000.uImage busybox-initramfs-loongarch64 ls2k1000-stage4.dtb check-ls2k1000-stage4
+
 # 别名（板卡更新菜单 / 'go' 命令沿用旧名）
 .PHONY: kernel.bin uImage
 kernel.bin: kernel-ls2k1000.bin
@@ -496,6 +513,12 @@ busybox-initramfs-vendor-all:
 	  fi; \
 	done; \
 	if [ "$$found" = 0 ]; then echo "error: no vendor BusyBox artifact found" >&2; exit 2; fi
+
+# SUDOOS_LS2K_STAGE4_V1: explicit loongarch64 BusyBox initramfs target.
+# Output: build/initramfs/busybox-loongarch64.cpio (newc, rootless, deterministic).
+.PHONY: busybox-initramfs-loongarch64
+busybox-initramfs-loongarch64:
+	$(MAKE) BUSYBOX_ARCH=loongarch64 busybox-initramfs-vendor
 
 smoke-riscv64-vendor-initramfs:
 	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor

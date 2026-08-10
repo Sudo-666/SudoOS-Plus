@@ -8,13 +8,24 @@
 # rejects. This minimal DTB describes RAM with plain physical addresses and
 # the UART0 console, matching the ls2k1000 platform constants.
 #
-# Output: build/host-tools/ls2k1000/ls2k1000-minimal.dtb
+# Stage-4 extension: when INITRD points at a newc initramfs, the chosen node
+# gains linux,initrd-start/end and a matching /memreserve/ is emitted, so the
+# kernel can locate and unpack the archive without any U-Boot initrd support
+# (the vendor U-Boot keeps images->initrd_start/end at 0).
+#   INITRD=build/initramfs/busybox-loongarch64.cpio \
+#   INITRD_PHYS_ADDR=0x0b000000 \
+#   scripts/build-ls2k1000-dtb.sh
+#
+# Output (no INITRD):   build/host-tools/ls2k1000/ls2k1000-minimal.dtb
+# Output (with INITRD): build/host-tools/ls2k1000/ls2k1000-stage4.dtb
 #
 # On the board (U-Boot):
-#   fatload usb 0:1 0x900000000a000000 ls2k1000-minimal.dtb
+#   fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+#   fatload usb 0:1 0x900000000a000000 ls2k1000-stage4.dtb
+#   fatload usb 0:1 0x900000000b000000 busybox-loongarch64.cpio
 #   bootm 0x9000000002000000 - 0x900000000a000000
 #
-# Requires: dtc (device tree compiler).
+# Requires: dtc (device tree compiler), stat/grep (coreutils).
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(
@@ -27,13 +38,69 @@ ROOT_DIR="$(
 )"
 
 OUT_DIR="${ROOT_DIR}/build/host-tools/ls2k1000"
-OUT="${OUT_DIR}/ls2k1000-minimal.dtb"
-
 mkdir -p "${OUT_DIR}"
 
-DTS_SRC="${OUT_DIR}/ls2k1000-minimal.dts"
-cat > "${DTS_SRC}" <<'EOF'
+# ---- stage-4 external initramfs (optional) ----
+INITRD="${INITRD:-}"
+INITRD_PHYS_ADDR="${INITRD_PHYS_ADDR:-0x0b000000}"
+
+# Fixed physical staging layout (U-Boot cached-VA = phys + 0x9000000000000000):
+#   kernel uImage   0x02000000
+#   DTB             0x0a000000
+#   raw initramfs   0x0b000000
+#   U-Boot          0x0ec00000
+KERNEL_BASE=0x02000000
+DTB_BASE=0x0a000000
+UBOOT_BASE=0x0ec00000
+LOW_BANK_END=0x10000000
+
+INITRD_PROPS=""
+MEMRESERVE_LINES=""
+OUT_BASENAME="ls2k1000-minimal"
+
+if [[ -n "${INITRD}" ]]; then
+    if [[ ! -f "${INITRD}" ]]; then
+        echo "error: INITRD is not a file: ${INITRD}" >&2
+        exit 1
+    fi
+    if ! head -c 6 "${INITRD}" | grep -q "070701"; then
+        echo "error: INITRD is not a newc cpio archive (bad magic): ${INITRD}" >&2
+        exit 1
+    fi
+    INITRD_SIZE=$(stat -c %s "${INITRD}")
+    INITRD_ADDR=$(( INITRD_PHYS_ADDR ))
+    INITRD_END=$(( INITRD_ADDR + INITRD_SIZE ))
+
+    # ---- reject overlaps with kernel/DTB staging and the U-Boot region ----
+    if [[ ${INITRD_ADDR} -lt ${DTB_BASE} && ${KERNEL_BASE} -lt ${INITRD_END} ]]; then
+        echo "error: initramfs [0x$(printf %x ${INITRD_ADDR}), 0x$(printf %x ${INITRD_END})) overlaps kernel/DTB staging [0x${KERNEL_BASE}, 0x${DTB_BASE})" >&2
+        exit 1
+    fi
+    if [[ ${INITRD_ADDR} -lt ${LOW_BANK_END} && ${UBOOT_BASE} -lt ${INITRD_END} ]]; then
+        echo "error: initramfs [0x$(printf %x ${INITRD_ADDR}), 0x$(printf %x ${INITRD_END})) overlaps U-Boot region [0x${UBOOT_BASE}, 0x${LOW_BANK_END})" >&2
+        exit 1
+    fi
+    if [[ ${INITRD_END} -gt ${LOW_BANK_END} ]]; then
+        echo "error: initramfs [0x$(printf %x ${INITRD_ADDR}), 0x$(printf %x ${INITRD_END})) exceeds low 256MiB bank" >&2
+        exit 1
+    fi
+
+    INITRD_START_HEX=$(printf '%08x' "${INITRD_ADDR}")
+    INITRD_END_HEX=$(printf '%08x' "${INITRD_END}")
+    INITRD_SIZE_HEX=$(printf '%08x' "${INITRD_SIZE}")
+    INITRD_PROPS="        linux,initrd-start = <0x0 0x${INITRD_START_HEX}>;
+        linux,initrd-end   = <0x0 0x${INITRD_END_HEX}>;"
+    MEMRESERVE_LINES="/memreserve/ 0x${INITRD_START_HEX} 0x${INITRD_SIZE_HEX};"
+    OUT_BASENAME="ls2k1000-stage4"
+fi
+
+OUT="${OUT_DIR}/${OUT_BASENAME}.dtb"
+DTS_SRC="${OUT_DIR}/${OUT_BASENAME}.dts"
+
+cat > "${DTS_SRC}" <<EOF
 /dts-v1/;
+
+${MEMRESERVE_LINES}
 
 / {
     #address-cells = <2>;
@@ -45,6 +112,7 @@ cat > "${DTS_SRC}" <<'EOF'
     chosen {
         stdout-path = "serial0:115200n8";
         bootargs = "console=ttyS0,115200n8";
+${INITRD_PROPS}
     };
 
     aliases {
@@ -53,7 +121,7 @@ cat > "${DTS_SRC}" <<'EOF'
 
     /*
      * 物理 RAM：主 bank [0x90000000, 0x100000000) = 1792 MiB。
-     * 低 256 MiB bank [0x0, 0x10000000) 留给 U-Boot（uImage 暂存、DTB 所在），
+     * 低 256 MiB bank [0x0, 0x10000000) 留给 U-Boot（uImage 暂存、DTB、initramfs 所在），
      * 内核不接管。
      */
     memory@90000000 {
@@ -99,6 +167,11 @@ command -v dtc >/dev/null 2>&1 || {
     exit 1
 }
 
-dtc -I dts -O dtb -o "${OUT}" "${DTS_SRC}" >/dev/null
+# -p 4096 pads the blob so U-Boot can append/fixup /chosen in place.
+dtc -I dts -O dtb -p 4096 -o "${OUT}" "${DTS_SRC}" >/dev/null
 
-echo "minimal DTB ready : ${OUT} ($(du -h "${OUT}" | cut -f1))"
+echo "${OUT_BASENAME}.dtb ready : ${OUT} ($(du -h "${OUT}" | cut -f1))"
+if [[ -n "${INITRD}" ]]; then
+    echo "  linux,initrd  : [0x${INITRD_START_HEX}, 0x${INITRD_END_HEX}) ${INITRD_SIZE} bytes"
+    echo "  /memreserve/  : 0x${INITRD_START_HEX} 0x${INITRD_SIZE_HEX}"
+fi

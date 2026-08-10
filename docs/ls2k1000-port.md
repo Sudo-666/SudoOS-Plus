@@ -406,6 +406,54 @@ uImage / kernel.bin       # 旧名别名（板卡更新菜单 / go）
 - [ ] 副核 SMP 启动（`secondary.S`、`rust_main_secondary` 桩）
 - [ ] 串口/网卡/存储驱动在真机上的轮询适配（RocketOS 采用纯轮询驱动）
 
+## 6.5 Stage-4：外部 initramfs 上板（Gate A）
+
+厂商 U-Boot 没有 raw initrd 支持（LoongArch 未定义 `CONFIG_SYS_BOOT_RAMDISK_HIGH`，
+`images->initrd_start/end` 保持 0），内核只从 FDT `/chosen` 的
+`linux,initrd-start/end` 获取 initrd。因此用 U-Boot 把 newc cpio 直接加载到
+固定地址，由 DTB 构建脚本把范围写进 `/chosen`，仍用 `bootm kernel - dtb`。
+
+构建：
+
+```bash
+make -f Makefile.project m14-vendor-userland-audit-strict
+make -f Makefile.project busybox-initramfs-loongarch64   # build/initramfs/busybox-loongarch64.cpio（72 entries）
+make -f Makefile.project ls2k1000-stage4-bundle          # uImage + cpio + stage4 DTB + 审计
+```
+
+地址布局（U-Boot cached VA = 物理地址 + 0x9000000000000000）：
+
+| 产物             | 物理地址      | U-Boot cached 地址         |
+| ---------------- | ----------: | -----------------------: |
+| kernel uImage    | `0x02000000` | `0x9000000002000000` |
+| DTB（stage4）     | `0x0a000000` | `0x900000000a000000` |
+| raw initramfs    | `0x0b000000` | `0x900000000b000000` |
+
+上板：
+
+```text
+usb reset
+fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
+fatload usb 0:1 0x900000000a000000 ls2k1000-stage4.dtb
+fatload usb 0:1 0x900000000b000000 busybox-loongarch64.cpio
+bootm 0x9000000002000000 - 0x900000000a000000
+```
+
+Gate A 判读（必须看到）：
+
+```text
+  initrd        : [0x000000000b000000, 0x000000000b2446b4) 2321 KiB
+initramfs:
+  external      : [0x000000000b000000, 0x000000000b2446b4)
+  rootfs entries: 72
+M14 BusyBox rootfs gate:
+  /bin/busybox true : verified
+SMOKE_TEST: PASS
+```
+
+`rootfs entries: 72` + `/bin/busybox true : verified` 即传递门通过；未通过则
+不进入 PID 1 改造（Commit 4.4+）。
+
 ## 7. 相关文件清单
 
 ```
