@@ -32,6 +32,7 @@ core
 /uImage
 /ls2k1000-minimal.dtb
 /ls2k1000-stage4.dtb
+/ls2k1000-stage4-init.dtb
 /uImage.fit
 /uImage-*
 /uImage-test/

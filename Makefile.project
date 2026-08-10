@@ -112,6 +112,19 @@ check-ls2k1000-stage4: kernel-ls2k1000.uImage ls2k1000-stage4.dtb
 
 ls2k1000-stage4-bundle: kernel-ls2k1000.uImage busybox-initramfs-loongarch64 ls2k1000-stage4.dtb check-ls2k1000-stage4
 
+# SUDOOS_LS2K_GATEB_V1: rdinit=/init variant of the stage-4 DTB. Same layout
+# and initrd placement as ls2k1000-stage4, but /chosen/bootargs carries
+# "rdinit=/init init.debug=1" so the kernel boots the real /init as PID 1
+# instead of the self-test sequence. The plain ls2k1000-stage4.dtb is kept as
+# the Gate A regression baseline.
+.PHONY: ls2k1000-stage4-init.dtb
+ls2k1000-stage4-init.dtb: busybox-initramfs-loongarch64
+	@test -s build/initramfs/busybox-loongarch64.cpio || (echo "error: initramfs build failed" >&2; exit 2)
+	@INITRD=build/initramfs/busybox-loongarch64.cpio INITRD_PHYS_ADDR=0x0b000000 DTB_NAME=ls2k1000-stage4-init \
+	    BOOTARGS="console=ttyS0,115200n8 rdinit=/init init.debug=1" scripts/build-ls2k1000-dtb.sh
+	@cp build/host-tools/ls2k1000/ls2k1000-stage4-init.dtb $@
+	@ls -lh $@
+
 # 别名（板卡更新菜单 / 'go' 命令沿用旧名）
 .PHONY: kernel.bin uImage
 kernel.bin: kernel-ls2k1000.bin

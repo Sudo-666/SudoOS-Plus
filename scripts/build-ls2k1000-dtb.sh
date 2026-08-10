@@ -44,6 +44,14 @@ mkdir -p "${OUT_DIR}"
 INITRD="${INITRD:-}"
 INITRD_PHYS_ADDR="${INITRD_PHYS_ADDR:-0x0b000000}"
 
+# Boot command line written into /chosen/bootargs. Override to select the
+# userland boot mode, e.g. "console=ttyS0,115200n8 rdinit=/init init.debug=1".
+BOOTARGS="${BOOTARGS:-console=ttyS0,115200n8}"
+
+# Output base name. Defaults to ls2k1000-minimal / ls2k1000-stage4; override to
+# emit a named variant such as ls2k1000-stage4-init.
+DTB_NAME="${DTB_NAME:-}"
+
 # Fixed physical staging layout (U-Boot cached-VA = phys + 0x9000000000000000):
 #   kernel uImage   0x02000000
 #   DTB             0x0a000000
@@ -56,7 +64,13 @@ LOW_BANK_END=0x10000000
 
 INITRD_PROPS=""
 MEMRESERVE_LINES=""
-OUT_BASENAME="ls2k1000-minimal"
+if [[ -n "${DTB_NAME}" ]]; then
+    OUT_BASENAME="${DTB_NAME}"
+elif [[ -n "${INITRD}" ]]; then
+    OUT_BASENAME="ls2k1000-stage4"
+else
+    OUT_BASENAME="ls2k1000-minimal"
+fi
 
 if [[ -n "${INITRD}" ]]; then
     if [[ ! -f "${INITRD}" ]]; then
@@ -91,7 +105,6 @@ if [[ -n "${INITRD}" ]]; then
     INITRD_PROPS="        linux,initrd-start = <0x0 0x${INITRD_START_HEX}>;
         linux,initrd-end   = <0x0 0x${INITRD_END_HEX}>;"
     MEMRESERVE_LINES="/memreserve/ 0x${INITRD_START_HEX} 0x${INITRD_SIZE_HEX};"
-    OUT_BASENAME="ls2k1000-stage4"
 fi
 
 OUT="${OUT_DIR}/${OUT_BASENAME}.dtb"
@@ -111,7 +124,7 @@ ${MEMRESERVE_LINES}
 
     chosen {
         stdout-path = "serial0:115200n8";
-        bootargs = "console=ttyS0,115200n8";
+        bootargs = "${BOOTARGS}";
 ${INITRD_PROPS}
     };
 
@@ -171,6 +184,7 @@ command -v dtc >/dev/null 2>&1 || {
 dtc -I dts -O dtb -p 4096 -o "${OUT}" "${DTS_SRC}" >/dev/null
 
 echo "${OUT_BASENAME}.dtb ready : ${OUT} ($(du -h "${OUT}" | cut -f1))"
+echo "  bootargs      : ${BOOTARGS}"
 if [[ -n "${INITRD}" ]]; then
     echo "  linux,initrd  : [0x${INITRD_START_HEX}, 0x${INITRD_END_HEX}) ${INITRD_SIZE} bytes"
     echo "  /memreserve/  : 0x${INITRD_START_HEX} 0x${INITRD_SIZE_HEX}"

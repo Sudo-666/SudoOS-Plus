@@ -91,6 +91,12 @@ fn boot_hardware_cpu_id(_boot: &BootInfo) -> usize {
 
 #[cfg(target_arch = "loongarch64")]
 fn direct_boot_oscomp_mode(boot: &BootInfo) -> Option<oscomp::RunMode> {
+    oscomp::mode_from_bootargs(direct_boot_command_line(boot).as_deref())
+}
+
+/// Read the QEMU direct-boot command line from the boot protocol pointer.
+#[cfg(target_arch = "loongarch64")]
+fn direct_boot_command_line(boot: &BootInfo) -> Option<alloc::string::String> {
     const MAX_COMMAND_LINE_BYTES: usize = 1024;
 
     let base = boot.command_line()?.get();
@@ -104,8 +110,7 @@ fn direct_boot_oscomp_mode(boot: &BootInfo) -> Option<oscomp::RunMode> {
         // command-line buffer and keeps it alive for the duration of boot.
         let byte = unsafe { core::ptr::read_volatile(pointer) };
         if byte == 0 {
-            let arguments = core::str::from_utf8(&bytes[..length]).ok()?;
-            return oscomp::mode_from_bootargs(Some(arguments));
+            return core::str::from_utf8(&bytes[..length]).ok().map(Into::into);
         }
         bytes[length] = byte;
         length += 1;
@@ -116,6 +121,38 @@ fn direct_boot_oscomp_mode(boot: &BootInfo) -> Option<oscomp::RunMode> {
 #[cfg(target_arch = "riscv64")]
 fn direct_boot_oscomp_mode(_boot: &BootInfo) -> Option<oscomp::RunMode> {
     None
+}
+
+#[cfg(target_arch = "riscv64")]
+fn direct_boot_command_line(_boot: &BootInfo) -> Option<alloc::string::String> {
+    None
+}
+
+/// How the kernel should hand control to userland once the VFS is ready.
+///
+/// `SelfTest` keeps the existing M8/M9/M10 + BusyBox + oscomp self-test
+/// sequence (the historical behaviour on qemu and the stage-4 DTB). When the
+/// bootargs contain `rdinit=/init`, the kernel instead skips every test that
+/// would allocate a throwaway Process and boots the real `/init` as PID 1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserlandBootMode {
+    SelfTest,
+    InitramfsInit,
+}
+
+fn userland_boot_mode(bootargs: Option<&str>) -> UserlandBootMode {
+    let mut mode = UserlandBootMode::SelfTest;
+    if let Some(arguments) = bootargs {
+        for word in arguments.split_whitespace() {
+            if let Some(init) = word.strip_prefix("rdinit=") {
+                // Accept both the canonical "/init" and a bare "init" spelling.
+                if init == "/init" || init == "init" {
+                    mode = UserlandBootMode::InitramfsInit;
+                }
+            }
+        }
+    }
+    mode
 }
 
 fn print_boot_info(boot: &BootInfo) {
@@ -240,6 +277,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         pci_hosts,
         initrd_range,
         explicit_oscomp_mode,
+        userland_mode,
     ) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
@@ -264,6 +302,8 @@ fn kernel_main(boot: BootInfo) -> ! {
         let firmware_timer_frequency = tree.timebase_frequency_hz();
         let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs())
             .or_else(|| direct_boot_oscomp_mode(&boot));
+        let direct_command_line = direct_boot_command_line(&boot);
+        let userland_mode = userland_boot_mode(tree.bootargs().or(direct_command_line.as_deref()));
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
@@ -282,6 +322,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             pci_hosts,
             initrd_range,
             explicit_oscomp_mode,
+            userland_mode,
         )
     };
 
@@ -532,36 +573,53 @@ fn kernel_main(boot: BootInfo) -> ! {
 
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     task::verify();
-    user::verify();
-    if initrd_range.is_some() {
-        user::verify_busybox_rootfs();
-    }
-    let oscomp_mode = oscomp::select_mode(explicit_oscomp_mode);
-    println!("BOOT14 user-entry");
-    let contest_ran = oscomp::run(oscomp_mode);
 
-    println!("kernel_main: initialization completed");
-    println!("SMOKE_TEST: PASS");
-
-    if contest_ran {
-        // Competition: contest completed, summary/score already printed.
-        // Use the same unified power-off path as the contest runner and
-        // watchdog so RISC-V and LoongArch behaviour stay consistent.
-        println!("contest: runner returned after summary; forcing platform shutdown");
-        user::contest_platform_shutdown();
-    } else {
-        // No sdcard: smoke / non-contest boot — stay alive so the smoke
-        // runner can capture all markers.
-        println!("oscomp: no contest — idle halt");
-    }
-    loop {
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack));
+    // Gate B: an explicit rdinit= bootarg routes the kernel to the real
+    // /init instead of the self-test sequence. The split must happen before
+    // user::verify() so no throwaway test Process can consume PID 1.
+    match userland_mode {
+        UserlandBootMode::InitramfsInit => {
+            println!("userland boot: rdinit=/init");
+            // Feed UART RX bytes into the console TTY before init starts;
+            // BusyBox askfirst blocks on /dev/console reads immediately.
+            crate::console::start_uart_input_poller();
+            // init_supervisor never returns: it publishes /init as PID 1,
+            // arms the PID 1 exit monitor, and enters the boot idle loop.
+            user::init_supervisor("/init");
         }
-        #[cfg(not(target_arch = "riscv64"))]
-        {
-            core::hint::spin_loop();
+        UserlandBootMode::SelfTest => {
+            user::verify();
+            if initrd_range.is_some() {
+                user::verify_busybox_rootfs();
+            }
+            let oscomp_mode = oscomp::select_mode(explicit_oscomp_mode);
+            println!("BOOT14 user-entry");
+            let contest_ran = oscomp::run(oscomp_mode);
+
+            println!("kernel_main: initialization completed");
+            println!("SMOKE_TEST: PASS");
+
+            if contest_ran {
+                // Competition: contest completed, summary/score already printed.
+                // Use the same unified power-off path as the contest runner and
+                // watchdog so RISC-V and LoongArch behaviour stay consistent.
+                println!("contest: runner returned after summary; forcing platform shutdown");
+                user::contest_platform_shutdown();
+            } else {
+                // No sdcard: smoke / non-contest boot — stay alive so the smoke
+                // runner can capture all markers.
+                println!("oscomp: no contest — idle halt");
+            }
+            loop {
+                #[cfg(target_arch = "riscv64")]
+                unsafe {
+                    core::arch::asm!("wfi", options(nomem, nostack));
+                }
+                #[cfg(not(target_arch = "riscv64"))]
+                {
+                    core::hint::spin_loop();
+                }
+            }
         }
     }
 }
