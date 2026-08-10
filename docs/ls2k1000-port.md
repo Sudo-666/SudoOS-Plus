@@ -446,6 +446,7 @@ Gate A 判读（必须看到）：
 initramfs:
   external      : [0x000000000b000000, 0x000000000b2446b4)
   rootfs entries: 72
+oscomp-la-ale: fixup count=1 era=0x... badv=0x...   ← 预期，见下
 M14 BusyBox rootfs gate:
   /bin/busybox true : verified
 SMOKE_TEST: PASS
@@ -453,6 +454,14 @@ SMOKE_TEST: PASS
 
 `rootfs entries: 72` + `/bin/busybox true : verified` 即传递门通过；未通过则
 不进入 PID 1 改造（Commit 4.4+）。
+
+**ALE fixup 说明**：BusyBox 是 GCC/musl 编译的 LoongArch 静态 ELF，默认开 ual，
+会执行未对齐访存并依赖 OS 修复（LA264 抛 ALE，Ecode 0x09）。内核 `user.rs`
+对 ls2k1000 提供未对齐访存模拟（decode ld/st → 字节读写 → era+=4），
+`oscomp-la-ale: fixup count=N`（前 16 次）证明模拟器生效。没有该修复时，
+`/bin/busybox true` 会以 `-EFAULT(-14)` 退出并触发断言 panic
+（`user.rs:999 assertion left == right failed: left: -14`）。qemu_virt 不启用
+该模拟器，保持原有 fail-fast 行为。
 
 ## 7. 相关文件清单
 

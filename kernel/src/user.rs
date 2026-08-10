@@ -389,6 +389,9 @@ pub(crate) fn oscomp_verbose_user_trace_active() -> bool {
 static OSCOMP_LA_FPD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_SXD_FIXUPS: AtomicUsize = AtomicUsize::new(0);
+// ls2k1000 ALE (Ecode 0x09) unaligned-access fixup counter (stage-4 Gate A).
+#[cfg(feature = "platform-ls2k1000")]
+static OSCOMP_LA_ALE_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_REAL_EXCEPTION_LOGS: AtomicUsize = AtomicUsize::new(0); // SUDOOS_FINAL_DIRECT_FIX_V1
 #[cfg(target_arch = "loongarch64")]
@@ -6848,6 +6851,29 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
         return;
     }
 
+    // ALE (Ecode 0x09): unaligned load/store in user mode. GCC/musl LoongArch
+    // binaries are built with ual enabled, so they rely on the OS to fix up
+    // unaligned accesses (the LA264 raises ALE instead). Emulate the access
+    // and resume after the faulting instruction; on unsupported opcodes fall
+    // through to the default -EFAULT kill below.
+    //
+    // ls2k1000-only: qemu_virt keeps its previous fail-fast ALE behaviour.
+    #[cfg(feature = "platform-ls2k1000")]
+    if _code == 9 {
+        let n = OSCOMP_LA_ALE_FIXUPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 {
+            crate::println!(
+                "oscomp-la-ale: fixup count={} era={:#x} badv={:#x}",
+                n,
+                frame.era,
+                frame.badv,
+            );
+        }
+        if emulate_unaligned_loongarch(frame) {
+            return;
+        }
+    }
+
     #[cfg(target_arch = "loongarch64")]
     if _code == 8 {
         let process = current_process();
@@ -6909,6 +6935,97 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
     #[cfg(target_arch = "loongarch64")]
     oscomp_la_status_trace("exception", -EFAULT);
     return_to_kernel(frame, -EFAULT);
+}
+
+/// Emulate one LoongArch unaligned load/store (ALE, Ecode 0x09) in user mode.
+///
+/// GCC/musl LoongArch binaries are compiled with ual enabled by default: the
+/// compiler freely emits unaligned ld/st and relies on the OS to fix them up
+/// (Linux does the same through its unaligned-access handler). We decode the
+/// faulting 32-bit instruction, perform a byte-wise access through the checked
+/// uaccess helpers, write back the target register and advance `era` by 4
+/// (every LoongArch instruction is 32 bits wide).
+///
+/// Returns `true` when the instruction was emulated; `false` for unsupported
+/// opcodes (e.g. FP loads, which need the FP register file) or an unmapped
+/// address, so the caller can fall back to the default -EFAULT kill.
+///
+/// ls2k1000-only: qemu_virt keeps its previous fail-fast ALE behaviour.
+#[cfg(feature = "platform-ls2k1000")]
+fn emulate_unaligned_loongarch(frame: &mut crate::arch::trap::TrapFrame) -> bool {
+    // Fetch the faulting instruction (a user VA) through the checked path.
+    let mut insn_bytes = [0u8; 4];
+    if copy_from_user(frame.era, &mut insn_bytes).is_err() {
+        return false;
+    }
+    let insn = u32::from_le_bytes(insn_bytes);
+    let opcode = insn & 0xfc000000;
+    let rd = (insn & 0x1f) as usize;
+    let rj = ((insn >> 5) & 0x1f) as usize;
+
+    // (is_load, size_bytes, sign_extend, si14_immediate).
+    let (is_load, size, sign, wide_imm) = match opcode {
+        0x0a000000 => (true, 1, true, false),  // ld.b
+        0x12000000 => (true, 1, false, false), // ld.bu
+        0x0b000000 => (true, 2, true, false),  // ld.h
+        0x13000000 => (true, 2, false, false), // ld.hu
+        0x0c000000 => (true, 4, true, false),  // ld.w
+        0x14000000 => (true, 4, false, false), // ld.wu
+        0x0d000000 => (true, 8, false, false), // ld.d
+        0x0e000000 => (false, 1, false, false), // st.b
+        0x0f000000 => (false, 2, false, false), // st.h
+        0x10000000 => (false, 4, false, false), // st.w
+        0x11000000 => (false, 8, false, false), // st.d
+        0x1c000000 => (true, 4, true, true),   // ldptr.w
+        0x1d000000 => (true, 8, false, true),  // ldptr.d
+        0x1e000000 => (false, 4, false, true), // stptr.w
+        0x1f000000 => (false, 8, false, true), // stptr.d
+        _ => return false,
+    };
+
+    let raw_imm = if wide_imm {
+        (insn >> 10) & 0x3fff
+    } else {
+        (insn >> 10) & 0xfff
+    };
+    let shift = if wide_imm { 18 } else { 20 };
+    let imm = ((raw_imm << shift) as i32 >> shift) as i64;
+    let address = (frame.gpr[rj] as i64).wrapping_add(imm) as usize;
+
+    let mut bytes = [0u8; 8];
+    if is_load {
+        if copy_from_user(address, &mut bytes[..size]).is_err() {
+            return false;
+        }
+        let value = match (size, sign) {
+            (1, true) => bytes[0] as i8 as u64,
+            (1, false) => bytes[0] as u64,
+            (2, true) => u16::from_le_bytes([bytes[0], bytes[1]]) as i16 as u64,
+            (2, false) => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+            (4, true) => {
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i32 as u64
+            }
+            (4, false) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+            (8, false) => u64::from_le_bytes(bytes),
+            _ => return false,
+        };
+        // r0 is hard-wired to zero; the trap frame must keep it that way.
+        if rd != 0 {
+            frame.gpr[rd] = value as usize;
+        }
+    } else {
+        let value = frame.gpr[rd];
+        for (index, byte) in value.to_le_bytes().iter().enumerate().take(size) {
+            bytes[index] = *byte;
+        }
+        if copy_to_user(address, &bytes[..size]).is_err() {
+            return false;
+        }
+    }
+
+    // Every LoongArch instruction is 32 bits; resume after the faulting one.
+    frame.era = frame.era.wrapping_add(4);
+    true
 }
 
 fn sys_brk(address: usize) -> isize {
