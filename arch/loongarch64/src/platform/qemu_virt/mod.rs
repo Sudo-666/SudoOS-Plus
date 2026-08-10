@@ -8,6 +8,6 @@ global_asm!(include_str!("entry.S"));
 global_asm!(include_str!("secondary.S"));
 
 pub(crate) use boot::boot_context;
-pub(crate) use console::{try_read_console_byte, write_console_byte};
+pub(crate) use console::{line_status, try_read_console_byte, write_console_byte};
 pub(crate) use memory::reserve_early_memory;
 

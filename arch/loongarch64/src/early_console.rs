@@ -11,3 +11,10 @@ pub fn write_byte(byte: u8) {
 pub fn try_read_byte() -> Option<u8> {
     crate::platform::try_read_console_byte()
 }
+
+/// 平台 UART 线路状态寄存器 (LSR),诊断用。
+///
+/// LS2K1000 读取 NS16550 LSR;qemu_virt 无输入路径,恒返回 0。
+pub fn line_status() -> u8 {
+    crate::platform::line_status()
+}

@@ -77,6 +77,14 @@ pub(crate) fn try_read_console_byte() -> Option<u8> {
     Uart::new().try_read_byte()
 }
 
+/// 读取 UART 线路状态寄存器 (LSR)。
+///
+/// 诊断用:UART RX 轮询 first-poll 时输出一次,确认 UART 接收状态。空闲时
+/// 通常为 0x60(THRE|TEMT);收到字符尚未读取时 bit 0 (DR) 置位。
+pub(crate) fn line_status() -> u8 {
+    unsafe { core::ptr::read_volatile(UART_LSR as *const u8) }
+}
+
 pub fn init() {
     // UART 在 U-Boot 阶段已经初始化过波特率（115200[cite: 1]）和时钟
     // 这里我们直接复用 U-Boot 的配置，不做重置

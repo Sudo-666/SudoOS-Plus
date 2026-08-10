@@ -45,3 +45,9 @@ fn read_line_status() -> u8 {
 pub(crate) fn try_read_console_byte() -> Option<u8> {
     None
 }
+
+/// qemu_virt has no UART RX path; returns 0 so the platform console interface
+/// stays uniform with the LS2K1000 board (which reads NS16550 LSR).
+pub(crate) fn line_status() -> u8 {
+    0
+}

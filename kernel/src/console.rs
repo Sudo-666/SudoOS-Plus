@@ -17,28 +17,55 @@ static CONSOLE_WRITE_LOCK: IrqSpinLock<()> = IrqSpinLock::new_with_class((), CON
 /// phase-4 stand-in for the stage-5 UART IRQ path.
 #[cfg(feature = "platform-ls2k1000")]
 mod uart_input {
+    use core::sync::atomic::{AtomicU64, Ordering};
     use core::time::Duration;
 
     const POLL_INTERVAL: Duration = Duration::from_millis(10);
     const MAX_DRAIN_PER_TICK: usize = 64;
 
+    static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
+    static RX_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    fn queue_next_poll() {
+        crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0)
+            .unwrap_or_else(|error| {
+                panic!("UART-RX: unable to queue poller: {error:?}");
+            });
+    }
+
     fn poll_uart_console(_argument: usize) {
+        // 一次性 first-poll 标志:仅首 tick 输出一次寄存器状态,证明 work 回调
+        // 确实在 worker 线程执行过,并记录 UART 接收状态(空闲通常 0x60)。
+        let poll = POLL_COUNT.fetch_add(1, Ordering::Relaxed);
+        if poll == 0 {
+            let lsr = crate::arch::early_console::line_status();
+            crate::println!("UART-RX: first poll executed lsr={lsr:#04x}");
+        }
+
         let mut drained = 0;
         while drained < MAX_DRAIN_PER_TICK {
             match crate::arch::early_console::try_read_byte() {
                 Some(byte) => {
+                    // 限量输出前 16 个 RX 字节,验证 UART RX 链路数据内容。
+                    let index = RX_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if index < 16 {
+                        crate::println!("UART-RX: byte[{index}]={byte:#04x}");
+                    }
                     crate::tty::input_byte(byte);
                     drained += 1;
                 }
                 None => break,
             }
         }
-        let _ = crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0);
+        queue_next_poll();
     }
 
     pub fn start() {
-        let _ = crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0);
-        crate::println!("tty: uart rx poller active (10 ms delayed work)");
+        // 首次立即入队而非延迟 10ms,确保启动日志能证明 worker 执行。
+        crate::workqueue::queue(poll_uart_console, 0).unwrap_or_else(|error| {
+            panic!("UART-RX: unable to start poller: {error:?}");
+        });
+        crate::println!("tty: uart rx poller queued");
     }
 }
 
