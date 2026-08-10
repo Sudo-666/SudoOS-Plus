@@ -83,6 +83,10 @@ struct TtyState {
     // Set when VEOF (^D) is received on an empty canonical line; the next
     // read() then returns 0 (end-of-file) so shells exit on ^D.
     eof_pending: bool,
+    // Canonical-mode VEOF on a partial line: number of bytes (from `head`)
+    // that read() should return WITHOUT a newline terminator. `abc` + ^D
+    // yields "abc" (3 bytes), not "abc\n".
+    committed_len: usize,
     // Full termios state so TCSETS* -> TCGETS* round-trips (BusyBox ash saves
     // the settings, switches to raw for line editing, then restores them).
     iflag: u32,
@@ -111,6 +115,7 @@ impl TtyState {
             head: 0,
             len: 0,
             eof_pending: false,
+            committed_len: 0,
             iflag: ICRNL,
             oflag: OPOST | ONLCR,
             cflag: B115200 | CS8,
@@ -171,10 +176,19 @@ impl TtyState {
         self.head = 0;
         self.len = 0;
         self.eof_pending = false;
+        self.committed_len = 0;
     }
 
     fn push(&mut self, byte: u8) {
-        if self.len == TTY_BUFFER {
+        // Canonical mode reserves one slot so the line-terminating newline
+        // (Enter) is never dropped when the input queue is full; a full line
+        // always gets its '\n'. Raw mode may use the entire buffer.
+        let limit = if self.canonical() {
+            TTY_BUFFER - 1
+        } else {
+            TTY_BUFFER
+        };
+        if self.len >= limit {
             return;
         }
         let tail = (self.head + self.len) % TTY_BUFFER;
@@ -195,8 +209,21 @@ impl TtyState {
             self.head = (self.head + 1) % TTY_BUFFER;
             self.len -= 1;
             copied += output.push(&[byte]);
-            if self.canonical() && byte == b'\n' {
-                break;
+            if self.canonical() {
+                if byte == b'\n' {
+                    // A full line (terminated by Enter) outranks any
+                    // VEOF-committed run: deliver through the newline.
+                    self.committed_len = 0;
+                    break;
+                }
+                if self.committed_len > 0 {
+                    self.committed_len -= 1;
+                    if self.committed_len == 0 {
+                        // VEOF-committed run delivered without a terminator
+                        // (`abc` + ^D -> "abc", no '\n').
+                        break;
+                    }
+                }
             }
         }
         copied
@@ -207,6 +234,11 @@ impl TtyState {
             return false;
         }
         self.len -= 1;
+        // A committed run can shrink if backspace races the reader; clamp so
+        // committed_len never exceeds what is actually buffered.
+        if self.committed_len > self.len {
+            self.committed_len = self.len;
+        }
         true
     }
 
@@ -218,6 +250,10 @@ impl TtyState {
             return self.eof_pending;
         }
         if !self.canonical() {
+            return true;
+        }
+        if self.committed_len > 0 {
+            // A VEOF-committed partial line is readable now (no '\n' yet).
             return true;
         }
         let mut index = self.head;
@@ -290,9 +326,10 @@ pub fn input_byte(byte: u8) {
                 drop(tty);
                 wake_readers();
             } else {
-                // Partial line: deliver the pending input immediately (the
-                // VEOF char is neither echoed nor copied into the buffer).
-                tty.push(b'\n');
+                // Partial line: commit the buffered characters without
+                // appending a newline (Linux `abc` + ^D hands read() "abc",
+                // not "abc\n"). The VEOF char is neither echoed nor copied.
+                tty.committed_len = tty.len;
                 drop(tty);
                 wake_readers();
             }
@@ -524,22 +561,33 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
             Ok(0)
         }
         TIOCGPGRP => {
-            let pgrp = CONSOLE_TTY.lock().foreground_pgrp;
-            let bytes = (pgrp as i32).to_ne_bytes();
-            copy_to_user(arg, &bytes)?;
+            let process = current_process()?;
+            let tty = CONSOLE_TTY.lock();
+            // Linux: TIOCGPGRP requires the caller to belong to the
+            // controlling session; otherwise ENOTTY (no controlling tty).
+            if tty.controlling_session == 0 || tty.controlling_session != process.session() {
+                return Err(Errno::Enotty);
+            }
+            let pgrp = tty.foreground_pgrp;
+            drop(tty);
+            copy_to_user(arg, &(pgrp as i32).to_ne_bytes())?;
             Ok(0)
         }
         TIOCSPGRP => {
             let process = current_process()?;
             let session = process.session();
+            // Linux: the caller must belong to the controlling session,
+            // otherwise ENOTTY. The target pgrp must then belong to a process
+            // in that same session; otherwise EPERM.
+            if CONSOLE_TTY.lock().controlling_session != session {
+                return Err(Errno::Enotty);
+            }
             let mut bytes = [0_u8; core::mem::size_of::<i32>()];
             process
                 .mm()
                 .copy_from_user(arg, &mut bytes)
                 .map_err(|_| Errno::Efault)?;
             let target = i32::from_ne_bytes(bytes);
-            // Linux: the target pgrp must belong to a process in the caller's
-            // own session; otherwise the request is EPERM.
             if target <= 0 || !crate::process::process_group_in_session(target as isize, session) {
                 return Err(Errno::Eperm);
             }
@@ -609,10 +657,15 @@ fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
             Ok(0)
         }
         TIOCGSID => {
-            let sid = CONSOLE_TTY.lock().controlling_session;
-            if sid == 0 {
+            let process = current_process()?;
+            let tty = CONSOLE_TTY.lock();
+            let sid = tty.controlling_session;
+            // Linux: TIOCGSID requires the caller to be in the controlling
+            // session; otherwise ENOTTY (no controlling tty).
+            if sid == 0 || sid != process.session() {
                 return Err(Errno::Enotty);
             }
+            drop(tty);
             copy_to_user(arg, &(sid as i32).to_ne_bytes())?;
             Ok(0)
         }

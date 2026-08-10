@@ -6160,7 +6160,17 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
             frame,
             sys_get_robust_list(arguments[0], arguments[1], arguments[2]),
         ),
-        SYS_SETSID => set_syscall_result(frame, current_process().setsid()),
+        SYS_SETSID => {
+            let process = current_process();
+            // Linux: a process that is already a process-group leader cannot
+            // call setsid — it could not be both the old group's leader and
+            // the new session's leader with a fresh pgid. EPERM.
+            if process.process_group() == process.id().get() as isize {
+                set_syscall_result(frame, -(crate::syscall::errno::EPERM));
+            } else {
+                set_syscall_result(frame, process.setsid());
+            }
+        }
         SYS_SETPGID => set_syscall_result(frame, sys_setpgid(arguments[0], arguments[1])),
         SYS_GETPGID => set_syscall_result(frame, sys_getpgid(arguments[0])),
         SYS_GETSID => set_syscall_result(frame, sys_getsid(arguments[0])),
@@ -9293,6 +9303,8 @@ fn set_signal_handler_frame(
 
 fn sys_setpgid(pid: usize, pgid: usize) -> isize {
     let current = current_process();
+    let caller_id = current.id();
+    let caller_session = current.session();
     let target = if pid == 0 {
         current
     } else {
@@ -9301,8 +9313,36 @@ fn sys_setpgid(pid: usize, pgid: usize) -> isize {
             None => return -crate::syscall::errno::ESRCH,
         }
     };
-    let group = if pgid == 0 { target.id().get() } else { pgid };
-    target.set_process_group(group as isize);
+    let group = if pgid == 0 {
+        target.id().get() as isize
+    } else {
+        pgid as isize
+    };
+    if group <= 0 {
+        return -crate::syscall::errno::EINVAL;
+    }
+    // Linux: the target must be in the caller's session.
+    if target.session() != caller_session {
+        return -crate::syscall::errno::EPERM;
+    }
+    // A session leader cannot be moved into another process group.
+    if target.session() == target.id().get() as isize {
+        return -crate::syscall::errno::EPERM;
+    }
+    // The target must be the caller itself or one of its children; an
+    // unrelated process is EPERM.
+    let related = target.id() == caller_id || target.parent_id() == Some(caller_id);
+    if !related {
+        return -crate::syscall::errno::EPERM;
+    }
+    // The group must already exist in the session, or be a brand-new group
+    // keyed by the target's own pid.
+    if group != target.id().get() as isize
+        && !crate::process::process_group_in_session(group, target.session())
+    {
+        return -crate::syscall::errno::ESRCH;
+    }
+    target.set_process_group(group);
     0
 }
 
