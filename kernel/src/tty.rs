@@ -38,6 +38,7 @@ const TTY_DIAG_LIMIT: usize = 8;
 static TTY_BLOCK_LOG: AtomicUsize = AtomicUsize::new(0);
 static TTY_RX_LOG: AtomicUsize = AtomicUsize::new(0);
 static TTY_READ_LOG: AtomicUsize = AtomicUsize::new(0);
+static TTY_IOCTL_LOG: AtomicUsize = AtomicUsize::new(0);
 
 struct TtyState {
     buffer: [u8; TTY_BUFFER],
@@ -193,6 +194,28 @@ pub fn write_console(bytes: &[u8]) -> usize {
 }
 
 pub fn ioctl(cmd: usize, arg: usize) -> Result<usize, Errno> {
+    let result = ioctl_dispatch(cmd, arg);
+    // Stage-4 Gate-C diagnostic: record the first few termios ioctls (with
+    // result) so a non-interactive shell can be traced to a failing TCGETS /
+    // TCSETS / TIOCGPGRP. Gated by the verbose flag (only armed on rdinit),
+    // so qemu_virt SelfTest never prints these.
+    if crate::user::oscomp_verbose_user_trace_active() {
+        let trace_index = TTY_IOCTL_LOG.fetch_add(1, Ordering::Relaxed);
+        if trace_index < TTY_DIAG_LIMIT {
+            let pid = current_process().map(|p| p.id().get()).unwrap_or(0);
+            match &result {
+                Ok(value) => crate::println!("TTY-IOCTL: pid={pid} cmd={cmd:#04x} -> ok({value})"),
+                Err(errno) => crate::println!(
+                    "TTY-IOCTL: pid={pid} cmd={cmd:#04x} -> errno={}",
+                    errno.to_isize(),
+                ),
+            }
+        }
+    }
+    result
+}
+
+fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {
     match cmd {
         TCGETS => {
             let tty = CONSOLE_TTY.lock();

@@ -1032,6 +1032,13 @@ static PID1_EXIT_MONITOR: crate::irq_lock::IrqSpinLock<Option<Arc<Thread>>> =
 /// function never returns.
 pub fn init_supervisor(init_path: &str) -> ! {
     crate::println!("INIT: exec pid=1 path={init_path}");
+    // Stage-4 Gate-C diagnostic: surface the shell's syscalls (ioctl-fail,
+    // unknown-syscall, TTY-IOCTL) so a missing login prompt can be traced to
+    // the exact failing call. Bounded by existing trace budgets. Only armed
+    // on the rdinit boot path — SelfTest never calls init_supervisor, so the
+    // flag (and every gated trace) stays off on qemu_virt.
+    OSCOMP_VERBOSE_USER_TRACE.store(true, Ordering::Release);
+    crate::println!("SUDOOS-TRACE: verbose syscall trace active (bounded)");
     let extra_areas = [VmArea::new(
         VirtRange::from_bounds(RUNTIME_TLS_PAGE, RUNTIME_TLS_PAGE + PAGE_SIZE),
         VmAreaFlags::user_rw(),
