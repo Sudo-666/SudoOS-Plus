@@ -274,9 +274,6 @@ pub fn create_pipe(flags: OpenFlags) -> Result<(myos_vfs::ArcFile, myos_vfs::Arc
         OpenFlags::empty()
     };
     let pipe = Pipe::new();
-    if crate::user::oscomp_verbose_user_trace_active() {
-        crate::println!("pipe-create: pipe={:#x}", Arc::as_ptr(&pipe) as usize);
-    }
     let reader = File::new(
         OpenFlags::O_RDONLY.union(status_flags),
         Arc::new(PipeReader {

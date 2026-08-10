@@ -63,8 +63,8 @@ impl KernelGlobalAllocator {
         *heap = Some(HeapAllocator::new(KernelPageProvider));
 
         /*
-         * LS2K1000：记录堆安装完成的标志，供 ls2k_fatal_heap_none 与
-         * HEAP-STATE 输出引用。仅 ls2k1000 平台编译。
+         * LS2K1000：记录堆安装完成的标志，供 ls2k_fatal_heap_none 引用。
+         * 仅 ls2k1000 平台编译。
          */
         #[cfg(feature = "platform-ls2k1000")]
         LS2K_HEAP_INSTALLED.store(true, core::sync::atomic::Ordering::Release);
@@ -279,29 +279,6 @@ fn ls2k_alloc_error_handler(layout: Layout) -> ! {
 
     loop {
         core::hint::spin_loop();
-    }
-}
-
-/*
- * LS2K1000 类型安全的堆状态统计接口。
- *
- * 只通过堆锁 + HeapAllocator::stats 读取状态，不访问堆内部结构原始内存。
- * 不分配内存、不长时间持锁，可在任意任务上下文安全调用。
- */
-#[cfg(feature = "platform-ls2k1000")]
-pub fn dump_heap_state(tag: &'static str) {
-    let Some(guard) = GLOBAL_HEAP.heap.try_lock() else {
-        crate::println!("HEAP-STATE[{}] lock-busy", tag);
-        return;
-    };
-    if let Some(heap) = guard.as_ref() {
-        crate::println!(
-            "HEAP-STATE[{}] initialized=true stats={:?}",
-            tag,
-            heap.stats(),
-        );
-    } else {
-        crate::println!("HEAP-STATE[{}] initialized=false", tag);
     }
 }
 

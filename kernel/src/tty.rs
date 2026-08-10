@@ -1,5 +1,3 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use myos_vfs::{Errno, MutableIoBuffer};
 
 use crate::irq_lock::IrqSpinLock;
@@ -46,16 +44,6 @@ const VMIN: usize = 6;
 
 static CONSOLE_TTY: IrqSpinLock<TtyState> = IrqSpinLock::new_with_class(TtyState::new(), TTY_LOCK);
 static TTY_READ_WAIT: WaitQueue = WaitQueue::new();
-
-// Stage-4 Gate-C diagnostics (bounded so they never flood the console). These
-// are shared TTY instrumentation, not board-specific: they only fire when a
-// process actually blocks on the console or input is fed to it, so qemu_virt's
-// SelfTest boot (no input path) never prints them.
-const TTY_DIAG_LIMIT: usize = 8;
-static TTY_BLOCK_LOG: AtomicUsize = AtomicUsize::new(0);
-static TTY_RX_LOG: AtomicUsize = AtomicUsize::new(0);
-static TTY_READ_LOG: AtomicUsize = AtomicUsize::new(0);
-static TTY_IOCTL_LOG: AtomicUsize = AtomicUsize::new(0);
 
 struct TtyState {
     buffer: [u8; TTY_BUFFER],
@@ -226,11 +214,7 @@ pub fn input_byte(byte: u8) {
                 write_output(b"\r\n");
             }
             drop(tty);
-            let woken = wake_readers();
-            let index = TTY_RX_LOG.fetch_add(1, Ordering::Relaxed);
-            if index < TTY_DIAG_LIMIT {
-                crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
-            }
+            wake_readers();
         }
         0x08 | 0x7f if tty.canonical() => {
             if tty.erase() && tty.echo() {
@@ -258,10 +242,8 @@ pub fn input_byte(byte: u8) {
             // reader, only the line terminator does.
             let wake = !tty.canonical();
             drop(tty);
-            let woken = if wake { wake_readers() } else { 0 };
-            let index = TTY_RX_LOG.fetch_add(1, Ordering::Relaxed);
-            if index < TTY_DIAG_LIMIT {
-                crate::println!("TTY-RX: byte={byte:#04x} wake_count={woken}");
+            if wake {
+                wake_readers();
             }
         }
     }
@@ -278,22 +260,12 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         if tty.read_ready() {
             let n = tty.pop_into(buf);
             drop(tty);
-            let index = TTY_READ_LOG.fetch_add(1, Ordering::Relaxed);
-            if index < TTY_DIAG_LIMIT {
-                let pid = current_process().map(|p| p.id().get()).unwrap_or(0);
-                crate::println!("TTY-READ: pid={pid} got {n} byte(s)");
-            }
             return Ok(n);
         }
         if !can_block {
             return Err(Errno::Eagain);
         }
         drop(tty);
-        let index = TTY_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
-        if index < TTY_DIAG_LIMIT {
-            let pid = current_process().map(|p| p.id().get()).unwrap_or(0);
-            crate::println!("TTY-READ: pid={pid} blocked");
-        }
         let _ = crate::task::block_current_on_if_from_user_trap(&TTY_READ_WAIT, || {
             !CONSOLE_TTY.lock().read_ready()
         });
@@ -349,25 +321,7 @@ fn baud_from_cflag(cflag: u32) -> u32 {
 }
 
 pub fn ioctl(cmd: usize, arg: usize) -> Result<usize, Errno> {
-    let result = ioctl_dispatch(cmd, arg);
-    // Stage-4 Gate-C diagnostic: record the first few termios ioctls (with
-    // result) so a non-interactive shell can be traced to a failing TCGETS /
-    // TCSETS / TIOCGPGRP. Gated by the verbose flag (only armed on rdinit),
-    // so qemu_virt SelfTest never prints these.
-    if crate::user::oscomp_verbose_user_trace_active() {
-        let trace_index = TTY_IOCTL_LOG.fetch_add(1, Ordering::Relaxed);
-        if trace_index < TTY_DIAG_LIMIT {
-            let pid = current_process().map(|p| p.id().get()).unwrap_or(0);
-            match &result {
-                Ok(value) => crate::println!("TTY-IOCTL: pid={pid} cmd={cmd:#04x} -> ok({value})"),
-                Err(errno) => crate::println!(
-                    "TTY-IOCTL: pid={pid} cmd={cmd:#04x} -> errno={}",
-                    errno.to_isize(),
-                ),
-            }
-        }
-    }
-    result
+    ioctl_dispatch(cmd, arg)
 }
 
 fn ioctl_dispatch(cmd: usize, arg: usize) -> Result<usize, Errno> {

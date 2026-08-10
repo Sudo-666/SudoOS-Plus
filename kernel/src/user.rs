@@ -399,10 +399,6 @@ static OSCOMP_LA_ALE_FIXUPS: AtomicUsize = AtomicUsize::new(0);
 static OSCOMP_LA_ALE_FAILS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "loongarch64")]
 static OSCOMP_LA_REAL_EXCEPTION_LOGS: AtomicUsize = AtomicUsize::new(0); // SUDOOS_FINAL_DIRECT_FIX_V1
-#[cfg(target_arch = "loongarch64")]
-static OSCOMP_LA_CLONE_DIAG_BUDGET: AtomicUsize = AtomicUsize::new(96);
-#[cfg(target_arch = "loongarch64")]
-static OSCOMP_LA_ENTER_DIAG_BUDGET: AtomicUsize = AtomicUsize::new(96);
 
 #[cfg(target_arch = "loongarch64")]
 pub(crate) fn oscomp_la_sleep_trace_active() -> bool {
@@ -1035,10 +1031,10 @@ static PID1_EXIT_MONITOR: crate::irq_lock::IrqSpinLock<Option<Arc<Thread>>> =
 pub fn init_supervisor(init_path: &str) -> ! {
     crate::println!("INIT: exec pid=1 path={init_path}");
     // Stage-4 Gate-C diagnostic: surface the shell's syscalls (ioctl-fail,
-    // unknown-syscall, TTY-IOCTL) so a missing login prompt can be traced to
-    // the exact failing call. Bounded by existing trace budgets. Only armed
-    // on the rdinit boot path — SelfTest never calls init_supervisor, so the
-    // flag (and every gated trace) stays off on qemu_virt.
+    // unknown-syscall) so a missing login prompt can be traced to the exact
+    // failing call. Bounded by existing trace budgets. Only armed on the
+    // rdinit boot path — SelfTest never calls init_supervisor, so the flag
+    // (and every gated trace) stays off on qemu_virt.
     OSCOMP_VERBOSE_USER_TRACE.store(true, Ordering::Release);
     crate::println!("SUDOOS-TRACE: verbose syscall trace active (bounded)");
     let extra_areas = [VmArea::new(
@@ -7695,17 +7691,12 @@ fn mremap_success_trace(
 
 // Separated trace counters: failures print unconditionally up to 64.
 // Successes are rate-limited independently so they don't crowd out failures.
-static MPROTECT_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MPROTECT_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FILE_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static MMAP_FILE_FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 const TRACE_OK_LIMIT: usize = 8;
 const TRACE_FAIL_LIMIT: usize = 128;
 
-fn mprotect_ok_trace() -> bool {
-    oscomp_verbose_user_trace_active()
-        && MPROTECT_OK_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_OK_LIMIT
-}
 fn mprotect_fail_trace() -> bool {
     MPROTECT_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) < TRACE_FAIL_LIMIT
 }
@@ -7811,13 +7802,6 @@ fn sys_mprotect(address: usize, length: usize, protection: usize) -> isize {
             protection,
             range.start().get(),
             range.end().get(),
-        );
-    } else if mprotect_ok_trace() {
-        crate::println!(
-            "mprotect: ok addr={:#x} len={:#x} prot={:#x}",
-            address,
-            length,
-            protection,
         );
     }
     ret
@@ -13163,27 +13147,6 @@ pub(crate) fn run_scheduled_thread(thread: &crate::process::Thread) -> isize {
     );
 
     if let Some(frame) = thread.take_trap_frame() {
-        #[cfg(target_arch = "loongarch64")]
-        if oscomp_verbose_user_trace_active()
-            && OSCOMP_LA_ENTER_DIAG_BUDGET
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
-                .is_ok()
-        {
-            crate::println!(
-                "oscomp-la-enter-clone-frame: pid={} tid={} era={:#x} sp={:#x} r1={:#x} r2={:#x} r22={:#x} r23={:#x} r24={:#x} r25={:#x} r26={:#x}",
-                thread.process().id().get(),
-                thread.id().get(),
-                frame.era,
-                frame.gpr[3],
-                frame.gpr[1],
-                frame.gpr[2],
-                frame.gpr[22],
-                frame.gpr[23],
-                frame.gpr[24],
-                frame.gpr[25],
-                frame.gpr[26],
-            );
-        }
         enter_user_frame(&frame)
     } else {
         enter_user(thread.entry().get(), thread.user_stack_pointer().get())

@@ -481,8 +481,6 @@ fn kernel_main(boot: BootInfo) -> ! {
      * 开启中断，最后标记 BSP scheduler active 并孵化 reaper。调度定时器
      * 绝不在 Scheduler 发布之前启动。
      */
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::heap::dump_heap_state("pre-task-init");
     task::initialize();
     time::start_periodic();
     task::start_boot_scheduler();
@@ -490,11 +488,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     time::verify_periodic();
 
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::heap::dump_heap_state("post-task-init");
     smp::start_secondaries();
-    #[cfg(feature = "platform-ls2k1000")]
-    crate::heap::dump_heap_state("post-secondaries");
     task::finalize_cpu_bringup();
     println!("BOOT11 all-ap-online");
     #[cfg(feature = "platform-ls2k1000")]

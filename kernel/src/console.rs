@@ -10,21 +10,27 @@ static CONSOLE_WRITE_LOCK: IrqSpinLock<()> = IrqSpinLock::new_with_class((), CON
 
 /// Stage-4 UART RX poller (LS2K1000 board only).
 ///
-/// A self-rescheduling delayed-work item drains up to 64 pending UART bytes
-/// into the console TTY each tick and then rearms itself. Workqueue callbacks
-/// run in a sleepable system-worker context, so the TTY echo, waitqueue
-/// wakeups and signal delivery inside `tty::input_byte` are legal. This is the
-/// phase-4 stand-in for the stage-5 UART IRQ path.
+/// A self-rescheduling delayed-work item drains the UART FIFO into the console
+/// TTY at 1 ms cadence. Each tick reads the whole FIFO into a stack array first
+/// and only then feeds the line discipline, so echo/termios processing can
+/// never stall the hardware drain loop and widen the window in which the FIFO
+/// fills and drops bytes. Workqueue callbacks run in a sleepable system-worker
+/// context, so the TTY echo, waitqueue wakeups and signal delivery inside
+/// `tty::input_byte` are legal. This is the phase-4 stand-in for the stage-5
+/// UART IRQ path.
 #[cfg(feature = "platform-ls2k1000")]
 mod uart_input {
     use core::sync::atomic::{AtomicU64, Ordering};
     use core::time::Duration;
 
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    // 115200-8N1 每秒约 11520 字节(≈11.5 字节/ms),1 ms 轮询配合硬件 FIFO
+    // 足够跟上连续粘贴;10 ms 周期会让突发粘贴超出 16 字节 FIFO 而丢字。
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
+    // 单轮排空上限:回显/TTY 处理期间不得独占 worker。达到上限说明 FIFO
+    // 仍有积压,立即重排队而不是等满一个周期。
     const MAX_DRAIN_PER_TICK: usize = 64;
 
     static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
-    static RX_COUNT: AtomicU64 = AtomicU64::new(0);
 
     fn queue_next_poll() {
         crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0)
@@ -42,22 +48,32 @@ mod uart_input {
             crate::println!("UART-RX: first poll executed lsr={lsr:#04x}");
         }
 
-        let mut drained = 0;
-        while drained < MAX_DRAIN_PER_TICK {
+        // 先把 FIFO 快速读入栈上数组,再统一交给行规程。读取循环里没有任何
+        // 串口输出,回显/TTY 处理与硬件排空完全解耦,不会因打印拉长排空间隙。
+        let mut pending = [0_u8; MAX_DRAIN_PER_TICK];
+        let mut count = 0;
+        while count < MAX_DRAIN_PER_TICK {
             match crate::arch::early_console::try_read_byte() {
                 Some(byte) => {
-                    // 限量输出前 16 个 RX 字节,验证 UART RX 链路数据内容。
-                    let index = RX_COUNT.fetch_add(1, Ordering::Relaxed);
-                    if index < 16 {
-                        crate::println!("UART-RX: byte[{index}]={byte:#04x}");
-                    }
-                    crate::tty::input_byte(byte);
-                    drained += 1;
+                    pending[count] = byte;
+                    count += 1;
                 }
                 None => break,
             }
         }
-        queue_next_poll();
+        let fifo_drained = count < MAX_DRAIN_PER_TICK;
+        for byte in &pending[..count] {
+            crate::tty::input_byte(*byte);
+        }
+
+        if fifo_drained {
+            queue_next_poll();
+        } else {
+            // 单轮排满:可能还有积压,立即再次排队以追上串口线速。
+            crate::workqueue::queue(poll_uart_console, 0).unwrap_or_else(|error| {
+                panic!("UART-RX: unable to queue poller: {error:?}");
+            });
+        }
     }
 
     pub fn start() {
