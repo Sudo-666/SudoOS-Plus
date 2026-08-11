@@ -51,12 +51,14 @@ help:
 
 # Board build artifacts must forward unconditionally: the `%` rule above
 # short-circuits targets whose file already exists on disk, which would leave
-# stale kernel binaries / uImages after a rebuild. The judge's `make all`
-# goes through oscomp-all -> scripts/oscomp-build.sh and is unaffected.
-.PHONY: ls2k1000-mkimage kernel-ls2k1000 kernel-ls2k1000.elf \
+# stale kernel binaries / uImages after a rebuild. kernel-rv is in the same
+# boat: the 4.8.18 gate-c-wait4-smoke regression needs a fresh RISC-V kernel
+# even though kernel-rv already exists. The judge's `make all` goes through
+# oscomp-all -> scripts/oscomp-build.sh and is unaffected.
+.PHONY: ls2k1000-mkimage kernel-rv kernel-ls2k1000 kernel-ls2k1000.elf \
         kernel-ls2k1000.bin kernel-ls2k1000.uImage check-ls2k1000-image \
         uImage kernel.bin
-ls2k1000-mkimage kernel-ls2k1000 kernel-ls2k1000.elf \
+ls2k1000-mkimage kernel-rv kernel-ls2k1000 kernel-ls2k1000.elf \
 kernel-ls2k1000.bin kernel-ls2k1000.uImage check-ls2k1000-image \
 uImage kernel.bin:
 	@$(MAKE) -f Makefile.project $@

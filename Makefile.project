@@ -537,6 +537,18 @@ smoke-riscv64-vendor-initramfs:
 	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
 	QEMU_ARGS="-initrd build/initramfs/busybox-riscv64.cpio" $(MAKE) smoke-riscv64
 
+# Gate C 4.8.18: PID 1 interruptible-wait regression through a real RISC-V
+# QEMU boot of BusyBox /init. The syscall/process code under test
+# (user.rs / task/mod.rs / task/wait_queue.rs / process.rs) is shared across
+# architectures, so this exercises the same fork -> parent wait4 blocks ->
+# sysinit child exits -> parent woken -> reap -> init reaches askfirst chain
+# that deadlocked on the LS2K1000 board (4.8.17 recursive SCHEDULER lock).
+# Requires qemu-system-riscv64: run inside WSL.
+.PHONY: gate-c-wait4-smoke
+gate-c-wait4-smoke: kernel-rv
+	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
+	python3 scripts/gate-c-wait4-smoke.py --skip-build
+
 smoke-riscv64-sdcard:
 	@test -f sdcard-rv.img || (echo "error: missing sdcard-rv.img" >&2; exit 2)
 	QEMU_ARGS="-drive file=sdcard-rv.img,if=none,format=raw,id=hd0,readonly=on -device virtio-blk-device,drive=hd0" $(MAKE) smoke-riscv64

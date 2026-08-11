@@ -602,6 +602,64 @@ cat
 - `exit` → Enter → 重新出现 `Please press Enter to activate this console.` + `sudoos:/#`，循环 20 次；
 - 全程无 `unknown-syscall`、panic、OOM、`oscomp-la-ale-fail`。
 
+### Gate C 回归（Commit 4.8.17–4.8.18）
+
+**4.8.17 递归锁修复（板卡 boot 挂死根因）**
+
+BusyBox PID 1 的 `fork sysinit → wait4` 路径在 `block_current_on_if_from_user_trap`
+的 `should_block` 闭包里调用了 `current_has_unblocked_signal()`，后者经
+`current_user_thread()` 二次获取 `SCHEDULER` 锁，造成递归加锁 panic，板卡
+停在 `SUDOOS_INIT_READY` 之前。修复：
+
+- `Arc<Thread>` 在进入 wait 循环前、持有 `SCHEDULER` 之前捕获一次；
+- 新增 `thread_has_unblocked_signal(&thread)`（纯原子读 `pending()` /
+  `blocked_signals()`，不碰 `SCHEDULER`），闭包内改用捕获线程；
+- 两种 interruptible wait 的所有检查点（含 `should_block` 闭包）全部替换，
+  未删除信号检查，保留 check-then-sleep 无丢失唤醒语义。
+
+**4.8.18 RISC-V PID 1 wait4 启动回归**
+
+新增 `make gate-c-wait4-smoke`：在 RISC-V QEMU 中真实启动 BusyBox `/init`。
+受测代码（`user.rs` / `task/mod.rs` / `task/wait_queue.rs` / `process.rs`）
+跨架构共享，因此覆盖与板卡完全相同的 `fork → wait4 interruptible wait →
+sysinit 子进程退出 → 父进程被唤醒收割 → init 继续 askfirst` 路径。运行
+等价于：
+
+```sh
+make kernel-rv
+make BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
+qemu-system-riscv64 -machine virt -bios default -kernel kernel-rv \
+    -initrd build/initramfs/busybox-riscv64.cpio \
+    -append "console=ttyS0 rdinit=/init init.debug=1" \
+    -m 256M -smp 1 -display none -monitor none \
+    -serial file:artifacts/gate-c-wait4-rv.log -no-reboot
+```
+
+判读（`scripts/gate-c-wait4-smoke.py`，超时 60s）：
+
+- 必须全部出现：`INIT: exec pid=1 path=/init`、`SUDOOS_INIT_READY`、
+  `Please press Enter to activate this console.`；
+- 必须为零：`recursive lock acquisition`、`lock order violation`、
+  `panicked at`、`kernel panic`、`KERNEL PANIC`。
+
+三个成功标志分别证明：PID 1 已启动 → sysinit 子进程获得运行机会并输出
+marker → 子进程退出 → 父进程 wait4 被唤醒并完成收割 → BusyBox init 继续
+执行 askfirst。仅有 `SUDOOS_INIT_READY` 不足以证明父进程已从 wait4 返回，
+`Please press Enter ...` 不可省略。
+
+**顺带修复：MAP_FIXED 劈开堆区后 fork 失败**
+
+RISC-V smoke 首先暴露了一个独立于 wait4 的真实缺陷：BusyBox init 用
+`mmap(MAP_FIXED, USER_HEAP_START, 0x1000)` 在堆区头部映射一页，
+`unmap_range` 劈开堆 VMA 但 `brk.start` 仍停留在劈开前地址；后续
+`set_program_break_and_sync_heap`（brk 或 `fork_clone_eager`）从 stale
+`brk.start` 重映射堆，撞上该匿名映射 → `Area(Overlap)` → fork 返回
+`-ENOMEM` → BusyBox `can't fork`。修复在 `mm/src/address_space.rs`：
+
+`set_program_break_and_sync_heap` 移除堆区前先记录现有堆区最低页，重映射
+起点取 `max(brk.start.align_down(PAGE_SIZE), 现有堆区起点)`，保留劈开后的
+低边。回归测试 `heap_rebuild_preserves_map_fixed_carve` 覆盖该场景。
+
 ## 7. 相关文件清单
 
 ```
