@@ -636,6 +636,74 @@ impl UserMm {
         Ok(range.start())
     }
 
+    /// Atomically replace any overlapping VMAs with a single exact anonymous
+    /// VMA — the VMA topology change (remove old, insert new) is done under a
+    /// single MM lock so no concurrent observer sees the intermediate "hole".
+    ///
+    /// Old page-table entries and backings are detached inside the lock but
+    /// freed after the lock is released (TLB-before-free).
+    ///
+    /// Returns the exact start address on success.
+    pub fn replace_anonymous_exact(
+        &self,
+        range: VirtRange,
+        flags: VmAreaFlags,
+    ) -> Result<VirtAddr, UserMmRuntimeError> {
+        let retirement = {
+            let mut state = self.state.lock();
+            let old_layout = state.core.layout().clone();
+
+            // 1. Remove overlapping VMAs from the topology.
+            state
+                .core
+                .layout_mut()
+                .unmap_range(range)
+                .map_err(UserMmError::from)?;
+
+            // 2. Insert the new exact VMA before detaching old PTEs/backings so
+            //    that a rollback of this step only needs to restore the layout.
+            if let Err(e) =
+                state
+                    .core
+                    .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))
+            {
+                *state.core.layout_mut() = old_layout;
+                return Err(UserMmRuntimeError::Core(e));
+            }
+
+            // 3. Detach old PTEs and backings.  Allocations happen before any
+            //    PTE/backing modification, so an error here leaves the state
+            //    consistent and a layout rollback is sufficient.
+            match retire_range_locked(&mut state, range) {
+                Ok(retirement) => retirement,
+                Err(error) => {
+                    *state.core.layout_mut() = old_layout;
+                    return Err(error);
+                }
+            }
+        };
+        finish_retirement(retirement)?;
+        Ok(range.start())
+    }
+
+    /// Exact anonymous mapping that MUST NOT replace any existing mapping.
+    ///
+    /// Returns `Core(AddressSpace(Area(Overlap)))` when any part of `range`
+    /// overlaps an existing VMA — the caller maps this to `EEXIST`.
+    /// The check and the map happen under the same MM lock so there is no
+    /// TOCTOU window between the overlap test and the insertion.
+    pub fn map_anonymous_noreplace(
+        &self,
+        range: VirtRange,
+        flags: VmAreaFlags,
+    ) -> Result<VirtAddr, UserMmRuntimeError> {
+        let mut state = self.state.lock();
+        state
+            .core
+            .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))?;
+        Ok(range.start())
+    }
+
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();
