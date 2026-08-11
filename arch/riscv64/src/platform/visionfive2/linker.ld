@@ -197,6 +197,13 @@ SECTIONS
     __kernel_phys_start = BOOT_PHYS_BASE;
     __kernel_phys_end = __rw_phys_end;
 
+    /*
+     * 内核物理末端必须落在 DTB/initramfs 预留地址 0x4600_0000 之前,
+     * 否则 bootm 会把 DTB 覆盖到内核身上。
+     */
+    ASSERT(__kernel_phys_end <= 0x46000000,
+           "VisionFive2 kernel image would overlap the DTB/initramfs reserve at 0x46000000")
+
     /DISCARD/ :
     {
         *(.eh_frame .eh_frame.*)

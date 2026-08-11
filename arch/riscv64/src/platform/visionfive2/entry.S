@@ -55,18 +55,28 @@
 
 _start:
     /*
+     * 一进入就把 a0(boot hart)/a1(FDT)保存到调用者保存的 s2/s3。
+     * 页表构建会覆盖 t0~t5/s0/s1,但不会动 s2/s3;进入 rust_entry 前
+     * (.Lenter_rust)再恢复,确保 bootm 传参不被第一阶段破坏。
+     */
+    mv s2, a0
+    mv s3, a1
+
+    /*
      * 诊断字符 'B'：物理直写 JH7110 DW APB UART0 @ 0x1000_0000。
      *
      * 当前 satp=Bare,0x1000_0000 是纯物理地址。reg-shift=2,THR 在
      * 0x00、LSR 在 0x14,均为 32 位访问。U-Boot 已初始化 UART0 时钟/波特率。
+     *
+     * 先轮询 LSR.THRE(发送保持寄存器空)再写 THR,避免向满 FIFO 写入。
      */
     li t0, 0x10000000
-    li t1, 0x42                /* 'B' */
-    sw t1, 0(t0)               /* THR */
 1:
     lw t2, 0x14(t0)            /* LSR */
     andi t2, t2, 0x20          /* THRE bit 5 */
     beqz t2, 1b
+    li t1, 0x42                /* 'B' */
+    sw t1, 0(t0)               /* THR */
 
     /*
      * 在完整 trap 子系统建立之前禁止 supervisor interrupt。
@@ -461,8 +471,11 @@ __riscv_high_entry:
      * a0 = boot hart ID
      * a1 = FDT 物理地址
      *
+     * 从 _start 入口保存的 s2/s3 恢复,确保页表构建没有破坏它们。
      * 当前接口仍保留第三个参数。
      */
+    mv a0, s2
+    mv a1, s3
     li a2, 0
 
     call rust_entry

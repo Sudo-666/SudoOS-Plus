@@ -118,22 +118,36 @@ impl<'a> DeviceTree<'a> {
     }
 
     /// 设备树中声明的全部可用物理内存区域。
+    ///
+    /// 遍历所有 `device_type = "memory"` 节点及其全部 `reg` 项,而不是只
+    /// 取 `root().memory()` 返回的单个 `/memory` 节点:多 RAM bank 的板卡
+    /// 可能拆成多个 memory 节点,或在一个节点里写多组 reg。跳过
+    /// `disabled`/`fail` 节点,跳过空区域与起始地址/长度溢出或
+    /// start+size 溢出的非法项。
     pub fn memory_regions(&self) -> impl Iterator<Item = MemoryRegion> + '_ {
         self.inner
-            .root()
-            .memory()
-            .reg()
-            .iter::<u64, u64>()
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-
-                let start = usize::try_from(entry.address).ok()?;
-
-                let size = usize::try_from(entry.len).ok()?;
-
-                Some(MemoryRegion::new(start, size))
+            .all_nodes()
+            .filter_map(|(_depth, node)| {
+                if node_is_available(node) && node_is_memory(node) {
+                    node.reg()
+                } else {
+                    None
+                }
             })
-            .filter(|region| !region.is_empty())
+            .flat_map(|reg| {
+                reg.iter::<u64, u64>().filter_map(|entry| {
+                    let entry = entry.ok()?;
+
+                    let start = usize::try_from(entry.address).ok()?;
+
+                    let size = usize::try_from(entry.len).ok()?;
+
+                    let region = MemoryRegion::new(start, size);
+
+                    // 跳过空区域(start+size 溢出时 end() 为 None)。
+                    (!region.is_empty() && region.end().is_some()).then_some(region)
+                })
+            })
     }
 
     /// 查找所有启用的 `virtio,mmio` 节点。
@@ -283,6 +297,13 @@ impl<'a> DeviceTree<'a> {
         }
 
         Ok(())
+    }
+}
+
+fn node_is_memory(node: UnalignedInfallibleNode<'_>) -> bool {
+    match node.raw_property("device_type") {
+        Some(property) => property_string(property.value) == Some("memory"),
+        None => false,
     }
 }
 
@@ -481,7 +502,133 @@ fn read_cells(bytes: &[u8]) -> Result<u64, FdtError> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::property_u64;
+    use crate::{DeviceTree, FdtBlob, MemoryRegion};
+    use std::vec::Vec;
+
+    /// FDT 结构块 token。
+    const FDT_BEGIN_NODE: u32 = 0x1;
+    const FDT_END_NODE: u32 = 0x2;
+    const FDT_PROP: u32 = 0x3;
+    const FDT_END: u32 = 0x9;
+
+    fn be32(value: u32) -> [u8; 4] {
+        value.to_be_bytes()
+    }
+
+    fn u64_cells(value: u64) -> [u8; 8] {
+        value.to_be_bytes()
+    }
+
+    /// 写入 FDT_BEGIN_NODE + 名称(NUL 结尾,4 字节对齐)。
+    fn push_node(bytes: &mut Vec<u8>, name: &str) {
+        bytes.extend_from_slice(&be32(FDT_BEGIN_NODE));
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+    }
+
+    fn push_end_node(bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&be32(FDT_END_NODE));
+    }
+
+    /// 写入 FDT_PROP: 长度、字符串区偏移、数据(4 字节对齐)。
+    fn push_prop(bytes: &mut Vec<u8>, strings: &mut Vec<u8>, name: &str, value: &[u8]) {
+        bytes.extend_from_slice(&be32(FDT_PROP));
+        bytes.extend_from_slice(&be32(value.len() as u32));
+
+        let name_off = strings.len() as u32;
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+
+        bytes.extend_from_slice(&be32(name_off));
+        bytes.extend_from_slice(value);
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+    }
+
+    /// 一个 memory 节点的描述。
+    ///
+    /// status: None 表示不写 status 属性(即 available),Some("disabled")
+    /// 表示显式禁用。reg 项直接给原始 8 字节地址/长度(2-cell 编码),
+    /// 便于构造 start+size 溢出的非法项。
+    struct MemoryNode {
+        name: &'static str,
+        address: u64,
+        size: u64,
+        status: Option<&'static str>,
+    }
+
+    /// 组装一个最小但结构合法的 FDT:根节点固定 `#address-cells = 2`、
+    /// `#size-cells = 2`,外加若干 memory 节点。
+    fn build_fdt(nodes: &[MemoryNode]) -> Vec<u8> {
+        let mut structure = Vec::new();
+        let mut strings = Vec::new();
+
+        push_node(&mut structure, "");
+        push_prop(&mut structure, &mut strings, "#address-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "#size-cells", &be32(2));
+
+        for node in nodes {
+            push_node(&mut structure, node.name);
+            push_prop(&mut structure, &mut strings, "device_type", b"memory\0");
+
+            let mut reg = Vec::with_capacity(16);
+            reg.extend_from_slice(&u64_cells(node.address));
+            reg.extend_from_slice(&u64_cells(node.size));
+            push_prop(&mut structure, &mut strings, "reg", &reg);
+
+            if let Some(status) = node.status {
+                let mut value = status.as_bytes().to_vec();
+                value.push(0);
+                push_prop(&mut structure, &mut strings, "status", &value);
+            }
+            push_end_node(&mut structure);
+        }
+
+        push_end_node(&mut structure);
+        structure.extend_from_slice(&be32(FDT_END));
+
+        let header_size = 40_usize;
+        let struct_offset = header_size + 16; // header + 16 字节 rsvmap 终止项
+        let strings_offset = struct_offset + structure.len();
+        let total_size = strings_offset + strings.len();
+
+        let mut fdt = Vec::with_capacity(total_size);
+        fdt.extend_from_slice(&be32(0xd00d_feed)); // magic
+        fdt.extend_from_slice(&be32(total_size as u32)); // totalsize
+        fdt.extend_from_slice(&be32(struct_offset as u32)); // off_dt_struct
+        fdt.extend_from_slice(&be32(strings_offset as u32)); // off_dt_strings
+        fdt.extend_from_slice(&be32(header_size as u32)); // off_mem_rsvmap
+        fdt.extend_from_slice(&be32(17)); // version
+        fdt.extend_from_slice(&be32(16)); // last_comp_version
+        fdt.extend_from_slice(&be32(0)); // boot_cpuid_phys
+        fdt.extend_from_slice(&be32(strings.len() as u32)); // size_dt_strings
+        fdt.extend_from_slice(&be32(structure.len() as u32)); // size_dt_struct
+        fdt.extend_from_slice(&[0_u8; 16]); // mem_rsvmap 终止项
+        fdt.extend_from_slice(&structure);
+        fdt.extend_from_slice(&strings);
+
+        assert_eq!(fdt.len(), total_size);
+        fdt
+    }
+
+    fn collect_memory_regions(bytes: &[u8]) -> Vec<MemoryRegion> {
+        let blob = FdtBlob::from_bytes(bytes).expect("valid FDT blob");
+        let tree = DeviceTree::from_blob(&blob).expect("parseable device tree");
+        tree.memory_regions().collect()
+    }
+
+    fn assert_region(regions: &[MemoryRegion], index: usize, start: usize, size: usize) {
+        let region = regions[index];
+        assert_eq!(region.start(), start);
+        assert_eq!(region.size(), size);
+    }
 
     #[test]
     fn parses_one_cell_frequency() {
@@ -502,5 +649,94 @@ mod tests {
     #[test]
     fn rejects_invalid_frequency_width() {
         assert_eq!(property_u64(&[0, 1]), None);
+    }
+
+    #[test]
+    fn memory_regions_single_bank() {
+        let fdt = build_fdt(&[MemoryNode {
+            name: "memory@80000000",
+            address: 0x8000_0000,
+            size: 0x2000_0000,
+            status: None,
+        }]);
+
+        let regions = collect_memory_regions(&fdt);
+        assert_eq!(regions.len(), 1);
+        assert_region(&regions, 0, 0x8000_0000, 0x2000_0000);
+    }
+
+    #[test]
+    fn memory_regions_two_banks() {
+        // 两个独立 memory 节点。
+        let fdt = build_fdt(&[
+            MemoryNode {
+                name: "memory@40000000",
+                address: 0x4000_0000,
+                size: 0x1000_0000,
+                status: None,
+            },
+            MemoryNode {
+                name: "memory@80000000",
+                address: 0x8000_0000,
+                size: 0x2000_0000,
+                status: None,
+            },
+        ]);
+
+        let regions = collect_memory_regions(&fdt);
+        assert_eq!(regions.len(), 2);
+        assert_region(&regions, 0, 0x4000_0000, 0x1000_0000);
+        assert_region(&regions, 1, 0x8000_0000, 0x2000_0000);
+    }
+
+    #[test]
+    fn memory_regions_64bit_address() {
+        // 地址/长度超过 4 GiB,验证 2-cell 编码。
+        let fdt = build_fdt(&[MemoryNode {
+            name: "memory@200000000",
+            address: 0x2_0000_0000,
+            size: 0x1_0000_0000,
+            status: None,
+        }]);
+
+        let regions = collect_memory_regions(&fdt);
+        assert_eq!(regions.len(), 1);
+        assert_region(&regions, 0, 0x2_0000_0000, 0x1_0000_0000);
+    }
+
+    #[test]
+    fn memory_regions_skips_disabled_node() {
+        let fdt = build_fdt(&[
+            MemoryNode {
+                name: "memory@40000000",
+                address: 0x4000_0000,
+                size: 0x1000_0000,
+                status: None,
+            },
+            MemoryNode {
+                name: "memory@80000000",
+                address: 0x8000_0000,
+                size: 0x2000_0000,
+                status: Some("disabled"),
+            },
+        ]);
+
+        let regions = collect_memory_regions(&fdt);
+        assert_eq!(regions.len(), 1);
+        assert_region(&regions, 0, 0x4000_0000, 0x1000_0000);
+    }
+
+    #[test]
+    fn memory_regions_skips_overflow_reg() {
+        // start+size 溢出 u64 的非法项必须被跳过,不能 panic。
+        let fdt = build_fdt(&[MemoryNode {
+            name: "memory@0",
+            address: u64::MAX,
+            size: 0x2,
+            status: None,
+        }]);
+
+        let regions = collect_memory_regions(&fdt);
+        assert!(regions.is_empty());
     }
 }

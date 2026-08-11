@@ -41,7 +41,7 @@ export M5_RELEASE_SOAK_LOOPS
 # Competition submission targets
 # ============================================================================
 .PHONY: all kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 \
-        ls2k1000-mkimage check-ls2k1000-image
+        ls2k1000-mkimage check-ls2k1000-image check-visionfive2-image
 all: kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 uImage uImage-vf2
 	@echo "=== Competition artifacts ==="
 	@ls -lh kernel-rv kernel-la kernel-ls2k1000 kernel-visionfive2 uImage uImage-vf2 2>/dev/null || true
@@ -142,6 +142,16 @@ uImage-vf2: kernel-visionfive2
 kernel-vf2.bin: kernel-visionfive2
 	@python3 scripts/elf-to-uimage.py --raw kernel-visionfive2 $@
 	@ls -lh $@
+
+# VisionFive 2 镜像检查:ELF/raw 与板级物理布局一致 (entry/trampoline/LMA/DTB 分离)
+kernel-visionfive2.elf: kernel-visionfive2
+	@cp kernel-visionfive2 $@
+
+.PHONY: check-visionfive2-image
+check-visionfive2-image: kernel-visionfive2.elf kernel-vf2.bin
+	@python3 scripts/check-visionfive2-image.py \
+	    --elf kernel-visionfive2.elf \
+	    --bin kernel-vf2.bin
 
 # Original build target (single architecture, uses current defaults)
 .PHONY: build
