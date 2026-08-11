@@ -168,16 +168,40 @@ impl<const VMA_CAPACITY: usize> AddressSpace<VMA_CAPACITY> {
         let old_break = self.program_break;
         let old_areas = self.areas.clone();
 
+        // Capture the lowest existing heap page BEFORE removing the heap area.
+        // A MAP_FIXED mapping can carve the head of the heap (the generic mmap
+        // unmap_range splits the heap VMA and keeps `brk.start` at the
+        // pre-carve address). Re-mapping from the raw `brk.start` on the next
+        // brk()/fork would then collide with the mapping that carved it, so the
+        // heap must keep its current low edge. When no heap area exists yet
+        // (first brk after exec) this is `None` and brk.start is used.
+        let existing_heap_start = {
+            let mut lowest: Option<VirtAddr> = None;
+            for index in 0..self.areas.len() {
+                let area = self.areas.area_at(index).expect("index below count");
+                if area.kind() == VmAreaKind::Heap {
+                    let start = area.range().start();
+                    if lowest.is_none_or(|current| start < current) {
+                        lowest = Some(start);
+                    }
+                }
+            }
+            lowest
+        };
+
         let result = (|| {
             let current = self.set_program_break(new_break)?;
             self.areas.remove_kind(VmAreaKind::Heap)?;
             let brk = self
                 .program_break
                 .ok_or(AddressSpaceError::ProgramBreakNotConfigured)?;
-            let start = brk
+            let mut start = brk
                 .start()
                 .align_down(PAGE_SIZE)
                 .ok_or(AddressSpaceError::InvalidProgramBreak)?;
+            if let Some(existing) = existing_heap_start {
+                start = core::cmp::max(start, existing);
+            }
             let end = current
                 .align_up(PAGE_SIZE)
                 .ok_or(AddressSpaceError::InvalidProgramBreak)?;
@@ -301,5 +325,63 @@ mod tests {
             .set_program_break_and_sync_heap(VirtAddr::new(0x4000))
             .unwrap();
         assert!(space.find_area(VirtAddr::new(0x4000)).is_none());
+    }
+
+    #[test]
+    fn heap_rebuild_preserves_map_fixed_carve() {
+        let mut space: AddressSpace<8> = AddressSpace::new(USER);
+        space
+            .configure_program_break(VirtAddr::new(0x4000), VirtAddr::new(0x9000))
+            .unwrap();
+        space
+            .set_program_break_and_sync_heap(VirtAddr::new(0x7000))
+            .unwrap();
+        assert_eq!(
+            space.find_area(VirtAddr::new(0x6000)).unwrap().kind(),
+            VmAreaKind::Heap,
+        );
+
+        // A MAP_FIXED mapping carves the head of the heap VMA: the generic
+        // mmap path unmaps the target range first, splitting [0x4000,0x7000)
+        // into Heap [0x5000,0x7000) while `brk.start` stays at 0x4000, then
+        // maps its own anonymous area over the freed page.
+        space
+            .unmap_range(VirtRange::from_bounds(0x4000, 0x5000))
+            .unwrap();
+        space
+            .map_area(VmArea::new(
+                VirtRange::from_bounds(0x4000, 0x5000),
+                VmAreaFlags::user_rw(),
+                VmAreaKind::Anonymous,
+            ))
+            .unwrap();
+
+        // Re-syncing the heap at the SAME break must keep the heap low edge at
+        // 0x5000 (the carved page) instead of re-mapping from the stale
+        // brk.start 0x4000 and colliding with the anonymous mapping.
+        space
+            .set_program_break_and_sync_heap(VirtAddr::new(0x7000))
+            .unwrap();
+        assert_eq!(
+            space.find_area(VirtAddr::new(0x6000)).unwrap().kind(),
+            VmAreaKind::Heap,
+        );
+        assert_eq!(
+            space.find_area(VirtAddr::new(0x4000)).unwrap().kind(),
+            VmAreaKind::Anonymous,
+        );
+
+        // Growing the heap still preserves the carve.
+        space
+            .set_program_break_and_sync_heap(VirtAddr::new(0x8000))
+            .unwrap();
+        assert_eq!(
+            space.find_area(VirtAddr::new(0x7000)).unwrap().kind(),
+            VmAreaKind::Heap,
+        );
+        assert_eq!(
+            space.find_area(VirtAddr::new(0x4500)).unwrap().kind(),
+            VmAreaKind::Anonymous,
+        );
     }
 }
