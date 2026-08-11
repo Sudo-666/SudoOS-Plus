@@ -64,6 +64,9 @@ pub fn console_putchar(c: u8) {
     Uart::new().putc(c);
 }
 
+/// LS2K1000 提供真正的 UART RX。
+pub(crate) const HAS_CONSOLE_RX: bool = true;
+
 /// 内核早期控制台要求的接口名称
 pub(crate) fn write_console_byte(byte: u8) {
     console_putchar(byte);
@@ -81,8 +84,8 @@ pub(crate) fn try_read_console_byte() -> Option<u8> {
 ///
 /// 诊断用:UART RX 轮询 first-poll 时输出一次,确认 UART 接收状态。空闲时
 /// 通常为 0x60(THRE|TEMT);收到字符尚未读取时 bit 0 (DR) 置位。
-pub(crate) fn line_status() -> u8 {
-    unsafe { core::ptr::read_volatile(UART_LSR as *const u8) }
+pub(crate) fn console_line_status() -> u32 {
+    unsafe { core::ptr::read_volatile(UART_LSR as *const u8) as u32 }
 }
 
 pub fn init() {

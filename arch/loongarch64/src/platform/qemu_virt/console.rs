@@ -12,6 +12,9 @@ const UART_LINE_STATUS: usize = 5;
 
 const LINE_STATUS_TRANSMIT_EMPTY: u8 = 1 << 5;
 
+/// qemu_virt has no UART RX path; the poller stays a no-op.
+pub(crate) const HAS_CONSOLE_RX: bool = false;
+
 pub(crate) fn write_console_byte(byte: u8) {
     while read_line_status() & LINE_STATUS_TRANSMIT_EMPTY == 0 {
         spin_loop();
@@ -48,6 +51,6 @@ pub(crate) fn try_read_console_byte() -> Option<u8> {
 
 /// qemu_virt has no UART RX path; returns 0 so the platform console interface
 /// stays uniform with the LS2K1000 board (which reads NS16550 LSR).
-pub(crate) fn line_status() -> u8 {
+pub(crate) fn console_line_status() -> u32 {
     0
 }

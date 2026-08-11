@@ -7,7 +7,9 @@ use core::arch::global_asm;
 global_asm!(include_str!("entry.S"));
 
 pub(crate) use boot::boot_context;
-pub(crate) use console::write_console_byte;
+pub(crate) use console::{
+    console_line_status, try_read_console_byte, write_console_byte, HAS_CONSOLE_RX,
+};
 pub(crate) use memory::reserve_early_memory;
 
 /// VisionFive 2 (JH7110) 只启动 4 个 U74:hart 1..=4。

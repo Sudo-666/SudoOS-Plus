@@ -8,7 +8,7 @@ use crate::lockdep::{LockClass, LockRank};
 const CONSOLE_WRITE_CLASS: LockClass = LockClass::new("console.write", LockRank::Console, 3);
 static CONSOLE_WRITE_LOCK: IrqSpinLock<()> = IrqSpinLock::new_with_class((), CONSOLE_WRITE_CLASS); // SUDOOS_FINAL_DIRECT_FIX_V1
 
-/// Stage-4 UART RX poller (LS2K1000 board only).
+/// Stage-4 UART RX poller (任何 HAS_CONSOLE_RX 平台)。
 ///
 /// A self-rescheduling delayed-work item drains the UART FIFO into the console
 /// TTY at 1 ms cadence. Each tick reads the whole FIFO into a stack array first
@@ -18,7 +18,9 @@ static CONSOLE_WRITE_LOCK: IrqSpinLock<()> = IrqSpinLock::new_with_class((), CON
 /// context, so the TTY echo, waitqueue wakeups and signal delivery inside
 /// `tty::input_byte` are legal. This is the phase-4 stand-in for the stage-5
 /// UART IRQ path.
-#[cfg(feature = "platform-ls2k1000")]
+///
+/// 平台是否真正启动本模块由 `HAS_CONSOLE_RX` 决定:无 RX 的平台仍编译本
+/// 模块(保证公共代码可编译),但 `start()` 不会入队任何 work。
 mod uart_input {
     use core::sync::atomic::{AtomicU64, Ordering};
     use core::time::Duration;
@@ -44,7 +46,7 @@ mod uart_input {
         // 确实在 worker 线程执行过,并记录 UART 接收状态(空闲通常 0x60)。
         let poll = POLL_COUNT.fetch_add(1, Ordering::Relaxed);
         if poll == 0 {
-            let lsr = crate::arch::early_console::line_status();
+            let lsr = crate::arch::early_console::console_line_status();
             crate::println!("UART-RX: first poll executed lsr={lsr:#04x}");
         }
 
@@ -87,11 +89,12 @@ mod uart_input {
 
 /// Start feeding the platform UART RX into the console TTY.
 ///
-/// Only the LS2K1000 board has a real input path; on every other platform this
-/// is a no-op, keeping the `rdinit=/init` boot branch platform-neutral.
+/// 按平台能力 `HAS_CONSOLE_RX` 决定是否真正入队 poller;无 RX 的平台
+/// (如 loongarch64 qemu_virt)为 no-op,`rdinit=/init` 分支保持平台中立。
 pub fn start_uart_input_poller() {
-    #[cfg(feature = "platform-ls2k1000")]
-    uart_input::start();
+    if crate::arch::early_console::HAS_CONSOLE_RX {
+        uart_input::start();
+    }
 }
 
 /// 将当前架构的早期控制台适配到公共格式化设施。
