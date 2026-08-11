@@ -3,6 +3,7 @@ use core::str;
 use fdt_parser::{
     Fdt,
     helpers::UnalignedInfallibleNode,
+    nodes::AsNode,
     parsing::{Panic, unaligned::UnalignedParser},
     properties::Compatible,
 };
@@ -47,17 +48,31 @@ impl<'a> DeviceTree<'a> {
     }
 
     pub fn cpu_count(&self) -> usize {
-        self.cpu_hardware_ids().count()
+        self.all_cpu_hardware_ids().count()
     }
 
-    /// Hardware CPU/thread identifiers from available `/cpus/cpu@*` nodes.
+    /// 全部 hardware CPU/thread IDs(仅排除 `fail`,保留 `disabled`)。
     ///
-    /// CPUs marked `disabled` are retained because the operating system may
-    /// start them through an architecture-specific enable mechanism. Nodes
-    /// marked `fail` are never exposed to the SMP layer.
-    pub fn cpu_hardware_ids(&self) -> impl Iterator<Item = usize> + '_ {
+    /// 只用于诊断输出,不应作为可启动 CPU 的依据——启动决策应使用
+    /// [`available_cpu_hardware_ids`](Self::available_cpu_hardware_ids)。
+    pub fn all_cpu_hardware_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.inner.root().cpus().iter().filter_map(|cpu| {
             if cpu.status().is_some_and(|status| status.is_failed()) {
+                return None;
+            }
+
+            cpu.reg::<usize>().first().ok()
+        })
+    }
+
+    /// 可启动的 hardware CPU/thread IDs。
+    ///
+    /// 排除 `disabled`、`fail` 及其他非 available 状态节点。平台层仍可用
+    /// `hardware_cpu_is_supported` 进一步过滤(例如 VisionFive 2 的 hart 0
+    /// 即使被错误 DTB 标成 `okay` 也必须排除)。
+    pub fn available_cpu_hardware_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.inner.root().cpus().iter().filter_map(|cpu| {
+            if !node_is_available(cpu.as_node()) {
                 return None;
             }
 
@@ -564,9 +579,19 @@ mod tests {
         status: Option<&'static str>,
     }
 
+    /// 一个 `/cpus/cpu@*` 节点的描述。
+    ///
+    /// `/cpus` 固定 `#address-cells = 1`、`#size-cells = 0`,reg 是
+    /// 单个 cell 的硬件 ID。
+    struct CpuNode {
+        name: &'static str,
+        id: u32,
+        status: Option<&'static str>,
+    }
+
     /// 组装一个最小但结构合法的 FDT:根节点固定 `#address-cells = 2`、
-    /// `#size-cells = 2`,外加若干 memory 节点。
-    fn build_fdt(nodes: &[MemoryNode]) -> Vec<u8> {
+    /// `#size-cells = 2`,外加若干 memory 节点与可选的 `/cpus` 节点。
+    fn build_fdt(nodes: &[MemoryNode], cpus: &[CpuNode]) -> Vec<u8> {
         let mut structure = Vec::new();
         let mut strings = Vec::new();
 
@@ -588,6 +613,25 @@ mod tests {
                 value.push(0);
                 push_prop(&mut structure, &mut strings, "status", &value);
             }
+            push_end_node(&mut structure);
+        }
+
+        if !cpus.is_empty() {
+            push_node(&mut structure, "cpus");
+            push_prop(&mut structure, &mut strings, "#address-cells", &be32(1));
+            push_prop(&mut structure, &mut strings, "#size-cells", &be32(0));
+
+            for cpu in cpus {
+                push_node(&mut structure, cpu.name);
+                push_prop(&mut structure, &mut strings, "reg", &be32(cpu.id));
+                if let Some(status) = cpu.status {
+                    let mut value = status.as_bytes().to_vec();
+                    value.push(0);
+                    push_prop(&mut structure, &mut strings, "status", &value);
+                }
+                push_end_node(&mut structure);
+            }
+
             push_end_node(&mut structure);
         }
 
@@ -618,10 +662,24 @@ mod tests {
         fdt
     }
 
+    fn build_fdt_mem(nodes: &[MemoryNode]) -> Vec<u8> {
+        build_fdt(nodes, &[])
+    }
+
     fn collect_memory_regions(bytes: &[u8]) -> Vec<MemoryRegion> {
         let blob = FdtBlob::from_bytes(bytes).expect("valid FDT blob");
         let tree = DeviceTree::from_blob(&blob).expect("parseable device tree");
         tree.memory_regions().collect()
+    }
+
+    fn collect_cpu_ids(bytes: &[u8], available: bool) -> Vec<usize> {
+        let blob = FdtBlob::from_bytes(bytes).expect("valid FDT blob");
+        let tree = DeviceTree::from_blob(&blob).expect("parseable device tree");
+        if available {
+            tree.available_cpu_hardware_ids().collect()
+        } else {
+            tree.all_cpu_hardware_ids().collect()
+        }
     }
 
     fn assert_region(regions: &[MemoryRegion], index: usize, start: usize, size: usize) {
@@ -653,7 +711,7 @@ mod tests {
 
     #[test]
     fn memory_regions_single_bank() {
-        let fdt = build_fdt(&[MemoryNode {
+        let fdt = build_fdt_mem(&[MemoryNode {
             name: "memory@80000000",
             address: 0x8000_0000,
             size: 0x2000_0000,
@@ -668,7 +726,7 @@ mod tests {
     #[test]
     fn memory_regions_two_banks() {
         // 两个独立 memory 节点。
-        let fdt = build_fdt(&[
+        let fdt = build_fdt_mem(&[
             MemoryNode {
                 name: "memory@40000000",
                 address: 0x4000_0000,
@@ -692,7 +750,7 @@ mod tests {
     #[test]
     fn memory_regions_64bit_address() {
         // 地址/长度超过 4 GiB,验证 2-cell 编码。
-        let fdt = build_fdt(&[MemoryNode {
+        let fdt = build_fdt_mem(&[MemoryNode {
             name: "memory@200000000",
             address: 0x2_0000_0000,
             size: 0x1_0000_0000,
@@ -706,7 +764,7 @@ mod tests {
 
     #[test]
     fn memory_regions_skips_disabled_node() {
-        let fdt = build_fdt(&[
+        let fdt = build_fdt_mem(&[
             MemoryNode {
                 name: "memory@40000000",
                 address: 0x4000_0000,
@@ -729,7 +787,7 @@ mod tests {
     #[test]
     fn memory_regions_skips_overflow_reg() {
         // start+size 溢出 u64 的非法项必须被跳过,不能 panic。
-        let fdt = build_fdt(&[MemoryNode {
+        let fdt = build_fdt_mem(&[MemoryNode {
             name: "memory@0",
             address: u64::MAX,
             size: 0x2,
@@ -738,5 +796,53 @@ mod tests {
 
         let regions = collect_memory_regions(&fdt);
         assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn cpu_available_filters_disabled_and_fail() {
+        let fdt = build_fdt(
+            &[],
+            &[
+                CpuNode {
+                    name: "cpu@0",
+                    id: 0,
+                    status: Some("okay"),
+                },
+                CpuNode {
+                    name: "cpu@1",
+                    id: 1,
+                    status: Some("disabled"),
+                },
+                CpuNode {
+                    name: "cpu@2",
+                    id: 2,
+                    status: Some("fail"),
+                },
+                CpuNode {
+                    name: "cpu@3",
+                    id: 3,
+                    status: None,
+                },
+            ],
+        );
+
+        // all: 保留 disabled(1),排除 fail(2)。
+        assert_eq!(collect_cpu_ids(&fdt, false), Vec::from([0, 1, 3]));
+        // available: 排除 disabled(1)与 fail(2)。
+        assert_eq!(collect_cpu_ids(&fdt, true), Vec::from([0, 3]));
+    }
+
+    #[test]
+    fn cpu_available_treats_no_status_as_available() {
+        let fdt = build_fdt(
+            &[],
+            &[CpuNode {
+                name: "cpu@7",
+                id: 7,
+                status: None,
+            }],
+        );
+
+        assert_eq!(collect_cpu_ids(&fdt, true), Vec::from([7]));
     }
 }

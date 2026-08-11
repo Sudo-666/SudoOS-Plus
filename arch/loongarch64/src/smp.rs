@@ -116,6 +116,12 @@ pub fn hardware_cpu_id() -> usize {
     read_csr::<CSR_CPUNUM>() & CPU_NUMBER_MASK
 }
 
+/// 平台层的硬件 CPU 可用性策略(当前所有 LoongArch 平台都接受 FDT 中
+/// available 的 CPU;start_secondary 再对 HARDWARE_CPU_ID_LIMIT 二次校验)。
+pub fn hardware_cpu_is_supported(hardware_id: usize) -> bool {
+    crate::platform::hardware_cpu_is_supported(hardware_id)
+}
+
 pub fn start_secondary(
     logical_id: usize,
     hardware_id: usize,

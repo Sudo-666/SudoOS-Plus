@@ -112,15 +112,25 @@ static DISCOVERED_CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 static HARDWARE_IDS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 static CPU_STATES: [AtomicU8; MAX_CPUS] =
     [const { AtomicU8::new(CpuState::Absent as u8) }; MAX_CPUS];
-pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
+pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize, max_cpus: usize) {
     crate::arch::smp::set_current_cpu_id(CpuId::BOOT.get());
+
+    // bootargs 解析层已拒绝 0/非数字;这里再防御一次。
+    assert!(max_cpus != 0, "sudoos.maxcpus must be positive");
 
     let mut topology = CpuTopology::EMPTY;
     topology.hardware_ids[0] = boot_hardware_id;
     topology.discovered = 1;
 
-    for hardware_id in tree.cpu_hardware_ids() {
+    crate::println!("SMP: boot hart={}", boot_hardware_id);
+
+    for hardware_id in tree.available_cpu_hardware_ids() {
         if hardware_id == boot_hardware_id {
+            continue;
+        }
+
+        if !crate::arch::smp::hardware_cpu_is_supported(hardware_id) {
+            crate::println!("SMP: ignore hart={} reason=platform-reserved", hardware_id);
             continue;
         }
 
@@ -137,7 +147,28 @@ pub fn initialize(tree: &DeviceTree<'_>, boot_hardware_id: usize) {
         topology.discovered += 1;
     }
 
+    // CPU 上限在发布 DISCOVERED_CPU_COUNT 前生效。boot hart 始终保留
+    // (logical 0),因此 effective 至少为 1。
+    let requested = max_cpus;
+    let effective = requested.min(topology.discovered);
+    if effective < topology.discovered {
+        crate::println!(
+            "SMP: maxcpus requested={requested} effective={effective} \
+             (discovered before cap={})",
+            topology.discovered,
+        );
+        topology.discovered = effective;
+    }
+
     assert!(topology.discovered != 0);
+
+    for (logical, hardware) in topology.hardware_ids[..topology.discovered]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        crate::println!("SMP: logical{} -> hart {}", logical, hardware);
+    }
 
     assert_eq!(
         DISCOVERED_CPU_COUNT.load(Ordering::Acquire),

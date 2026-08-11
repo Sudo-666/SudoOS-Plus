@@ -5,6 +5,7 @@
 #![no_main]
 
 mod block;
+mod bootargs;
 mod call_function;
 mod console;
 mod context;
@@ -297,7 +298,15 @@ fn kernel_main(boot: BootInfo) -> ! {
         inspect_device_tree(&boot, &blob, &tree);
         let virtio_regions = collect_virtio_mmio_regions(&tree);
         let pci_hosts = collect_pci_host_bridges(&tree);
-        smp::initialize(&tree, boot_hardware_cpu_id(&boot));
+        let max_cpus = match bootargs::max_cpus(tree.bootargs()) {
+            Ok(Some(requested)) => {
+                println!("SMP: maxcpus requested={requested}");
+                requested
+            }
+            Ok(None) => smp::MAX_CPUS,
+            Err(error) => panic!("invalid boot argument: {error}"),
+        };
+        smp::initialize(&tree, boot_hardware_cpu_id(&boot), max_cpus);
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
         let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs())

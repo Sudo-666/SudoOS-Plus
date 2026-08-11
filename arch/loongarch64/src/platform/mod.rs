@@ -2,7 +2,10 @@
 mod qemu_virt;
 
 #[cfg(feature = "platform-qemu-virt")]
-pub(crate) use qemu_virt::{boot_context, line_status, reserve_early_memory, try_read_console_byte, write_console_byte};
+pub(crate) use qemu_virt::{
+    boot_context, hardware_cpu_is_supported, line_status, reserve_early_memory,
+    try_read_console_byte, write_console_byte,
+};
 
 
 // 新增平台架构

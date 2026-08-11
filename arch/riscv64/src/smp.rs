@@ -95,6 +95,12 @@ pub fn current_cpu_id() -> usize {
     cpu
 }
 
+/// 平台层的硬件 hart 可用性策略(QEMU virt 接受所有 available hart;
+/// VisionFive 2 只接受 hart 1..=4,hart 0/S7 永远排除)。
+pub fn hardware_cpu_is_supported(hardware_id: usize) -> bool {
+    crate::platform::hardware_cpu_is_supported(hardware_id)
+}
+
 pub fn start_secondary(
     logical_id: usize,
     hardware_id: usize,

@@ -9,13 +9,17 @@
 mod qemu_virt;
 
 #[cfg(feature = "platform-qemu-virt")]
-pub(crate) use qemu_virt::{boot_context, reserve_early_memory, write_console_byte};
+pub(crate) use qemu_virt::{
+    boot_context, hardware_cpu_is_supported, reserve_early_memory, write_console_byte,
+};
 
 #[cfg(feature = "platform-visionfive2")]
 mod visionfive2;
 
 #[cfg(feature = "platform-visionfive2")]
-pub(crate) use visionfive2::{boot_context, reserve_early_memory, write_console_byte};
+pub(crate) use visionfive2::{
+    boot_context, hardware_cpu_is_supported, reserve_early_memory, write_console_byte,
+};
 
 // 防止漏选平台
 #[cfg(not(any(feature = "platform-qemu-virt", feature = "platform-visionfive2")))]
