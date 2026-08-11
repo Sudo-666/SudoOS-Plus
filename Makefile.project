@@ -560,6 +560,17 @@ busybox-initramfs-vendor-all:
 busybox-initramfs-loongarch64:
 	$(MAKE) BUSYBOX_ARCH=loongarch64 busybox-initramfs-vendor
 
+# SUDOOS_VF2_INITRAMFS_V1: explicit riscv64 BusyBox initramfs target for the
+# VisionFive 2 FIT. Same deterministic newc builder as loongarch64, then both
+# the generic m14 audit and the RISC-V/VF2-specific audit (ELF64 EM_RISCV,
+# static no PT_INTERP, Gate applets).
+.PHONY: busybox-initramfs-riscv64
+busybox-initramfs-riscv64:
+	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
+	python3 scripts/vf2-busybox-audit.py \
+	    --busybox vendor/userland/riscv64/busybox-static \
+	    --cpio build/initramfs/busybox-riscv64.cpio
+
 smoke-riscv64-vendor-initramfs:
 	$(MAKE) BUSYBOX_ARCH=riscv64 busybox-initramfs-vendor
 	QEMU_ARGS="-initrd build/initramfs/busybox-riscv64.cpio" $(MAKE) smoke-riscv64
