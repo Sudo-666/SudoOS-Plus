@@ -2416,16 +2416,19 @@ pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
         .current_user_thread(cpu)
 }
 
-/// True when the current user thread has a pending signal it does not mask.
-/// Read-only (atomics only), so it is safe to evaluate while holding the
-/// scheduler lock — the interruptible-wait block decision uses this under the
-/// same lock that `wake_process_for_signal` takes, closing the check-then-sleep
+/// True when `thread` has a pending signal it does not mask. Read-only
+/// (atomics only), so it is safe to evaluate while holding the scheduler
+/// lock — the interruptible-wait block decision uses this under the same
+/// lock that `wake_process_for_signal` takes, closing the check-then-sleep
 /// race: a signal either lands before the check (thread does not block) or
 /// after it (thread is Blocked and precisely woken).
-pub(crate) fn current_has_unblocked_signal() -> bool {
-    current_user_thread().is_some_and(|thread| {
-        thread.process().signals().pending() & !thread.blocked_signals() != 0
-    })
+///
+/// Callers must pass a thread already captured outside the scheduler lock —
+/// this function never acquires `SCHEDULER` itself (unlike
+/// `current_user_thread()`), so it is the only signal predicate usable from
+/// inside `block_current_on_if_from_user_trap`'s `should_block` closure.
+pub(crate) fn thread_has_unblocked_signal(thread: &crate::process::Thread) -> bool {
+    thread.process().signals().pending() & !thread.blocked_signals() != 0
 }
 
 pub(crate) fn scheduler_is_initialized() -> bool {

@@ -201,26 +201,40 @@ impl WaitQueue {
 
     /// Block on this queue from the user-trap syscall path until `ready`
     /// becomes true or an unblocked signal is pending. The blocking decision
-    /// atomically checks `!ready() && !current_has_unblocked_signal()` under
-    /// the scheduler lock, so a signal that lands between the check and the
-    /// sleep still wakes the task: 4.8.13's precise signal wake unlinks it
+    /// atomically checks `!ready() && !thread_has_unblocked_signal(&thread)`
+    /// under the scheduler lock, so a signal that lands between the check and
+    /// the sleep still wakes the task: 4.8.13's precise signal wake unlinks it
     /// from this queue and it re-evaluates `ready()` / signal state in the
     /// loop. Callers turn `Interrupted` into -EINTR (or return the bytes
     /// already transferred).
+    ///
+    /// The current thread is captured once, before the loop, so the
+    /// `should_block` closure (invoked under `SCHEDULER`) can consult pending
+    /// signals without re-entering the scheduler lock. Fixes the 4.8.17
+    /// recursive-lock deadlock where the predicate called
+    /// `current_user_thread()`, which acquires `SCHEDULER` a second time.
     pub fn wait_interruptible_from_user_trap<F>(&self, ready: F) -> InterruptibleWaitOutcome
     where
         F: Fn() -> bool,
     {
         crate::context::assert_task_context();
+        // Capture the current thread once, before any scheduler-lock-acquiring
+        // helper runs. `block_current_on_if_from_user_trap` invokes its
+        // `should_block` closure while holding `SCHEDULER`, so the signal
+        // predicate used there must not re-enter the scheduler lock — hence
+        // `thread_has_unblocked_signal(&thread)` (atomics only) instead of a
+        // fresh `current_user_thread()` lookup.
+        let thread = super::current_user_thread()
+            .expect("interruptible wait outside a user task");
         loop {
             if ready() {
                 return InterruptibleWaitOutcome::Ready;
             }
-            if super::current_has_unblocked_signal() {
+            if super::thread_has_unblocked_signal(&thread) {
                 return InterruptibleWaitOutcome::Interrupted;
             }
             let _ = super::block_current_on_if_from_user_trap(self, || {
-                !ready() && !super::current_has_unblocked_signal()
+                !ready() && !super::thread_has_unblocked_signal(&thread)
             });
         }
     }
@@ -239,16 +253,21 @@ impl WaitQueue {
         F: Fn() -> bool,
     {
         crate::context::assert_task_context();
+        // As in `wait_interruptible_from_user_trap`, capture the current
+        // thread once so the `should_block` closure (run under `SCHEDULER`)
+        // can consult pending signals without re-entering the scheduler lock.
+        let thread = super::current_user_thread()
+            .expect("interruptible wait outside a user task");
         if ready() {
             return InterruptibleWaitOutcome::Ready;
         }
-        if super::current_has_unblocked_signal() {
+        if super::thread_has_unblocked_signal(&thread) {
             return InterruptibleWaitOutcome::Interrupted;
         }
         if crate::time::deadline_reached(crate::time::now(), deadline) {
             return if ready() {
                 InterruptibleWaitOutcome::Ready
-            } else if super::current_has_unblocked_signal() {
+            } else if super::thread_has_unblocked_signal(&thread) {
                 InterruptibleWaitOutcome::Interrupted
             } else {
                 InterruptibleWaitOutcome::TimedOut
@@ -271,13 +290,13 @@ impl WaitQueue {
             if ready() {
                 break InterruptibleWaitOutcome::Ready;
             }
-            if super::current_has_unblocked_signal() {
+            if super::thread_has_unblocked_signal(&thread) {
                 break InterruptibleWaitOutcome::Interrupted;
             }
             if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
                 break if ready() {
                     InterruptibleWaitOutcome::Ready
-                } else if super::current_has_unblocked_signal() {
+                } else if super::thread_has_unblocked_signal(&thread) {
                     InterruptibleWaitOutcome::Interrupted
                 } else {
                     InterruptibleWaitOutcome::TimedOut
@@ -285,7 +304,7 @@ impl WaitQueue {
             }
             let _ = super::block_current_on_if_from_user_trap(self, || {
                 !ready()
-                    && !super::current_has_unblocked_signal()
+                    && !super::thread_has_unblocked_signal(&thread)
                     && timeout.state.load(Ordering::Acquire) == TIMEOUT_WAITING
             });
         };
@@ -302,7 +321,7 @@ impl WaitQueue {
 
         if ready() {
             InterruptibleWaitOutcome::Ready
-        } else if super::current_has_unblocked_signal() {
+        } else if super::thread_has_unblocked_signal(&thread) {
             InterruptibleWaitOutcome::Interrupted
         } else if timeout.state.load(Ordering::Acquire) == TIMEOUT_FIRED {
             InterruptibleWaitOutcome::TimedOut
