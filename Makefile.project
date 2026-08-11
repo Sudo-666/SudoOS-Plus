@@ -231,13 +231,30 @@ test:
 .PHONY: clippy
 clippy: clippy-riscv64 clippy-loongarch64 clippy-host
 
-.PHONY: clippy-riscv64
-clippy-riscv64:
+.PHONY: clippy-riscv64 clippy-riscv64-qemu clippy-riscv64-visionfive2
+clippy-riscv64: clippy-riscv64-qemu clippy-riscv64-visionfive2
+
+# RISC-V 平台严格互斥:每个 clippy 目标显式启用恰好一个平台 feature。
+clippy-riscv64-qemu:
 	@cargo clippy \
 		--manifest-path Cargo.toml \
 		--package "$(KERNEL_PACKAGE)" \
 		--bin "$(KERNEL_BINARY)" \
 		--target riscv64imac-unknown-none-elf \
+		--no-default-features \
+		--features platform-qemu-virt \
+		-Z build-std=core,alloc \
+		-Z build-std-features=compiler-builtins-mem \
+		-- -D warnings
+
+clippy-riscv64-visionfive2:
+	@cargo clippy \
+		--manifest-path Cargo.toml \
+		--package "$(KERNEL_PACKAGE)" \
+		--bin "$(KERNEL_BINARY)" \
+		--target riscv64imac-unknown-none-elf \
+		--no-default-features \
+		--features platform-visionfive2 \
 		-Z build-std=core,alloc \
 		-Z build-std-features=compiler-builtins-mem \
 		-- -D warnings

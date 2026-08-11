@@ -95,15 +95,15 @@ select_platform_features() {
     esac
 
     # 未指定 PLATFORM 时，按架构选择默认平台。
-    # riscv64 的平台化由 arch-riscv64 的 default feature 兜底,这里显式
-    # 传参保证 build.rs 能根据 CARGO_FEATURE_* 选对链接脚本。
+    # 两个架构都显式传入 --no-default-features + 恰好一个平台 feature:
+    # 架构 crate 已无默认平台,若这里不带参数会命中 compile_error!(未选平台)。
     if [ -z "${PLATFORM}" ]; then
         if [ "${ARCH}" = "riscv64" ]; then
             echo "  platform     : qemu-virt (default for riscv64)"
             CARGO_PLATFORM_ARGS=(--no-default-features --features platform-qemu-virt)
         else
-            echo "  platform     : default (from Cargo.toml)"
-            CARGO_PLATFORM_ARGS=()
+            echo "  platform     : ls2k1000 (default for loongarch64)"
+            CARGO_PLATFORM_ARGS=(--no-default-features --features platform-ls2k1000)
         fi
         return
     fi

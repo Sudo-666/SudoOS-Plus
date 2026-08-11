@@ -15,11 +15,17 @@ fn main() {
 
     let linker_script = match target_arch.as_str() {
         "riscv64" => {
-            // 根据 Cargo 的 Feature 环境变量,动态选择对应的链接脚本
+            // 根据 Cargo 的 Feature 环境变量,动态选择对应的链接脚本。
+            // 平台 feature 严格互斥(见 arch/riscv64/platform/mod.rs),这里不设
+            // "VF2 优先"回退,避免在混编时静默选错链接脚本。
             if env::var("CARGO_FEATURE_PLATFORM_VISIONFIVE2").is_ok() {
                 project_root.join("arch/riscv64/src/platform/visionfive2/linker.ld")
-            } else {
+            } else if env::var("CARGO_FEATURE_PLATFORM_QEMU_VIRT").is_ok() {
                 project_root.join("arch/riscv64/src/platform/qemu_virt/linker.ld")
+            } else {
+                panic!(
+                    "For riscv64, a platform feature must be enabled (e.g., 'platform-qemu-virt')."
+                );
             }
         }
 

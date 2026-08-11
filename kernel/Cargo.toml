@@ -15,7 +15,8 @@ bench = false
 [features]
 # 默认开启物理开发板特性
 default = ["platform-ls2k1000"]
-# 将外层的特性透传给 arch 依赖 (riscv64 默认平台由 arch-riscv64 自带)
+# 将外层的特性透传给 arch 依赖。架构 crate 均以 default-features=false
+# 引入,平台 feature 完全由本层显式透传,杜绝隐式默认平台。
 platform-qemu-virt = [
     "arch-loongarch64/platform-qemu-virt",
     "arch-riscv64/platform-qemu-virt",
@@ -37,10 +38,10 @@ virtio-drivers = { path = "../vendor/virtio-drivers", default-features = false, 
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-raw"]}
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-arch-riscv64 = { path = "../arch/riscv64"}
+arch-riscv64 = { path = "../arch/riscv64", default-features = false }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
-arch-loongarch64 = { path = "../arch/loongarch64"}
+arch-loongarch64 = { path = "../arch/loongarch64", default-features = false }
 
 [lints]
 workspace = true
