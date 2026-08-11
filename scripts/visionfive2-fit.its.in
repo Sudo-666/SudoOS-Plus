@@ -1,0 +1,108 @@
+/*
+ * VisionFive 2 (JH7110) FIT source template.
+ *
+ * build-visionfive2-fit.sh substitutes the KERNEL_RAW / DTB_* / INITRAMFS
+ * placeholders with absolute paths, then mkimage -f builds sudoos-visionfive2.itb.
+ *
+ * Address strategy (see SudoOS-VisionFive2-TFTP-CodePlan §3):
+ *   kernel raw  load/entry 0x4020_0000
+ *   DTB/initramfs addresses are assigned by U-Boot bootm at runtime — the FIT
+ *   DTBs deliberately carry NO linux,initrd-* so bootm writes /chosen fresh.
+ *
+ * Node names avoid "@<unit>" so dtc does not warn unit_address_vs_reg.
+ *
+ * os = "linux" only to select U-Boot's standard RISC-V OS handoff (a0/a1);
+ * SudoOS is still a self-hosted kernel.
+ */
+/dts-v1/;
+
+/ {
+    description = "SudoOS VisionFive 2 (JH7110) FIT image";
+    #address-cells = <2>;
+
+    images {
+        kernel {
+            description = "SudoOS kernel (raw)";
+            data = /incbin/("KERNEL_RAW");
+            type = "kernel";
+            arch = "riscv";
+            os = "linux";
+            compression = "none";
+            load = <0x0 0x40200000>;
+            entry = <0x0 0x40200000>;
+            hash {
+                algo = "sha256";
+            };
+        };
+
+        fdt-selftest {
+            description = "VF2 DTB (conf-selftest)";
+            data = /incbin/("DTB_SELFTEST");
+            type = "flat_dt";
+            arch = "riscv";
+            compression = "none";
+            hash {
+                algo = "sha256";
+            };
+        };
+
+        fdt-single {
+            description = "VF2 DTB (conf-single)";
+            data = /incbin/("DTB_SINGLE");
+            type = "flat_dt";
+            arch = "riscv";
+            compression = "none";
+            hash {
+                algo = "sha256";
+            };
+        };
+
+        fdt-smp {
+            description = "VF2 DTB (conf-smp)";
+            data = /incbin/("DTB_SMP");
+            type = "flat_dt";
+            arch = "riscv";
+            compression = "none";
+            hash {
+                algo = "sha256";
+            };
+        };
+
+        ramdisk {
+            description = "BusyBox ramdisk (riscv64)";
+            data = /incbin/("INITRAMFS");
+            type = "ramdisk";
+            arch = "riscv";
+            os = "linux";
+            compression = "none";
+            hash {
+                algo = "sha256";
+            };
+        };
+    };
+
+    configurations {
+        default = "conf-smp";
+
+        conf-selftest {
+            description = "Gate A: kernel self-test, single CPU";
+            kernel = "kernel";
+            fdt = "fdt-selftest";
+            ramdisk = "ramdisk";
+        };
+
+        conf-single {
+            description = "Gate B: single-core real BusyBox /init (PID 1)";
+            kernel = "kernel";
+            fdt = "fdt-single";
+            ramdisk = "ramdisk";
+        };
+
+        conf-smp {
+            description = "Gate C/D: 4x U74 final configuration";
+            kernel = "kernel";
+            fdt = "fdt-smp";
+            ramdisk = "ramdisk";
+        };
+    };
+};

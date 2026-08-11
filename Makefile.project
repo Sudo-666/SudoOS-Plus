@@ -153,6 +153,51 @@ check-visionfive2-image: kernel-visionfive2.elf kernel-vf2.bin
 	    --elf kernel-visionfive2.elf \
 	    --bin kernel-vf2.bin
 
+# SUDOOS_VF2_FIT_V1: VisionFive 2 FIT/TFTP bundle (CodePlan VF2.6).
+# 外部完整板级 DTB 由 VISIONFIVE2_DTB 提供;构建器只派生三个 bootargs 变体。
+VISIONFIVE2_DTB ?=
+PCB ?= unknown
+VF2_TFTP_DIR := build/visionfive2/tftp/sudoos/vf2
+
+.PHONY: visionfive2-dtbs
+visionfive2-dtbs:
+	@test -n "$(VISIONFIVE2_DTB)" || (echo "error: VISIONFIVE2_DTB=/absolute/path/to/board.dtb is required" >&2; exit 2)
+	@test -f "$(VISIONFIVE2_DTB)" || (echo "error: VISIONFIVE2_DTB not found: $(VISIONFIVE2_DTB)" >&2; exit 2)
+	VISIONFIVE2_DTB="$(VISIONFIVE2_DTB)" scripts/build-visionfive2-dtb.sh
+
+.PHONY: visionfive2-fit
+visionfive2-fit: kernel-visionfive2 busybox-initramfs-riscv64 visionfive2-dtbs
+	@mkdir -p $(VF2_TFTP_DIR)
+	@python3 scripts/elf-to-uimage.py --raw kernel-visionfive2 $(VF2_TFTP_DIR)/kernel-vf2.bin >/dev/null
+	KERNEL_RAW="$(CURDIR)/$(VF2_TFTP_DIR)/kernel-vf2.bin" \
+	KERNEL_ELF="$(CURDIR)/kernel-visionfive2" \
+	INITRAMFS="$(CURDIR)/build/initramfs/busybox-riscv64.cpio" \
+	VISIONFIVE2_DTB="$(VISIONFIVE2_DTB)" PCB="$(PCB)" \
+	scripts/build-visionfive2-fit.sh
+
+.PHONY: check-visionfive2-fit
+check-visionfive2-fit: visionfive2-fit
+	@python3 scripts/check-visionfive2-fit.py \
+	    --itb $(VF2_TFTP_DIR)/sudoos-visionfive2.itb \
+	    --kernel-raw $(VF2_TFTP_DIR)/kernel-vf2.bin \
+	    --dtb-selftest $(VF2_TFTP_DIR)/dtbs/vf2-selftest.dtb \
+	    --dtb-single $(VF2_TFTP_DIR)/dtbs/vf2-single.dtb \
+	    --dtb-smp $(VF2_TFTP_DIR)/dtbs/vf2-smp.dtb \
+	    --initramfs build/initramfs/busybox-riscv64.cpio
+
+.PHONY: visionfive2-tftp-bundle
+visionfive2-tftp-bundle: check-visionfive2-fit
+	@scripts/build-visionfive2-uboot-script.sh
+	@echo "=== VisionFive 2 TFTP bundle ==="
+	@ls -lh $(VF2_TFTP_DIR)/sudoos-visionfive2.itb $(VF2_TFTP_DIR)/sudoos-vf2-tftp.cmd $(VF2_TFTP_DIR)/sudoos-vf2-tftp.scr $(VF2_TFTP_DIR)/visionfive2-manifest.txt
+
+.PHONY: visionfive2-tftp-install
+visionfive2-tftp-install: visionfive2-tftp-bundle
+	@test -n "$(TFTP_ROOT)" || (echo "error: TFTP_ROOT=/path/to/tftp/root is required" >&2; exit 2)
+	@mkdir -p "$(TFTP_ROOT)/sudoos/vf2"
+	@cp $(VF2_TFTP_DIR)/sudoos-visionfive2.itb $(VF2_TFTP_DIR)/sudoos-vf2-tftp.cmd $(VF2_TFTP_DIR)/sudoos-vf2-tftp.scr $(VF2_TFTP_DIR)/visionfive2-manifest.txt "$(TFTP_ROOT)/sudoos/vf2/"
+	@echo "installed: $(TFTP_ROOT)/sudoos/vf2/"
+
 # Original build target (single architecture, uses current defaults)
 .PHONY: build
 build:

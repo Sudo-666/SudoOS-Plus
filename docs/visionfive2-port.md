@@ -159,6 +159,46 @@ StarFive# bootm 0x40200000 - 0x46000000
 - 上电打印顺序：`B`（入口诊断）→ 内核 Rust 侧 `BOOT00 entry` → ...
 - 若 `bootm` 报 "Device tree not found"，补显式 FDT 参数（如上第 2 条）。
 
+## 5.1 FIT / TFTP 启动（VF2.6）
+
+U-Boot 通过以太网从 TFTP 服务器下载单个 FIT，再 `bootm` 分发内核 + DTB + initramfs。
+产物与脚本（见 `scripts/`）：
+
+```text
+build/visionfive2/tftp/sudoos/vf2/
+├── sudoos-visionfive2.itb     # 单个 FIT: raw kernel + 3 个派生 DTB + cpio
+├── sudoos-vf2-tftp.cmd        # 网络地址无关的 U-Boot 脚本源码
+├── sudoos-vf2-tftp.scr        # mkimage -T script 编译产物
+└── visionfive2-manifest.txt   # commit/toolchain/全部 sha256
+```
+
+构建（必须提供与 PCB 匹配的外部完整板级 DTB，禁止手写 minimal DTB）：
+
+```sh
+make visionfive2-tftp-bundle \
+  VISIONFIVE2_DTB=/absolute/path/to/jh7110-starfive-visionfive-2-v1.3b.dtb
+```
+
+脚本链：
+
+- `build-visionfive2-dtb.sh`：验证 `model`/`compatible`/CPU/memory/UART0/`stdout-path`，
+  再按 bootargs 派生三个 DTB 变体（`conf-selftest` / `conf-single` / `conf-smp`），
+  **不**写入 `linux,initrd-*`（由 U-Boot `bootm` 启动时填 `/chosen`）。
+- `visionfive2-fit.its.in` + `build-visionfive2-fit.sh`：`mkimage -f` 生成 FIT，
+  kernel 节点 `os="linux"` 只为选 RISC-V handoff，`load=entry=0x4020_0000`。
+- `check-visionfive2-fit.py`：`mkimage -l`/`dumpimage` 验证 default=conf-smp、
+  三个 config、kernel load/entry、SHA-256、以及逐字节一致性与 staging 不重叠。
+- `visionfive2-tftp.cmd` / `build-visionfive2-uboot-script.sh`：网络地址无关的
+  启动脚本（`tftpboot 0x60000000 ... && iminfo && bootm 0x60000000#${sudoos_conf}`）。
+
+FIT 配置与 bootargs：
+
+| 配置 | bootargs | 用途 |
+|---|---|---|
+| `conf-selftest` | `console=ttyS0,115200n8 sudoos.maxcpus=1` | Gate A |
+| `conf-single` | `console=ttyS0,115200n8 rdinit=/init init.debug=1 sudoos.maxcpus=1` | Gate B |
+| `conf-smp`（default） | `console=ttyS0,115200n8 rdinit=/init init.debug=1 sudoos.maxcpus=4` | Gate C/D |
+
 ## 6. 已修复的既有问题
 
 - `kernel/src/task/mod.rs`：ls2k1000 移植把 worker 验证数组从 8 扩到 16 个显式元素，

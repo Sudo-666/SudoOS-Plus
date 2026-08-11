@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Validate an external VisionFive 2 board DTB and derive the three FIT DTB
+# variants (conf-selftest / conf-single / conf-smp), which differ only in
+# /chosen/bootargs. No linux,initrd-* is embedded: U-Boot bootm writes
+# /chosen at runtime from the FIT ramdisk.
+#
+# Usage:
+#   VISIONFIVE2_DTB=/absolute/path/to/jh7110-starfive-visionfive-2-v1.3b.dtb \
+#   scripts/build-visionfive2-dtb.sh
+#
+# Output: build/visionfive2/tftp/sudoos/vf2/dtbs/vf2-{selftest,single,smp}.dtb
+#
+# Requires: dtc (for fdtget/fdtput), a full board DTB matching the PCB.
+# Hand-written minimal DTBs are rejected (see CodePlan §16).
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+    pwd
+)"
+ROOT_DIR="$(
+    cd -- "${SCRIPT_DIR}/.."
+    pwd
+)"
+
+OUT_DIR="${ROOT_DIR}/build/visionfive2/tftp/sudoos/vf2/dtbs"
+mkdir -p "${OUT_DIR}"
+
+if [[ -z "${VISIONFIVE2_DTB:-}" ]]; then
+    echo "error: VISIONFIVE2_DTB=/absolute/path/to/board.dtb is required" >&2
+    exit 2
+fi
+if [[ ! -f "${VISIONFIVE2_DTB}" ]]; then
+    echo "error: VISIONFIVE2_DTB is not a file: ${VISIONFIVE2_DTB}" >&2
+    exit 2
+fi
+
+command -v fdtget >/dev/null 2>&1 || {
+    echo "error: fdtget (device-tree-compiler) not found" >&2
+    exit 1
+}
+
+DTB="${VISIONFIVE2_DTB}"
+
+# ---- helpers (fdtget fails loudly; read as optional) ----
+getprop() { # getprop <path> <prop>
+    fdtget -t s "${DTB}" "$1" "$2" 2>/dev/null || true
+}
+
+die() {
+    echo "error: ${1}" >&2
+    exit 1
+}
+
+# ---- 1. model / compatible ----
+MODEL="$(getprop / model)"
+COMPAT="$(getprop / compatible)"
+[[ -n "${MODEL}" ]] || die "DTB has no /model — not a real board DTB?"
+[[ -n "${COMPAT}" ]] || die "DTB has no /compatible"
+if ! grep -qi "starfive" <<<"${COMPAT}"; then
+    echo "warning: /compatible '${COMPAT}' does not mention starfive; is this a JH7110 DTB?"
+fi
+echo "model          : ${MODEL}"
+echo "compatible     : ${COMPAT}"
+
+# ---- 2. CPU nodes (must expose the four U74 harts) ----
+CPU1_TYPE="$(getprop /cpus/cpu@1 device_type)"
+[[ "${CPU1_TYPE}" = "cpu" ]] || die "/cpus/cpu@1 is missing or not device_type=cpu (need the four U74 nodes)"
+echo "cpus           : /cpus/cpu@1 present (U74 harts)"
+
+# ---- 3. memory node ----
+MEM_TYPE="$(getprop /memory device_type)"
+[[ "${MEM_TYPE}" = "memory" ]] || die "/memory is missing or not device_type=memory"
+echo "memory         : /memory present"
+
+# ---- 4. UART0 (0x10000000, JH7110 DW_apb_uart) ----
+UART_FOUND=0
+for candidate in /soc/serial@10000000 /soc/uart@10000000 /serial@10000000; do
+    COMPAT_UART="$(getprop "${candidate}" compatible)"
+    if [[ -n "${COMPAT_UART}" ]]; then
+        UART_FOUND=1
+        echo "uart0          : ${candidate} compatible=${COMPAT_UART}"
+        break
+    fi
+done
+[[ "${UART_FOUND}" = 1 ]] || {
+    echo "warning: no serial node at 0x10000000 found; check stdout-path below" >&2
+}
+
+# ---- 5. chosen / stdout-path ----
+STDOUT="$(getprop /chosen stdout-path)"
+[[ -n "${STDOUT}" ]] || die "/chosen/stdout-path is missing"
+echo "stdout-path    : ${STDOUT}"
+
+# ---- derive the three variants ----
+BOOTARGS_SELFTEST="console=ttyS0,115200n8 sudoos.maxcpus=1"
+BOOTARGS_SINGLE="console=ttyS0,115200n8 rdinit=/init init.debug=1 sudoos.maxcpus=1"
+BOOTARGS_SMP="console=ttyS0,115200n8 rdinit=/init init.debug=1 sudoos.maxcpus=4"
+
+declare -A VARIANTS=(
+    [selftest]="${BOOTARGS_SELFTEST}"
+    [single]="${BOOTARGS_SINGLE}"
+    [smp]="${BOOTARGS_SMP}"
+)
+
+for variant in selftest single smp; do
+    out="${OUT_DIR}/vf2-${variant}.dtb"
+    cp "${DTB}" "${out}"
+    fdtput -t s "${out}" /chosen bootargs "${VARIANTS[${variant}]}"
+    echo "derived        : ${out} (bootargs='${VARIANTS[${variant}]}')"
+done
+
+echo
+echo "VISIONFIVE2_DTB_DERIVE : PASS (${#VARIANTS[@]} variants)"
