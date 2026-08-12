@@ -7697,23 +7697,10 @@ fn sys_file_private_mmap(
     start.get() as isize
 }
 
-fn zero_user_mapping(mut addr: VirtAddr, mut remaining: usize) -> Result<(), ()> {
-    let mm = current_user_mm();
-    while remaining > 0 {
-        // `populate_page()` returns a physical address with the same in-page
-        // offset as `addr`. A fixed PAGE_SIZE write from an unaligned tail
-        // would cross into an unrelated physical frame.
-        let in_page = addr.get() & (PAGE_SIZE - 1);
-        let chunk = core::cmp::min(PAGE_SIZE - in_page, remaining);
-        let phys = mm.populate_page(addr).map_err(|_| ())?;
-        let ptr = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(phys).map_err(|_| ())?;
-        unsafe {
-            core::ptr::write_bytes(ptr, 0, chunk);
-        }
-        addr = addr.checked_add(chunk).ok_or(())?;
-        remaining -= chunk;
-    }
-    Ok(())
+fn zero_user_mapping(addr: VirtAddr, remaining: usize) -> Result<(), ()> {
+    current_user_mm()
+        .populate_zeroed_range(addr, remaining)
+        .map_err(|_| ())
 }
 
 fn copy_file_into_private_mapping(
@@ -7736,11 +7723,10 @@ fn copy_file_into_private_mapping(
         if read == 0 {
             break;
         }
-        let destination = start.get().checked_add(copied).ok_or(())?;
+        let destination = start.checked_add(copied).ok_or(())?;
         current_user_mm()
-            .populate_page(VirtAddr::new(destination))
+            .load_bytes(destination, output.filled_bytes())
             .map_err(|_| ())?;
-        copy_to_user(destination, output.filled_bytes()).map_err(|_| ())?;
         copied += read;
     }
     Ok(())

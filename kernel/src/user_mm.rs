@@ -395,10 +395,12 @@ impl UserMm {
         Ok(physical)
     }
 
-    /// Populate and initialize a loader-owned range while the address space is
-    /// still private and inactive.  Keeping the MM lock across the complete
-    /// ELF segment avoids one lock acquisition, VMA lookup, and page-table
-    /// setup pass per 4 KiB page when execve loads large toolchain binaries.
+    /// Populate and initialize a range in one MM-lock acquisition.
+    ///
+    /// Execve uses this while the new address space is inactive. File-backed
+    /// mmap also uses it for each bulk read while the calling thread owns the
+    /// syscall. In both cases batching avoids one lock acquisition, VMA lookup,
+    /// and page-table setup pass per 4 KiB page.
     pub(crate) fn load_bytes(
         &self,
         address: VirtAddr,
@@ -435,19 +437,13 @@ impl UserMm {
                 .layout()
                 .find_area(current)
                 .ok_or(UserMmRuntimeError::PermissionDenied)?;
-            map_zero_page_locked(&mut state, area, current)?;
-            let physical = state
-                .page_table
-                .as_ref()
-                .ok_or(UserMmRuntimeError::NotMapped)?
-                .translate(current)?
-                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let physical = map_zero_page_locked(&mut state, area, current)?;
             let in_page = current.get() & (PAGE_SIZE - 1);
             let chunk = min(PAGE_SIZE - in_page, input.len() - copied);
             let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
                 .map_err(|_| UserMmRuntimeError::NotMapped)?;
-            // SAFETY: the newly populated translation names RAM owned by this
-            // inactive MM, and the copy is bounded to its current page.
+            // SAFETY: the populated translation names RAM owned by this MM,
+            // and the copy is bounded to its current page.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     input.as_ptr().add(copied),
@@ -458,6 +454,54 @@ impl UserMm {
             copied += chunk;
         }
         debug_assert_eq!(address.get() + copied, end);
+        Ok(())
+    }
+
+    /// Ensure every page intersecting `range` has a zeroed backing page.
+    ///
+    /// Fresh allocations are already kernel-zeroed, so unlike a byte-at-a-time
+    /// memset this only needs to install missing pages. Existing pages are left
+    /// intact, which is required when the zero tail shares its first page with
+    /// file data loaded immediately before this call.
+    pub(crate) fn populate_zeroed_range(
+        &self,
+        address: VirtAddr,
+        length: usize,
+    ) -> Result<(), UserMmRuntimeError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = address
+            .get()
+            .checked_add(length)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let first_page = address
+            .align_down(PAGE_SIZE)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let page_count = length
+            .checked_add(address.get() & (PAGE_SIZE - 1))
+            .and_then(|covered| covered.checked_add(PAGE_SIZE - 1))
+            .ok_or(UserMmRuntimeError::AddressOverflow)?
+            / PAGE_SIZE;
+
+        let mut state = self.state.lock();
+        state
+            .pages
+            .try_reserve(page_count)
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+
+        let mut page = first_page;
+        while page.get() < end {
+            let area = state
+                .core
+                .layout()
+                .find_area(page)
+                .ok_or(UserMmRuntimeError::PermissionDenied)?;
+            map_zero_page_locked(&mut state, area, page)?;
+            page = page
+                .checked_add(PAGE_SIZE)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        }
         Ok(())
     }
 
@@ -1340,21 +1384,21 @@ pub fn assert_no_leaks() {
 fn map_zero_page_locked(
     state: &mut UserMmState,
     area: VmArea,
-    page_address: VirtAddr,
-) -> Result<(), UserMmRuntimeError> {
-    let page_address = page_address
+    address: VirtAddr,
+) -> Result<PhysAddr, UserMmRuntimeError> {
+    let offset = address.get() & (PAGE_SIZE - 1);
+    let page_address = address
         .align_down(PAGE_SIZE)
         .ok_or(UserMmRuntimeError::AddressOverflow)?;
     let page =
         VirtPage::from_start_address(page_address).ok_or(UserMmRuntimeError::InvalidRange)?;
-    if state
+    if let Some(physical) = state
         .page_table
         .as_ref()
         .ok_or(UserMmRuntimeError::NotMapped)?
-        .translate(page_address)?
-        .is_some()
+        .translate(address)?
     {
-        return Ok(());
+        return Ok(physical);
     }
 
     state
@@ -1363,6 +1407,13 @@ fn map_zero_page_locked(
         .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
     let backing =
         crate::page_alloc::allocate(0, crate::page_alloc::PageAllocationOptions::kernel_zeroed())?;
+    let physical = match backing.start().start_address().checked_add(offset) {
+        Some(physical) => physical,
+        None => {
+            crate::page_alloc::free(backing)?;
+            return Err(UserMmRuntimeError::AddressOverflow);
+        }
+    };
     let page_table = state
         .page_table
         .as_mut()
@@ -1374,7 +1425,7 @@ fn map_zero_page_locked(
 
     state.pages.push(MappedPage { page, backing });
     LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
-    Ok(())
+    Ok(physical)
 }
 
 fn retire_range_locked(
