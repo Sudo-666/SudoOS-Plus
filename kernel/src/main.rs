@@ -566,6 +566,64 @@ fn kernel_main(boot: BootInfo) -> ! {
         );
         crate::console::raw::puts("CPU-COUNTERS PASS\n");
     }
+    #[cfg(feature = "platform-visionfive2")]
+    {
+        // 板级 per-CPU timer/IPI 中断路径检查（真实硬件）。
+        //
+        // 与 ls2k1000 相同的模型：启动检查窗口内只有 boot CPU 保持调度
+        // tick。副核进入 tickless NO_HZ idle 后，time::enter_idle 会在本地
+        // 无软件定时器时 shutdown 硬件定时器，因此副核收不到 timer IRQ——
+        // 这是有意设计，不是故障。所以：
+        //   * boot CPU：用 timer IRQ 验证（tick 保持 armed）；
+        //   * 副核：用真实 reschedule IPI 往返验证——唤醒 idle → trap
+        //     入口 → SUPERVISOR_SOFTWARE → IPI 分发 → acknowledge，覆盖与
+        //     timer IRQ 完全相同的异常入口与中断分发代码。
+        let discovered = crate::smp::discovered_cpu_count();
+
+        // 1) boot CPU 定时器路径：等待首个 timer IRQ（启动检查期间
+        //    boot CPU 的 tick 不会进入 NO_HZ，计数必然增长）。
+        let mut waits = 0u32;
+        while crate::irq::timer_irq_count(0) == 0 && waits < 50 {
+            crate::arch::cpu::wait_for_interrupt();
+            waits += 1;
+        }
+
+        // 2) 副核中断路径：向逻辑 CPU 1..N 各发送真实 IPI 并等待接收确认。
+        for logical in 1..discovered {
+            let cpu =
+                crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+            let mut round = 0u32;
+            while crate::ipi::interrupt_count(cpu) == 0 && round < 50 {
+                crate::smp::send_ipi(cpu);
+                crate::arch::cpu::wait_for_interrupt();
+                round += 1;
+            }
+        }
+
+        for logical in 0..discovered {
+            let cpu = crate::smp::CpuId::new(logical)
+                .expect("discovered CPU exceeds MAX_CPUS");
+            crate::println!(
+                "CPU-CNTR cpu={} timer={} ipi_recv={}",
+                logical,
+                crate::irq::timer_irq_count(logical),
+                crate::ipi::interrupt_count(cpu),
+            );
+        }
+        assert!(
+            crate::irq::timer_irq_count(0) > 0,
+            "boot CPU timer IRQ never arrived",
+        );
+        assert!(
+            (1..discovered).all(|logical| {
+                let cpu = crate::smp::CpuId::new(logical)
+                    .expect("discovered CPU exceeds MAX_CPUS");
+                crate::ipi::interrupt_count(cpu) > 0
+            }),
+            "secondary CPU IPI round-trip did not reach every online CPU",
+        );
+        crate::println!("CPU-COUNTERS PASS");
+    }
     workqueue::initialize();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     timer::verify();
