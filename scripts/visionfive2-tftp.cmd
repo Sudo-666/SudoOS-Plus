@@ -28,4 +28,10 @@ tftpboot 0x60000000 ${sudoos_fit}
 
 iminfo 0x60000000
 
+# Clear a stale U-Boot env bootargs (e.g. the stock Linux command line) so the
+# FIT DTB's /chosen/bootargs (rdinit=/init, sudoos.maxcpus=N) takes effect for
+# the selected config. Without this, bootm would hand the board's env bootargs
+# to the kernel and conf-single would boot 4 cores onto the selftest path.
+setenv bootargs
+
 bootm 0x60000000#${sudoos_conf}
