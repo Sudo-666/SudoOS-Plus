@@ -156,6 +156,22 @@ pub unsafe fn switch_user_address_space(root: myos_mm::PhysFrame, asid: myos_mm:
             );
         }
     }
+
+    /*
+     * Synchronize the local instruction stream after any user-address-space
+     * switch.  Exec and eager fork both install freshly-written executable
+     * pages; SFENCE.VMA above only invalidates translation caches, and the
+     * RISC-V I-cache is not coherent with the stores that wrote those pages.
+     * Without FENCE.I the hart can fetch stale bytes (garbage execution,
+     * SIGSEGV at pc=0 / near-null writes) — invisible under QEMU's TCG, real
+     * on the JH7110 U74.  FENCE.I is per-hart, so it must run on the hart
+     * that will actually execute the new code, which is this one.
+     */
+    // SAFETY: FENCE.I orders this hart's instruction fetch against prior
+    // stores made visible to it; it touches no memory or stack.
+    unsafe {
+        core::arch::asm!("fence.i", options(nostack));
+    }
 }
 
 pub fn current_lower_root() -> myos_mm::PhysFrame {

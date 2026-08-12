@@ -40,6 +40,11 @@ REJECT_MARKERS = [
     "OOM",
     "ale-fail",
     "unknown-syscall",
+    # User-mode faults: a real SIGSEGV in a child process is a stability
+    # failure, not a pass.  The kernel prints `sigsegv: pid=...` on the serial
+    # and BusyBox ash echoes `Segmentation fault`.
+    "sigsegv:",
+    "Segmentation fault",
 ]
 
 # ── Gate A: conf-selftest 单核自测 ──────────────────────────────
@@ -167,11 +172,19 @@ def check_gate_c(text: str) -> list[str]:
 def check_gate_d(text: str) -> list[str]:
     # 稳定性证据计数。阈值对真机手工会话保持宽松:重点是重复的
     # fork/wait、Ctrl-C、VEOF 和"shell exit 后被 init 重拉"至少 20 次。
+    #
+    # 计数严格对齐内核自己的串口 trace 标记,而不是宽松的子串:
+    #   shell 重拉  -> TTY-CTTY:   每次 relaunch 的会话重新获取控制终端
+    #   fork/wait   -> 整行 FORK_WAIT_OK (只匹配单独一行,避免命令回显误计)
+    #   Ctrl-C      -> TTY-SIGINT: 内核 VINTR trace
+    #   VEOF        -> TTY-VEOF:   内核 VEOF trace
+    # 这些标记在 rdinit 路径默认开启 (init_supervisor 置 verbose trace),
+    # 并在 Gate C/D 会话中被验证可用。
     counters = {
-        "shell relaunch": len(re.findall(r"sudoos:/#", text)),
-        "fork/wait": len(re.findall(r"FORK_WAIT_OK", text)),
-        "Ctrl-C": len(re.findall(r"Ctrl-C|SIGINT|\^C", text, re.IGNORECASE)),
-        "VEOF": len(re.findall(r"VEOF|ctrl-d|Ctrl-D|\^D", text, re.IGNORECASE)),
+        "shell relaunch": len(re.findall(r"TTY-CTTY:", text)),
+        "fork/wait": len(re.findall(r"^FORK_WAIT_OK$", text, re.MULTILINE)),
+        "Ctrl-C": len(re.findall(r"TTY-SIGINT:", text)),
+        "VEOF": len(re.findall(r"TTY-VEOF:", text)),
     }
     thresholds = {
         "shell relaunch": GATE_D_MIN_ITERATIONS,  # init 重拉 shell ≥ 20 次
