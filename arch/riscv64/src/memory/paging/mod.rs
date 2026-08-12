@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+
 mod activate;
 mod boot;
 mod entry;
@@ -33,8 +35,32 @@ const SATP_ASID_BITS: usize = 16;
 const SATP_ASID_MASK: usize = ((1usize << SATP_ASID_BITS) - 1) << SATP_ASID_SHIFT;
 const SATP_PPN_MASK: usize = (1usize << SATP_ASID_SHIFT) - 1;
 
+// All harts are homogeneous (the kernel assumes identical ASIDLEN across the
+// topology), so one cached probe result is sufficient. A concurrent probe on
+// another hart recomputes the same value and races benignly on these atomics.
+static HARDWARE_ASID_PROBED: AtomicBool = AtomicBool::new(false);
+static HARDWARE_ASID_MAXIMUM: AtomicU16 = AtomicU16::new(0);
+
 /// Returns the implemented Sv39 ASID width as an inclusive maximum ID.
+///
+/// A value of `0` is legal: RISC-V lets `ASIDLEN = 0`, so SATP.ASID is WARL to
+/// zero and the hart carries no hardware address-space tags. StarFive's JH7110
+/// U74 cores report exactly this (`ASID allocator disabled (0 bits)` under
+/// Linux). Callers must use [`hardware_address_space_id_available`] to select
+/// the ASID-less fallback instead of treating 0 as a configuration error.
 pub fn maximum_address_space_id() -> u16 {
+    if HARDWARE_ASID_PROBED.load(Ordering::Acquire) {
+        return HARDWARE_ASID_MAXIMUM.load(Ordering::Acquire);
+    }
+
+    if !translation_is_enabled() {
+        // Early boot: satp is still BARE and no address space exists yet. The
+        // probe writes SATP.ASID, which is meaningless without Sv39; return a
+        // conservative "ASIDs present" answer and let the first post-Sv39
+        // caller probe and cache the real width.
+        return u16::MAX;
+    }
+
     let original = current_satp();
     assert_eq!(
         (original & SATP_MODE_MASK) >> SATP_MODE_SHIFT,
@@ -59,8 +85,18 @@ pub fn maximum_address_space_id() -> u16 {
     };
 
     let maximum = ((observed & SATP_ASID_MASK) >> SATP_ASID_SHIFT) as u16;
-    assert_ne!(maximum, 0, "RISC-V hart implements no usable ASID bits");
+    HARDWARE_ASID_MAXIMUM.store(maximum, Ordering::Release);
+    HARDWARE_ASID_PROBED.store(true, Ordering::Release);
     maximum
+}
+
+/// Whether the hart implements non-zero hardware ASID bits.
+///
+/// When false, every logical address space maps to SATP.ASID == 0, so address
+/// space switches and per-ASID flushes must fall back to full local TLB
+/// flushes (the Linux behavior on `ASIDLEN = 0` harts).
+pub fn hardware_address_space_id_available() -> bool {
+    maximum_address_space_id() != 0
 }
 
 /// Installs an Sv39 root and ASID without invalidating unrelated ASIDs.
@@ -77,7 +113,15 @@ pub unsafe fn switch_user_address_space(root: myos_mm::PhysFrame, asid: myos_mm:
     );
     let ppn = root_address >> myos_mm::PAGE_SHIFT;
     assert_eq!(ppn & !SATP_PPN_MASK, 0, "RISC-V root exceeds SATP.PPN");
-    let asid_value = usize::from(asid.get());
+    let has_hardware_asid = hardware_address_space_id_available();
+    // On an ASID-less hart SATP.ASID is WARL to zero: every logical address
+    // space maps to hardware ASID 0, so the switch must discard the whole local
+    // TLB rather than only the previous ASID's entries.
+    let asid_value = if has_hardware_asid {
+        usize::from(asid.get())
+    } else {
+        0
+    };
     let satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (asid_value << SATP_ASID_SHIFT) | ppn;
 
     /*
@@ -90,15 +134,27 @@ pub unsafe fn switch_user_address_space(root: myos_mm::PhysFrame, asid: myos_mm:
     // The validated SATP value selects only that root/ASID, and the assembly
     // touches no Rust-managed memory or stack while fencing the local hart.
     unsafe {
-        core::arch::asm!(
-            "fence rw, rw",
-            "sfence.vma zero, {asid}",
-            "csrw satp, {satp}",
-            "sfence.vma zero, {asid}",
-            asid = in(reg) asid_value,
-            satp = in(reg) satp,
-            options(nostack),
-        );
+        if has_hardware_asid {
+            core::arch::asm!(
+                "fence rw, rw",
+                "sfence.vma zero, {asid}",
+                "csrw satp, {satp}",
+                "sfence.vma zero, {asid}",
+                asid = in(reg) asid_value,
+                satp = in(reg) satp,
+                options(nostack),
+            );
+        } else {
+            // No hardware tags to discriminate: a full local fence after the
+            // switch is both necessary and sufficient.
+            core::arch::asm!(
+                "fence rw, rw",
+                "csrw satp, {satp}",
+                "sfence.vma zero, zero",
+                satp = in(reg) satp,
+                options(nostack),
+            );
+        }
     }
 }
 
@@ -118,6 +174,12 @@ pub fn current_address_space_id() -> myos_mm::AddressSpaceId {
 
 #[inline]
 pub fn flush_page(address: myos_mm::VirtAddr) {
+    if !hardware_address_space_id_available() {
+        // ASID-less hart: SFENCE.VMA cannot discriminate address spaces, so
+        // fall back to a full local flush (matches the Linux no-ASID path).
+        flush_all();
+        return;
+    }
     // SAFETY: SFENCE.VMA invalidates only the current hart's translation
     // caches and does not dereference the supplied virtual address.
     unsafe {
@@ -136,6 +198,10 @@ pub fn flush_asid(asid: myos_mm::AddressSpaceId) {
         myos_mm::AddressSpaceId::KERNEL,
         "kernel/global translations require a full local TLB flush",
     );
+    if !hardware_address_space_id_available() {
+        flush_all();
+        return;
+    }
     let asid = usize::from(asid.get());
 
     // SAFETY: SFENCE.VMA with rs1=zero and an explicit ASID invalidates only
@@ -156,6 +222,10 @@ pub fn flush_asid_page(asid: myos_mm::AddressSpaceId, address: myos_mm::VirtAddr
         myos_mm::AddressSpaceId::KERNEL,
         "kernel/global translations require the kernel page flush path",
     );
+    if !hardware_address_space_id_available() {
+        flush_all();
+        return;
+    }
     let asid = usize::from(asid.get());
 
     // SAFETY: SFENCE.VMA invalidates only the current hart's non-global

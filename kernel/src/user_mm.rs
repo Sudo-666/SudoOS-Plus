@@ -1070,11 +1070,23 @@ impl UserMm {
             root,
             "M8-B3 hardware root does not match the active user mm",
         );
-        assert_eq!(
-            crate::arch::memory::paging::current_address_space_id(),
-            asid,
-            "M8-B3 hardware ASID does not match the active user mm",
-        );
+        if crate::arch::memory::paging::hardware_address_space_id_available() {
+            assert_eq!(
+                crate::arch::memory::paging::current_address_space_id(),
+                asid,
+                "M8-B3 hardware ASID does not match the active user mm",
+            );
+        } else {
+            // ASID-less hart: SATP.ASID is WARL to zero, so the hardware must
+            // present the reserved kernel ASID 0 even while a user mm is
+            // active. Only the page-table root is a meaningful hardware
+            // invariant here.
+            assert_eq!(
+                crate::arch::memory::paging::current_address_space_id(),
+                myos_mm::AddressSpaceId::KERNEL,
+                "M8-B3 ASID-less hart did not present hardware ASID 0",
+            );
+        }
         // `active_cpus` is the Linux-like mm_cpumask, not a single-owner
         // marker. A CLONE_VM/pthread process may legally execute this same mm
         // on multiple CPUs at once. Hardware root/ASID checks above and the
@@ -1557,9 +1569,16 @@ fn release_mm_reservation() {
 
 fn ensure_asid_allocator(slot: &mut Option<AsidAllocator>) -> Result<(), UserMmRuntimeError> {
     if slot.is_none() {
-        *slot = Some(AsidAllocator::new(
-            crate::arch::memory::paging::maximum_address_space_id(),
-        )?);
+        // An ASID-less hart (ASIDLEN = 0, e.g. StarFive JH7110 U74) still gets
+        // a logical ID space so MM/TLB requests can be matched by generation;
+        // the arch layer maps every logical ID to hardware ASID 0.
+        let hardware_max = crate::arch::memory::paging::maximum_address_space_id();
+        let logical_max = if hardware_max == 0 {
+            u16::MAX
+        } else {
+            hardware_max
+        };
+        *slot = Some(AsidAllocator::new(logical_max)?);
     }
     Ok(())
 }
