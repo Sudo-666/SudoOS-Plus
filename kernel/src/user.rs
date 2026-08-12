@@ -1,5 +1,5 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: uname release is Linux-compatible for contest libc startup.
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
@@ -9017,6 +9017,10 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
 
     let process = current_process();
+    // Publish /proc/<pid> comm+cmdline from the argv that actually went onto
+    // the user stack.  Runs before any Vfs lock, matching the metadata lock
+    // rank contract in process.rs.
+    process.set_exec_metadata(&argv_refs);
     if process.thread_count() > 1 {
         crate::task::request_process_thread_exit(process.id(), thread.id(), 0);
         process.wait_until_single_thread();
@@ -11937,12 +11941,25 @@ fn sys_readlinkat(
     if length > MAX_USER_COPY {
         return -EINVAL;
     }
-    let path = match resolve_user_path(dirfd, path_address) {
+    let raw_path = match copy_user_c_string(path_address) {
         Ok(path) => path,
         Err(errno) => return errno,
     };
-
-    // Compatibility /proc symlinks
+    // Compatibility /proc symlinks are recognized on the literal path, before
+    // resolve_path_from_user substitutes the caller's pid for "self".
+    if raw_path == "/proc/self" {
+        let pid = current_process().id().get();
+        let target = pid.to_string();
+        let copy_len = core::cmp::min(length, target.len());
+        if copy_to_user(buffer_address, &target.as_bytes()[..copy_len]).is_err() {
+            return -EFAULT;
+        }
+        return copy_len as isize;
+    }
+    let path = match resolve_path_from_user_raw(dirfd, &raw_path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
     if path == "/proc/self/exe" || path == "/proc/thread-self/exe" {
         let target = b"/init";
         let copy_len = core::cmp::min(length, target.len());
@@ -11966,6 +11983,13 @@ fn sys_readlinkat(
         return -(crate::syscall::errno::EBADF);
     }
 
+    // Resolve any remaining /proc/self (e.g. /proc/self/comm) to the caller's
+    // pid before the VFS readlink; the self node's stored target is only a
+    // placeholder.
+    let path = match resolve_proc_self(&path) {
+        Ok(path) => path,
+        Err(errno) => return errno,
+    };
     let mut buffer = [0_u8; MAX_USER_COPY];
     let mut output = myos_vfs::MutableIoBuffer::new(&mut buffer[..length]);
     match crate::fs::readlink(&path, &mut output) {
@@ -13112,20 +13136,55 @@ fn resolve_user_path(dirfd: usize, path_address: usize) -> Result<alloc::string:
 }
 
 fn resolve_path_from_user(dirfd: usize, path: &str) -> Result<alloc::string::String, isize> {
+    let resolved = resolve_path_from_user_raw(dirfd, path)?;
+    // Materialize the live-PID children before a /proc path resolves, so a
+    // direct `cat /proc/<pid>/comm` works without a prior readdir.  This runs
+    // at the syscall boundary with no Vfs lock held; reconcile_proc_root
+    // snapshots the registry, then takes the node lock.  Best-effort: a stale
+    // cache simply falls back to the inode tree as-is.
+    if resolved == "/proc" || resolved.starts_with("/proc/") {
+        let _ = crate::fs::reconcile_proc_root();
+    }
+    resolve_proc_self(&resolved)
+}
+
+/// Resolve `path` against `dirfd` without applying the `/proc/self` rewrite.
+/// `readlink` uses this so its `/proc/self/{exe,fd}` compatibility cases see the
+/// literal path.
+fn resolve_path_from_user_raw(dirfd: usize, path: &str) -> Result<alloc::string::String, isize> {
     if path.starts_with('/') {
-        return crate::fs::resolve_path("/", path).map_err(|errno| errno.to_isize());
-    }
-    if dirfd == AT_FDCWD {
+        crate::fs::resolve_path("/", path).map_err(|errno| errno.to_isize())
+    } else if dirfd == AT_FDCWD {
         let cwd = current_process().fs().cwd_path();
-        return crate::fs::resolve_path(&cwd, path).map_err(|errno| errno.to_isize());
+        crate::fs::resolve_path(&cwd, path).map_err(|errno| errno.to_isize())
+    } else {
+        let file = current_process_file(dirfd).map_err(|errno| errno.to_isize())?;
+        let stat = file.fstat().map_err(|errno| errno.to_isize())?;
+        if stat.mode & myos_vfs::FileMode::S_IFMT != myos_vfs::FileMode::S_IFDIR {
+            return Err(myos_vfs::Errno::Enotdir.to_isize());
+        }
+        let base = file.path().ok_or(-EBADF)?;
+        crate::fs::resolve_path(base, path).map_err(|errno| errno.to_isize())
     }
-    let file = current_process_file(dirfd).map_err(|errno| errno.to_isize())?;
-    let stat = file.fstat().map_err(|errno| errno.to_isize())?;
-    if stat.mode & myos_vfs::FileMode::S_IFMT != myos_vfs::FileMode::S_IFDIR {
-        return Err(myos_vfs::Errno::Enotdir.to_isize());
+}
+
+/// `/proc/self` is a real per-process symlink: substitute the caller's pid.
+///
+/// Resolving it inside VFS lookup is impossible (that path holds the Vfs-rank
+/// tree lock and cannot consult the scheduler for the current pid), so the
+/// syscall boundary rewrites the path before it reaches `fs::open`.  The VFS
+/// still carries a `self` symlink node for `ls`/`readdir`; `readlink` handles
+/// it in `sys_readlinkat`.
+fn resolve_proc_self(path: &str) -> Result<alloc::string::String, isize> {
+    if path == "/proc/self" {
+        let pid = current_process().id().get();
+        return Ok(alloc::format!("/proc/{pid}"));
     }
-    let base = file.path().ok_or(-EBADF)?;
-    crate::fs::resolve_path(base, path).map_err(|errno| errno.to_isize())
+    if let Some(rest) = path.strip_prefix("/proc/self/") {
+        let pid = current_process().id().get();
+        return Ok(alloc::format!("/proc/{pid}/{rest}"));
+    }
+    Ok(alloc::string::String::from(path))
 }
 
 fn copy_user_c_string(address: usize) -> Result<alloc::string::String, isize> {

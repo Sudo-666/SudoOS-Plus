@@ -1,4 +1,4 @@
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use myos_vfs::{
@@ -22,6 +22,12 @@ static ROOT: IrqSpinLock<Option<Arc<Node>>> = IrqSpinLock::new_with_class(None, 
 static TREE: IrqSpinLock<()> = IrqSpinLock::new_with_class((), TREE_LOCK);
 static MOUNTS: IrqSpinLock<Vec<MountEntry>> = IrqSpinLock::new_with_class(Vec::new(), MOUNT_LOCK);
 static NEXT_INODE: AtomicU64 = AtomicU64::new(1);
+/// The mounted `/proc` root node, so readdir/lookup can identify it and
+/// refresh its live-PID children.  Set once by `populate_proc_root`.
+static PROC_ROOT: IrqSpinLock<Option<Arc<Node>>> = IrqSpinLock::new_with_class(None, TREE_LOCK);
+/// Registry generation last materialized into the `/proc` children.  Prevents
+/// rebuilding PID directories on every path syscall that touches `/proc`.
+static PROC_LAST_GEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 struct Node {
     ino: u64,
@@ -614,12 +620,73 @@ pub fn umount(target: &str, flags: usize) -> Result<(), Errno> {
 }
 
 fn populate_proc_root(parent: &Arc<Node>) -> Result<(), Errno> {
+    // Static files only at mount time: PID directories are added lazily by
+    // `reconcile_proc_root` on the first readdir/lookup, which runs without the
+    // Vfs tree lock and can therefore snapshot the process registry safely.
     let entries = crate::procfs::root_entries();
     for (name, generator) in entries {
         let node = proc_file_node(generator);
         insert_child(parent, name, node)?;
     }
+    // /proc/self is a real symlink to the current pid.  The VFS node keeps a
+    // placeholder target; open/stat/readlink resolve the actual pid at the
+    // syscall boundary (see user.rs resolve_path_from_user / sys_readlinkat).
+    insert_child(parent, "self", symlink_node("self"))?;
+    *PROC_ROOT.lock() = Some(Arc::clone(parent));
     Ok(())
+}
+
+/// Whether `node` is the mounted `/proc` root (used by readdir to decide
+/// whether the live-PID children need refreshing).
+fn is_proc_root(node: &Arc<Node>) -> bool {
+    PROC_ROOT.lock().as_ref().is_some_and(|root| Arc::ptr_eq(root, node))
+}
+
+/// Rebuild the `/proc` root's children from the live process registry.
+///
+/// Lock order: snapshots process metadata with NO Vfs lock held (lockdep rank
+/// Process 35 < Vfs 36), then takes the node lock to install the new children.
+/// Callers must run outside the Vfs tree lock (readdir / syscall boundary).
+pub fn reconcile_proc_root() -> Result<(), Errno> {
+    let generation = crate::process::process_generation();
+    if generation == PROC_LAST_GEN.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let metas = crate::procfs::live_process_metas();
+    let mut children = Vec::new();
+    children
+        .try_reserve(crate::procfs::root_entries().len() + 1 + metas.len())
+        .map_err(|_| Errno::Enomem)?;
+    for (name, generator) in crate::procfs::root_entries() {
+        children.push((String::from(name), proc_file_node(generator)));
+    }
+    children.push((String::from("self"), symlink_node("self")));
+    for meta in metas {
+        let pid_name = meta.pid.to_string();
+        let dir = proc_pid_dir_node(meta);
+        children.push((pid_name, dir));
+    }
+    let root = PROC_ROOT.lock().as_ref().cloned().ok_or(Errno::Enodev)?;
+    let mut state = root.state.lock();
+    *state = NodeState::Directory(children);
+    PROC_LAST_GEN.store(generation, Ordering::Release);
+    Ok(())
+}
+
+/// Build a `/proc/<pid>` directory node containing comm/cmdline/status/stat.
+fn proc_pid_dir_node(meta: Arc<crate::procfs::ProcMeta>) -> Arc<Node> {
+    let mut children = Vec::new();
+    for (name, generator) in crate::procfs::pid_dir_entries(meta) {
+        children.push((String::from(name), proc_file_node(generator)));
+    }
+    Arc::new(Node {
+        ino: allocate_inode(),
+        parent_ino: AtomicU64::new(0),
+        nlink: AtomicU64::new(1),
+        mode: FileMode::from_bits(FileMode::S_IFDIR | 0o555),
+        read_only: AtomicBool::new(true),
+        state: IrqSpinLock::new_with_class(NodeState::Directory(children), NODE_LOCK),
+    })
 }
 
 fn populate_sysfs_root(parent: &Arc<Node>) -> Result<(), Errno> {
@@ -1828,6 +1895,12 @@ impl FileOperations for DirectoryFile {
 
     fn readdir(&self, file: &File, buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         populate_ext4_directory(&self.node)?;
+        // /proc: refresh the live-PID children before enumerating.  Runs
+        // outside the Vfs tree lock (getdents holds only the file position
+        // lock), so reconcile_proc_root can snapshot the registry safely.
+        if is_proc_root(&self.node) {
+            reconcile_proc_root()?;
+        }
         file.with_position(|position| {
             let mut index = usize::try_from(*position).map_err(|_| Errno::Eoverflow)?;
             let state = self.node.state.lock();

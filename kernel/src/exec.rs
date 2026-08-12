@@ -186,8 +186,15 @@ pub fn kernel_execve_from_vfs(
 }
 
 pub fn exec_elf(image: &[u8], config: ExecConfig<'_>) -> Result<ExecImage, ExecError> {
+    // Copy the argv slice before `prepare_elf` moves `config`; the strings it
+    // points into are owned by the caller and stay alive for the whole exec.
+    let argv = config.argv;
     let prepared = prepare_elf(image, config)?;
     let process = Process::create(prepared.mm);
+    // Publish /proc/<pid> comm+cmdline from the argv that actually went onto
+    // the user stack.  Runs before any Vfs lock, matching the metadata lock
+    // rank contract in process.rs.
+    process.set_exec_metadata(argv);
     if let Err(error) = crate::fs::install_standard_fds(&process) {
         destroy_unique_process(process)?;
         return Err(error.into());

@@ -39,12 +39,31 @@ const PROCESS_FILE_TABLE_LOCK: LockClass =
 const PROCESS_FS_LOCK: LockClass = LockClass::new("process.fs", LockRank::Process, 3);
 const PROCESS_RELATION_LOCK: LockClass = LockClass::new("process.relation", LockRank::Process, 4);
 const PROCESS_REGISTRY_LOCK: LockClass = LockClass::new("process.registry", LockRank::Process, 5);
+// Process metadata shown by /proc/<pid>/comm|cmdline.  Read/updated only from
+// exec (no Vfs lock held) and the procfs snapshot path (which also runs with no
+// Vfs lock held), so it sits at the tail of the Process rank.
+const PROCESS_METADATA_LOCK: LockClass =
+    LockClass::new("process.metadata", LockRank::Process, 6);
+
+/// Length of the `/proc/<pid>/comm` name, matching Linux `TASK_COMM_LEN`
+/// (15 displayable bytes + a terminating NUL).
+pub const TASK_COMM_LEN: usize = 16;
 
 static NEXT_PROCESS_ID: AtomicUsize = AtomicUsize::new(1);
 static LIVE_PROCESSES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
 static PROCESS_REGISTRY: IrqSpinLock<Option<BTreeMap<ProcessId, alloc::sync::Weak<Process>>>> =
     IrqSpinLock::new_with_class(None, PROCESS_REGISTRY_LOCK);
+/// Monotonic counter bumped on every process register/unregister.  The procfs
+/// dynamic directory uses it to decide whether the live-PID snapshot is stale
+/// without locking the registry during path resolution.
+static PROCESS_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Current registry generation.  `procfs` compares this against the generation
+/// it last materialized; a change means live PIDs changed since the last pass.
+pub fn process_generation() -> u64 {
+    PROCESS_GENERATION.load(Ordering::Acquire)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProcessId(usize);
@@ -450,6 +469,11 @@ pub struct Process {
     thread_exit: WaitQueue,
     vfork_pending: AtomicBool,
     vfork_done: Completion,
+    /// `/proc/<pid>/comm`: executable basename (argv[0] last component),
+    /// truncated to `TASK_COMM_LEN - 1` bytes.
+    comm: IrqSpinLock<alloc::vec::Vec<u8>>,
+    /// `/proc/<pid>/cmdline`: argv NUL-separated, as pushed on the user stack.
+    cmdline: IrqSpinLock<alloc::vec::Vec<u8>>,
 }
 
 impl Process {
@@ -477,6 +501,8 @@ impl Process {
             thread_exit: WaitQueue::new(),
             vfork_pending: AtomicBool::new(false),
             vfork_done: Completion::new(),
+            comm: IrqSpinLock::new_with_class(alloc::vec::Vec::new(), PROCESS_METADATA_LOCK),
+            cmdline: IrqSpinLock::new_with_class(alloc::vec::Vec::new(), PROCESS_METADATA_LOCK),
         });
         register_process(&process);
         LIVE_PROCESSES.fetch_add(1, Ordering::AcqRel);
@@ -521,6 +547,10 @@ impl Process {
         child.session.store(self.session(), Ordering::Release);
         child.set_parent(self.id())?;
         self.add_child(Arc::clone(&child))?;
+        // A forked child inherits the parent's comm/cmdline until exec replaces
+        // them (Linux semantics: /proc/<pid>/comm shows the original argv[0]).
+        *child.comm.lock() = self.comm.lock().clone();
+        *child.cmdline.lock() = self.cmdline.lock().clone();
         Ok(child)
     }
 
@@ -673,6 +703,46 @@ impl Process {
         self.session.store(sid, Ordering::Release);
         self.process_group.store(sid, Ordering::Release);
         sid
+    }
+
+    /// `/proc/<pid>/comm`: executable basename (argv[0] last path component),
+    /// truncated to `TASK_COMM_LEN - 1` bytes.
+    pub fn comm(&self) -> alloc::vec::Vec<u8> {
+        self.comm.lock().clone()
+    }
+
+    /// `/proc/<pid>/cmdline`: argv NUL-separated, exactly as pushed on the
+    /// user stack at exec time (so the `ps` COMMAND column reproduces the
+    /// invocation, spaces and all).
+    pub fn cmdline(&self) -> alloc::vec::Vec<u8> {
+        self.cmdline.lock().clone()
+    }
+
+    /// Record the argv used for the process image, for `/proc/<pid>/{comm,
+    /// cmdline}`.  Called by the exec paths (user `sys_execve` and the kernel
+    /// `exec_elf`) after a successful image load, and never under a Vfs lock.
+    pub fn set_exec_metadata(&self, argv: &[&str]) {
+        let comm = argv
+            .first()
+            .map(|arg| {
+                let base = arg.rsplit('/').next().unwrap_or(arg);
+                let bytes = base.as_bytes();
+                let end = bytes.len().min(TASK_COMM_LEN - 1);
+                bytes[..end].to_vec()
+            })
+            .unwrap_or_default();
+        let mut cmdline = alloc::vec::Vec::new();
+        cmdline
+            .try_reserve(
+                argv.iter().map(|arg| arg.len() + 1).sum::<usize>().min(4096),
+            )
+            .ok();
+        for arg in argv {
+            cmdline.extend_from_slice(arg.as_bytes());
+            cmdline.push(0);
+        }
+        *self.comm.lock() = comm;
+        *self.cmdline.lock() = cmdline;
     }
 
     pub const fn credentials(&self) -> Credentials {
@@ -862,6 +932,7 @@ fn register_process(process: &Arc<Process>) {
     let mut registry = PROCESS_REGISTRY.lock();
     let map = registry.get_or_insert_with(BTreeMap::new);
     map.insert(process.id(), Arc::downgrade(process));
+    PROCESS_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 fn unregister_process(pid: ProcessId) {
@@ -869,6 +940,7 @@ fn unregister_process(pid: ProcessId) {
     if let Some(map) = registry.as_mut() {
         map.remove(&pid);
     }
+    PROCESS_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 pub fn lookup_process(pid: ProcessId) -> Option<Arc<Process>> {
