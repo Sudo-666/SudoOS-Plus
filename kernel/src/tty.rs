@@ -76,6 +76,29 @@ fn trace_sigint(session: isize, pgrp: isize, delivered: usize) {
     }
 }
 
+/*
+ * Temporary Gate C/D diagnostic: unlike VINTR (^C), the VEOF char (^D) is
+ * deliberately neither echoed nor copied to the serial console, so the Gate D
+ * stability checker would otherwise have no serial-visible evidence that VEOF
+ * was processed. Each empty-line ^D delivers EOF (shells exit) and each
+ * partial-line ^D commits the buffered characters; the budget keeps the trace
+ * from spamming the console.
+ */
+static TTY_VEOF_SEQ: AtomicUsize = AtomicUsize::new(1);
+static TTY_VEOF_BUDGET: AtomicUsize = AtomicUsize::new(64);
+
+fn trace_veof(kind: &str) {
+    let seq = TTY_VEOF_SEQ.fetch_add(1, Ordering::Relaxed);
+    if TTY_VEOF_BUDGET
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(1)
+        })
+        .is_ok()
+    {
+        crate::println!("TTY-VEOF: seq={} kind={}", seq, kind);
+    }
+}
+
 struct TtyState {
     buffer: [u8; TTY_BUFFER],
     head: usize,
@@ -324,6 +347,7 @@ pub fn input_byte(byte: u8) {
                 // exit on ^D.
                 tty.eof_pending = true;
                 drop(tty);
+                trace_veof("empty-line");
                 wake_readers();
             } else {
                 // Partial line: commit the buffered characters without
@@ -331,6 +355,7 @@ pub fn input_byte(byte: u8) {
                 // not "abc\n"). The VEOF char is neither echoed nor copied.
                 tty.committed_len = tty.len;
                 drop(tty);
+                trace_veof("partial-line");
                 wake_readers();
             }
         }
