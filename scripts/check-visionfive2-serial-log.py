@@ -15,7 +15,7 @@ Gate 定义 (SudoOS-VisionFive2-TFTP-CodePlan §13):
 - Gate D  (stability):     稳定性压力场景,无拒绝标志、无残留进程。
 
 所有 Gate 都检查全局拒绝标志:
-  invalid FDT | HsmUnavailable | hart_start failed | page fault |
+  invalid FDT | HsmUnavailable | hart_start failed | kernel/user page fault |
   recursive lock acquisition | lock order violation | panicked at |
   kernel panic | OOM | ale-fail | unknown-syscall
 """
@@ -31,7 +31,8 @@ REJECT_MARKERS = [
     "invalid FDT",
     "HsmUnavailable",
     "hart_start failed",
-    "page fault",
+    "kernel page fault:",
+    "user page fault before task subsystem:",
     "recursive lock acquisition",
     "lock order violation",
     "panicked at",
@@ -123,7 +124,20 @@ def check_gate_b(text: str) -> list[str]:
     missing = [m for m in GATE_B_MARKERS if m not in text]
     if missing:
         raise GateFailure(f"missing PID 1 / prompt markers: {missing}")
-    return [f"PID 1 shell     : {len(GATE_B_MARKERS)}/{len(GATE_B_MARKERS)} markers"]
+
+    # conf-single must run truly single-core. If a stale U-Boot env bootargs
+    # leaks in (without rdinit=/init sudoos.maxcpus=1), the FIT still selects
+    # conf-single but the kernel boots 4 cores onto the selftest path instead
+    # of PID 1 — catch that here rather than in Gate C.
+    for marker in ("discovered CPUs : 1", "online CPUs     : 1",
+                   "active CPUs     : 1"):
+        if marker not in text:
+            raise GateFailure(f"conf-single must show {marker.strip()} (single-core gate)")
+
+    return [
+        f"PID 1 shell     : {len(GATE_B_MARKERS)}/{len(GATE_B_MARKERS)} markers",
+        "single core     : discovered/online/active CPUs = 1",
+    ]
 
 
 def check_gate_c(text: str) -> list[str]:
