@@ -829,6 +829,41 @@ fn lookup_follow(path: &str, follow_final: bool, depth: usize) -> Result<Arc<Nod
     if depth > MAX_SYMLINK_FOLLOWS {
         return Err(Errno::Eloop);
     }
+    if !path.starts_with('/') {
+        return Err(Errno::Enoent);
+    }
+    if path.as_bytes().contains(&0) {
+        return Err(Errno::Einval);
+    }
+
+    // Cargo/rustc path lookup is one of BuildStorm's hottest kernel paths.
+    // Avoid allocating a Vec of components for the overwhelmingly common
+    // absolute path without `..` or a followed symlink. Preserve the complete
+    // normalization logic in the slow path for those uncommon cases.
+    if !path.split('/').any(|component| component == "..") {
+        let mut current = root()?;
+        let mut parts = path
+            .split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .peekable();
+        while let Some(component) = parts.next() {
+            validate_component(component)?;
+            let next = lookup_child(&current, component)?.ok_or(Errno::Enoent)?;
+            let is_final = parts.peek().is_none();
+            if next.mode.file_type() == myos_vfs::FileType::Symlink
+                && (!is_final || follow_final)
+            {
+                return lookup_follow_slow(path, follow_final, depth);
+            }
+            current = next;
+        }
+        return Ok(current);
+    }
+
+    lookup_follow_slow(path, follow_final, depth)
+}
+
+fn lookup_follow_slow(path: &str, follow_final: bool, depth: usize) -> Result<Arc<Node>, Errno> {
     let parts = components(path)?;
     let mut current = root()?;
     for (index, component) in parts.iter().enumerate() {

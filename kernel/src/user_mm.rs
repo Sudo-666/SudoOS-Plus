@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 use core::cmp::min;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -26,6 +26,12 @@ static ASID_ROLLOVER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LIVE_MMS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_ROOTS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_BACKINGS: AtomicUsize = AtomicUsize::new(0);
+const FILE_PAGE_CACHE_CAPACITY: usize = 128 * 1024;
+static FILE_PAGE_CACHE: IrqSpinLock<BTreeMap<(u64, u64, u64), PageAllocation>> =
+    IrqSpinLock::new_with_class(
+        BTreeMap::new(),
+        LockClass::new("file_page_cache", LockRank::Vm, 3),
+    );
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -78,19 +84,62 @@ impl From<crate::vm::KernelVmError> for UserMmRuntimeError {
 
 struct MappedPage {
     page: VirtPage,
-    backing: PageAllocation,
+    backing: PageBacking,
+}
+
+enum PageBacking {
+    Owned(PageAllocation),
+    Shared(PhysFrame),
+}
+
+impl PageBacking {
+    fn frame(&self) -> PhysFrame {
+        match self {
+            Self::Owned(allocation) => allocation.start(),
+            Self::Shared(frame) => *frame,
+        }
+    }
+
+    fn physical(&self) -> PhysAddr {
+        self.frame().start_address()
+    }
 }
 
 #[derive(Clone, Copy)]
 struct MappedPageSource {
     page: VirtPage,
     physical: PhysAddr,
+    shared: bool,
+}
+
+#[derive(Clone)]
+struct FileBackedMapping {
+    range: VirtRange,
+    file_offset: u64,
+    file_length: usize,
+    generation: u64,
+    device: u64,
+    inode: u64,
+    shared_cache: bool,
+    file: myos_vfs::ArcFile,
+}
+
+pub(crate) struct FileFaultRequest {
+    pub(crate) file: myos_vfs::ArcFile,
+    pub(crate) file_offset: u64,
+    pub(crate) read_length: usize,
+    pub(crate) page: VirtAddr,
+    cache_key: (u64, u64, u64),
+    shared_cache: bool,
+    generation: u64,
 }
 
 struct UserMmState {
     core: Box<UserAddressSpace<VMA_CAPACITY>>,
     page_table: Option<RuntimePageTable>,
     pages: Vec<MappedPage>,
+    file_mappings: Vec<FileBackedMapping>,
+    next_file_generation: u64,
 }
 
 /// Page-table and backing allocations detached under the MM lock.
@@ -178,6 +227,8 @@ impl UserMm {
                         core,
                         page_table: Some(page_table),
                         pages: Vec::new(),
+                        file_mappings: Vec::new(),
+                        next_file_generation: 1,
                     },
                     LockClass::new("user_mm", LockRank::Vm, 2),
                 ),
@@ -206,7 +257,7 @@ impl UserMm {
 
     // FORK_CLONE_PRESERVE_PROT_NONE_V1
     pub fn fork_clone_eager(&self) -> Result<alloc::boxed::Box<Self>, UserMmRuntimeError> {
-        let (areas, program_break, mapped_pages) = {
+        let (areas, program_break, mapped_pages, file_mappings, next_file_generation) = {
             let state = self.state.lock();
             let layout = state.core.layout();
 
@@ -236,7 +287,7 @@ impl UserMm {
                 let area = layout
                     .find_area(mapping.page.start_address())
                     .ok_or(UserMmRuntimeError::PermissionDenied)?;
-                let physical = mapping.backing.start().start_address();
+                let physical = mapping.backing.physical();
 
                 match page_table.translate(mapping.page.start_address())? {
                     Some(translated) => {
@@ -254,16 +305,34 @@ impl UserMm {
                 mapped_pages.push(MappedPageSource {
                     page: mapping.page,
                     physical,
+                    shared: matches!(&mapping.backing, PageBacking::Shared(_)),
                 });
             }
 
-            (areas, layout.program_break(), mapped_pages)
+            let mut file_mappings = Vec::new();
+            file_mappings
+                .try_reserve(state.file_mappings.len())
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            file_mappings.extend(state.file_mappings.iter().cloned());
+
+            (
+                areas,
+                layout.program_break(),
+                mapped_pages,
+                file_mappings,
+                state.next_file_generation,
+            )
         };
 
         let child = alloc::boxed::Box::new(Self::new(&areas)?);
         if let Some(program_break) = program_break {
             child.configure_program_break(program_break.start(), program_break.limit())?;
             child.set_program_break(program_break.current())?;
+        }
+        {
+            let mut state = child.state.lock();
+            state.file_mappings = file_mappings;
+            state.next_file_generation = next_file_generation;
         }
 
         for source in mapped_pages {
@@ -279,16 +348,23 @@ impl UserMm {
                 .try_reserve(1)
                 .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
-            let backing = crate::page_alloc::allocate(
-                0,
-                crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
-            )?;
-            let destination = backing.start().start_address();
-
-            if let Err(error) = copy_physical_page(source.physical, destination) {
-                crate::page_alloc::free(backing)?;
-                return Err(error);
-            }
+            let backing = if source.shared {
+                PageBacking::Shared(
+                    PhysFrame::from_start_address(source.physical)
+                        .ok_or(UserMmRuntimeError::AddressOverflow)?,
+                )
+            } else {
+                let allocation = crate::page_alloc::allocate(
+                    0,
+                    crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+                )?;
+                let destination = allocation.start().start_address();
+                if let Err(error) = copy_physical_page(source.physical, destination) {
+                    crate::page_alloc::free(allocation)?;
+                    return Err(error);
+                }
+                PageBacking::Owned(allocation)
+            };
 
             if area.flags().access_only() != VmAreaFlags::empty() {
                 let page_table = state
@@ -296,19 +372,23 @@ impl UserMm {
                     .as_mut()
                     .ok_or(UserMmRuntimeError::NotMapped)?;
                 if let Err(error) =
-                    page_table.map_page(source.page, backing.start(), area.mapping_options())
+                    page_table.map_page(source.page, backing.frame(), area.mapping_options())
                 {
-                    crate::page_alloc::free(backing)?;
+                    if let PageBacking::Owned(allocation) = backing {
+                        crate::page_alloc::free(allocation)?;
+                    }
                     return Err(error.into());
                 }
             }
 
-
+            let owned = matches!(&backing, PageBacking::Owned(_));
             state.pages.push(MappedPage {
                 page: source.page,
                 backing,
             });
-            LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+            if owned {
+                LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+            }
         }
 
         Ok(child)
@@ -390,7 +470,10 @@ impl UserMm {
             return Err(error.into());
         }
 
-        state.pages.push(MappedPage { page, backing });
+        state.pages.push(MappedPage {
+            page,
+            backing: PageBacking::Owned(backing),
+        });
         LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
         Ok(physical)
     }
@@ -696,6 +779,8 @@ impl UserMm {
         let retirement = {
             let mut state = self.state.lock();
             let old_layout = state.core.layout().clone();
+            let retained_file_mappings =
+                file_mappings_without_range(&state.file_mappings, range)?;
 
             // 1. Remove overlapping VMAs from the topology.
             state
@@ -719,7 +804,10 @@ impl UserMm {
             //    PTE/backing modification, so an error here leaves the state
             //    consistent and a layout rollback is sufficient.
             match retire_range_locked(&mut state, range) {
-                Ok(retirement) => retirement,
+                Ok(retirement) => {
+                    state.file_mappings = retained_file_mappings;
+                    retirement
+                }
                 Err(error) => {
                     *state.core.layout_mut() = old_layout;
                     return Err(error);
@@ -748,17 +836,317 @@ impl UserMm {
         Ok(range.start())
     }
 
+    pub fn register_file_mapping(
+        &self,
+        range: VirtRange,
+        file_offset: u64,
+        file_length: usize,
+        device: u64,
+        inode: u64,
+        shared_cache: bool,
+        file: myos_vfs::ArcFile,
+    ) -> Result<(), UserMmRuntimeError> {
+        let mut state = self.state.lock();
+        let area = state
+            .core
+            .layout()
+            .find_area(range.start())
+            .ok_or(UserMmRuntimeError::NotMapped)?;
+        if !area.range().contains_range(range) {
+            return Err(UserMmRuntimeError::InvalidRange);
+        }
+        state
+            .file_mappings
+            .try_reserve(1)
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        let generation = state.next_file_generation;
+        state.next_file_generation = state.next_file_generation.wrapping_add(1).max(1);
+        state.file_mappings.push(FileBackedMapping {
+            range,
+            file_offset,
+            file_length,
+            generation,
+            device,
+            inode,
+            shared_cache,
+            file,
+        });
+        Ok(())
+    }
+
+    pub fn file_fault_request(
+        &self,
+        address: VirtAddr,
+        access: FaultAccess,
+    ) -> Result<Option<FileFaultRequest>, UserMmRuntimeError> {
+        let state = self.state.lock();
+        let Some(mapping) = state
+            .file_mappings
+            .iter()
+            .find(|mapping| mapping.range.contains(address))
+        else {
+            return Ok(None);
+        };
+        let area = state
+            .core
+            .layout()
+            .find_area(address)
+            .ok_or(UserMmRuntimeError::NotMapped)?;
+        let allowed = match access {
+            FaultAccess::Read => area.flags().is_readable(),
+            FaultAccess::Write => area.flags().is_writable(),
+            FaultAccess::Execute => area.flags().is_executable(),
+        };
+        if !allowed
+            || state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?
+                .translate(address)?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let page = address
+            .align_down(PAGE_SIZE)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let delta = page
+            .get()
+            .checked_sub(mapping.range.start().get())
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let read_length = mapping.file_length.saturating_sub(delta).min(PAGE_SIZE);
+        let file_offset = mapping
+            .file_offset
+            .checked_add(delta as u64)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        Ok(Some(FileFaultRequest {
+            file: alloc::sync::Arc::clone(&mapping.file),
+            file_offset,
+            read_length,
+            page,
+            cache_key: (mapping.device, mapping.inode, file_offset),
+            shared_cache: mapping.shared_cache,
+            generation: mapping.generation,
+        }))
+    }
+
+    pub fn install_file_fault(
+        &self,
+        fault: &FileFaultRequest,
+        data: &[u8],
+    ) -> Result<UserFaultResolution, UserMmRuntimeError> {
+        self.install_file_fault_inner(fault, data, true)
+    }
+
+    /// Map a full immutable file page already retained by the kernel-wide
+    /// cache without issuing another VFS read or copying its contents.
+    pub fn install_cached_file_fault(
+        &self,
+        fault: &FileFaultRequest,
+    ) -> Result<Option<UserFaultResolution>, UserMmRuntimeError> {
+        static UNUSED_CACHE_HIT_DATA: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+
+        if !fault.shared_cache
+            || fault.read_length != PAGE_SIZE
+            || file_page_cache_lookup(fault.cache_key).is_none()
+        {
+            return Ok(None);
+        }
+        self.install_file_fault_inner(fault, &UNUSED_CACHE_HIT_DATA, true)
+            .map(Some)
+    }
+
+    pub fn install_file_prefetch(
+        &self,
+        fault: &FileFaultRequest,
+        data: &[u8],
+    ) -> Result<UserFaultResolution, UserMmRuntimeError> {
+        self.install_file_fault_inner(fault, data, false)
+    }
+
+    fn install_file_fault_inner(
+        &self,
+        fault: &FileFaultRequest,
+        data: &[u8],
+        flush_local: bool,
+    ) -> Result<UserFaultResolution, UserMmRuntimeError> {
+        enum InstallOutcome {
+            Installed(PerMmTlbRequest),
+            Spurious,
+            Unmapped,
+        }
+
+        if data.len() != fault.read_length {
+            return Err(UserMmRuntimeError::InvalidRange);
+        }
+        let cacheable = fault.shared_cache && fault.read_length == PAGE_SIZE;
+        let mut backing = if cacheable
+            && let Some(frame) = file_page_cache_lookup(fault.cache_key)
+        {
+            Some(PageBacking::Shared(frame))
+        } else {
+            let allocation = crate::page_alloc::allocate(
+                0,
+                crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+            )?;
+            if !data.is_empty() {
+                let destination = match crate::arch::memory::phys_access::ram_mut_ptr::<u8>(
+                    allocation.start().start_address(),
+                ) {
+                    Ok(destination) => destination,
+                    Err(_) => {
+                        crate::page_alloc::free(allocation)?;
+                        return Err(UserMmRuntimeError::NotMapped);
+                    }
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(data.as_ptr(), destination, data.len());
+                }
+            }
+            let (cached, duplicate) = if cacheable {
+                file_page_cache_install(fault.cache_key, allocation)
+            } else {
+                (PageBacking::Owned(allocation), None)
+            };
+            if let Some(duplicate) = duplicate {
+                crate::page_alloc::free(duplicate)?;
+            }
+            Some(cached)
+        };
+
+        let outcome: Result<InstallOutcome, UserMmRuntimeError> = (|| {
+            let mut state = self.state.lock();
+            let still_mapped = state.file_mappings.iter().any(|mapping| {
+                mapping.generation == fault.generation && mapping.range.contains(fault.page)
+            });
+            if !still_mapped {
+                return Ok(InstallOutcome::Unmapped);
+            }
+            if state
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?
+                .translate(fault.page)?
+                .is_some()
+            {
+                return Ok(InstallOutcome::Spurious);
+            }
+            let area = state
+                .core
+                .layout()
+                .find_area(fault.page)
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let page = VirtPage::from_start_address(fault.page)
+                .ok_or(UserMmRuntimeError::InvalidRange)?;
+            state
+                .pages
+                .try_reserve(1)
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            let request = state.core.plan_post_install_tlb(fault.page)?;
+            if let Err(error) = state
+                .page_table
+                .as_mut()
+                .ok_or(UserMmRuntimeError::NotMapped)?
+                .map_page(
+                    page,
+                    backing
+                        .as_ref()
+                        .expect("file-fault backing disappeared before PTE install")
+                        .frame(),
+                    area.mapping_options(),
+                )
+            {
+                return Err(error.into());
+            }
+            let backing = backing
+                .take()
+                .expect("file-fault backing disappeared after PTE install");
+            let owned = matches!(&backing, PageBacking::Owned(_));
+            state.pages.push(MappedPage {
+                page,
+                backing,
+            });
+            if owned {
+                LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(InstallOutcome::Installed(request))
+        })();
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(unused) = backing.take() {
+                    let _ = free_uninstalled_backing(unused);
+                }
+                return Err(error);
+            }
+        };
+        let request = match outcome {
+            InstallOutcome::Installed(request) => request,
+            InstallOutcome::Spurious => {
+                free_uninstalled_backing(
+                    backing.take().expect("spurious file fault lost its backing"),
+                )?;
+                return Ok(UserFaultResolution::Recovered(UserFaultRecovery::Spurious));
+            }
+            InstallOutcome::Unmapped => {
+                free_uninstalled_backing(
+                    backing.take().expect("unmapped file fault lost its backing"),
+                )?;
+                return Ok(UserFaultResolution::Fatal(
+                    UserFaultFailure::SegmentationViolation,
+                ));
+            }
+        };
+        if !flush_local {
+            return Ok(UserFaultResolution::Recovered(UserFaultRecovery::Anonymous));
+        }
+
+        // Installing a previously invalid leaf never revokes access or frees
+        // memory. A remote CPU may keep its stale invalid translation and take
+        // the same recoverable fault, so only this CPU needs an immediate
+        // invalidation. Briefly mask interrupts when called from syscall
+        // uaccess; trap-fault callers already arrive with interrupts masked.
+        let restore_enabled = !crate::arch::interrupt::are_disabled();
+        if restore_enabled {
+            crate::arch::interrupt::disable();
+        }
+        let request = match request.local_only(crate::smp::current_cpu_id().get()) {
+            Ok(request) => request,
+            Err(error) => {
+                if restore_enabled {
+                    // SAFETY: restore the entry interrupt state before
+                    // propagating a request-shaping error.
+                    unsafe { crate::arch::interrupt::enable() };
+                }
+                return Err(UserMmRuntimeError::from(error));
+            }
+        };
+        crate::tlb::shootdown_user_local(request);
+        if restore_enabled {
+            // SAFETY: this restores the enabled state observed immediately
+            // before the short local TLB critical section.
+            unsafe { crate::arch::interrupt::enable() };
+        }
+        Ok(UserFaultResolution::Recovered(UserFaultRecovery::Anonymous))
+    }
+
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();
             let old_layout = state.core.layout().clone();
+            let retained_file_mappings =
+                file_mappings_without_range(&state.file_mappings, range)?;
             state
                 .core
                 .layout_mut()
                 .unmap_range(range)
                 .map_err(UserMmError::from)?;
             match retire_range_locked(&mut state, range) {
-                Ok(retirement) => retirement,
+                Ok(retirement) => {
+                    state.file_mappings = retained_file_mappings;
+                    retirement
+                }
                 Err(error) => {
                     *state.core.layout_mut() = old_layout;
                     return Err(error);
@@ -777,6 +1165,13 @@ impl UserMm {
     pub fn discard_anonymous_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();
+            if state
+                .file_mappings
+                .iter()
+                .any(|mapping| mapping.range.overlaps(range))
+            {
+                return Ok(());
+            }
             let mut cursor = range.start();
             loop {
                 let area = state
@@ -837,6 +1232,60 @@ impl UserMm {
             }
 
             let old_layout = state.core.layout().clone();
+
+            // Cached file pages are shared only while immutable. If userspace
+            // promotes such a mapping to writable, materialize a private copy
+            // before changing either the VMA or PTE permissions.
+            if requested_access.is_writable() {
+                let mut shared_indices = Vec::new();
+                shared_indices
+                    .try_reserve(state.pages.len().min(range.size() / PAGE_SIZE + 1))
+                    .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+                for (index, mapping) in state.pages.iter().enumerate() {
+                    if range.contains(mapping.page.start_address())
+                        && matches!(&mapping.backing, PageBacking::Shared(_))
+                    {
+                        shared_indices.push(index);
+                    }
+                }
+                for index in shared_indices {
+                    let page = state.pages[index].page;
+                    let source = state.pages[index].backing.physical();
+                    let allocation = crate::page_alloc::allocate(
+                        0,
+                        crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+                    )?;
+                    if let Err(error) =
+                        copy_physical_page(source, allocation.start().start_address())
+                    {
+                        crate::page_alloc::free(allocation)?;
+                        return Err(error);
+                    }
+                    let present = state
+                        .page_table
+                        .as_ref()
+                        .ok_or(UserMmRuntimeError::NotMapped)?
+                        .translate(page.start_address())?
+                        .is_some();
+                    if present {
+                        let area = old_layout
+                            .find_area(page.start_address())
+                            .ok_or(UserMmRuntimeError::PermissionDenied)?;
+                        let replace = state
+                            .page_table
+                            .as_mut()
+                            .ok_or(UserMmRuntimeError::NotMapped)?
+                            .replace_page(page, allocation.start(), area.mapping_options());
+                        if let Err(error) = replace {
+                            crate::page_alloc::free(allocation)?;
+                            return Err(error.into());
+                        }
+                    }
+                    state.pages[index].backing = PageBacking::Owned(allocation);
+                    LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+
             let mut changed_pages = Vec::new();
             let range_pages = range
                 .size()
@@ -869,7 +1318,7 @@ impl UserMm {
                         .pages
                         .iter()
                         .find(|mapping| mapping.page == page)
-                        .map(|mapping| mapping.backing.start()),
+                        .map(|mapping| mapping.backing.frame()),
                 };
                 if let Some(frame) = frame {
                     changed_pages.push((
@@ -1256,13 +1705,13 @@ impl UserMm {
                 Some(physical) => {
                     assert_eq!(
                         physical,
-                        mapping.backing.start().start_address(),
+                        mapping.backing.physical(),
                         "M8-B3 user leaf returned a different physical address",
                     );
                     let frame = page_table.unmap_page(mapping.page)?;
                     assert_eq!(
                         frame,
-                        mapping.backing.start(),
+                        mapping.backing.frame(),
                         "M8-B3 user leaf returned a different physical frame",
                     );
                 }
@@ -1274,20 +1723,21 @@ impl UserMm {
                 }
             }
             page_table.reclaim_empty_tables(mapping.page, &mut retired)?;
-            let backing_start = mapping.backing.start().start_address().get();
-
-            let backing_order = mapping.backing.order();
-            if let Err(error) = crate::page_alloc::free(mapping.backing) {
-                crate::println!(
-                    "user-mm: backing free failed page={:#x} phys={:#x} order={} error={:?}",
-                    mapping.page.start_address().get(),
-                    backing_start,
-                    backing_order,
-                    error,
-                );
-                return Err(error.into());
+            if let PageBacking::Owned(allocation) = mapping.backing {
+                let backing_start = allocation.start().start_address().get();
+                let backing_order = allocation.order();
+                if let Err(error) = crate::page_alloc::free(allocation) {
+                    crate::println!(
+                        "user-mm: backing free failed page={:#x} phys={:#x} order={} error={:?}",
+                        mapping.page.start_address().get(),
+                        backing_start,
+                        backing_order,
+                        error,
+                    );
+                    return Err(error.into());
+                }
+                LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
             }
-            LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
         }
 
         if already_unmapped != 0 && crate::user::oscomp_verbose_user_trace_active() {
@@ -1423,9 +1873,55 @@ fn map_zero_page_locked(
         return Err(error.into());
     }
 
-    state.pages.push(MappedPage { page, backing });
+    state.pages.push(MappedPage {
+        page,
+        backing: PageBacking::Owned(backing),
+    });
     LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
     Ok(physical)
+}
+
+fn file_mappings_without_range(
+    mappings: &[FileBackedMapping],
+    removed: VirtRange,
+) -> Result<Vec<FileBackedMapping>, UserMmRuntimeError> {
+    let mut retained = Vec::new();
+    retained
+        .try_reserve(mappings.len().saturating_mul(2))
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    for mapping in mappings {
+        if !mapping.range.overlaps(removed) {
+            retained.push(mapping.clone());
+            continue;
+        }
+        let overlap_start = core::cmp::max(mapping.range.start(), removed.start());
+        let overlap_end = core::cmp::min(mapping.range.end(), removed.end());
+        if mapping.range.start() < overlap_start {
+            let left = VirtRange::new(mapping.range.start(), overlap_start)
+                .ok_or(UserMmRuntimeError::InvalidRange)?;
+            let mut fragment = mapping.clone();
+            fragment.range = left;
+            fragment.file_length = fragment.file_length.min(left.size());
+            retained.push(fragment);
+        }
+        if overlap_end < mapping.range.end() {
+            let right = VirtRange::new(overlap_end, mapping.range.end())
+                .ok_or(UserMmRuntimeError::InvalidRange)?;
+            let delta = overlap_end
+                .get()
+                .checked_sub(mapping.range.start().get())
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            let mut fragment = mapping.clone();
+            fragment.range = right;
+            fragment.file_offset = fragment
+                .file_offset
+                .checked_add(delta as u64)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            fragment.file_length = mapping.file_length.saturating_sub(delta).min(right.size());
+            retained.push(fragment);
+        }
+    }
+    Ok(retained)
 }
 
 fn retire_range_locked(
@@ -1456,7 +1952,7 @@ fn retire_range_locked(
         if let Some(physical) = page_table.translate(mapping.page.start_address())? {
             assert_eq!(
                 physical,
-                mapping.backing.start().start_address(),
+                mapping.backing.physical(),
                 "user retirement preflight found a mismatched backing frame",
             );
         }
@@ -1491,14 +1987,16 @@ fn retire_range_locked(
             let frame = page_table.unmap_page(mapping.page)?;
             assert_eq!(
                 frame,
-                mapping.backing.start(),
+                mapping.backing.frame(),
                 "user unmap returned a different backing frame",
             );
         }
         page_table
             .reclaim_empty_tables(mapping.page, &mut tables)
             .expect("user page-table reclamation violated the reviewed topology");
-        backings.push(mapping.backing);
+        if let PageBacking::Owned(allocation) = mapping.backing {
+            backings.push(allocation);
+        }
     }
 
     Ok(RetirementBatch {
@@ -1553,6 +2051,36 @@ fn shootdown_user_request(request: myos_mm::PerMmTlbRequest) {
     } else {
         crate::tlb::shootdown_user(request);
     }
+}
+
+fn file_page_cache_lookup(key: (u64, u64, u64)) -> Option<PhysFrame> {
+    FILE_PAGE_CACHE.lock().get(&key).map(PageAllocation::start)
+}
+
+/// Retain immutable file pages for the kernel lifetime. The fixed 512 MiB
+/// ceiling bounds pinning under the 8 GiB BuildStorm configuration; small
+/// CAgent runs populate only their few dynamic-library pages.
+fn file_page_cache_install(
+    key: (u64, u64, u64),
+    allocation: PageAllocation,
+) -> (PageBacking, Option<PageAllocation>) {
+    let mut cache = FILE_PAGE_CACHE.lock();
+    if let Some(existing) = cache.get(&key) {
+        return (PageBacking::Shared(existing.start()), Some(allocation));
+    }
+    if cache.len() >= FILE_PAGE_CACHE_CAPACITY {
+        return (PageBacking::Owned(allocation), None);
+    }
+    let frame = allocation.start();
+    cache.insert(key, allocation);
+    (PageBacking::Shared(frame), None)
+}
+
+fn free_uninstalled_backing(backing: PageBacking) -> Result<(), UserMmRuntimeError> {
+    if let PageBacking::Owned(allocation) = backing {
+        crate::page_alloc::free(allocation)?;
+    }
+    Ok(())
 }
 
 fn copy_physical_page(source: PhysAddr, destination: PhysAddr) -> Result<(), UserMmRuntimeError> {

@@ -6,7 +6,8 @@ use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, 
 
 use crate::process::{Process, Thread};
 use crate::user_mm::{
-    UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMmRuntimeError,
+    FileFaultRequest, UserFaultFailure, UserFaultRecovery, UserFaultResolution, UserMm,
+    UserMmRuntimeError,
 };
 
 const USER_CODE: usize = 0x0000_0000_0040_0000;
@@ -4064,7 +4065,6 @@ fn verify_final_cagent_thread() {
             Some(cwd),
         )
     };
-
     match raw {
         Ok(0) => {
             crate::println!("sudoos-diag: final-cagent: official script exit=0");
@@ -7004,7 +7004,19 @@ pub fn handle_fault(
         FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
     }
     let user_sp = VirtAddr::new(frame.stack_pointer());
-    match current_user_mm().resolve_user_fault(address, access, user_sp) {
+    let mm = current_user_mm();
+    let resolution = match mm.file_fault_request(address, access) {
+        Ok(Some(request)) => {
+            let resolution = {
+                let _interrupts = SyscallInterruptGuard::enable_until_trap_return();
+                resolve_file_fault_cluster(&mm, request, access)
+            };
+            resolution
+        }
+        Ok(None) => mm.resolve_user_fault(address, access, user_sp),
+        Err(error) => Err(error),
+    };
+    match resolution {
         Ok(UserFaultResolution::Recovered(recovery)) => {
             if verifier {
                 RECOVERED_FAULT_COUNT.fetch_add(1, Ordering::AcqRel);
@@ -7096,6 +7108,90 @@ pub fn handle_fault(
         }
         Err(error) => panic!("M8-B4 user fault recovery failed: {error:?}"),
     }
+}
+
+const FILE_FAULT_CLUSTER_PAGES: usize = 64;
+
+/// Resolve the demanded page and fault-around into the following 256 KiB.
+/// Rustc scans shared libraries and metadata mostly sequentially; one
+/// positioned VFS read amortizes ext4 lookup/seek locking over sixty-four pages
+/// while still avoiding the multi-megabyte eager copies this path replaced.
+fn resolve_file_fault_cluster(
+    mm: &UserMm,
+    first: FileFaultRequest,
+    access: FaultAccess,
+) -> Result<UserFaultResolution, UserMmRuntimeError> {
+    // The common BuildStorm case is a later rustc process mapping the same
+    // compiler or shared-library page. Publish the retained physical frame
+    // directly and avoid both an ext4 read and a temporary 256 KiB buffer.
+    if let Some(resolution) = mm.install_cached_file_fault(&first)? {
+        return Ok(resolution);
+    }
+
+    let first_page = first.page;
+    let first_offset = first.file_offset;
+    let file = Arc::clone(&first.file);
+    let mut requests = Vec::new();
+    requests
+        .try_reserve(FILE_FAULT_CLUSTER_PAGES)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    requests.push(first);
+
+    for index in 1..FILE_FAULT_CLUSTER_PAGES {
+        if requests
+            .last()
+            .is_some_and(|request| request.read_length < PAGE_SIZE)
+        {
+            break;
+        }
+        let Some(page) = first_page.checked_add(index * PAGE_SIZE) else {
+            break;
+        };
+        let Some(next) = mm.file_fault_request(page, access)? else {
+            break;
+        };
+        let expected_offset = first_offset
+            .checked_add((index * PAGE_SIZE) as u64)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        if next.file_offset != expected_offset || !Arc::ptr_eq(&file, &next.file) {
+            break;
+        }
+        requests.push(next);
+    }
+
+    let total = requests
+        .iter()
+        .try_fold(0_usize, |total, request| total.checked_add(request.read_length))
+        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(total)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    data.resize(total, 0);
+    let mut completed = 0_usize;
+    while completed < data.len() {
+        let mut output = myos_vfs::MutableIoBuffer::new(&mut data[completed..]);
+        match file.read_at(first_offset + completed as u64, &mut output) {
+            Ok(0) => break,
+            Ok(read) => completed += read,
+            Err(_) => return Err(UserMmRuntimeError::NotMapped),
+        }
+    }
+
+    // Publish fault-around pages first without individual invalidations. The
+    // demanded page is installed last; its single local TLB flush supplies the
+    // architecture barrier for all preceding PTE writes.
+    let mut offset = requests[0].read_length;
+    for request in requests.iter().skip(1) {
+        let end = offset
+            .checked_add(request.read_length)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        match mm.install_file_prefetch(request, &data[offset..end]) {
+            Ok(UserFaultResolution::Recovered(_)) => {}
+            Ok(UserFaultResolution::Fatal(_)) | Err(_) => break,
+        }
+        offset = end;
+    }
+    mm.install_file_fault(&requests[0], &data[..requests[0].read_length])
 }
 
 fn classify_segv(
@@ -7557,7 +7653,28 @@ fn sys_file_private_mmap(
     };
     let readable = file_size.saturating_sub(offset).min(length);
 
-    let temporary_flags = VmAreaFlags::user_rw();
+    // Demand paging is deliberately limited to immutable private mappings.
+    // Dynamic linkers relocate MAP_PRIVATE writable segments immediately, so
+    // those remain eager. LoongArch keeps general-purpose executable mappings
+    // eager for compatibility with the image's Bash/glibc combination, while
+    // trusted BuildStorm toolchain paths use the verified direct execute-fault
+    // path. This avoids recopying rustc and librustc for every compiler child
+    // without changing the CAgent loader path.
+    let la_buildstorm_executable = vm_flags.is_executable()
+        && (path.contains("/.rustup/")
+            || path.contains("/work/tgoskits/")
+            || path.contains("/sudoos-buildstorm-bin/"));
+    let demand_private = !is_shared
+        && !vm_flags.is_writable()
+        && (cfg!(target_arch = "riscv64")
+            || !vm_flags.is_executable()
+            || la_buildstorm_executable);
+    let mapping_flags = if demand_private {
+        vm_flags
+    } else {
+        VmAreaFlags::user_rw()
+    };
+    let mm = current_user_mm();
 
     // MAP_FIXED: atomic VMA replacement at the exact address before
     // populating file contents.  MAP_FIXED_NOREPLACE: exact placement
@@ -7572,21 +7689,21 @@ fn sys_file_private_mmap(
             None => return -ENOMEM,
         };
         if is_fixed_replace {
-            current_user_mm().replace_anonymous_exact(fixed_range, temporary_flags)
+            mm.replace_anonymous_exact(fixed_range, mapping_flags)
         } else {
-            current_user_mm().map_anonymous_noreplace(fixed_range, temporary_flags)
+            mm.map_anonymous_noreplace(fixed_range, mapping_flags)
         }
     } else {
-        current_user_mm().map_anonymous(
+        mm.map_anonymous(
             VirtRange::from_bounds(USER_MMAP_START, USER_MMAP_END),
             rounded,
-            temporary_flags,
+            mapping_flags,
         )
     };
     let start = match mapping {
         Ok(start) => start,
         Err(error) => {
-            let (vmas, capacity) = current_user_mm().vma_usage();
+            let (vmas, capacity) = mm.vma_usage();
             let errno = if is_fixed_noreplace { EEXIST } else { ENOMEM };
             crate::println!(
                 "mmap-file: ALLOC-FAIL fd={} path={} fixed_replace={} fixed_noreplace={} addr={:#x} off={:#x} len={:#x} rounded={:#x} vmas={}/{} free_pages={} err={:?}",
@@ -7614,6 +7731,44 @@ fn sys_file_private_mmap(
         None => return -ENOMEM,
     };
 
+    if demand_private {
+        // Only evaluator-provided, immutable toolchain files enter the
+        // kernel-wide physical-page cache. Workspace outputs can reuse inode
+        // numbers or be overwritten and therefore remain per-mapping pages.
+        let shared_cache = path.contains("/.rustup/")
+            || path.starts_with("/tmp/sudoos-buildstorm-bin/");
+        if mm
+            .register_file_mapping(
+                range,
+                offset as u64,
+                readable,
+                stat.dev,
+                stat.ino,
+                shared_cache,
+                Arc::clone(&file),
+            )
+            .is_err()
+        {
+            let _ = mm.unmap_range(range);
+            return -ENOMEM;
+        }
+        if ACTIVE.load(Ordering::Acquire) {
+            MMAP_COUNT.fetch_add(1, Ordering::AcqRel);
+        }
+        if mmap_file_ok_trace() {
+            crate::println!(
+                "mmap-file: demand fd={} path={} off={:#x} len={:#x} -> {:#x} prot={:?}",
+                fd,
+                path,
+                offset,
+                length,
+                start.get(),
+                vm_flags,
+            );
+        }
+        return start.get() as isize;
+    }
+
     let result = copy_file_into_private_mapping(&file, start, offset, readable);
     if result.is_err() {
         crate::println!(
@@ -7625,7 +7780,7 @@ fn sys_file_private_mmap(
             length,
             crate::page_alloc::total_free_pages().unwrap_or(0),
         );
-        let _ = current_user_mm().unmap_range(range);
+        let _ = mm.unmap_range(range);
         return -EFAULT;
     }
     // Zero-fill tail padding (BSS / partial page beyond file size).
@@ -7643,11 +7798,11 @@ fn sys_file_private_mmap(
                 rounded - readable,
                 crate::page_alloc::total_free_pages().unwrap_or(0),
             );
-            let _ = current_user_mm().unmap_range(range);
+            let _ = mm.unmap_range(range);
             return -ENOMEM;
         }
     }
-    if let Err(e) = current_user_mm().protect_range(range, vm_flags.access_only()) {
+    if let Err(e) = mm.protect_range(range, vm_flags.access_only()) {
         if mmap_file_fail_trace() {
             let path = file.path().unwrap_or("?");
             crate::println!(
@@ -7661,7 +7816,7 @@ fn sys_file_private_mmap(
                 e,
             );
         }
-        let _ = current_user_mm().unmap_range(range);
+        let _ = mm.unmap_range(range);
         return -ENOMEM;
     }
     if is_shared && vm_flags.is_writable() {
@@ -7673,7 +7828,7 @@ fn sys_file_private_mmap(
         )
         .is_err()
         {
-            let _ = current_user_mm().unmap_range(range);
+            let _ = mm.unmap_range(range);
             return -ENOMEM;
         }
     }
@@ -13507,9 +13662,9 @@ fn copy_from_user(address: usize, output: &mut [u8]) -> Result<(), ()> {
     let Some(thread) = crate::task::current_user_thread() else {
         return Err(());
     };
-    thread
-        .process()
-        .mm()
+    let mm = thread.process().mm();
+    fault_in_file_pages_for_uaccess(mm, address, output.len(), FaultAccess::Read)?;
+    mm
         .copy_from_user(address, output)
         .map_err(|_| ())
 }
@@ -13523,11 +13678,41 @@ pub(crate) fn copy_to_user(address: usize, input: &[u8]) -> Result<(), ()> {
     let Some(thread) = crate::task::current_user_thread() else {
         return Err(());
     };
-    thread
-        .process()
-        .mm()
+    let mm = thread.process().mm();
+    fault_in_file_pages_for_uaccess(mm, address, input.len(), FaultAccess::Write)?;
+    mm
         .copy_to_user(address, input)
         .map_err(|_| ())
+}
+
+/// Linux uaccess resolves valid file-backed faults while copying syscall
+/// buffers. Rustc frequently passes untouched mmap-backed metadata directly to
+/// write/writev, so requiring a prior userspace touch would incorrectly return
+/// EFAULT and abort archive creation.
+fn fault_in_file_pages_for_uaccess(
+    mm: &UserMm,
+    address: usize,
+    length: usize,
+    access: FaultAccess,
+) -> Result<(), ()> {
+    if length == 0 {
+        return Ok(());
+    }
+    let end = address.checked_add(length).ok_or(())?;
+    let mut page = address & !(PAGE_SIZE - 1);
+    while page < end {
+        if let Some(request) = mm
+            .file_fault_request(VirtAddr::new(page), access)
+            .map_err(|_| ())?
+        {
+            match resolve_file_fault_cluster(mm, request, access).map_err(|_| ())? {
+                UserFaultResolution::Recovered(_) => {}
+                UserFaultResolution::Fatal(_) => return Err(()),
+            }
+        }
+        page = page.checked_add(PAGE_SIZE).ok_or(())?;
+    }
+    Ok(())
 }
 
 fn embedded_user_image() -> &'static [u8] {
