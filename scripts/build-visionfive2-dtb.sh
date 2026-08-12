@@ -63,10 +63,22 @@ fi
 echo "model          : ${MODEL}"
 echo "compatible     : ${COMPAT}"
 
-# ---- 2. CPU nodes (must expose the four U74 harts) ----
-CPU1_TYPE="$(getprop /cpus/cpu@1 device_type)"
-[[ "${CPU1_TYPE}" = "cpu" ]] || die "/cpus/cpu@1 is missing or not device_type=cpu (need the four U74 nodes)"
-echo "cpus           : /cpus/cpu@1 present (U74 harts)"
+# ---- 1b. size sanity: real VF2 DTBs are tens of KiB; a hand-written minimal
+# DTB (988 B) sails through the per-node checks but is not board-grade. ----
+DTB_SIZE="$(stat -c %s "${DTB}")"
+if (( DTB_SIZE < 4096 )); then
+    die "DTB is only ${DTB_SIZE} bytes (< 4096) — not a full board DTB; supply the real starfive/jh7110-starfive-visionfive-2-v1.*.dtb (check printenv fdtfile), not a hand-written minimal DTB"
+fi
+echo "size           : ${DTB_SIZE} bytes"
+
+# ---- 2. CPU nodes: JH7110 exposes all 5 harts (cpu@0 S7 + cpu@1..4 U74) ----
+for hart in 0 1 2 3 4; do
+    TYPE="$(getprop "/cpus/cpu@${hart}" device_type)"
+    [[ "${TYPE}" = "cpu" ]] || die "/cpus/cpu@${hart} is missing or not device_type=cpu (need all 5 JH7110 hart nodes)"
+done
+TIMEBASE="$(fdtget -t x "${DTB}" /cpus timebase-frequency 2>/dev/null || true)"
+[[ -n "${TIMEBASE}" ]] || die "/cpus timebase-frequency is missing (kernel SBI timer frequency comes from here)"
+echo "cpus           : /cpus/cpu@0..cpu@4 present (S7 + 4x U74), timebase=${TIMEBASE}"
 
 # ---- 3. memory node ----
 MEM_TYPE="$(getprop /memory device_type)"
