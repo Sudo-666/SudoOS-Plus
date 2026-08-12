@@ -6,8 +6,13 @@
  *
  * Address strategy (see SudoOS-VisionFive2-TFTP-CodePlan §3):
  *   kernel raw  load/entry 0x4020_0000
- *   DTB/initramfs addresses are assigned by U-Boot bootm at runtime — the FIT
- *   DTBs deliberately carry NO linux,initrd-* so bootm writes /chosen fresh.
+ *   FDT fixed at 0x4600_0000 — 8-byte aligned so the kernel valid_fdt_address()
+ *     accepts it, and inside the boot direct map [0x4000_0000, 0x2_4000_0000).
+ *     A fixed FDT address also stops U-Boot bootm from packing the FDT into the
+ *     tftp staging area where it was observed to land unaligned (a1=0x603846a4).
+ *   ramdisk fixed at 0x4610_0000 — 1 MiB below the FDT so bootm's in-place DTB
+ *     extension can never grow into the initramfs.
+ *   The FIT DTBs deliberately carry NO linux,initrd-* so bootm writes /chosen fresh.
  *
  * Node names avoid "@<unit>" so dtc does not warn unit_address_vs_reg.
  *
@@ -41,6 +46,7 @@
             type = "flat_dt";
             arch = "riscv";
             compression = "none";
+            load = <0x0 0x46000000>;
             hash {
                 algo = "sha256";
             };
@@ -52,6 +58,7 @@
             type = "flat_dt";
             arch = "riscv";
             compression = "none";
+            load = <0x0 0x46000000>;
             hash {
                 algo = "sha256";
             };
@@ -63,6 +70,7 @@
             type = "flat_dt";
             arch = "riscv";
             compression = "none";
+            load = <0x0 0x46000000>;
             hash {
                 algo = "sha256";
             };
@@ -75,6 +83,7 @@
             arch = "riscv";
             os = "linux";
             compression = "none";
+            load = <0x0 0x46100000>;
             hash {
                 algo = "sha256";
             };

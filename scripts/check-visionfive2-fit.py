@@ -6,6 +6,8 @@
     - 三个 config (conf-selftest / conf-single / conf-smp) 引用正确
       kernel / FDT / ramdisk;
     - kernel load/entry 均为 0x40200000;
+    - 三个 FDT load 固定 0x46000000、ramdisk load 固定 0x46100000
+      (8 字节对齐 + 不重叠,见 visionfive2-fit.its.in);
     - kernel/ramdisk 的 type/arch 正确 (os=linux 以选 RISC-V handoff);
     - SHA-256 节点存在;
     - 从 FIT 提取的每个组件与构建输入逐字节一致;
@@ -32,6 +34,11 @@ from pathlib import Path
 
 KERNEL_LOAD = 0x40200000
 KERNEL_ENTRY = 0x40200000
+# 固定加载地址 (见 visionfive2-fit.its.in):FDT 必须 8 字节对齐并落在内核
+# valid_fdt_address() 的 direct map 范围内;ramdisk 在 FDT 下方 1 MiB,避免
+# bootm 原地扩展 DTB 时与 initramfs 重叠 (实测 U-Boot 分配的重叠 ~10.6 KiB)。
+FDT_LOAD = 0x46000000
+INITRD_LOAD = 0x46100000
 
 
 class CheckFailure(Exception):
@@ -128,9 +135,26 @@ def check_image(itb: Path, inputs: dict[str, Path]) -> None:
           f"os={kernel.get('os')} load=0x{int_field(kernel, 'load address'):x} "
           f"entry=0x{int_field(kernel, 'entry point'):x}")
 
+    # 三个 FDT 节点必须全部固定到 0x46000000:8 字节对齐(内核 valid_fdt_address
+    # 要求)且与 tftp staging 解耦,避免 bootm 在 0x60xxxxxx 原地放未对齐 FDT。
+    for name in ("fdt-selftest", "fdt-single", "fdt-smp"):
+        fdt = next((b for b in blocks if b.get("name") == name), None)
+        if fdt is None:
+            raise CheckFailure(f"FIT lacks {name} image block")
+        load = int_field(fdt, "load address")
+        if load != FDT_LOAD:
+            raise CheckFailure(f"{name} load address = 0x{load:x} (want 0x{FDT_LOAD:x})")
+        print(f"{name:<14}: load=0x{load:x}")
+
     assert_field(ramdisk, "type", "RAMDisk Image")
     assert_field(ramdisk, "architecture", "RISC-V")
-    print(f"ramdisk         : type={ramdisk.get('type')} arch={ramdisk.get('architecture')}")
+    ramdisk_load = int_field(ramdisk, "load address")
+    if ramdisk_load != INITRD_LOAD:
+        raise CheckFailure(
+            f"ramdisk load address = 0x{ramdisk_load:x} (want 0x{INITRD_LOAD:x})"
+        )
+    print(f"ramdisk         : type={ramdisk.get('type')} arch={ramdisk.get('architecture')} "
+          f"load=0x{ramdisk_load:x}")
 
     # SHA-256 节点
     hash_lines = [b for b in blocks if b.get("name", "").startswith("hash")]
