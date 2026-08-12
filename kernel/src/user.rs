@@ -12892,9 +12892,11 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
             if !matches!(requested.l_type, F_RDLCK | F_WRLCK) {
                 return -EINVAL;
             }
-            if let Err(errno) = fcntl_validate_access(&file, requested.l_type) {
-                return errno;
-            }
+            // GETLK only asks whether a hypothetical lock would conflict; it
+            // does not place that lock. Linux therefore does not apply the
+            // descriptor access-mode check used by SETLK/SETLKW. QEMU relies
+            // on this when it probes an exclusive conflict byte through an
+            // O_RDONLY pflash descriptor before taking its shared read lock.
             let (start, end) = match fcntl_normalize_range(&file, &requested) {
                 Ok(range) => range,
                 Err(errno) => return errno,
