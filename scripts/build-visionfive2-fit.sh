@@ -106,7 +106,7 @@ bool() { if git rev-parse --git-dir >/dev/null 2>&1; then
     echo
     echo "fit_configs     = conf-selftest conf-single conf-smp (default conf-smp)"
     echo "dtb_addr        = 0x46000000"
-    echo "initrd_addr     = 0x46100000"
+    echo "initrd_addr     = 0x46200000"
     echo "fit_staging     = 0x60000000"
     echo
     echo "bootargs_selftest = console=ttyS0,115200n8 sudoos.maxcpus=1"

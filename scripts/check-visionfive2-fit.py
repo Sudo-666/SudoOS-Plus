@@ -6,8 +6,8 @@
     - 三个 config (conf-selftest / conf-single / conf-smp) 引用正确
       kernel / FDT / ramdisk;
     - kernel load/entry 均为 0x40200000;
-    - 三个 FDT load 固定 0x46000000、ramdisk load 固定 0x46100000
-      (8 字节对齐 + 不重叠,见 visionfive2-fit.its.in);
+    - 三个 FDT load 固定 0x46000000、ramdisk load 固定 0x46200000
+      (8 字节对齐 + 2 MiB 间距不重叠,见 visionfive2-fit.its.in);
     - kernel/ramdisk 的 type/arch 正确 (os=linux 以选 RISC-V handoff);
     - SHA-256 节点存在;
     - 从 FIT 提取的每个组件与构建输入逐字节一致;
@@ -35,10 +35,10 @@ from pathlib import Path
 KERNEL_LOAD = 0x40200000
 KERNEL_ENTRY = 0x40200000
 # 固定加载地址 (见 visionfive2-fit.its.in):FDT 必须 8 字节对齐并落在内核
-# valid_fdt_address() 的 direct map 范围内;ramdisk 在 FDT 下方 1 MiB,避免
-# bootm 原地扩展 DTB 时与 initramfs 重叠 (实测 U-Boot 分配的重叠 ~10.6 KiB)。
+# valid_fdt_address() 的 direct map 范围内;ramdisk 在 FDT 下方 2 MiB,避免
+# bootm 原地扩展 DTB (size + CONFIG_SYS_FDT_PAD 0x3000) 时与 initramfs 重叠。
 FDT_LOAD = 0x46000000
-INITRD_LOAD = 0x46100000
+INITRD_LOAD = 0x46200000
 
 
 class CheckFailure(Exception):

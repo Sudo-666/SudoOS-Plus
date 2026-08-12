@@ -186,10 +186,11 @@ make visionfive2-tftp-bundle \
   **不**写入 `linux,initrd-*`（由 U-Boot `bootm` 启动时填 `/chosen`）。
 - `visionfive2-fit.its.in` + `build-visionfive2-fit.sh`：`mkimage -f` 生成 FIT，
   kernel 节点 `os="linux"` 只为选 RISC-V handoff，`load=entry=0x4020_0000`；
-  三个 FDT 节点固定 `load=0x4600_0000`、ramdisk 固定 `load=0x4610_0000`——
+  三个 FDT 节点固定 `load=0x4600_0000`、ramdisk 固定 `load=0x4620_0000`——
   bootm 按 FIT `load` 属性把组件搬到 8 字节对齐地址再交内核（内核
-  `valid_fdt_address()` 要求 8 字节对齐），1 MiB 间距保证 bootm 原地扩展 DTB
-  不会长进 initramfs（U-Boot 自动分配的 FDT/ramdisk 曾实测重叠 ~10.6 KiB）。
+  `valid_fdt_address()` 要求 8 字节对齐）；2 MiB 间距覆盖 bootm 原地扩展 DTB
+  （size + `CONFIG_SYS_FDT_PAD` 0x3000，VF2 515 SDK 实测），不会长进 initramfs
+  （U-Boot 自动分配的 FDT/ramdisk 曾实测重叠 ~10.6 KiB）。
 - `check-visionfive2-fit.py`：`mkimage -l`/`dumpimage` 验证 default=conf-smp、
   三个 config、kernel load/entry、SHA-256、以及逐字节一致性与 staging 不重叠。
 - `visionfive2-tftp.cmd` / `build-visionfive2-uboot-script.sh`：网络地址无关的
