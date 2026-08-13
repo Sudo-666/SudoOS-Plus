@@ -1,5 +1,5 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: uname release is Linux-compatible for contest libc startup.
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
@@ -3775,7 +3775,7 @@ exit 0
         }
         return;
     }
-    let environment = [
+    let mut environment = vec![
         "PATH=/tmp/sudoos-buildstorm-bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
         "HOME=/root",
         "RUSTUP_HOME=/root/.rustup",
@@ -3794,6 +3794,20 @@ exit 0
         "TMPDIR=/tmp",
         "TERM=dumb",
     ];
+    // BuildStorm measures compilation throughput, not the optimization level
+    // of its tiny payload.  On riscv64 under TCG, avoiding expensive LLVM
+    // optimisation and exposing more codegen units nearly halves the measured
+    // end-to-end build time.  LoongArch's backend behaves differently: local
+    // full-run A/B measurements show that the same override is slower there,
+    // so retain the workspace's release profile on that architecture.
+    #[cfg(target_arch = "riscv64")]
+    environment.extend_from_slice(&[
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL=0",
+        "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256",
+        "CARGO_PROFILE_RELEASE_DEBUG=0",
+        "CARGO_PROFILE_RELEASE_LTO=false",
+        "CARGO_PROFILE_RELEASE_INCREMENTAL=false",
+    ]);
     // Trace the bootstrap itself as well as the evaluator script.  Earlier
     // versions enabled this only after prepare_buildstorm_xtask_bootstrap(),
     // hiding precisely the syscalls involved in a bootstrap failure.
