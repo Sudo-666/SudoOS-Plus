@@ -128,7 +128,10 @@ impl AsidAllocator {
             return;
         }
         let id = token.id().get();
-        assert!(id <= self.maximum, "released ASID exceeds allocator maximum");
+        assert!(
+            id <= self.maximum,
+            "released ASID exceeds allocator maximum"
+        );
         assert!(!self.free.contains(&id), "ASID released twice");
         self.free.push(id);
     }

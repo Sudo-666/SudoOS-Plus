@@ -54,13 +54,15 @@ pub type KernelThreadEntry = fn();
 
 #[must_use = "dropping the guard re-enables preemption"]
 pub struct PreemptGuard {
+    task: TaskId,
     _not_send: PhantomData<*mut ()>,
 }
 
 impl PreemptGuard {
     pub fn new() -> Self {
-        preempt_disable();
+        let task = preempt_disable();
         Self {
+            task,
             _not_send: PhantomData,
         }
     }
@@ -74,7 +76,7 @@ impl Default for PreemptGuard {
 
 impl Drop for PreemptGuard {
     fn drop(&mut self) {
-        preempt_enable();
+        preempt_enable_task(self.task);
     }
 }
 
@@ -151,6 +153,7 @@ struct Task {
     affinity: Option<CpuId>,
     queued_on: Option<CpuId>,
     has_run: bool,
+    preempt_count: usize,
     wait_channel: Option<usize>,
     wait_queue_address: Option<usize>,
     wait_prev: Option<TaskId>,
@@ -199,6 +202,7 @@ impl Task {
             affinity: Some(CpuId::BOOT),
             queued_on: None,
             has_run: true,
+            preempt_count: 0,
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -221,6 +225,7 @@ impl Task {
             affinity: Some(cpu),
             queued_on: None,
             has_run: false,
+            preempt_count: 0,
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -253,6 +258,7 @@ impl Task {
             affinity,
             queued_on: None,
             has_run: false,
+            preempt_count: 0,
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -285,6 +291,7 @@ impl Task {
             affinity,
             queued_on: None,
             has_run: false,
+            preempt_count: 0,
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -334,7 +341,7 @@ impl Task {
         );
         if let Some(stack) = self.stack.take() {
             stack
-                .destroy()
+                .recycle()
                 .unwrap_or_else(|error| panic!("unable to release kernel stack: {error:?}"));
         }
         assert!(
@@ -402,7 +409,6 @@ struct CpuScheduler {
     preemptions: u64,
     mm_switches: u64,
     irq_depth: usize,
-    preempt_count: usize,
     need_resched: bool,
     timeslice_remaining: u32,
 }
@@ -419,7 +425,6 @@ impl CpuScheduler {
             preemptions: 0,
             mm_switches: 0,
             irq_depth: 0,
-            preempt_count: 0,
             need_resched: false,
             timeslice_remaining: DEFAULT_TIME_SLICE_TICKS,
         }
@@ -601,16 +606,18 @@ impl Scheduler {
         };
 
         let id = self.allocate_task_id();
-        // SUDOOS_BUILDSTORM_ROOTFIX_USER_MIGRATION_V1
-        // `target` chooses only the initial run queue. Preserve explicit
-        // caller affinity while ordinary user tasks remain migratable.
+        // Keep a user task on the least-loaded CPU chosen at creation. Cargo
+        // and rustc expose abundant process/thread parallelism, so balancing
+        // at spawn fills every CPU without migrating a live user trap stack.
+        // This also keeps architecture per-CPU trap/IRQ state coherent across
+        // blocking syscalls and return-to-user anchor reconstruction.
         let task = Task::user_thread(
             id,
             thread,
             exit_visible,
             process_cleanup,
             stack,
-            affinity,
+            Some(target),
         );
         if id.0 == self.tasks.len() {
             self.tasks.push(Some(task));
@@ -622,17 +629,13 @@ impl Scheduler {
         // A CLONE_THREAD can join the Process before its scheduler task is
         // inserted.  Recheck after insertion while holding SCHEDULER so a
         // concurrent exit_group scan cannot leave that late clone alive.
-        let late_forced_exit = self
-            .task(id)
-            .user_thread
-            .as_ref()
-            .and_then(|thread| {
-                let process = thread.process();
-                process
-                    .group_exit_status()
-                    .or_else(|| process.exec_in_progress().then_some(0))
-                    .map(|status| (Arc::clone(thread), status))
-            });
+        let late_forced_exit = self.task(id).user_thread.as_ref().and_then(|thread| {
+            let process = thread.process();
+            process
+                .group_exit_status()
+                .or_else(|| process.exec_in_progress().then_some(0))
+                .map(|status| (Arc::clone(thread), status))
+        });
         if let Some((thread, status)) = late_forced_exit {
             thread.request_forced_exit(status);
         }
@@ -747,12 +750,12 @@ impl Scheduler {
 
             let position = self.cpus[donor.get()].run_queue.iter().position(|id| {
                 let task = self.task(*id);
-                // SUDOOS_BUILDSTORM_SAFE_FIRST_RUN_PIN_V4
-                // Only a never-run user task may change its initial CPU.
-                // activate_next() commits it permanently on first use.
-                task.state == TaskState::Runnable
-                    && task.affinity.is_none()
-                    && !task.has_run
+                // Linux-style work stealing: a runnable task without explicit
+                // affinity may move after any completed switch-out. The
+                // architecture context carries FP/vector state, and the user
+                // trap anchor is rebuilt from the destination CPU before
+                // returning to user mode.
+                task.state == TaskState::Runnable && task.affinity.is_none()
             });
 
             let Some(position) = position else {
@@ -792,24 +795,9 @@ impl Scheduler {
                 task.has_run = true;
             }
             TaskKind::UserThread => {
-                // SUDOOS_BUILDSTORM_SAFE_FIRST_RUN_PIN_V4
-                // Initial queue placement is movable, but a live user context is not.
                 assert_eq!(task.state, TaskState::Runnable);
-                match task.affinity {
-                    Some(affinity) => {
-                        assert_eq!(
-                            affinity,
-                            cpu,
-                            "pinned user task selected by the wrong CPU",
-                        );
-                    }
-                    None => {
-                        assert!(
-                            !task.has_run,
-                            "previously-run user task attempted cross-CPU migration",
-                        );
-                        task.affinity = Some(cpu);
-                    }
+                if let Some(affinity) = task.affinity {
+                    assert_eq!(affinity, cpu, "pinned user task selected by the wrong CPU",);
                 }
                 task.has_run = true;
             }
@@ -874,19 +862,27 @@ impl Scheduler {
             "inactive CPU attempted to preempt",
         );
         let cpu_state = &self.cpus[cpu.get()];
-        if cpu_state.irq_depth != 0 || cpu_state.preempt_count != 0 {
+        if cpu_state.irq_depth != 0 {
             return None;
         }
-        assert!(
-            cpu_state.pending.is_none(),
-            "nested context switch attempted"
-        );
+        // An interrupt can be delivered after the hardware stack changed but
+        // before switch-tail commits `pending.next` as current. The existing
+        // switch owns this CPU; defer the tick instead of nesting a second
+        // context switch into the same per-CPU transaction.
+        if cpu_state.pending.is_some() {
+            return None;
+        }
+
+        let current = self.current(cpu);
+        if self.task(current).preempt_count != 0 {
+            return None;
+        }
 
         if !cpu_state.need_resched {
             return None;
         }
 
-        let previous = self.current(cpu);
+        let previous = current;
         assert_eq!(self.task(previous).state, TaskState::Running(cpu));
 
         let Some(next) = self.dequeue_next(cpu) else {
@@ -929,14 +925,12 @@ impl Scheduler {
             0,
             "IRQ context attempted to block"
         );
-        assert_eq!(
-            self.cpus[cpu.get()].preempt_count,
-            0,
-            "preemption-disabled task attempted to block",
-        );
-
         let previous = self.current(cpu);
         let previous_task = self.task(previous);
+        assert_eq!(
+            previous_task.preempt_count, 0,
+            "preemption-disabled task attempted to block",
+        );
         assert_eq!(previous_task.state, TaskState::Running(cpu));
         assert!(
             !previous_task.kind.is_idle(),
@@ -1035,6 +1029,31 @@ impl Scheduler {
         };
 
         (previous_pointer, next_pointer)
+    }
+
+    /// Resolve the CPU which owns the stack currently executing switch-tail.
+    ///
+    /// Before `complete_switch`, scheduler.current still names the outgoing
+    /// task, so a CPU with a pending switch must be matched against
+    /// `pending.next`. This makes CPU identity independent of an RV user trap
+    /// anchor that may have been built before the task migrated.
+    fn switch_tail_cpu_for_stack(&self, running_sp: usize) -> Option<CpuId> {
+        let mut owner = None;
+        for index in 0..self.discovered_cpus {
+            let cpu = CpuId::new(index).expect("scheduler CPU index is invalid");
+            let Some(task) = self.cpus[index]
+                .pending
+                .map(|pending| pending.next)
+                .or(self.cpus[index].current)
+            else {
+                continue;
+            };
+            if self.task(task).stack_contains(running_sp) {
+                assert!(owner.is_none(), "kernel stack is assigned to multiple CPUs");
+                owner = Some(cpu);
+            }
+        }
+        owner
     }
 
     fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> CompletedSwitch {
@@ -1526,10 +1545,16 @@ impl Scheduler {
             self.unlink_waiter_locked(&mut list, id, channel);
             match self.task(id).state {
                 TaskState::Blocked => {
-                    let target_cpu = self
-                        .task(id)
-                        .affinity
-                        .unwrap_or_else(|| self.choose_target_cpu());
+                    let target_cpu = if matches!(self.task(id).kind, TaskKind::UserThread) {
+                        // A blocked user task owns no live CPU/trap anchor.
+                        // Rebalance only at this safe boundary; running and
+                        // timer-preempted user tasks remain fixed.
+                        self.choose_target_cpu()
+                    } else {
+                        self.task(id)
+                            .affinity
+                            .unwrap_or_else(|| self.choose_target_cpu())
+                    };
                     {
                         let task = self.task_mut(id);
                         assert!(!task.wake_after_switch);
@@ -1537,6 +1562,9 @@ impl Scheduler {
                         task.wait_channel = None;
                         task.wait_queue_address = None;
                         task.state = TaskState::Runnable;
+                        if matches!(task.kind, TaskKind::UserThread) {
+                            task.affinity = Some(target_cpu);
+                        }
                     }
                     self.enqueue(id, target_cpu);
                     self.cpus[target_cpu.get()].need_resched = true;
@@ -1608,12 +1636,16 @@ impl Scheduler {
     }
 
     fn irq_exit(&mut self, cpu: CpuId) -> bool {
-        let state = &mut self.cpus[cpu.get()];
-        state.irq_depth = state
-            .irq_depth
-            .checked_sub(1)
-            .expect("IRQ nesting counter underflowed");
-        state.irq_depth == 0 && state.preempt_count == 0 && state.need_resched
+        let (irq_depth_zero, need_resched) = {
+            let state = &mut self.cpus[cpu.get()];
+            state.irq_depth = state
+                .irq_depth
+                .checked_sub(1)
+                .expect("IRQ nesting counter underflowed");
+            (state.irq_depth == 0, state.need_resched)
+        };
+        let current = self.current(cpu);
+        irq_depth_zero && self.task(current).preempt_count == 0 && need_resched
     }
 
     fn timer_ticks(&mut self, cpu: CpuId, ticks: u64) {
@@ -1640,21 +1672,84 @@ impl Scheduler {
         }
     }
 
-    fn preempt_disable(&mut self, cpu: CpuId) {
-        let state = &mut self.cpus[cpu.get()];
-        state.preempt_count = state
+    fn preempt_disable(&mut self, cpu: CpuId, running_sp: usize) -> (TaskId, CpuId) {
+        let scheduled = self.current(cpu);
+        let (current, actual_cpu) = if self.task(scheduled).stack.is_none()
+            || self.task(scheduled).stack_contains(running_sp)
+        {
+            (scheduled, cpu)
+        } else {
+            let mut owner = None;
+            for task in self.tasks.iter().flatten() {
+                if !task.stack_contains(running_sp) {
+                    continue;
+                }
+                let owner_cpu = match task.state {
+                    TaskState::Running(owner_cpu) | TaskState::Idle(owner_cpu) => owner_cpu,
+                    TaskState::SwitchingOut(owner_cpu)
+                        if self.cpus[owner_cpu.get()]
+                            .pending
+                            .is_some_and(|pending| pending.next == task.id) =>
+                    {
+                        owner_cpu
+                    }
+                    state => panic!(
+                        "executing stack belongs to a non-running task: task={:?} state={state:?} sp={running_sp:#x}",
+                        task.id,
+                    ),
+                };
+                assert!(
+                    owner.is_none(),
+                    "kernel stack belongs to multiple live tasks"
+                );
+                owner = Some((task.id, owner_cpu));
+            }
+            owner.unwrap_or_else(|| {
+                panic!(
+                    "preemption pin could not resolve executing stack: cpu={} scheduled={scheduled:?} sp={running_sp:#x}",
+                    cpu.get(),
+                )
+            })
+        };
+        assert!(
+            self.current(actual_cpu) == current
+                || self.cpus[actual_cpu.get()]
+                    .pending
+                    .is_some_and(|pending| pending.next == current),
+            "stack-resolved task is not assigned to its recorded CPU",
+        );
+        let task = self.task_mut(current);
+        task.preempt_count = task
             .preempt_count
             .checked_add(1)
             .expect("preempt counter overflowed");
+        (current, actual_cpu)
     }
 
-    fn preempt_enable(&mut self, cpu: CpuId) -> bool {
-        let state = &mut self.cpus[cpu.get()];
-        state.preempt_count = state
-            .preempt_count
-            .checked_sub(1)
-            .expect("preempt counter underflowed");
-        state.preempt_count == 0 && state.irq_depth == 0 && state.need_resched
+    fn preempt_enable_task(&mut self, current: TaskId) -> Option<CpuId> {
+        let running_cpu = match self.task(current).state {
+            TaskState::Running(cpu) | TaskState::Idle(cpu) => cpu,
+            state => panic!(
+                "preemption guard released by a non-running task: task={current:?} state={state:?}",
+            ),
+        };
+        assert_eq!(
+            self.current(running_cpu),
+            current,
+            "preemption guard task disagrees with scheduler current",
+        );
+        let count_zero = {
+            let task = self.task_mut(current);
+            task.preempt_count = task
+                .preempt_count
+                .checked_sub(1)
+                .expect("preempt counter underflowed");
+            task.preempt_count == 0
+        };
+        (count_zero
+            && self.cpus[running_cpu.get()].irq_depth == 0
+            && self.cpus[running_cpu.get()].need_resched)
+            .then_some(running_cpu)
     }
 
     fn assert_schedulable(&self, cpu: CpuId) {
@@ -1664,13 +1759,17 @@ impl Scheduler {
             "task attempted to schedule in IRQ context"
         );
         assert_eq!(
-            state.preempt_count, 0,
-            "task attempted to schedule with preemption disabled",
+            self.task(self.current(cpu)).preempt_count,
+            0,
+            "task attempted to schedule with preemption disabled: cpu={} current={:?} tracked={:?}",
+            cpu.get(),
+            self.current(cpu),
+            crate::tracked_spin::held_diagnostic(cpu)
         );
     }
 
     fn preempt_count(&self, cpu: CpuId) -> usize {
-        self.cpus[cpu.get()].preempt_count
+        self.task(self.current(cpu)).preempt_count
     }
 
     fn irq_depth(&self, cpu: CpuId) -> usize {
@@ -1710,9 +1809,7 @@ impl Scheduler {
             self.retired_tasks
                 .iter()
                 .filter(|task| matches!(task.kind, TaskKind::UserThread))
-                .all(|task| {
-                    task.state == TaskState::Exited && task.exit_visible.is_none()
-                }),
+                .all(|task| { task.state == TaskState::Exited && task.exit_visible.is_none() }),
             "M9-B retained a non-retired user task in the reaper queue",
         );
         for (index, cpu) in self.cpus.iter().take(self.discovered_cpus).enumerate() {
@@ -1774,9 +1871,7 @@ pub(crate) struct TaskLifecycleSnapshot {
 pub(crate) fn task_lifecycle_snapshot() -> TaskLifecycleSnapshot {
     let (live_user_threads, live_kernel_threads) = {
         let slot = SCHEDULER.lock();
-        let scheduler = slot
-            .as_ref()
-            .expect("kernel scheduler is not initialized");
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
         (scheduler.live_user_threads, scheduler.live_kernel_threads)
     };
     TaskLifecycleSnapshot {
@@ -1821,9 +1916,7 @@ pub(crate) fn thread_count_summary() -> alloc::string::String {
     let live_threads = crate::process::live_thread_count();
     let live_user: usize = {
         let slot = SCHEDULER.lock();
-        slot.as_ref()
-            .map(|s| s.live_user_threads)
-            .unwrap_or(0)
+        slot.as_ref().map(|s| s.live_user_threads).unwrap_or(0)
     };
     alloc::format!(
         "live_user={} live_processes={} live_threads={}",
@@ -1860,9 +1953,7 @@ pub(crate) fn print_lifecycle_stress_progress(label: &str, iteration: usize) {
 pub(crate) fn print_task_debug_dump() {
     let (tasks, cpus) = {
         let slot = SCHEDULER.lock();
-        let scheduler = slot
-            .as_ref()
-            .expect("kernel scheduler is not initialized");
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
         let tasks = scheduler
             .tasks
             .iter()
@@ -2034,26 +2125,44 @@ fn request_reschedule_on(cpu: CpuId) {
     }
 }
 
-pub fn preempt_disable() {
+pub fn preempt_disable() -> TaskId {
+    repair_current_cpu_from_stack();
     let cpu = crate::smp::current_cpu_id();
+    let running_sp = crate::arch::task::current_stack_pointer();
     let mut slot = SCHEDULER.lock();
-    slot.as_mut()
+    let (task, actual_cpu) = slot
+        .as_mut()
         .expect("preemption used before scheduler initialization")
-        .preempt_disable(cpu);
+        .preempt_disable(cpu, running_sp);
+    if actual_cpu != cpu {
+        crate::arch::smp::set_current_cpu_id(actual_cpu.get());
+    }
+    task
 }
 
 pub fn preempt_enable() {
-    let cpu = crate::smp::current_cpu_id();
+    repair_current_cpu_from_stack();
+    let task = current_task_id();
+    preempt_enable_task(task);
+}
+
+fn preempt_enable_task(task: TaskId) {
+    repair_current_cpu_from_stack();
     let should_schedule_now = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot
             .as_mut()
             .expect("preemption used before scheduler initialization");
-        scheduler.preempt_enable(cpu) && scheduler.can_preempt_in_task_context(cpu)
+        scheduler.preempt_enable_task(task)
     };
 
-    if should_schedule_now && crate::arch::interrupt::are_enabled() {
-        preempt_schedule();
+    if let Some(cpu) = should_schedule_now {
+        if crate::smp::current_cpu_id() != cpu {
+            crate::arch::smp::set_current_cpu_id(cpu.get());
+        }
+        if crate::arch::interrupt::are_enabled() {
+            preempt_schedule();
+        }
     }
 }
 
@@ -2065,6 +2174,24 @@ pub fn preempt_count() -> usize {
         .preempt_count(cpu)
 }
 
+pub(crate) fn current_task_diagnostic() -> (TaskId, &'static str, usize) {
+    repair_current_cpu_from_stack();
+    let cpu = crate::smp::current_cpu_id();
+    let slot = SCHEDULER.lock();
+    let scheduler = slot
+        .as_ref()
+        .expect("scheduler diagnostic before initialization");
+    let id = scheduler.current(cpu);
+    let task = scheduler.task(id);
+    let kind = match task.kind {
+        TaskKind::Idle(_) => "idle",
+        TaskKind::KernelThread => "kernel",
+        TaskKind::SystemThread => "system",
+        TaskKind::UserThread => "user",
+    };
+    (id, kind, task.preempt_count)
+}
+
 pub fn irq_depth() -> usize {
     let cpu = crate::smp::current_cpu_id();
     let slot = SCHEDULER.lock();
@@ -2074,11 +2201,47 @@ pub fn irq_depth() -> usize {
 }
 
 pub(crate) fn current_task_id() -> TaskId {
+    repair_current_cpu_from_stack();
     let cpu = crate::smp::current_cpu_id();
     let slot = SCHEDULER.lock();
     slot.as_ref()
         .expect("kernel scheduler is not initialized")
         .current(cpu)
+}
+
+/// Re-establish architecture per-CPU identity from the scheduler-owned stack.
+///
+/// RISC-V temporarily gives `tp` to user TLS and restores it through a trap
+/// anchor. A task that migrated after an older anchor was prepared can enter
+/// with the source CPU value. Stack ownership is the authoritative identity
+/// and is independent of user register state.
+pub(crate) fn repair_current_cpu_from_stack() {
+    if !scheduler_is_initialized() {
+        return;
+    }
+    let running_sp = crate::arch::task::current_stack_pointer();
+    let owner = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        scheduler.switch_tail_cpu_for_stack(running_sp)
+    };
+    if let Some(cpu) = owner {
+        crate::arch::smp::set_current_cpu_id(cpu.get());
+        let pending = {
+            let slot = SCHEDULER.lock();
+            slot.as_ref()
+                .expect("kernel scheduler is not initialized")
+                .cpus[cpu.get()]
+            .pending
+            .is_some()
+        };
+        if pending {
+            // The trap landed after the hardware stack switch and before the
+            // normal Rust switch-tail committed it. Complete that transaction
+            // before the trap path can request another yield/preemption.
+            finish_switch();
+        }
+    }
 }
 
 pub(super) fn block_current_on_if<F>(queue: &WaitQueue, should_block: F) -> bool
@@ -2341,10 +2504,7 @@ pub(crate) fn spawn_user_thread_on(
     if target != crate::smp::current_cpu_id() {
         crate::smp::send_ipi(target);
     }
-    UserTaskHandle {
-        id,
-        exit_visible,
-    }
+    UserTaskHandle { id, exit_visible }
 }
 
 pub(crate) fn spawn_user_thread_from_user_trap(
@@ -2359,22 +2519,12 @@ pub(crate) fn spawn_user_thread_from_user_trap(
         let mut slot = SCHEDULER.lock();
         slot.as_mut()
             .expect("kernel scheduler is not initialized")
-            .spawn_user(
-                thread,
-                Arc::clone(&exit_visible),
-                None,
-                stack,
-                None,
-                None,
-            )
+            .spawn_user(thread, Arc::clone(&exit_visible), None, stack, None, None)
     };
     if target != current {
         crate::smp::send_ipi(target);
     }
-    UserTaskHandle {
-        id,
-        exit_visible,
-    }
+    UserTaskHandle { id, exit_visible }
 }
 
 pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
@@ -2787,9 +2937,7 @@ fn exit_current() -> ! {
             }
         }
         owner.unwrap_or_else(|| {
-            panic!(
-                "exiting task stack has no scheduler owner: sp={running_sp:#x}",
-            )
+            panic!("exiting task stack has no scheduler owner: sp={running_sp:#x}",)
         })
     };
     // Always repair tp — it may have been corrupted by a stale anchor.
@@ -2808,16 +2956,24 @@ fn exit_current() -> ! {
 }
 
 fn finish_switch() {
-    let cpu = crate::smp::current_cpu_id();
     let running_sp = crate::arch::task::current_stack_pointer();
-    let (completed, current_is_idle) = {
+    let (cpu, completed, current_is_idle) = {
         let mut slot = SCHEDULER.lock();
         let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
+        let cpu = scheduler
+            .switch_tail_cpu_for_stack(running_sp)
+            .unwrap_or_else(crate::smp::current_cpu_id);
+        // RISC-V uses tp as kernel CPU identity but temporarily lends it to
+        // userspace TLS. Repair it before any switch-tail code indexes
+        // per-CPU scheduler, preemption, IPI, or lock state.
+        crate::arch::smp::set_current_cpu_id(cpu.get());
         let completed = scheduler.complete_switch(cpu, running_sp);
         let current = scheduler.current(cpu);
         let current_is_idle = scheduler.task(current).kind.is_idle();
-        (completed, current_is_idle)
+        (cpu, completed, current_is_idle)
     };
+
+    let _ = cpu;
 
     // The switch tail still owns the IRQ-save guard, but no longer owns the
     // scheduler lock. Restore policy ticks here to preserve Timer < Scheduler.
@@ -2879,7 +3035,6 @@ fn task_reaper_main() {
 }
 
 fn reap_retired_tasks() {
-    crate::context::might_sleep();
     if retired_task_backlog() != 0 {
         TASK_REAPER_QUEUE.wake_one();
     }

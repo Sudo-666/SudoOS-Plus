@@ -1,12 +1,18 @@
 use core::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::AtomicUsize,
 };
+
+#[cfg(debug_assertions)]
+use core::sync::atomic::Ordering;
 
 use myos_sync::{SpinLock, SpinLockGuard};
 
-use crate::lockdep::{LockClass, LockInstanceId, LockRank};
+use crate::lockdep::LockClass;
+
+#[cfg(debug_assertions)]
+use crate::lockdep::{LockInstanceId, LockRank};
 
 const NO_OWNER: usize = usize::MAX;
 
@@ -42,17 +48,24 @@ impl<T> IrqSpinLock<T> {
 
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
         let interrupt_guard = crate::context::IrqSaveGuard::new();
-        let cpu = crate::smp::current_cpu_id();
-        crate::lockdep::before_lock(
-            self.class,
-            LockInstanceId::of(self),
-            self.owner.load(Ordering::Acquire),
-            cpu,
-        );
+        #[cfg(debug_assertions)]
+        let cpu = {
+            let cpu = crate::smp::current_cpu_id();
+            crate::lockdep::before_lock(
+                self.class,
+                LockInstanceId::of(self),
+                self.owner.load(Ordering::Acquire),
+                cpu,
+            );
+            cpu
+        };
 
         let guard = self.inner.lock();
-        self.owner.store(cpu.get(), Ordering::Release);
-        crate::lockdep::after_lock(self.class, LockInstanceId::of(self), cpu);
+        #[cfg(debug_assertions)]
+        {
+            self.owner.store(cpu.get(), Ordering::Release);
+            crate::lockdep::after_lock(self.class, LockInstanceId::of(self), cpu);
+        }
 
         IrqSpinLockGuard {
             lock: self,
@@ -64,21 +77,28 @@ impl<T> IrqSpinLock<T> {
 
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         let interrupt_guard = crate::context::IrqSaveGuard::new();
-        let cpu = crate::smp::current_cpu_id();
-        if self.owner.load(Ordering::Acquire) == cpu.get() {
-            return None;
-        }
-        crate::lockdep::before_lock(
-            self.class,
-            LockInstanceId::of(self),
-            self.owner.load(Ordering::Acquire),
-            cpu,
-        );
+        #[cfg(debug_assertions)]
+        let cpu = {
+            let cpu = crate::smp::current_cpu_id();
+            if self.owner.load(Ordering::Acquire) == cpu.get() {
+                return None;
+            }
+            crate::lockdep::before_lock(
+                self.class,
+                LockInstanceId::of(self),
+                self.owner.load(Ordering::Acquire),
+                cpu,
+            );
+            cpu
+        };
 
         match self.inner.try_lock() {
             Some(guard) => {
-                self.owner.store(cpu.get(), Ordering::Release);
-                crate::lockdep::after_lock(self.class, LockInstanceId::of(self), cpu);
+                #[cfg(debug_assertions)]
+                {
+                    self.owner.store(cpu.get(), Ordering::Release);
+                    crate::lockdep::after_lock(self.class, LockInstanceId::of(self), cpu);
+                }
                 Some(IrqSpinLockGuard {
                     lock: self,
                     guard: Some(guard),
@@ -124,9 +144,12 @@ impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
 
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        let cpu = crate::smp::current_cpu_id();
-        crate::lockdep::before_unlock(self.lock.class, LockInstanceId::of(self.lock), cpu);
-        self.lock.owner.store(NO_OWNER, Ordering::Release);
+        #[cfg(debug_assertions)]
+        {
+            let cpu = crate::smp::current_cpu_id();
+            crate::lockdep::before_unlock(self.lock.class, LockInstanceId::of(self.lock), cpu);
+            self.lock.owner.store(NO_OWNER, Ordering::Release);
+        }
         drop(self.guard.take());
     }
 }

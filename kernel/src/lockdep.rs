@@ -83,6 +83,10 @@ impl LockClass {
 /// IRQ-enabled outer lock must precede the Timer rank. This is the small-kernel
 /// equivalent of Linux lockdep's hardirq-unsafe -> hardirq-safe dependency rule.
 pub fn assert_irq_enabled_outer_lock(class: LockClass) {
+    if !cfg!(debug_assertions) {
+        let _ = class;
+        return;
+    }
     assert!(
         class.rank < LockRank::Timer,
         "IRQ-enabled tracked lock must precede hardirq timer locks: lock={} rank={:?} timer_rank={:?}",
@@ -145,6 +149,10 @@ static MAX_HOLD_CYCLES: [AtomicU64; RANK_COUNT] = [const { AtomicU64::new(0) }; 
 static MAX_IRQ_OFF_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 pub fn before_lock(class: LockClass, instance: LockInstanceId, owner: usize, current: CpuId) {
+    if !cfg!(debug_assertions) {
+        let _ = (class, instance, owner, current);
+        return;
+    }
     if owner == current.get() {
         panic!(
             "recursive lock acquisition: lock={} cpu={}",
@@ -193,6 +201,10 @@ pub fn before_lock(class: LockClass, instance: LockInstanceId, owner: usize, cur
 }
 
 pub fn after_lock(class: LockClass, instance: LockInstanceId, current: CpuId) {
+    if !cfg!(debug_assertions) {
+        let _ = (class, instance, current);
+        return;
+    }
     let state = &HELD_LOCKS[current.get()];
     let depth = state.depth.load(Ordering::Relaxed);
     assert!(depth < MAX_HELD_LOCKS, "held-lock stack overflow");
@@ -209,6 +221,10 @@ pub fn after_lock(class: LockClass, instance: LockInstanceId, current: CpuId) {
 }
 
 pub fn before_unlock(class: LockClass, instance: LockInstanceId, current: CpuId) {
+    if !cfg!(debug_assertions) {
+        let _ = (class, instance, current);
+        return;
+    }
     let state = &HELD_LOCKS[current.get()];
     let depth = state.depth.load(Ordering::Relaxed);
     assert!(depth != 0, "unlock with empty held-lock stack");
@@ -245,6 +261,10 @@ pub fn before_unlock(class: LockClass, instance: LockInstanceId, current: CpuId)
 }
 
 pub fn record_irq_off(cycles: u64) {
+    if !cfg!(debug_assertions) {
+        let _ = cycles;
+        return;
+    }
     update_max(&MAX_IRQ_OFF_CYCLES, cycles);
 }
 

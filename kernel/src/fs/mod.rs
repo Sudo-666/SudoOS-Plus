@@ -35,6 +35,10 @@ struct Node {
     ino: u64,
     parent_ino: AtomicU64,
     nlink: AtomicU64,
+    /// Monotonic content identity used by executable and mmap page caches.
+    /// Writers advance it before publishing modified bytes, so new mappings
+    /// never reuse pages belonging to an older version of the inode.
+    generation: AtomicU64,
     mode: FileMode,
     read_only: AtomicBool,
     state: IrqSpinLock<NodeState>,
@@ -526,11 +530,12 @@ pub fn mount_ext4_overlay(source: &str, target: &str) -> Result<(), Errno> {
     target_node.read_only.store(false, Ordering::Release);
     *target_node.state.lock() = NodeState::Ext4Directory {
         fs,
-        ino: root.ino,        populated: false,
+        ino: root.ino,
+        populated: false,
         children: BTreeMap::new(),
         whiteouts: BTreeSet::new(),
         negative: BTreeSet::new(),
-};
+    };
     Ok(())
 }
 
@@ -571,6 +576,7 @@ pub fn install_bytes(target_path: &str, data: &[u8]) -> Result<(), Errno> {
         ino: NEXT_INODE.fetch_add(1, Ordering::Relaxed),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode: FileMode::from_bits(FileMode::S_IFREG | 0o755),
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(
@@ -912,11 +918,12 @@ fn ext4_node(
     let state = match info.kind {
         crate::ext4::Ext4NodeKind::Directory => NodeState::Ext4Directory {
             fs,
-            ino: info.ino,        populated: false,
-        children: BTreeMap::new(),
-        whiteouts: BTreeSet::new(),
-        negative: BTreeSet::new(),
-},
+            ino: info.ino,
+            populated: false,
+            children: BTreeMap::new(),
+            whiteouts: BTreeSet::new(),
+            negative: BTreeSet::new(),
+        },
         crate::ext4::Ext4NodeKind::Regular => NodeState::Ext4Regular {
             fs,
             ino: info.ino,
@@ -932,6 +939,7 @@ fn ext4_node(
         ino: u64::from(info.ino),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode: FileMode::from_bits(info.mode),
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(state, NODE_LOCK),
@@ -1115,7 +1123,7 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     }
     let length = usize::try_from(length).map_err(|_| Errno::Eoverflow)?;
     let mut state = node.state.lock();
-    match &mut *state {
+    let result = match &mut *state {
         NodeState::Ext4Regular {
             overlay,
             size,
@@ -1142,7 +1150,11 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
         NodeState::Device(_) => Ok(()),
         NodeState::BlockDevice { .. } => Err(Errno::Einval),
         NodeState::ProcFile(_) => Err(Errno::Erofs),
+    };
+    if result.is_ok() {
+        node.generation.fetch_add(1, Ordering::AcqRel);
     }
+    result
 }
 
 // SUDOOS_M15A_EXT4_RO_PATCH_V1: native read-only ext4 VFS snapshot handoff.
@@ -1246,6 +1258,7 @@ fn directory(mode: FileMode) -> Arc<Node> {
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Directory(BTreeMap::new()), NODE_LOCK),
@@ -1261,6 +1274,7 @@ fn regular_with_data(mode: FileMode, data: Vec<u8>) -> Arc<Node> {
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Regular(data), NODE_LOCK),
@@ -1276,6 +1290,7 @@ fn symlink_node_with_mode(target: &str, mode: FileMode) -> Arc<Node> {
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Symlink(String::from(target)), NODE_LOCK),
@@ -1287,6 +1302,7 @@ fn device(kind: DeviceKind) -> Arc<Node> {
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode: FileMode::CHAR_DEFAULT,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(NodeState::Device(kind), NODE_LOCK),
@@ -1298,6 +1314,7 @@ fn proc_file_node(generator: Arc<dyn crate::procfs::ProcFileGenerator>) -> Arc<N
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode: FileMode::from_bits(FileMode::S_IFREG | 0o444),
         read_only: AtomicBool::new(true),
         state: IrqSpinLock::new_with_class(NodeState::ProcFile(generator), NODE_LOCK),
@@ -1319,6 +1336,7 @@ fn block_device_node(
         ino: allocate_inode(),
         parent_ino: AtomicU64::new(0),
         nlink: AtomicU64::new(1),
+        generation: AtomicU64::new(1),
         mode: FileMode::BLOCK_DEFAULT,
         read_only: AtomicBool::new(false),
         state: IrqSpinLock::new_with_class(
@@ -1792,6 +1810,7 @@ impl FileOperations for RegularFile {
             }
             data[start..end].copy_from_slice(buf.as_bytes());
             *position = end as u64;
+            self.node.generation.fetch_add(1, Ordering::AcqRel);
             Ok(buf.len())
         })
     }
@@ -2127,6 +2146,9 @@ fn stat_for_node(node: &Arc<Node>) -> Result<Stat, Errno> {
         NodeState::ProcFile(generator) => generator.generate().map(|d| d.len() as i64).unwrap_or(0),
     };
     stat.nlink = node.nlink.load(Ordering::Acquire) as u32;
+    let generation = node.generation.load(Ordering::Acquire);
+    stat.mtime_sec = i64::try_from(generation).unwrap_or(i64::MAX);
+    stat.ctime_sec = stat.mtime_sec;
     stat.blocks = (stat.size.saturating_add(511)) / 512;
     Ok(stat)
 }

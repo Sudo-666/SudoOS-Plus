@@ -204,22 +204,18 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
         // separate entry exhausts bounded kernel metadata even though the
         // resulting address-space topology is simple.
         let coalescible = matches!(area.kind(), VmAreaKind::Anonymous);
-        let merge_previous = coalescible
-            && index > 0
-            && {
-                let previous = self.areas[index - 1];
-                previous.range().end() == area.range().start()
-                    && previous.flags() == area.flags()
-                    && previous.kind() == area.kind()
-            };
-        let merge_next = coalescible
-            && index < self.len()
-            && {
-                let next = self.areas[index];
-                area.range().end() == next.range().start()
-                    && next.flags() == area.flags()
-                    && next.kind() == area.kind()
-            };
+        let merge_previous = coalescible && index > 0 && {
+            let previous = self.areas[index - 1];
+            previous.range().end() == area.range().start()
+                && previous.flags() == area.flags()
+                && previous.kind() == area.kind()
+        };
+        let merge_next = coalescible && index < self.len() && {
+            let next = self.areas[index];
+            area.range().end() == next.range().start()
+                && next.flags() == area.flags()
+                && next.kind() == area.kind()
+        };
 
         if merge_previous && merge_next {
             let previous = self.areas[index - 1];
@@ -270,41 +266,50 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
     /// capacity and all replacement fragments are validated before publication.
     pub fn remove_range(&mut self, range: VirtRange) -> Result<usize, VmAreaError> {
         validate_operation_range(range)?;
-
-        let mut rebuilt = Vec::new();
-        rebuilt
-            .try_reserve(core::cmp::min(self.len().saturating_add(1), CAPACITY))
-            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
-        let mut affected = 0;
-
-        for area in self.areas.iter().copied() {
-            if !area.range().overlaps(range) {
-                append_area(&mut rebuilt, area, CAPACITY)?;
-                continue;
-            }
-
-            affected += 1;
-            if area.range().start() < range.start() {
-                let left = VirtRange::new(area.range().start(), range.start())
-                    .ok_or(VmAreaError::AddressOverflow)?;
-                append_area(
-                    &mut rebuilt,
-                    VmArea::new(left, area.flags(), area.kind()),
-                    CAPACITY,
-                )?;
-            }
-            if range.end() < area.range().end() {
-                let right = VirtRange::new(range.end(), area.range().end())
-                    .ok_or(VmAreaError::AddressOverflow)?;
-                append_area(
-                    &mut rebuilt,
-                    VmArea::new(right, area.flags(), area.kind()),
-                    CAPACITY,
-                )?;
-            }
+        // The vector is ordered. Locate only the overlapping window instead
+        // of rebuilding and reallocating the complete VMA table for every
+        // munmap. Rustc performs thousands of small unmaps while retaining a
+        // large address space, so the old implementation became quadratic.
+        let first = self
+            .areas
+            .partition_point(|area| area.range().end() <= range.start());
+        let mut last = first;
+        while last < self.len() && self.areas[last].range().start() < range.end() {
+            last += 1;
+        }
+        let affected = last - first;
+        if affected == 0 {
+            return Ok(0);
         }
 
-        self.areas = rebuilt;
+        let first_area = self.areas[first];
+        let last_area = self.areas[last - 1];
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve(2)
+            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
+        if first_area.range().start() < range.start() {
+            let left = VirtRange::new(first_area.range().start(), range.start())
+                .ok_or(VmAreaError::AddressOverflow)?;
+            replacements.push(VmArea::new(left, first_area.flags(), first_area.kind()));
+        }
+        if range.end() < last_area.range().end() {
+            let right = VirtRange::new(range.end(), last_area.range().end())
+                .ok_or(VmAreaError::AddressOverflow)?;
+            replacements.push(VmArea::new(right, last_area.flags(), last_area.kind()));
+        }
+        let new_len = self
+            .len()
+            .checked_sub(affected)
+            .and_then(|length| length.checked_add(replacements.len()))
+            .ok_or(VmAreaError::AddressOverflow)?;
+        if new_len > CAPACITY {
+            return Err(VmAreaError::CapacityExceeded);
+        }
+        self.areas
+            .try_reserve(replacements.len().saturating_sub(affected))
+            .map_err(|_| VmAreaError::MetadataOutOfMemory)?;
+        self.areas.splice(first..last, replacements);
         Ok(affected)
     }
 
@@ -444,7 +449,6 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
             .ok_or(VmAreaError::AddressOverflow)?;
 
         for area in self.areas.iter().copied() {
-
             if area.range().end() <= candidate {
                 continue;
             }
@@ -508,11 +512,7 @@ impl<const CAPACITY: usize> Default for VmAreaSet<CAPACITY> {
     }
 }
 
-fn append_area(
-    areas: &mut Vec<VmArea>,
-    area: VmArea,
-    capacity: usize,
-) -> Result<(), VmAreaError> {
+fn append_area(areas: &mut Vec<VmArea>, area: VmArea, capacity: usize) -> Result<(), VmAreaError> {
     validate_area(area)?;
     if let Some(previous) = areas.last().copied() {
         if previous.range().overlaps(area.range())
@@ -654,7 +654,10 @@ mod tests {
         assert_eq!(set.len(), ENTRIES);
         assert_eq!(
             set.insert(VmArea::new(
-                range(0x1000 + ENTRIES * PAGE_SIZE * 2, 0x2000 + ENTRIES * PAGE_SIZE * 2),
+                range(
+                    0x1000 + ENTRIES * PAGE_SIZE * 2,
+                    0x2000 + ENTRIES * PAGE_SIZE * 2
+                ),
                 VmAreaFlags::user_rw(),
                 VmAreaKind::Anonymous,
             )),

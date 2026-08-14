@@ -1,17 +1,18 @@
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
 use core::cmp::min;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{
     AddressSpaceError, AsidAllocator, AsidAllocatorError, AsidToken, FaultAccess, FaultSource,
     PAGE_SIZE, PageAllocation, PageFault, PerMmTlbRequest, PhysAddr, PhysFrame, TlbFlush, TlbScope,
-    UserAddressSpace, UserFaultPlan, UserMmError, VirtAddr, VirtPage, VirtRange, VmArea,
-    VmAreaError, VmAreaFlags,
+    UserAddressSpace, UserFaultPlan, UserMmError, UserTlbContext, VirtAddr, VirtPage, VirtRange,
+    VmArea, VmAreaError, VmAreaFlags,
 };
 
 use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
+use crate::tracked_spin::TrackedSpinLock;
 
 // Native toolchains keep many shared objects, allocator arenas, thread stacks,
 // and guard mappings live at once. LoongArch rustc crosses 1024 VMAs while
@@ -19,6 +20,7 @@ use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
 // entries on the heap, so this Linux-like ceiling does not preallocate 64K
 // records and does not consume a kernel task's 64-KiB stack.
 const VMA_CAPACITY: usize = 65_536;
+const ANONYMOUS_FAULT_CLUSTER_PAGES: usize = 16;
 
 static ASID_ALLOCATOR: IrqSpinLock<Option<AsidAllocator>> =
     IrqSpinLock::new_with_class(None, LockClass::new("user_asid_allocator", LockRank::Vm, 1));
@@ -26,12 +28,16 @@ static ASID_ROLLOVER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LIVE_MMS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_ROOTS: AtomicUsize = AtomicUsize::new(0);
 static LIVE_BACKINGS: AtomicUsize = AtomicUsize::new(0);
-const FILE_PAGE_CACHE_CAPACITY: usize = 128 * 1024;
-static FILE_PAGE_CACHE: IrqSpinLock<BTreeMap<(u64, u64, u64), PageAllocation>> =
+const FILE_PAGE_CACHE_SHARDS: usize = 64;
+const FILE_PAGE_CACHE_CAPACITY_PER_SHARD: usize = 4 * 1024;
+type FilePageCacheKey = (u64, u64, u64, u64);
+static FILE_PAGE_CACHE: [IrqSpinLock<BTreeMap<FilePageCacheKey, PageAllocation>>;
+    FILE_PAGE_CACHE_SHARDS] = [const {
     IrqSpinLock::new_with_class(
         BTreeMap::new(),
         LockClass::new("file_page_cache", LockRank::Vm, 3),
-    );
+    )
+}; FILE_PAGE_CACHE_SHARDS];
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -89,6 +95,9 @@ struct MappedPage {
 
 enum PageBacking {
     Owned(PageAllocation),
+    /// Anonymous/private page shared by fork. The global allocator reference
+    /// count owns the physical frame until every parent/child mapping drops it.
+    Cow(PhysFrame),
     Shared(PhysFrame),
 }
 
@@ -96,7 +105,7 @@ impl PageBacking {
     fn frame(&self) -> PhysFrame {
         match self {
             Self::Owned(allocation) => allocation.start(),
-            Self::Shared(frame) => *frame,
+            Self::Cow(frame) | Self::Shared(frame) => *frame,
         }
     }
 
@@ -109,7 +118,13 @@ impl PageBacking {
 struct MappedPageSource {
     page: VirtPage,
     physical: PhysAddr,
-    shared: bool,
+    kind: ForkPageKind,
+}
+
+#[derive(Clone, Copy)]
+enum ForkPageKind {
+    Cow,
+    FileShared,
 }
 
 #[derive(Clone)]
@@ -120,6 +135,7 @@ struct FileBackedMapping {
     generation: u64,
     device: u64,
     inode: u64,
+    content_generation: u64,
     shared_cache: bool,
     file: myos_vfs::ArcFile,
 }
@@ -129,7 +145,7 @@ pub(crate) struct FileFaultRequest {
     pub(crate) file_offset: u64,
     pub(crate) read_length: usize,
     pub(crate) page: VirtAddr,
-    cache_key: (u64, u64, u64),
+    cache_key: FilePageCacheKey,
     shared_cache: bool,
     generation: u64,
 }
@@ -137,8 +153,14 @@ pub(crate) struct FileFaultRequest {
 struct UserMmState {
     core: Box<UserAddressSpace<VMA_CAPACITY>>,
     page_table: Option<RuntimePageTable>,
-    pages: Vec<MappedPage>,
-    file_mappings: Vec<FileBackedMapping>,
+    // Resident-page ownership indexed by virtual page address.  Rustc issues
+    // thousands of small mmap/munmap/mprotect operations; an unordered Vec
+    // made each range retirement scan every page in the address space.
+    pages: BTreeMap<usize, MappedPage>,
+    // File-backed VMAs indexed by virtual start address. A rustc process can
+    // carry hundreds of loader mappings and take hundreds of thousands of
+    // file faults; a linear Vec scan here multiplied both numbers together.
+    file_mappings: BTreeMap<usize, FileBackedMapping>,
     next_file_generation: u64,
 }
 
@@ -150,6 +172,7 @@ struct UserMmState {
 struct RetirementBatch {
     request: Option<PerMmTlbRequest>,
     backings: Vec<PageAllocation>,
+    cow_frames: Vec<PhysFrame>,
     page_tables: Vec<PageAllocation>,
 }
 
@@ -158,13 +181,20 @@ impl RetirementBatch {
         Self {
             request: None,
             backings: Vec::new(),
+            cow_frames: Vec::new(),
             page_tables: Vec::new(),
         }
     }
 }
 
 pub struct UserMm {
-    state: IrqSpinLock<UserMmState>,
+    state: TrackedSpinLock<UserMmState>,
+    tlb: UserTlbContext,
+    root: PhysFrame,
+    /// Last TLB generation known synchronized on each CPU. ASIDs let a CPU
+    /// retain translations while another process runs; a generation mismatch
+    /// is the only normal-switch condition that requires a local flush.
+    local_tlb_generation: [AtomicU64; crate::smp::MAX_CPUS],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +235,25 @@ impl UserMm {
         area.range().contains_range(range).then_some(area)
     }
 
+    /// Resolve a user PC back to its file-backed mapping for fatal-fault
+    /// diagnostics. This runs only after a process is already doomed, so the
+    /// owned path keeps the MM lock out of console output and VFS formatting.
+    pub(crate) fn debug_file_location(
+        &self,
+        address: VirtAddr,
+    ) -> Option<(String, usize, usize, u64)> {
+        let state = self.state.lock();
+        let mapping = file_mapping_at(&state.file_mappings, address)?;
+        let delta = address.get().checked_sub(mapping.range.start().get())?;
+        let file_offset = mapping.file_offset.checked_add(delta as u64)?;
+        Some((
+            String::from(mapping.file.path().unwrap_or("?")),
+            mapping.range.start().get(),
+            mapping.range.end().get(),
+            file_offset,
+        ))
+    }
+
     pub fn new(areas: &[VmArea]) -> Result<Self, UserMmRuntimeError> {
         let asid = reserve_asid_for_mm()?;
         let result: Result<Self, UserMmRuntimeError> = (|| {
@@ -220,18 +269,23 @@ impl UserMm {
             }
 
             let page_table = crate::vm::create_user_page_table()?;
+            let root = page_table.root_frame();
+            let tlb = core.tlb_context();
             LIVE_ROOTS.fetch_add(1, Ordering::AcqRel);
             Ok(Self {
-                state: IrqSpinLock::new_with_class(
+                state: TrackedSpinLock::new_preemptible(
                     UserMmState {
                         core,
                         page_table: Some(page_table),
-                        pages: Vec::new(),
-                        file_mappings: Vec::new(),
+                        pages: BTreeMap::new(),
+                        file_mappings: BTreeMap::new(),
                         next_file_generation: 1,
                     },
-                    LockClass::new("user_mm", LockRank::Vm, 2),
+                    LockClass::new("user_mm", LockRank::CrossCpu, 10),
                 ),
+                tlb,
+                root,
+                local_tlb_generation: [const { AtomicU64::new(u64::MAX) }; crate::smp::MAX_CPUS],
             })
         })();
 
@@ -242,7 +296,7 @@ impl UserMm {
     }
 
     pub fn asid(&self) -> AsidToken {
-        self.state.lock().core.asid()
+        self.tlb.asid()
     }
 
     pub fn root_is_private(&self) -> Result<bool, UserMmRuntimeError> {
@@ -255,10 +309,15 @@ impl UserMm {
             && page_table.root_frame() != crate::vm::kernel_page_table_root()?)
     }
 
-    // FORK_CLONE_PRESERVE_PROT_NONE_V1
+    // FORK_CLONE_COW_V1
     pub fn fork_clone_eager(&self) -> Result<alloc::boxed::Box<Self>, UserMmRuntimeError> {
-        let (areas, program_break, mapped_pages, file_mappings, next_file_generation) = {
-            let state = self.state.lock();
+        // Allocate the empty root/ASID before taking user_mm. The complete VMA
+        // and resident-page snapshot is then captured under one parent lock,
+        // so mmap activity in another rustc thread cannot make fork fail or
+        // mix two generations of the address space.
+        let child = alloc::boxed::Box::new(Self::new(&[])?);
+        let (areas, program_break, mapped_pages, file_mappings, next_file_generation, request) = {
+            let mut state = self.state.lock();
             let layout = state.core.layout();
 
             let mut areas = Vec::new();
@@ -272,70 +331,182 @@ impl UserMm {
                         .expect("area index below count was empty"),
                 );
             }
+            let program_break = layout.program_break();
 
-            let page_table = state
-                .page_table
-                .as_ref()
-                .ok_or(UserMmRuntimeError::NotMapped)?;
+            let mut keys = Vec::new();
+            keys.try_reserve(state.pages.len())
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            keys.extend(state.pages.keys().copied());
 
             let mut mapped_pages = Vec::new();
             mapped_pages
-                .try_reserve(state.pages.len())
+                .try_reserve(keys.len())
                 .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            let mut retained_cow_frames = Vec::new();
+            retained_cow_frames
+                .try_reserve(keys.len())
+                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            let mut first_protected = None::<VirtAddr>;
+            let mut last_protected_end = None::<VirtAddr>;
 
-            for mapping in &state.pages {
-                let area = layout
-                    .find_area(mapping.page.start_address())
-                    .ok_or(UserMmRuntimeError::PermissionDenied)?;
-                let physical = mapping.backing.physical();
-
-                match page_table.translate(mapping.page.start_address())? {
-                    Some(translated) => {
-                        if translated != physical {
+            let result: Result<(), UserMmRuntimeError> = (|| {
+                for key in keys {
+                    let (page, physical, kind, area, present) = {
+                        let mapping = state
+                            .pages
+                            .get(&key)
+                            .expect("fork page disappeared while user_mm was locked");
+                        let area = state
+                            .core
+                            .layout()
+                            .find_area(mapping.page.start_address())
+                            .ok_or(UserMmRuntimeError::PermissionDenied)?;
+                        let physical = mapping.backing.physical();
+                        let translated = state
+                            .page_table
+                            .as_ref()
+                            .ok_or(UserMmRuntimeError::NotMapped)?
+                            .translate(mapping.page.start_address())?;
+                        if let Some(translated) = translated {
+                            if translated != physical {
+                                return Err(UserMmRuntimeError::NotMapped);
+                            }
+                        } else if area.flags().access_only() != VmAreaFlags::empty() {
                             return Err(UserMmRuntimeError::NotMapped);
                         }
-                    }
-                    None => {
-                        if area.flags().access_only() != VmAreaFlags::empty() {
-                            return Err(UserMmRuntimeError::NotMapped);
+                        let kind = if matches!(&mapping.backing, PageBacking::Shared(_)) {
+                            ForkPageKind::FileShared
+                        } else {
+                            ForkPageKind::Cow
+                        };
+                        (mapping.page, physical, kind, area, translated.is_some())
+                    };
+
+                    if matches!(kind, ForkPageKind::Cow) {
+                        let frame = PhysFrame::from_start_address(physical)
+                            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                        crate::page_alloc::increment_reference(frame)?;
+                        retained_cow_frames.push(frame);
+                        let mapping = state
+                            .pages
+                            .get_mut(&key)
+                            .expect("fork page disappeared while converting to COW");
+                        let previous =
+                            core::mem::replace(&mut mapping.backing, PageBacking::Cow(frame));
+                        debug_assert!(matches!(
+                            previous,
+                            PageBacking::Owned(_) | PageBacking::Cow(_)
+                        ));
+
+                        if present && area.flags().is_writable() {
+                            let readonly = VmArea::new(
+                                area.range(),
+                                area.flags().without(VmAreaFlags::WRITE),
+                                area.kind(),
+                            );
+                            apply_page_protection(
+                                state
+                                    .page_table
+                                    .as_mut()
+                                    .ok_or(UserMmRuntimeError::NotMapped)?,
+                                page,
+                                frame,
+                                readonly,
+                            )?;
+                            first_protected.get_or_insert(page.start_address());
+                            last_protected_end = Some(
+                                page.start_address()
+                                    .checked_add(PAGE_SIZE)
+                                    .ok_or(UserMmRuntimeError::AddressOverflow)?,
+                            );
                         }
                     }
+
+                    mapped_pages.push(MappedPageSource {
+                        page,
+                        physical,
+                        kind,
+                    });
                 }
+                Ok(())
+            })();
 
-                mapped_pages.push(MappedPageSource {
-                    page: mapping.page,
-                    physical,
-                    shared: matches!(&mapping.backing, PageBacking::Shared(_)),
-                });
+            if let Err(error) = result {
+                // Converted parent pages remain valid COW pages with one
+                // reference; a read-only leaf will become writable on its
+                // next write fault. Only the prospective child references
+                // need rolling back here.
+                for frame in retained_cow_frames {
+                    release_cow_frame(frame)?;
+                }
+                return Err(error);
             }
 
-            let mut file_mappings = Vec::new();
-            file_mappings
-                .try_reserve(state.file_mappings.len())
-                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-            file_mappings.extend(state.file_mappings.iter().cloned());
-
+            let request = match (first_protected, last_protected_end) {
+                (Some(start), Some(end)) => match state.core.plan_tlb_request(TlbFlush::Range {
+                    scope: TlbScope::AddressSpace(state.core.asid().id()),
+                    range: VirtRange::from_bounds(start.get(), end.get()),
+                }) {
+                    Ok(request) => Some(request),
+                    Err(error) => {
+                        for frame in retained_cow_frames {
+                            release_cow_frame(frame)?;
+                        }
+                        return Err(error.into());
+                    }
+                },
+                _ => None,
+            };
             (
                 areas,
-                layout.program_break(),
+                program_break,
                 mapped_pages,
-                file_mappings,
+                state.file_mappings.clone(),
                 state.next_file_generation,
+                request,
             )
         };
 
-        let child = alloc::boxed::Box::new(Self::new(&areas)?);
-        if let Some(program_break) = program_break {
-            child.configure_program_break(program_break.start(), program_break.limit())?;
-            child.set_program_break(program_break.current())?;
-        }
-        {
-            let mut state = child.state.lock();
-            state.file_mappings = file_mappings;
-            state.next_file_generation = next_file_generation;
+        // This is the fork snapshot point. Every CPU that could still hold a
+        // writable parent translation must acknowledge the revocation before
+        // either address space can run independently.
+        if let Some(request) = request {
+            shootdown_user_request(request);
         }
 
-        for source in mapped_pages {
+        let child_layout_result: Result<(), UserMmRuntimeError> = (|| {
+            let mut state = child.state.lock();
+            for area in &areas {
+                state.core.map_area(*area)?;
+            }
+            if let Some(program_break) = program_break {
+                state
+                    .core
+                    .layout_mut()
+                    .configure_program_break(program_break.start(), program_break.limit())
+                    .map_err(UserMmError::from)?;
+                state
+                    .core
+                    .layout_mut()
+                    .set_program_break_and_sync_heap(program_break.current())
+                    .map_err(UserMmError::from)?;
+            }
+            state.file_mappings = file_mappings;
+            state.next_file_generation = next_file_generation;
+            Ok(())
+        })();
+        if let Err(error) = child_layout_result {
+            for source in &mapped_pages {
+                if matches!(source.kind, ForkPageKind::Cow) {
+                    let frame = PhysFrame::from_start_address(source.physical)
+                        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                    release_cow_frame(frame)?;
+                }
+            }
+            return Err(error);
+        }
+
+        for (index, source) in mapped_pages.iter().copied().enumerate() {
             let mut state = child.state.lock();
             let area = state
                 .core
@@ -343,52 +514,51 @@ impl UserMm {
                 .find_area(source.page.start_address())
                 .ok_or(UserMmRuntimeError::PermissionDenied)?;
 
-            state
-                .pages
-                .try_reserve(1)
-                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-
-            let backing = if source.shared {
-                PageBacking::Shared(
-                    PhysFrame::from_start_address(source.physical)
-                        .ok_or(UserMmRuntimeError::AddressOverflow)?,
-                )
-            } else {
-                let allocation = crate::page_alloc::allocate(
-                    0,
-                    crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
-                )?;
-                let destination = allocation.start().start_address();
-                if let Err(error) = copy_physical_page(source.physical, destination) {
-                    crate::page_alloc::free(allocation)?;
-                    return Err(error);
-                }
-                PageBacking::Owned(allocation)
+            let frame = PhysFrame::from_start_address(source.physical)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            let backing = match source.kind {
+                ForkPageKind::Cow => PageBacking::Cow(frame),
+                ForkPageKind::FileShared => PageBacking::Shared(frame),
             };
 
             if area.flags().access_only() != VmAreaFlags::empty() {
+                let mapped_area = match source.kind {
+                    ForkPageKind::Cow if area.flags().is_writable() => VmArea::new(
+                        area.range(),
+                        area.flags().without(VmAreaFlags::WRITE),
+                        area.kind(),
+                    ),
+                    _ => area,
+                };
                 let page_table = state
                     .page_table
                     .as_mut()
                     .ok_or(UserMmRuntimeError::NotMapped)?;
                 if let Err(error) =
-                    page_table.map_page(source.page, backing.frame(), area.mapping_options())
+                    page_table.map_page(source.page, backing.frame(), mapped_area.mapping_options())
                 {
-                    if let PageBacking::Owned(allocation) = backing {
-                        crate::page_alloc::free(allocation)?;
+                    drop(state);
+                    // The child Drop releases already-installed COW pages;
+                    // release this page and every not-yet-installed child
+                    // reference explicitly.
+                    for pending in &mapped_pages[index..] {
+                        if matches!(pending.kind, ForkPageKind::Cow) {
+                            let pending_frame = PhysFrame::from_start_address(pending.physical)
+                                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                            release_cow_frame(pending_frame)?;
+                        }
                     }
                     return Err(error.into());
                 }
             }
 
-            let owned = matches!(&backing, PageBacking::Owned(_));
-            state.pages.push(MappedPage {
-                page: source.page,
-                backing,
-            });
-            if owned {
-                LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
-            }
+            let previous = state
+                .pages
+                .insert(source.page.start_address().get(), MappedPage {
+                    page: source.page,
+                    backing,
+                });
+            debug_assert!(previous.is_none());
         }
 
         Ok(child)
@@ -442,10 +612,6 @@ impl UserMm {
             return Ok(physical);
         }
 
-        state
-            .pages
-            .try_reserve(1)
-            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
         let backing = crate::page_alloc::allocate(
             0,
             crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
@@ -470,10 +636,11 @@ impl UserMm {
             return Err(error.into());
         }
 
-        state.pages.push(MappedPage {
+        let previous = state.pages.insert(page.start_address().get(), MappedPage {
             page,
             backing: PageBacking::Owned(backing),
         });
+        debug_assert!(previous.is_none());
         LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
         Ok(physical)
     }
@@ -496,19 +663,7 @@ impl UserMm {
             .get()
             .checked_add(input.len())
             .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let covered = input
-            .len()
-            .checked_add(address.get() & (PAGE_SIZE - 1))
-            .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let page_count = covered
-            .checked_add(PAGE_SIZE - 1)
-            .ok_or(UserMmRuntimeError::AddressOverflow)?
-            / PAGE_SIZE;
         let mut state = self.state.lock();
-        state
-            .pages
-            .try_reserve(page_count)
-            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
         let mut copied = 0;
         while copied < input.len() {
@@ -528,11 +683,7 @@ impl UserMm {
             // SAFETY: the populated translation names RAM owned by this MM,
             // and the copy is bounded to its current page.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    input.as_ptr().add(copied),
-                    destination,
-                    chunk,
-                );
+                core::ptr::copy_nonoverlapping(input.as_ptr().add(copied), destination, chunk);
             }
             copied += chunk;
         }
@@ -561,17 +712,7 @@ impl UserMm {
         let first_page = address
             .align_down(PAGE_SIZE)
             .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let page_count = length
-            .checked_add(address.get() & (PAGE_SIZE - 1))
-            .and_then(|covered| covered.checked_add(PAGE_SIZE - 1))
-            .ok_or(UserMmRuntimeError::AddressOverflow)?
-            / PAGE_SIZE;
-
         let mut state = self.state.lock();
-        state
-            .pages
-            .try_reserve(page_count)
-            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
         let mut page = first_page;
         while page.get() < end {
@@ -779,8 +920,7 @@ impl UserMm {
         let retirement = {
             let mut state = self.state.lock();
             let old_layout = state.core.layout().clone();
-            let retained_file_mappings =
-                file_mappings_without_range(&state.file_mappings, range)?;
+            let retained_file_mappings = file_mappings_without_range(&state.file_mappings, range)?;
 
             // 1. Remove overlapping VMAs from the topology.
             state
@@ -843,6 +983,7 @@ impl UserMm {
         file_length: usize,
         device: u64,
         inode: u64,
+        content_generation: u64,
         shared_cache: bool,
         file: myos_vfs::ArcFile,
     ) -> Result<(), UserMmRuntimeError> {
@@ -855,22 +996,26 @@ impl UserMm {
         if !area.range().contains_range(range) {
             return Err(UserMmRuntimeError::InvalidRange);
         }
-        state
-            .file_mappings
-            .try_reserve(1)
-            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
         let generation = state.next_file_generation;
         state.next_file_generation = state.next_file_generation.wrapping_add(1).max(1);
-        state.file_mappings.push(FileBackedMapping {
+        let mapping = FileBackedMapping {
             range,
             file_offset,
             file_length,
             generation,
             device,
             inode,
+            content_generation,
             shared_cache,
             file,
-        });
+        };
+        if state
+            .file_mappings
+            .insert(range.start().get(), mapping)
+            .is_some()
+        {
+            return Err(UserMmRuntimeError::InvalidRange);
+        }
         Ok(())
     }
 
@@ -880,54 +1025,49 @@ impl UserMm {
         access: FaultAccess,
     ) -> Result<Option<FileFaultRequest>, UserMmRuntimeError> {
         let state = self.state.lock();
-        let Some(mapping) = state
-            .file_mappings
-            .iter()
-            .find(|mapping| mapping.range.contains(address))
-        else {
-            return Ok(None);
-        };
-        let area = state
-            .core
-            .layout()
-            .find_area(address)
-            .ok_or(UserMmRuntimeError::NotMapped)?;
-        let allowed = match access {
-            FaultAccess::Read => area.flags().is_readable(),
-            FaultAccess::Write => area.flags().is_writable(),
-            FaultAccess::Execute => area.flags().is_executable(),
-        };
-        if !allowed
-            || state
-                .page_table
-                .as_ref()
-                .ok_or(UserMmRuntimeError::NotMapped)?
-                .translate(address)?
-                .is_some()
-        {
-            return Ok(None);
+        file_fault_request_locked(&state, address, access)
+    }
+
+    /// Collect a sequential fault-around window while taking user_mm once.
+    /// The old caller performed one lock/lookup/Arc clone round trip per page,
+    /// which made a 64-page cache hit contend on the same MM 64 times.
+    pub fn file_fault_cluster(
+        &self,
+        first: FileFaultRequest,
+        access: FaultAccess,
+        maximum: usize,
+    ) -> Result<Vec<FileFaultRequest>, UserMmRuntimeError> {
+        let first_page = first.page;
+        let first_offset = first.file_offset;
+        let file = alloc::sync::Arc::clone(&first.file);
+        let mut requests = Vec::new();
+        requests
+            .try_reserve(maximum)
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        requests.push(first);
+        let state = self.state.lock();
+        for index in 1..maximum {
+            if requests
+                .last()
+                .is_some_and(|request| request.read_length < PAGE_SIZE)
+            {
+                break;
+            }
+            let Some(page) = first_page.checked_add(index * PAGE_SIZE) else {
+                break;
+            };
+            let Some(next) = file_fault_request_locked(&state, page, access)? else {
+                break;
+            };
+            let expected_offset = first_offset
+                .checked_add((index * PAGE_SIZE) as u64)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            if next.file_offset != expected_offset || !alloc::sync::Arc::ptr_eq(&file, &next.file) {
+                break;
+            }
+            requests.push(next);
         }
-        let page = address
-            .align_down(PAGE_SIZE)
-            .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let delta = page
-            .get()
-            .checked_sub(mapping.range.start().get())
-            .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let read_length = mapping.file_length.saturating_sub(delta).min(PAGE_SIZE);
-        let file_offset = mapping
-            .file_offset
-            .checked_add(delta as u64)
-            .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        Ok(Some(FileFaultRequest {
-            file: alloc::sync::Arc::clone(&mapping.file),
-            file_offset,
-            read_length,
-            page,
-            cache_key: (mapping.device, mapping.inode, file_offset),
-            shared_cache: mapping.shared_cache,
-            generation: mapping.generation,
-        }))
+        Ok(requests)
     }
 
     pub fn install_file_fault(
@@ -935,24 +1075,131 @@ impl UserMm {
         fault: &FileFaultRequest,
         data: &[u8],
     ) -> Result<UserFaultResolution, UserMmRuntimeError> {
-        self.install_file_fault_inner(fault, data, true)
+        self.install_file_fault_inner(fault, data, true, None)
     }
 
-    /// Map a full immutable file page already retained by the kernel-wide
-    /// cache without issuing another VFS read or copying its contents.
+    /// Map a full file page already retained by the kernel-wide cache without
+    /// issuing another VFS read or taking the cache lock twice.
     pub fn install_cached_file_fault(
         &self,
         fault: &FileFaultRequest,
     ) -> Result<Option<UserFaultResolution>, UserMmRuntimeError> {
-        static UNUSED_CACHE_HIT_DATA: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        self.install_cached_file_page(fault, true)
+    }
 
-        if !fault.shared_cache
-            || fault.read_length != PAGE_SIZE
-            || file_page_cache_lookup(fault.cache_key).is_none()
-        {
+    /// Fault-around companion for an already cached file page. The demanded
+    /// page is installed last with a local invalidation, publishing all of the
+    /// preceding leaf writes with one architecture barrier.
+    pub fn install_cached_file_prefetch(
+        &self,
+        fault: &FileFaultRequest,
+    ) -> Result<Option<UserFaultResolution>, UserMmRuntimeError> {
+        self.install_cached_file_page(fault, false)
+    }
+
+    /// Install the cached prefix of a fault-around window under one MM lock.
+    /// Returns None only when the demanded first page is not cached.
+    pub fn install_cached_file_cluster(
+        &self,
+        faults: &[FileFaultRequest],
+    ) -> Result<Option<UserFaultResolution>, UserMmRuntimeError> {
+        let Some(first) = faults.first() else {
+            return Ok(None);
+        };
+        let mut frames = Vec::new();
+        frames
+            .try_reserve(faults.len())
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        for fault in faults {
+            if !fault.shared_cache || fault.read_length != PAGE_SIZE {
+                break;
+            }
+            let Some(frame) = file_page_cache_lookup(fault.cache_key) else {
+                break;
+            };
+            frames.push(frame);
+        }
+        if frames.is_empty() {
             return Ok(None);
         }
-        self.install_file_fault_inner(fault, &UNUSED_CACHE_HIT_DATA, true)
+
+        let (request, first_spurious, first_unmapped, installed_any) = {
+            let mut state = self.state.lock();
+            let request = state.core.plan_post_install_tlb(first.page)?;
+            let mut first_spurious = false;
+            let mut first_unmapped = false;
+            let mut installed_any = false;
+            for (index, (fault, frame)) in faults.iter().zip(frames.iter()).enumerate() {
+                let still_mapped = file_mapping_at(&state.file_mappings, fault.page)
+                    .is_some_and(|mapping| mapping.generation == fault.generation);
+                if !still_mapped {
+                    if index == 0 {
+                        first_unmapped = true;
+                    }
+                    break;
+                }
+                if state
+                    .page_table
+                    .as_ref()
+                    .ok_or(UserMmRuntimeError::NotMapped)?
+                    .translate(fault.page)?
+                    .is_some()
+                {
+                    if index == 0 {
+                        first_spurious = true;
+                    }
+                    continue;
+                }
+                let area = state
+                    .core
+                    .layout()
+                    .find_area(fault.page)
+                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                let page = VirtPage::from_start_address(fault.page)
+                    .ok_or(UserMmRuntimeError::InvalidRange)?;
+                state
+                    .page_table
+                    .as_mut()
+                    .ok_or(UserMmRuntimeError::NotMapped)?
+                    .map_page(page, *frame, area.mapping_options())?;
+                let previous = state.pages.insert(page.start_address().get(), MappedPage {
+                    page,
+                    backing: PageBacking::Shared(*frame),
+                });
+                debug_assert!(previous.is_none());
+                installed_any = true;
+            }
+            (request, first_spurious, first_unmapped, installed_any)
+        };
+
+        if installed_any {
+            flush_post_install_local(request)?;
+        }
+        if first_unmapped {
+            return Ok(Some(UserFaultResolution::Fatal(
+                UserFaultFailure::SegmentationViolation,
+            )));
+        }
+        Ok(Some(UserFaultResolution::Recovered(if first_spurious {
+            UserFaultRecovery::Spurious
+        } else {
+            UserFaultRecovery::Anonymous
+        })))
+    }
+
+    fn install_cached_file_page(
+        &self,
+        fault: &FileFaultRequest,
+        flush_local: bool,
+    ) -> Result<Option<UserFaultResolution>, UserMmRuntimeError> {
+        static UNUSED_CACHE_HIT_DATA: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        if !fault.shared_cache || fault.read_length != PAGE_SIZE {
+            return Ok(None);
+        }
+        let Some(frame) = file_page_cache_lookup(fault.cache_key) else {
+            return Ok(None);
+        };
+        self.install_file_fault_inner(fault, &UNUSED_CACHE_HIT_DATA, flush_local, Some(frame))
             .map(Some)
     }
 
@@ -961,7 +1208,7 @@ impl UserMm {
         fault: &FileFaultRequest,
         data: &[u8],
     ) -> Result<UserFaultResolution, UserMmRuntimeError> {
-        self.install_file_fault_inner(fault, data, false)
+        self.install_file_fault_inner(fault, data, false, None)
     }
 
     fn install_file_fault_inner(
@@ -969,6 +1216,7 @@ impl UserMm {
         fault: &FileFaultRequest,
         data: &[u8],
         flush_local: bool,
+        cached_frame: Option<PhysFrame>,
     ) -> Result<UserFaultResolution, UserMmRuntimeError> {
         enum InstallOutcome {
             Installed(PerMmTlbRequest),
@@ -980,9 +1228,9 @@ impl UserMm {
             return Err(UserMmRuntimeError::InvalidRange);
         }
         let cacheable = fault.shared_cache && fault.read_length == PAGE_SIZE;
-        let mut backing = if cacheable
-            && let Some(frame) = file_page_cache_lookup(fault.cache_key)
-        {
+        let mut backing = if let Some(frame) = cached_frame {
+            Some(PageBacking::Shared(frame))
+        } else if cacheable && let Some(frame) = file_page_cache_lookup(fault.cache_key) {
             Some(PageBacking::Shared(frame))
         } else {
             let allocation = crate::page_alloc::allocate(
@@ -1016,9 +1264,8 @@ impl UserMm {
 
         let outcome: Result<InstallOutcome, UserMmRuntimeError> = (|| {
             let mut state = self.state.lock();
-            let still_mapped = state.file_mappings.iter().any(|mapping| {
-                mapping.generation == fault.generation && mapping.range.contains(fault.page)
-            });
+            let still_mapped = file_mapping_at(&state.file_mappings, fault.page)
+                .is_some_and(|mapping| mapping.generation == fault.generation);
             if !still_mapped {
                 return Ok(InstallOutcome::Unmapped);
             }
@@ -1036,12 +1283,8 @@ impl UserMm {
                 .layout()
                 .find_area(fault.page)
                 .ok_or(UserMmRuntimeError::NotMapped)?;
-            let page = VirtPage::from_start_address(fault.page)
-                .ok_or(UserMmRuntimeError::InvalidRange)?;
-            state
-                .pages
-                .try_reserve(1)
-                .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+            let page =
+                VirtPage::from_start_address(fault.page).ok_or(UserMmRuntimeError::InvalidRange)?;
             let request = state.core.plan_post_install_tlb(fault.page)?;
             if let Err(error) = state
                 .page_table
@@ -1062,10 +1305,10 @@ impl UserMm {
                 .take()
                 .expect("file-fault backing disappeared after PTE install");
             let owned = matches!(&backing, PageBacking::Owned(_));
-            state.pages.push(MappedPage {
-                page,
-                backing,
-            });
+            let previous = state
+                .pages
+                .insert(page.start_address().get(), MappedPage { page, backing });
+            debug_assert!(previous.is_none());
             if owned {
                 LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
             }
@@ -1085,13 +1328,17 @@ impl UserMm {
             InstallOutcome::Installed(request) => request,
             InstallOutcome::Spurious => {
                 free_uninstalled_backing(
-                    backing.take().expect("spurious file fault lost its backing"),
+                    backing
+                        .take()
+                        .expect("spurious file fault lost its backing"),
                 )?;
                 return Ok(UserFaultResolution::Recovered(UserFaultRecovery::Spurious));
             }
             InstallOutcome::Unmapped => {
                 free_uninstalled_backing(
-                    backing.take().expect("unmapped file fault lost its backing"),
+                    backing
+                        .take()
+                        .expect("unmapped file fault lost its backing"),
                 )?;
                 return Ok(UserFaultResolution::Fatal(
                     UserFaultFailure::SegmentationViolation,
@@ -1102,32 +1349,7 @@ impl UserMm {
             return Ok(UserFaultResolution::Recovered(UserFaultRecovery::Anonymous));
         }
 
-        // Installing a previously invalid leaf never revokes access or frees
-        // memory. A remote CPU may keep its stale invalid translation and take
-        // the same recoverable fault, so only this CPU needs an immediate
-        // invalidation. Briefly mask interrupts when called from syscall
-        // uaccess; trap-fault callers already arrive with interrupts masked.
-        let restore_enabled = !crate::arch::interrupt::are_disabled();
-        if restore_enabled {
-            crate::arch::interrupt::disable();
-        }
-        let request = match request.local_only(crate::smp::current_cpu_id().get()) {
-            Ok(request) => request,
-            Err(error) => {
-                if restore_enabled {
-                    // SAFETY: restore the entry interrupt state before
-                    // propagating a request-shaping error.
-                    unsafe { crate::arch::interrupt::enable() };
-                }
-                return Err(UserMmRuntimeError::from(error));
-            }
-        };
-        crate::tlb::shootdown_user_local(request);
-        if restore_enabled {
-            // SAFETY: this restores the enabled state observed immediately
-            // before the short local TLB critical section.
-            unsafe { crate::arch::interrupt::enable() };
-        }
+        flush_post_install_local(request)?;
         Ok(UserFaultResolution::Recovered(UserFaultRecovery::Anonymous))
     }
 
@@ -1135,8 +1357,7 @@ impl UserMm {
         let retirement = {
             let mut state = self.state.lock();
             let old_layout = state.core.layout().clone();
-            let retained_file_mappings =
-                file_mappings_without_range(&state.file_mappings, range)?;
+            let retained_file_mappings = file_mappings_without_range(&state.file_mappings, range)?;
             state
                 .core
                 .layout_mut()
@@ -1165,11 +1386,7 @@ impl UserMm {
     pub fn discard_anonymous_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
             let mut state = self.state.lock();
-            if state
-                .file_mappings
-                .iter()
-                .any(|mapping| mapping.range.overlaps(range))
-            {
+            if file_mappings_overlap(&state.file_mappings, range) {
                 return Ok(());
             }
             let mut cursor = range.start();
@@ -1237,20 +1454,35 @@ impl UserMm {
             // promotes such a mapping to writable, materialize a private copy
             // before changing either the VMA or PTE permissions.
             if requested_access.is_writable() {
-                let mut shared_indices = Vec::new();
-                shared_indices
+                let mut private_copy_keys = Vec::new();
+                private_copy_keys
                     .try_reserve(state.pages.len().min(range.size() / PAGE_SIZE + 1))
                     .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-                for (index, mapping) in state.pages.iter().enumerate() {
-                    if range.contains(mapping.page.start_address())
-                        && matches!(&mapping.backing, PageBacking::Shared(_))
-                    {
-                        shared_indices.push(index);
+                for (&key, mapping) in state.pages.range(range.start().get()..range.end().get()) {
+                    let must_copy = match &mapping.backing {
+                        PageBacking::Shared(_) => true,
+                        PageBacking::Cow(frame) => crate::page_alloc::reference_count(*frame)? > 1,
+                        PageBacking::Owned(_) => false,
+                    };
+                    if must_copy {
+                        private_copy_keys.push(key);
                     }
                 }
-                for index in shared_indices {
-                    let page = state.pages[index].page;
-                    let source = state.pages[index].backing.physical();
+                for key in private_copy_keys {
+                    let (page, source, old_cow) = {
+                        let mapping = state
+                            .pages
+                            .get(&key)
+                            .expect("writable-promotion page disappeared");
+                        (
+                            mapping.page,
+                            mapping.backing.physical(),
+                            match &mapping.backing {
+                                PageBacking::Cow(frame) => Some(*frame),
+                                _ => None,
+                            },
+                        )
+                    };
                     let allocation = crate::page_alloc::allocate(
                         0,
                         crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
@@ -1281,8 +1513,15 @@ impl UserMm {
                             return Err(error.into());
                         }
                     }
-                    state.pages[index].backing = PageBacking::Owned(allocation);
+                    state
+                        .pages
+                        .get_mut(&key)
+                        .expect("writable-promotion page disappeared")
+                        .backing = PageBacking::Owned(allocation);
                     LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+                    if let Some(frame) = old_cow {
+                        release_cow_frame(frame)?;
+                    }
                 }
             }
 
@@ -1311,13 +1550,13 @@ impl UserMm {
                     .ok_or(UserMmRuntimeError::InvalidRange)?;
                 let old_area = old_layout.find_area(page_address);
                 let frame = match page_table.translate(page_address)? {
-                    Some(physical) => Some(PhysFrame::from_start_address(physical).ok_or(
-                        UserMmRuntimeError::AddressOverflow,
-                    )?),
+                    Some(physical) => Some(
+                        PhysFrame::from_start_address(physical)
+                            .ok_or(UserMmRuntimeError::AddressOverflow)?,
+                    ),
                     None => state
                         .pages
-                        .iter()
-                        .find(|mapping| mapping.page == page)
+                        .get(&page_address.get())
                         .map(|mapping| mapping.backing.frame()),
                 };
                 if let Some(frame) = frame {
@@ -1459,67 +1698,93 @@ impl UserMm {
     ) -> Result<UserFaultResolution, UserMmRuntimeError> {
         let (resolution, request) = {
             let mut state = self.state.lock();
-            let present = state
-                .page_table
-                .as_ref()
-                .ok_or(UserMmRuntimeError::NotMapped)?
-                .translate(address)?
-                .is_some();
-            let fault = PageFault::new(address, access, FaultSource::User, present);
-            match state.core.plan_user_fault(fault, user_sp)? {
-                UserFaultPlan::MapAnonymous { area, page } => {
-                    let request = state.core.plan_post_install_tlb(page)?;
-                    map_zero_page_locked(&mut state, area, page)?;
-                    (
-                        UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
-                        Some(request),
-                    )
-                }
-                UserFaultPlan::GrowStack { growth } => {
-                    let request = state.core.plan_post_install_tlb(growth.fault_page())?;
-                    state.core.commit_stack_growth(growth)?;
-                    if let Err(error) =
-                        map_zero_page_locked(&mut state, growth.new_area(), growth.fault_page())
-                    {
-                        let removed = state
-                            .core
-                            .unmap_exact(growth.new_area().range())
-                            .expect("stack-growth rollback lost the expanded VMA");
-                        assert_eq!(removed, growth.new_area());
-                        state
-                            .core
-                            .map_area(growth.old_area())
-                            .expect("stack-growth rollback could not restore the old VMA");
-                        return Err(error);
+            if let Some(cow) = resolve_cow_write_fault_locked(&mut state, address, access)? {
+                cow
+            } else {
+                let present = state
+                    .page_table
+                    .as_ref()
+                    .ok_or(UserMmRuntimeError::NotMapped)?
+                    .translate(address)?
+                    .is_some();
+                let fault = PageFault::new(address, access, FaultSource::User, present);
+                match state.core.plan_user_fault(fault, user_sp)? {
+                    UserFaultPlan::MapAnonymous { area, page } => {
+                        let request = state.core.plan_post_install_tlb(page)?;
+                        map_zero_page_locked(&mut state, area, page)?;
+                        if access == FaultAccess::Write
+                            && matches!(
+                                area.kind(),
+                                myos_mm::VmAreaKind::Anonymous | myos_mm::VmAreaKind::Heap
+                            )
+                        {
+                            // Rustc grows bump arenas and Vec allocations mostly
+                            // forward. Populate one 64-KiB folio-sized run under
+                            // the existing MM lock and use the demanded page's
+                            // single TLB request as the publication barrier.
+                            for index in 1..ANONYMOUS_FAULT_CLUSTER_PAGES {
+                                let Some(next) = page.checked_add(index * PAGE_SIZE) else {
+                                    break;
+                                };
+                                if !area.range().contains(next) {
+                                    break;
+                                }
+                                if map_zero_page_locked(&mut state, area, next).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        (
+                            UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
+                            Some(request),
+                        )
                     }
-                    (
-                        UserFaultResolution::Recovered(UserFaultRecovery::StackGrowth),
-                        Some(request),
-                    )
+                    UserFaultPlan::GrowStack { growth } => {
+                        let request = state.core.plan_post_install_tlb(growth.fault_page())?;
+                        state.core.commit_stack_growth(growth)?;
+                        if let Err(error) =
+                            map_zero_page_locked(&mut state, growth.new_area(), growth.fault_page())
+                        {
+                            let removed = state
+                                .core
+                                .unmap_exact(growth.new_area().range())
+                                .expect("stack-growth rollback lost the expanded VMA");
+                            assert_eq!(removed, growth.new_area());
+                            state
+                                .core
+                                .map_area(growth.old_area())
+                                .expect("stack-growth rollback could not restore the old VMA");
+                            return Err(error);
+                        }
+                        (
+                            UserFaultResolution::Recovered(UserFaultRecovery::StackGrowth),
+                            Some(request),
+                        )
+                    }
+                    UserFaultPlan::Spurious { .. } => {
+                        let request = state.core.plan_post_install_tlb(address)?;
+                        (
+                            UserFaultResolution::Recovered(UserFaultRecovery::Spurious),
+                            Some(request),
+                        )
+                    }
+                    UserFaultPlan::CopyOnWriteUnsupported { .. } => (
+                        UserFaultResolution::Fatal(UserFaultFailure::CopyOnWriteUnsupported),
+                        None,
+                    ),
+                    UserFaultPlan::ProtectionViolation { .. } => (
+                        UserFaultResolution::Fatal(UserFaultFailure::ProtectionViolation),
+                        None,
+                    ),
+                    UserFaultPlan::SegmentationViolation => (
+                        UserFaultResolution::Fatal(UserFaultFailure::SegmentationViolation),
+                        None,
+                    ),
+                    UserFaultPlan::KernelBug => (
+                        UserFaultResolution::Fatal(UserFaultFailure::KernelBug),
+                        None,
+                    ),
                 }
-                UserFaultPlan::Spurious { .. } => {
-                    let request = state.core.plan_post_install_tlb(address)?;
-                    (
-                        UserFaultResolution::Recovered(UserFaultRecovery::Spurious),
-                        Some(request),
-                    )
-                }
-                UserFaultPlan::CopyOnWriteUnsupported { .. } => (
-                    UserFaultResolution::Fatal(UserFaultFailure::CopyOnWriteUnsupported),
-                    None,
-                ),
-                UserFaultPlan::ProtectionViolation { .. } => (
-                    UserFaultResolution::Fatal(UserFaultFailure::ProtectionViolation),
-                    None,
-                ),
-                UserFaultPlan::SegmentationViolation => (
-                    UserFaultResolution::Fatal(UserFaultFailure::SegmentationViolation),
-                    None,
-                ),
-                UserFaultPlan::KernelBug => (
-                    UserFaultResolution::Fatal(UserFaultFailure::KernelBug),
-                    None,
-                ),
             }
         };
 
@@ -1543,8 +1808,8 @@ impl UserMm {
         Ok(resolution)
     }
 
-    /// Installs the private root, synchronizes the local ASID, and publishes
-    /// this CPU only after both hardware operations are complete.
+    /// Installs the private root and publishes this CPU after synchronizing
+    /// only generations invalidated while this mm was inactive locally.
     pub fn activate_current_cpu(&self) -> Result<(), UserMmRuntimeError> {
         crate::context::assert_interrupts_disabled();
         let cpu = crate::smp::current_cpu_id().get();
@@ -1562,42 +1827,37 @@ impl UserMm {
         };
 
         loop {
-            let (root, token, tlb_generation) = {
-                let mut state = self.state.lock();
-                let token = state.core.asid();
-                if !token.is_current(current_asid_generation) {
-                    return Err(UserMmError::AsidMismatch.into());
-                }
-                let tlb_generation = state.core.tlb_generation();
-                let page_table = state
-                    .page_table
-                    .as_mut()
-                    .ok_or(UserMmRuntimeError::NotMapped)?;
-                crate::vm::synchronize_user_page_table(page_table)?;
-                (page_table.root_frame(), token, tlb_generation)
-            };
+            let token = self.tlb.asid();
+            if !token.is_current(current_asid_generation) {
+                return Err(UserMmError::AsidMismatch.into());
+            }
+            let tlb_generation = self.tlb.tlb_generation();
 
             // SAFETY: Process owns the root and shared kernel tables, while the
             // scheduler's loaded_mm Arc pins this UserMm across installation and
             // the complete interval in which this CPU can execute the user task.
             unsafe {
-                crate::vm::activate_user_page_table(root, token.id());
+                crate::vm::activate_user_page_table(self.root, token.id());
             }
+            #[cfg(target_arch = "loongarch64")]
             crate::arch::memory::paging::flush_asid(token.id());
+            #[cfg(target_arch = "riscv64")]
+            if self.local_tlb_generation[cpu].load(Ordering::Acquire) != tlb_generation {
+                crate::arch::memory::paging::flush_asid(token.id());
+                self.local_tlb_generation[cpu].store(tlb_generation, Ordering::Release);
+            }
 
-            let state = self.state.lock();
-            match state.core.enter_cpu_after_local_sync(
-                cpu,
-                current_asid_generation,
-                tlb_generation,
-            ) {
+            match self
+                .tlb
+                .enter_cpu_after_local_sync(cpu, current_asid_generation, tlb_generation)
+            {
                 Ok(()) => return Ok(()),
                 Err(UserMmError::TlbGenerationMismatch { .. }) => {
-                    drop(state);
                     crate::arch::memory::paging::flush_asid(token.id());
+                    self.local_tlb_generation[cpu]
+                        .store(tlb_generation.wrapping_add(1), Ordering::Release);
                 }
                 Err(error) => {
-                    drop(state);
                     // SAFETY: KERNEL_PAGE_TABLE permanently owns this root.
                     unsafe {
                         crate::vm::activate_kernel_page_table()?;
@@ -1609,8 +1869,10 @@ impl UserMm {
         }
     }
 
-    /// Restores the kernel root and flushes the departing ASID before clearing
-    /// this CPU from the mm's active mask.
+    /// Restores the kernel root and clears this CPU from the mm's active mask.
+    /// A stable generation snapshot proves that any destructive change which
+    /// raced this departure either flushed us while active or will advance the
+    /// generation and force a flush on the next activation.
     pub fn deactivate_current_cpu(&self) -> Result<(), UserMmRuntimeError> {
         crate::context::assert_interrupts_disabled();
         let cpu = crate::smp::current_cpu_id().get();
@@ -1620,15 +1882,17 @@ impl UserMm {
         unsafe {
             crate::vm::activate_kernel_page_table()?;
         }
+        #[cfg(target_arch = "loongarch64")]
         crate::arch::memory::paging::flush_asid(token.id());
 
         loop {
-            let state = self.state.lock();
-            let generation = state.core.tlb_generation();
-            match state.core.leave_cpu_after_local_flush(cpu, generation) {
-                Ok(()) => break,
+            let generation = self.tlb.tlb_generation();
+            match self.tlb.leave_cpu_after_local_flush(cpu, generation) {
+                Ok(()) => {
+                    self.local_tlb_generation[cpu].store(generation, Ordering::Release);
+                    break;
+                }
                 Err(UserMmError::TlbGenerationMismatch { .. }) => {
-                    drop(state);
                     crate::arch::memory::paging::flush_asid(token.id());
                 }
                 Err(error) => return Err(error.into()),
@@ -1649,14 +1913,9 @@ impl UserMm {
     }
 
     pub fn assert_hardware_active(&self) -> Result<(), UserMmRuntimeError> {
-        let state = self.state.lock();
-        let root = state
-            .page_table
-            .as_ref()
-            .ok_or(UserMmRuntimeError::NotMapped)?
-            .root_frame();
-        let asid = state.core.asid().id();
-        let active = state.core.active_cpus();
+        let root = self.root;
+        let asid = self.tlb.asid().id();
+        let active = self.tlb.active_cpus();
         let cpu = crate::smp::current_cpu_id().get();
 
         assert_eq!(
@@ -1673,7 +1932,10 @@ impl UserMm {
         // marker. A CLONE_VM/pthread process may legally execute this same mm
         // on multiple CPUs at once. Hardware root/ASID checks above and the
         // current-CPU membership check below are the required local invariant.
-        assert!(active.count() >= 1, "M8-B3 published an unexpected CPU mask");
+        assert!(
+            active.count() >= 1,
+            "M8-B3 published an unexpected CPU mask"
+        );
         let current_is_active = active.contains(cpu).map_err(UserMmError::from)?;
         assert!(
             current_is_active,
@@ -1696,7 +1958,7 @@ impl UserMm {
             .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
         let mut already_unmapped = 0_usize;
-        while let Some(mapping) = state.pages.pop() {
+        while let Some((_key, mapping)) = state.pages.pop_first() {
             let page_table = state
                 .page_table
                 .as_mut()
@@ -1723,20 +1985,24 @@ impl UserMm {
                 }
             }
             page_table.reclaim_empty_tables(mapping.page, &mut retired)?;
-            if let PageBacking::Owned(allocation) = mapping.backing {
-                let backing_start = allocation.start().start_address().get();
-                let backing_order = allocation.order();
-                if let Err(error) = crate::page_alloc::free(allocation) {
-                    crate::println!(
-                        "user-mm: backing free failed page={:#x} phys={:#x} order={} error={:?}",
-                        mapping.page.start_address().get(),
-                        backing_start,
-                        backing_order,
-                        error,
-                    );
-                    return Err(error.into());
+            match mapping.backing {
+                PageBacking::Owned(allocation) => {
+                    let backing_start = allocation.start().start_address().get();
+                    let backing_order = allocation.order();
+                    if let Err(error) = crate::page_alloc::free(allocation) {
+                        crate::println!(
+                            "user-mm: backing free failed page={:#x} phys={:#x} order={} error={:?}",
+                            mapping.page.start_address().get(),
+                            backing_start,
+                            backing_order,
+                            error,
+                        );
+                        return Err(error.into());
+                    }
+                    LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
                 }
-                LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
+                PageBacking::Cow(frame) => release_cow_frame(frame)?,
+                PageBacking::Shared(_) => {}
             }
         }
 
@@ -1831,6 +2097,95 @@ pub fn assert_no_leaks() {
     );
 }
 
+fn resolve_cow_write_fault_locked(
+    state: &mut UserMmState,
+    address: VirtAddr,
+    access: FaultAccess,
+) -> Result<Option<(UserFaultResolution, Option<PerMmTlbRequest>)>, UserMmRuntimeError> {
+    if access != FaultAccess::Write {
+        return Ok(None);
+    }
+    let page_address = address
+        .align_down(PAGE_SIZE)
+        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+    let page =
+        VirtPage::from_start_address(page_address).ok_or(UserMmRuntimeError::InvalidRange)?;
+    let frame = match state.pages.get(&page_address.get()) {
+        Some(MappedPage {
+            backing: PageBacking::Cow(frame),
+            ..
+        }) => *frame,
+        _ => return Ok(None),
+    };
+    let area = state
+        .core
+        .layout()
+        .find_area(page_address)
+        .ok_or(UserMmRuntimeError::NotMapped)?;
+    if !area.flags().is_writable()
+        || state
+            .page_table
+            .as_ref()
+            .ok_or(UserMmRuntimeError::NotMapped)?
+            .translate(page_address)?
+            .is_none()
+    {
+        return Ok(None);
+    }
+
+    let request = state.core.plan_post_install_tlb(page_address)?;
+    let references = crate::page_alloc::reference_count(frame)?;
+    if references > 1 {
+        let allocation = crate::page_alloc::allocate(
+            0,
+            crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+        )?;
+        if let Err(error) =
+            copy_physical_page(frame.start_address(), allocation.start().start_address())
+        {
+            crate::page_alloc::free(allocation)?;
+            return Err(error);
+        }
+        let replaced = match state
+            .page_table
+            .as_mut()
+            .ok_or(UserMmRuntimeError::NotMapped)?
+            .replace_page(page, allocation.start(), area.mapping_options())
+        {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                crate::page_alloc::free(allocation)?;
+                return Err(error.into());
+            }
+        };
+        debug_assert_eq!(replaced, frame);
+        state
+            .pages
+            .get_mut(&page_address.get())
+            .expect("COW page disappeared while user_mm was locked")
+            .backing = PageBacking::Owned(allocation);
+        LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+        release_cow_frame(frame)?;
+    } else if references == 1 {
+        apply_page_protection(
+            state
+                .page_table
+                .as_mut()
+                .ok_or(UserMmRuntimeError::NotMapped)?,
+            page,
+            frame,
+            area,
+        )?;
+    } else {
+        return Err(UserMmRuntimeError::NotMapped);
+    }
+
+    Ok(Some((
+        UserFaultResolution::Recovered(UserFaultRecovery::Anonymous),
+        Some(request),
+    )))
+}
+
 fn map_zero_page_locked(
     state: &mut UserMmState,
     area: VmArea,
@@ -1851,10 +2206,6 @@ fn map_zero_page_locked(
         return Ok(physical);
     }
 
-    state
-        .pages
-        .try_reserve(1)
-        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
     let backing =
         crate::page_alloc::allocate(0, crate::page_alloc::PageAllocationOptions::kernel_zeroed())?;
     let physical = match backing.start().start_address().checked_add(offset) {
@@ -1873,25 +2224,23 @@ fn map_zero_page_locked(
         return Err(error.into());
     }
 
-    state.pages.push(MappedPage {
+    let previous = state.pages.insert(page.start_address().get(), MappedPage {
         page,
         backing: PageBacking::Owned(backing),
     });
+    debug_assert!(previous.is_none());
     LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
     Ok(physical)
 }
 
 fn file_mappings_without_range(
-    mappings: &[FileBackedMapping],
+    mappings: &BTreeMap<usize, FileBackedMapping>,
     removed: VirtRange,
-) -> Result<Vec<FileBackedMapping>, UserMmRuntimeError> {
-    let mut retained = Vec::new();
-    retained
-        .try_reserve(mappings.len().saturating_mul(2))
-        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-    for mapping in mappings {
+) -> Result<BTreeMap<usize, FileBackedMapping>, UserMmRuntimeError> {
+    let mut retained = BTreeMap::new();
+    for mapping in mappings.values() {
         if !mapping.range.overlaps(removed) {
-            retained.push(mapping.clone());
+            retained.insert(mapping.range.start().get(), mapping.clone());
             continue;
         }
         let overlap_start = core::cmp::max(mapping.range.start(), removed.start());
@@ -1902,7 +2251,7 @@ fn file_mappings_without_range(
             let mut fragment = mapping.clone();
             fragment.range = left;
             fragment.file_length = fragment.file_length.min(left.size());
-            retained.push(fragment);
+            retained.insert(fragment.range.start().get(), fragment);
         }
         if overlap_end < mapping.range.end() {
             let right = VirtRange::new(overlap_end, mapping.range.end())
@@ -1918,21 +2267,47 @@ fn file_mappings_without_range(
                 .checked_add(delta as u64)
                 .ok_or(UserMmRuntimeError::AddressOverflow)?;
             fragment.file_length = mapping.file_length.saturating_sub(delta).min(right.size());
-            retained.push(fragment);
+            retained.insert(fragment.range.start().get(), fragment);
         }
     }
     Ok(retained)
+}
+
+fn file_mapping_at(
+    mappings: &BTreeMap<usize, FileBackedMapping>,
+    address: VirtAddr,
+) -> Option<&FileBackedMapping> {
+    mappings
+        .range(..=address.get())
+        .next_back()
+        .map(|(_, mapping)| mapping)
+        .filter(|mapping| mapping.range.contains(address))
+}
+
+fn file_mappings_overlap(mappings: &BTreeMap<usize, FileBackedMapping>, range: VirtRange) -> bool {
+    if file_mapping_at(mappings, range.start()).is_some() {
+        return true;
+    }
+    mappings
+        .range(range.start().get()..range.end().get())
+        .next()
+        .is_some()
 }
 
 fn retire_range_locked(
     state: &mut UserMmState,
     range: VirtRange,
 ) -> Result<RetirementBatch, UserMmRuntimeError> {
-    let count = state
-        .pages
-        .iter()
-        .filter(|mapping| range.contains(mapping.page.start_address()))
-        .count();
+    let mut keys = Vec::new();
+    keys.try_reserve(range.size() / PAGE_SIZE + 1)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    keys.extend(
+        state
+            .pages
+            .range(range.start().get()..range.end().get())
+            .map(|(&key, _)| key),
+    );
+    let count = keys.len();
     if count == 0 {
         return Ok(RetirementBatch::empty());
     }
@@ -1941,10 +2316,11 @@ fn retire_range_locked(
         .page_table
         .as_ref()
         .ok_or(UserMmRuntimeError::NotMapped)?;
-    for mapping in &state.pages {
-        if !range.contains(mapping.page.start_address()) {
-            continue;
-        }
+    for key in &keys {
+        let mapping = state
+            .pages
+            .get(key)
+            .expect("retirement key disappeared during preflight");
         // PROT_NONE deliberately removes the leaf PTE while retaining both
         // the VMA and this backing-owner record.  A later MAP_FIXED/munmap of
         // that range must still retire the owned page; Linux does not reject
@@ -1963,6 +2339,10 @@ fn retire_range_locked(
     backings
         .try_reserve(count)
         .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+    let mut cow_frames = Vec::new();
+    cow_frames
+        .try_reserve(count)
+        .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
     let mut tables = Vec::new();
     tables
         .try_reserve(table_capacity)
@@ -1972,18 +2352,19 @@ fn retire_range_locked(
         range,
     })?;
 
-    let mut index = 0;
-    while index < state.pages.len() {
-        if !range.contains(state.pages[index].page.start_address()) {
-            index += 1;
-            continue;
-        }
-        let mapping = state.pages.swap_remove(index);
+    for key in keys {
+        let mapping = state
+            .pages
+            .remove(&key)
+            .expect("retirement key disappeared after preflight");
         let page_table = state
             .page_table
             .as_mut()
             .expect("retirement preflight lost the user page table");
-        if page_table.translate(mapping.page.start_address())?.is_some() {
+        if page_table
+            .translate(mapping.page.start_address())?
+            .is_some()
+        {
             let frame = page_table.unmap_page(mapping.page)?;
             assert_eq!(
                 frame,
@@ -1994,14 +2375,17 @@ fn retire_range_locked(
         page_table
             .reclaim_empty_tables(mapping.page, &mut tables)
             .expect("user page-table reclamation violated the reviewed topology");
-        if let PageBacking::Owned(allocation) = mapping.backing {
-            backings.push(allocation);
+        match mapping.backing {
+            PageBacking::Owned(allocation) => backings.push(allocation),
+            PageBacking::Cow(frame) => cow_frames.push(frame),
+            PageBacking::Shared(_) => {}
         }
     }
 
     Ok(RetirementBatch {
         request: Some(request),
         backings,
+        cow_frames,
         page_tables: tables,
     })
 }
@@ -2013,6 +2397,9 @@ fn finish_retirement(retirement: RetirementBatch) -> Result<(), UserMmRuntimeErr
     for backing in retirement.backings {
         crate::page_alloc::free(backing)?;
         LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
+    }
+    for frame in retirement.cow_frames {
+        release_cow_frame(frame)?;
     }
     for table in retirement.page_tables {
         crate::page_alloc::free(table)?;
@@ -2053,22 +2440,126 @@ fn shootdown_user_request(request: myos_mm::PerMmTlbRequest) {
     }
 }
 
-fn file_page_cache_lookup(key: (u64, u64, u64)) -> Option<PhysFrame> {
-    FILE_PAGE_CACHE.lock().get(&key).map(PageAllocation::start)
+/// Publish newly valid user leaves on the faulting CPU. New mappings do not
+/// revoke access or free memory, so remote CPUs may recover independently.
+fn flush_post_install_local(request: PerMmTlbRequest) -> Result<(), UserMmRuntimeError> {
+    let restore_enabled = !crate::arch::interrupt::are_disabled();
+    if restore_enabled {
+        crate::arch::interrupt::disable();
+    }
+    let request = match request.local_only(crate::smp::current_cpu_id().get()) {
+        Ok(request) => request,
+        Err(error) => {
+            if restore_enabled {
+                // SAFETY: restore the entry state before propagating failure.
+                unsafe { crate::arch::interrupt::enable() };
+            }
+            return Err(UserMmRuntimeError::from(error));
+        }
+    };
+    crate::tlb::shootdown_user_local(request);
+    if restore_enabled {
+        // SAFETY: restores the enabled state observed above.
+        unsafe { crate::arch::interrupt::enable() };
+    }
+    Ok(())
 }
 
-/// Retain immutable file pages for the kernel lifetime. The fixed 512 MiB
-/// ceiling bounds pinning under the 8 GiB BuildStorm configuration; small
-/// CAgent runs populate only their few dynamic-library pages.
+fn file_fault_request_locked(
+    state: &UserMmState,
+    address: VirtAddr,
+    access: FaultAccess,
+) -> Result<Option<FileFaultRequest>, UserMmRuntimeError> {
+    let Some(mapping) = file_mapping_at(&state.file_mappings, address) else {
+        return Ok(None);
+    };
+    let area = state
+        .core
+        .layout()
+        .find_area(address)
+        .ok_or(UserMmRuntimeError::NotMapped)?;
+    let allowed = match access {
+        FaultAccess::Read => area.flags().is_readable(),
+        FaultAccess::Write => area.flags().is_writable(),
+        FaultAccess::Execute => area.flags().is_executable(),
+    };
+    if !allowed
+        || state
+            .page_table
+            .as_ref()
+            .ok_or(UserMmRuntimeError::NotMapped)?
+            .translate(address)?
+            .is_some()
+    {
+        return Ok(None);
+    }
+    let page = address
+        .align_down(PAGE_SIZE)
+        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+    let delta = page
+        .get()
+        .checked_sub(mapping.range.start().get())
+        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+    let read_length = mapping.file_length.saturating_sub(delta).min(PAGE_SIZE);
+    let file_offset = mapping
+        .file_offset
+        .checked_add(delta as u64)
+        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+    Ok(Some(FileFaultRequest {
+        file: alloc::sync::Arc::clone(&mapping.file),
+        file_offset,
+        read_length,
+        page,
+        cache_key: (
+            mapping.device,
+            mapping.inode,
+            mapping.content_generation,
+            file_offset,
+        ),
+        shared_cache: mapping.shared_cache,
+        generation: mapping.generation,
+    }))
+}
+
+fn file_page_cache_shard(key: FilePageCacheKey) -> usize {
+    let mut hash = key.0
+        ^ key.1.rotate_left(13)
+        ^ key.2.rotate_left(29)
+        ^ (key.3 / PAGE_SIZE as u64).rotate_left(47);
+    // SplitMix64 finalizer: file offsets are page-aligned and therefore have
+    // zero low bits; using those low bits directly collapsed a large ELF into
+    // one shard. Avalanche every input bit before choosing a shard.
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash as usize & (FILE_PAGE_CACHE_SHARDS - 1)
+}
+
+fn file_page_cache_lookup(key: FilePageCacheKey) -> Option<PhysFrame> {
+    let shard = file_page_cache_shard(key);
+    let result = FILE_PAGE_CACHE[shard]
+        .lock()
+        .get(&key)
+        .map(PageAllocation::start);
+    result
+}
+
+/// Retain versioned file pages for the kernel lifetime. The generation in the
+/// key gives writers Linux-like invalidation semantics without freeing frames
+/// that are still mapped by an older process. The fixed 1 GiB ceiling bounds
+/// pinning under the 8 GiB BuildStorm configuration.
 fn file_page_cache_install(
-    key: (u64, u64, u64),
+    key: FilePageCacheKey,
     allocation: PageAllocation,
 ) -> (PageBacking, Option<PageAllocation>) {
-    let mut cache = FILE_PAGE_CACHE.lock();
+    let shard = file_page_cache_shard(key);
+    let mut cache = FILE_PAGE_CACHE[shard].lock();
     if let Some(existing) = cache.get(&key) {
         return (PageBacking::Shared(existing.start()), Some(allocation));
     }
-    if cache.len() >= FILE_PAGE_CACHE_CAPACITY {
+    if cache.len() >= FILE_PAGE_CACHE_CAPACITY_PER_SHARD {
         return (PageBacking::Owned(allocation), None);
     }
     let frame = allocation.start();
@@ -2077,8 +2568,18 @@ fn file_page_cache_install(
 }
 
 fn free_uninstalled_backing(backing: PageBacking) -> Result<(), UserMmRuntimeError> {
-    if let PageBacking::Owned(allocation) = backing {
-        crate::page_alloc::free(allocation)?;
+    match backing {
+        PageBacking::Owned(allocation) => crate::page_alloc::free(allocation)?,
+        PageBacking::Cow(frame) => release_cow_frame(frame)?,
+        PageBacking::Shared(_) => {}
+    }
+    Ok(())
+}
+
+fn release_cow_frame(frame: PhysFrame) -> Result<(), UserMmRuntimeError> {
+    if crate::page_alloc::decrement_reference(frame)? == 0 {
+        crate::page_alloc::free_unreferenced_frame(frame)?;
+        LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
     }
     Ok(())
 }

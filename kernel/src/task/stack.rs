@@ -1,5 +1,13 @@
 use myos_mm::{PAGE_SIZE, VirtRange};
 
+#[cfg(not(debug_assertions))]
+use crate::{
+    irq_lock::IrqSpinLock,
+    lockdep::{LockClass, LockRank},
+};
+#[cfg(not(debug_assertions))]
+use alloc::vec::Vec;
+
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
 const KERNEL_STACK_ALIGNMENT: usize = PAGE_SIZE;
 // M6-B r3: architecture-owned fresh-task bootstrap reserve.
@@ -8,6 +16,12 @@ const KERNEL_STACK_ALIGNMENT: usize = PAGE_SIZE;
 // context is published only after its saved SP is inside mapped memory and a
 // full bootstrap reserve separates it from the upper guard page.
 const FRESH_CONTEXT_HEADROOM: usize = crate::arch::task::FRESH_TASK_STACK_RESERVE;
+
+#[cfg(not(debug_assertions))]
+static STACK_CACHE: IrqSpinLock<Vec<KernelStack>> = IrqSpinLock::new_with_class(
+    Vec::new(),
+    LockClass::new("kernel_stack_cache", LockRank::Vm, 12),
+);
 
 const _: () = {
     assert!(FRESH_CONTEXT_HEADROOM >= 512);
@@ -22,6 +36,13 @@ pub struct KernelStack {
 
 impl KernelStack {
     pub fn allocate() -> Result<Self, crate::vm::KernelVmError> {
+        #[cfg(not(debug_assertions))]
+        if crate::user::buildstorm_runtime_active()
+            && let Some(stack) = STACK_CACHE.lock().pop()
+        {
+            return Ok(stack);
+        }
+
         let allocation = crate::vm::vmalloc(KERNEL_STACK_SIZE, KERNEL_STACK_ALIGNMENT)?;
         let usable = allocation.usable_range();
 
@@ -81,6 +102,18 @@ impl KernelStack {
             .expect("kernel stack allocation disappeared before destroy");
 
         crate::vm::vfree(allocation)
+    }
+
+    /// Cache hot BuildStorm stacks instead of globally invalidating 16 kernel
+    /// mappings for every short-lived cargo/rustc helper. The mapping and
+    /// backing remain owned by the cache and are safely reused by a later task.
+    pub fn recycle(self) -> Result<(), crate::vm::KernelVmError> {
+        #[cfg(not(debug_assertions))]
+        if crate::user::buildstorm_runtime_active() {
+            STACK_CACHE.lock().push(self);
+            return Ok(());
+        }
+        self.destroy()
     }
 }
 

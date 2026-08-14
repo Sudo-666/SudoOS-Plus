@@ -62,6 +62,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
     const SUPERVISOR_TIMER: usize = 5;
     const SUPERVISOR_EXTERNAL: usize = 9;
 
+    crate::task::repair_current_cpu_from_stack();
     validate_trap_frame(frame);
 
     if frame.is_interrupt() {
@@ -116,6 +117,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
     const IPI_INTERRUPT_BIT: usize = 1 << 12;
     const SUPPORTED_INTERRUPT_BITS: usize = TIMER_INTERRUPT_BIT | IPI_INTERRUPT_BIT;
 
+    crate::task::repair_current_cpu_from_stack();
     validate_trap_frame(frame);
 
     match frame.exception_code() {

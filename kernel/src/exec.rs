@@ -1,11 +1,73 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: richer auxv for libc startup probes.
 // SUDOOS_M16A_ELF_AUXV_PATCH_V1
 // SUDOOS_M16B_DYNAMIC_ELF: PT_INTERP interpreter loading and dynamic-linker handoff.
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use myos_mm::{PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
 
 use crate::process::{Process, Thread};
 use crate::user_mm::{UserMm, UserMmRuntimeError};
+use crate::{
+    irq_lock::IrqSpinLock,
+    lockdep::{LockClass, LockRank},
+};
+
+const EXEC_IMAGE_CACHE_LIMIT: usize = 1024 * 1024 * 1024;
+static EXEC_IMAGE_CACHE: IrqSpinLock<BTreeMap<ExecCacheKey, Arc<Vec<u8>>>> =
+    IrqSpinLock::new_with_class(
+        BTreeMap::new(),
+        LockClass::new("exec_image_cache", LockRank::Vfs, 1),
+    );
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ExecCacheKey {
+    dev: u64,
+    ino: u64,
+    size: i64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+}
+
+impl ExecCacheKey {
+    pub const fn from_stat(stat: myos_vfs::Stat) -> Self {
+        Self {
+            dev: stat.dev,
+            ino: stat.ino,
+            size: stat.size,
+            mtime_sec: stat.mtime_sec,
+            mtime_nsec: stat.mtime_nsec,
+        }
+    }
+}
+
+pub fn cached_exec_image(key: ExecCacheKey) -> Option<Arc<Vec<u8>>> {
+    EXEC_IMAGE_CACHE.lock().get(&key).cloned()
+}
+
+pub fn retain_exec_image(key: ExecCacheKey, image: Vec<u8>) -> Arc<Vec<u8>> {
+    let mut cache = EXEC_IMAGE_CACHE.lock();
+    if let Some(existing) = cache.get(&key) {
+        return Arc::clone(existing);
+    }
+    let retained = Arc::new(image);
+    let used = cache.values().fold(0_usize, |sum, entry| sum.saturating_add(entry.len()));
+    if used.saturating_add(retained.len()) <= EXEC_IMAGE_CACHE_LIMIT {
+        cache.insert(key, Arc::clone(&retained));
+    }
+    retained
+}
+
+#[derive(Clone)]
+pub struct ExecFileBacking {
+    pub file: myos_vfs::ArcFile,
+    pub device: u64,
+    pub inode: u64,
+    pub content_generation: u64,
+    pub shared_cache: bool,
+}
+
+pub const fn stat_content_generation(stat: myos_vfs::Stat) -> u64 {
+    (stat.mtime_sec as u64) ^ (stat.mtime_nsec as u64).rotate_left(32)
+}
 
 // Keep the signal trampoline immediately below the production TLS/stack
 // reservation. Large fixed-address toolchain executables legitimately cover
@@ -205,6 +267,14 @@ const INTERP_LOAD_BIAS: usize = 0x2000_0000;
 const MAX_EXEC_IMAGE: usize = 128 * 1024 * 1024;
 
 pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec, ExecError> {
+    prepare_elf_backed(image, None, config)
+}
+
+pub fn prepare_elf_backed(
+    image: &[u8],
+    main_backing: Option<&ExecFileBacking>,
+    config: ExecConfig<'_>,
+) -> Result<PreparedExec, ExecError> {
     let elf = crate::elf::parse(image)?;
 
     // Validate ELF kind and load_bias invariants.
@@ -222,7 +292,8 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
     }
 
     // Load the ELF interpreter if this binary has PT_INTERP.
-    let interp_image: Option<Vec<u8>>;
+    let interp_image: Option<Arc<Vec<u8>>>;
+    let interp_backing: Option<ExecFileBacking>;
     let interp_elf: Option<crate::elf::ElfImage>;
     let interp_entry: Option<VirtAddr>;
     let main_entry: Option<VirtAddr>;
@@ -240,8 +311,8 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
             interpreter_path.as_str()
         };
         // Read the interpreter binary from the VFS.
-        let interp_bytes = match load_exec_image_from_vfs(interpreter_load_path) {
-            Ok(bytes) => bytes,
+        let (interp_bytes, backing) = match load_exec_image_from_vfs(interpreter_load_path) {
+            Ok(source) => source,
             Err(e) => {
                 crate::println!(
                     "exec: interp={} open-failed reason={}",
@@ -273,6 +344,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
             .program_headers
             .map(|info| (info.virtual_address, info.entry_size, info.count));
         interp_image = Some(interp_bytes);
+        interp_backing = Some(backing);
         interp_elf = Some(parsed);
     } else {
         interp_entry = None;
@@ -280,6 +352,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         interp_base = None;
         main_phdr = None;
         interp_image = None;
+        interp_backing = None;
         interp_elf = None;
     }
 
@@ -321,7 +394,7 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
     let stack_pointer = match (|| {
         // Load main ELF segments.
         for segment in &elf.segments {
-            load_segment(&mm, image, *segment)?;
+            load_segment_backed(&mm, image, *segment, main_backing)?;
         }
         // Apply static PIE relocations on the MAIN binary ONLY if it has
         // no PT_INTERP (true static PIE).  Dynamically-linked binaries
@@ -339,21 +412,15 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
         // Load interpreter segments if present.
         if let (Some(interp_data), Some(interp)) = (interp_image.as_ref(), interp_elf.as_ref()) {
             for segment in &interp.segments {
-                load_segment(&mm, interp_data, *segment)?;
+                load_segment_backed(&mm, interp_data, *segment, interp_backing.as_ref())?;
             }
-            // RISC-V's bundled interpreter currently relies on the kernel's
-            // bootstrap relocation pass.  The LoongArch glibc loader is a
-            // self-relocating static PIE: pre-applying its RELR table here
-            // makes rtld apply the load bias a second time (for example
-            // 0x200011b0 becomes 0x400011b0 in _rtld_global_ro callbacks).
-            // Keep static-PIE main binaries on apply_static_pie_relocations,
-            // but let a LoongArch PT_INTERP loader relocate itself exactly
-            // once.
-            #[cfg(target_arch = "riscv64")]
-            apply_static_pie_relocations(&mm, interp_data, interp)?;
-            #[cfg(target_arch = "loongarch64")]
+            // A PT_INTERP loader is itself a self-relocating static PIE.  The
+            // kernel only maps it and supplies AT_BASE; rtld must perform its
+            // bootstrap relocation exactly once. Applying the same relative
+            // relocation in both the kernel and rtld would add the load bias
+            // twice and is not part of the Linux exec contract.
             if crate::user::oscomp_verbose_user_trace_active() {
-                crate::println!("exec-reloc-la: defer interpreter self-relocation");
+                crate::println!("exec-reloc: defer interpreter self-relocation");
             }
         }
         mm.copy_to_user(USER_SIGNAL_TRAMPOLINE, SIGNAL_TRAMPOLINE_BYTES)?;
@@ -390,13 +457,25 @@ pub fn prepare_elf(image: &[u8], config: ExecConfig<'_>) -> Result<PreparedExec,
 }
 
 /// Read an ELF image from the VFS by path. Used for loading the dynamic linker.
-fn load_exec_image_from_vfs(path: &str) -> Result<Vec<u8>, ExecError> {
+fn load_exec_image_from_vfs(path: &str) -> Result<(Arc<Vec<u8>>, ExecFileBacking), ExecError> {
     match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
         Ok(file) => {
             let stat = file.fstat().map_err(ExecError::from)?;
             let size = usize::try_from(stat.size).map_err(|_| ExecError::AddressOverflow)?;
             if size > MAX_EXEC_IMAGE {
                 return Err(ExecError::AddressOverflow);
+            }
+            let key = ExecCacheKey::from_stat(stat);
+            let cacheable = exec_path_is_immutable(path);
+            let backing = ExecFileBacking {
+                file: Arc::clone(&file),
+                device: stat.dev,
+                inode: stat.ino,
+                content_generation: stat_content_generation(stat),
+                shared_cache: true,
+            };
+            if cacheable && let Some(image) = cached_exec_image(key) {
+                return Ok((image, backing));
             }
             let mut image = Vec::new();
             image
@@ -406,10 +485,22 @@ fn load_exec_image_from_vfs(path: &str) -> Result<Vec<u8>, ExecError> {
             let mut output = myos_vfs::MutableIoBuffer::new(&mut image);
             let read = file.read(&mut output).map_err(ExecError::from)?;
             image.truncate(read);
-            Ok(image)
+            let image = if cacheable {
+                retain_exec_image(key, image)
+            } else {
+                Arc::new(image)
+            };
+            Ok((image, backing))
         }
         Err(errno) => Err(ExecError::Vfs(errno)),
     }
+}
+
+pub fn exec_path_is_immutable(path: &str) -> bool {
+    path.starts_with("/mnt/sdcard/")
+        || path.contains("/.rustup/")
+        || path.starts_with("/work/tgoskits/")
+        || path.starts_with("/tmp/sudoos-buildstorm-bin/")
 }
 
 fn build_mm(
@@ -452,6 +543,46 @@ fn load_segment(
     if page_start < page_end && page_start & (PAGE_SIZE - 1) != 0 {
         mm.populate_page(VirtAddr::new(page_start))?;
     }
+    Ok(())
+}
+
+fn load_segment_backed(
+    mm: &UserMm,
+    image: &[u8],
+    segment: crate::elf::LoadSegment,
+    backing: Option<&ExecFileBacking>,
+) -> Result<(), ExecError> {
+    let Some(backing) = backing else {
+        return load_segment(mm, image, segment);
+    };
+
+    // Writable LOAD segments contain process-private GOT/data and must be
+    // materialized before relocation. Immutable text/rodata instead follows
+    // the Linux filemap model: register the aligned file interval and fault
+    // physical pages into every process from the global page cache.
+    if segment.flags.is_writable() {
+        return load_segment(mm, image, segment);
+    }
+
+    let in_page = segment.virtual_address.get() & (PAGE_SIZE - 1);
+    let file_offset = segment
+        .file_offset
+        .checked_sub(in_page)
+        .ok_or(ExecError::AddressOverflow)?;
+    let file_length = in_page
+        .checked_add(segment.file_size)
+        .ok_or(ExecError::AddressOverflow)?
+        .min(segment.range.size());
+    mm.register_file_mapping(
+        segment.range,
+        file_offset as u64,
+        file_length,
+        backing.device,
+        backing.inode,
+        backing.content_generation,
+        backing.shared_cache,
+        Arc::clone(&backing.file),
+    )?;
     Ok(())
 }
 

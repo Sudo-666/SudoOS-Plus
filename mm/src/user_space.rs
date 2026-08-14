@@ -1,3 +1,4 @@
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
@@ -125,25 +126,149 @@ impl UserFaultPlan {
 /// owns VMA metadata, the generation-tagged ASID, `mm_cpumask` equivalent, and
 /// the per-mm TLB sequence number. Keeping hardware ownership out of this crate
 /// makes all state-machine rules host-testable.
-pub struct UserAddressSpace<const VMA_CAPACITY: usize> {
-    layout: AddressSpace<VMA_CAPACITY>,
-    asid: AsidToken,
+struct UserTlbState {
     active_cpus: AtomicCpuMask,
     tlb_generation: AtomicU64,
 }
 
-impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
-    pub const fn new(user_range: VirtRange, asid: AsidToken) -> Self {
+/// Atomically shared, layout-independent half of an mm context.
+///
+/// The scheduler may enter or leave an address space without taking the VMA
+/// or page-table lock. This mirrors Linux's split between mmap/page-table
+/// locking and the atomic `mm_cpumask`/TLB-generation protocol.
+#[derive(Clone)]
+pub struct UserTlbContext {
+    asid: AsidToken,
+    state: Arc<UserTlbState>,
+}
+
+impl UserTlbContext {
+    fn new(asid: AsidToken) -> Self {
         Self {
-            layout: AddressSpace::new(user_range),
             asid,
-            active_cpus: AtomicCpuMask::new(CpuMask::EMPTY),
-            tlb_generation: AtomicU64::new(0),
+            state: Arc::new(UserTlbState {
+                active_cpus: AtomicCpuMask::new(CpuMask::EMPTY),
+                tlb_generation: AtomicU64::new(0),
+            }),
         }
     }
 
     pub const fn asid(&self) -> AsidToken {
         self.asid
+    }
+
+    pub fn tlb_generation(&self) -> u64 {
+        self.state.tlb_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn enter_cpu_after_local_sync(
+        &self,
+        cpu: usize,
+        current_asid_generation: u64,
+        synchronized_tlb_generation: u64,
+    ) -> Result<(), UserMmError> {
+        if !self.asid.is_current(current_asid_generation) {
+            return Err(UserMmError::AsidMismatch);
+        }
+
+        self.state.active_cpus.insert(cpu, Ordering::SeqCst)?;
+        let observed = self.tlb_generation();
+        if observed != synchronized_tlb_generation {
+            self.state.active_cpus.remove(cpu, Ordering::SeqCst)?;
+            return Err(UserMmError::TlbGenerationMismatch {
+                expected: synchronized_tlb_generation,
+                observed,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn leave_cpu_after_local_flush(
+        &self,
+        cpu: usize,
+        flushed_tlb_generation: u64,
+    ) -> Result<(), UserMmError> {
+        let observed = self.tlb_generation();
+        if observed != flushed_tlb_generation {
+            return Err(UserMmError::TlbGenerationMismatch {
+                expected: flushed_tlb_generation,
+                observed,
+            });
+        }
+        self.state.active_cpus.remove(cpu, Ordering::SeqCst)?;
+        Ok(())
+    }
+
+    pub fn active_cpus(&self) -> CpuMask {
+        self.state.active_cpus.load(Ordering::SeqCst)
+    }
+
+    pub fn assert_inactive_for_destroy(&self) -> Result<(), UserMmError> {
+        if self.active_cpus().is_empty() {
+            Ok(())
+        } else {
+            Err(UserMmError::ActiveOnCpu)
+        }
+    }
+
+    pub fn plan_tlb_request(&self, flush: TlbFlush) -> Result<PerMmTlbRequest, UserMmError> {
+        let expected_scope = TlbScope::AddressSpace(self.asid.id());
+        let scope_matches = match flush {
+            TlbFlush::All { scope }
+            | TlbFlush::Page { scope, .. }
+            | TlbFlush::Range { scope, .. } => scope == expected_scope,
+        };
+        if !scope_matches {
+            return Err(UserMmError::AsidMismatch);
+        }
+
+        let generation = self.next_tlb_generation()?;
+        Ok(PerMmTlbRequest {
+            asid: self.asid,
+            targets: self.active_cpus(),
+            flush,
+            generation,
+        })
+    }
+
+    fn next_tlb_generation(&self) -> Result<u64, UserMmError> {
+        let mut current = self.state.tlb_generation.load(Ordering::SeqCst);
+        loop {
+            let next = current
+                .checked_add(1)
+                .ok_or(UserMmError::TlbGenerationOverflow)?;
+            match self.state.tlb_generation.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+pub struct UserAddressSpace<const VMA_CAPACITY: usize> {
+    layout: AddressSpace<VMA_CAPACITY>,
+    tlb: UserTlbContext,
+}
+
+impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
+    pub fn new(user_range: VirtRange, asid: AsidToken) -> Self {
+        Self {
+            layout: AddressSpace::new(user_range),
+            tlb: UserTlbContext::new(asid),
+        }
+    }
+
+    pub const fn asid(&self) -> AsidToken {
+        self.tlb.asid()
+    }
+
+    pub fn tlb_context(&self) -> UserTlbContext {
+        self.tlb.clone()
     }
 
     pub const fn layout(&self) -> &AddressSpace<VMA_CAPACITY> {
@@ -155,7 +280,7 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
     }
 
     pub fn tlb_generation(&self) -> u64 {
-        self.tlb_generation.load(Ordering::SeqCst)
+        self.tlb.tlb_generation()
     }
 
     /// Publish this CPU only after installing the hardware root and bringing
@@ -170,20 +295,11 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
         current_asid_generation: u64,
         synchronized_tlb_generation: u64,
     ) -> Result<(), UserMmError> {
-        if !self.asid.is_current(current_asid_generation) {
-            return Err(UserMmError::AsidMismatch);
-        }
-
-        self.active_cpus.insert(cpu, Ordering::SeqCst)?;
-        let observed = self.tlb_generation();
-        if observed != synchronized_tlb_generation {
-            self.active_cpus.remove(cpu, Ordering::SeqCst)?;
-            return Err(UserMmError::TlbGenerationMismatch {
-                expected: synchronized_tlb_generation,
-                observed,
-            });
-        }
-        Ok(())
+        self.tlb.enter_cpu_after_local_sync(
+            cpu,
+            current_asid_generation,
+            synchronized_tlb_generation,
+        )
     }
 
     /// Clear this CPU only after the next root is active and the departed ASID
@@ -194,27 +310,16 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
         cpu: usize,
         flushed_tlb_generation: u64,
     ) -> Result<(), UserMmError> {
-        let observed = self.tlb_generation();
-        if observed != flushed_tlb_generation {
-            return Err(UserMmError::TlbGenerationMismatch {
-                expected: flushed_tlb_generation,
-                observed,
-            });
-        }
-        self.active_cpus.remove(cpu, Ordering::SeqCst)?;
-        Ok(())
+        self.tlb
+            .leave_cpu_after_local_flush(cpu, flushed_tlb_generation)
     }
 
     pub fn active_cpus(&self) -> CpuMask {
-        self.active_cpus.load(Ordering::SeqCst)
+        self.tlb.active_cpus()
     }
 
     pub fn assert_inactive_for_destroy(&self) -> Result<(), UserMmError> {
-        if self.active_cpus().is_empty() {
-            Ok(())
-        } else {
-            Err(UserMmError::ActiveOnCpu)
-        }
+        self.tlb.assert_inactive_for_destroy()
     }
 
     pub fn map_area(&mut self, area: VmArea) -> Result<(), UserMmError> {
@@ -333,7 +438,7 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
             .align_down(PAGE_SIZE)
             .ok_or(UserMmError::AddressOverflow)?;
         self.plan_tlb_request(TlbFlush::Page {
-            scope: TlbScope::AddressSpace(self.asid.id()),
+            scope: TlbScope::AddressSpace(self.asid().id()),
             address: page,
         })
     }
@@ -435,41 +540,7 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
     /// Build a per-mm request from a snapshot of `active_cpus`. The kernel must
     /// not hold its page-table lock while waiting for remote acknowledgements.
     pub fn plan_tlb_request(&self, flush: TlbFlush) -> Result<PerMmTlbRequest, UserMmError> {
-        let expected_scope = TlbScope::AddressSpace(self.asid.id());
-        let scope_matches = match flush {
-            TlbFlush::All { scope }
-            | TlbFlush::Page { scope, .. }
-            | TlbFlush::Range { scope, .. } => scope == expected_scope,
-        };
-        if !scope_matches {
-            return Err(UserMmError::AsidMismatch);
-        }
-
-        let generation = self.next_tlb_generation()?;
-        Ok(PerMmTlbRequest {
-            asid: self.asid,
-            targets: self.active_cpus(),
-            flush,
-            generation,
-        })
-    }
-
-    fn next_tlb_generation(&self) -> Result<u64, UserMmError> {
-        let mut current = self.tlb_generation.load(Ordering::SeqCst);
-        loop {
-            let next = current
-                .checked_add(1)
-                .ok_or(UserMmError::TlbGenerationOverflow)?;
-            match self.tlb_generation.compare_exchange_weak(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return Ok(next),
-                Err(observed) => current = observed,
-            }
-        }
+        self.tlb.plan_tlb_request(flush)
     }
 }
 

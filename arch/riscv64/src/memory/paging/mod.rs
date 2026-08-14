@@ -81,9 +81,12 @@ pub unsafe fn switch_user_address_space(root: myos_mm::PhysFrame, asid: myos_mm:
     let satp = (SATP_MODE_SV39 << SATP_MODE_SHIFT) | (asid_value << SATP_ASID_SHIFT) | ppn;
 
     /*
-     * SATP does not order ordinary page-table stores against implicit
-     * page-table reads. Keep publication, root/ASID selection, and local
-     * invalidation in one non-interruptible instruction sequence.
+     * SATP does not order ordinary page-table stores against implicit reads,
+     * so publish the table before selecting it. Do not invalidate a stable
+     * ASID here: UserMm's per-CPU TLB generation performs the required fence
+     * on first use, ASID reuse, or after an inactive invalidation. Retaining
+     * translations across ordinary context switches is the main reason Linux
+     * assigns ASIDs in the first place.
      */
     // SAFETY: the caller guarantees that `root` and every reachable page-table
     // page remain alive and that this hart's address-space switch is serialized.
@@ -92,10 +95,7 @@ pub unsafe fn switch_user_address_space(root: myos_mm::PhysFrame, asid: myos_mm:
     unsafe {
         core::arch::asm!(
             "fence rw, rw",
-            "sfence.vma zero, {asid}",
             "csrw satp, {satp}",
-            "sfence.vma zero, {asid}",
-            asid = in(reg) asid_value,
             satp = in(reg) satp,
             options(nostack),
         );

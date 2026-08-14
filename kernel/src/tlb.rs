@@ -18,7 +18,7 @@ use crate::{
     tracked_spin::TrackedSpinLock,
 };
 
-const SHOOTDOWN_TIMEOUT_SECONDS: u64 = 5;
+const SHOOTDOWN_TIMEOUT_SECONDS: u64 = 30;
 const RANGE_PAGE_FLUSH_LIMIT: usize = 32;
 
 const REQUEST_FREE: u8 = 0;
@@ -231,8 +231,10 @@ pub fn shootdown(flush: TlbFlush) {
     crate::context::assert_interrupts_enabled();
     crate::context::assert_task_context();
 
-    // Pin before sampling the caller CPU and lifecycle masks.
-    let migration_guard = crate::task::MigrationGuard::new();
+    // The serializer guard pins this task. Acquire it before sampling CPU
+    // identity and target masks so no second, redundant MigrationGuard is
+    // needed around the request.
+    let serializer = acquire_serializer();
     let current = crate::smp::current_cpu_id();
     let current_bit = cpu_bit(current);
 
@@ -256,10 +258,6 @@ pub fn shootdown(flush: TlbFlush) {
         targets, 0,
         "multi-CPU TLB request lost every remote target after migration was disabled",
     );
-
-    // Interrupts remain enabled while contending and waiting. This CPU must be
-    // able to service another CPU's shootdown/call-function request.
-    let serializer = acquire_serializer(current);
 
     let request_id = NEXT_REQUEST_ID
         .fetch_add(1, Ordering::AcqRel)
@@ -289,7 +287,6 @@ pub fn shootdown(flush: TlbFlush) {
     COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
 
     drop(serializer);
-    drop(migration_guard);
 }
 
 /// Executes one synchronous, exact-target TLB request for a user address space.
@@ -306,7 +303,16 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
     let requested = usize::try_from(request.targets().bits())
         .expect("per-mm CPU mask exceeds the kernel target-mask width");
     let flush = request.flush();
-    let migration_guard = crate::task::MigrationGuard::new();
+
+    if requested == 0 {
+        COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // Pin through the serializer before reading current CPU. Even a local-only
+    // request uses this short critical section so the target comparison cannot
+    // race migration.
+    let serializer = acquire_serializer();
     let current = crate::smp::current_cpu_id();
     let current_bit = cpu_bit(current);
     let online = crate::smp::online_cpu_mask();
@@ -330,25 +336,18 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
          requested={requested:#x} ready={ready:#x}",
     );
 
-    if requested == 0 {
-        COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-        drop(migration_guard);
-        return;
-    }
-
     let targets = requested & !current_bit;
     if targets == 0 {
         if requested & current_bit != 0 {
             flush_local(flush);
         }
         COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-        drop(migration_guard);
+        drop(serializer);
         return;
     }
 
-    // Reuse the same serializer as kernel-wide requests.  Interrupts remain
-    // enabled so this CPU can acknowledge another CPU's request while waiting.
-    let serializer = acquire_serializer(current);
+    // Interrupts remain enabled so this CPU can acknowledge another CPU's
+    // request while waiting.
     let request_id = NEXT_REQUEST_ID
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
@@ -371,7 +370,6 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
     COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
 
     drop(serializer);
-    drop(migration_guard);
 }
 
 /// Executes an ASID-scoped request that is known to target only this CPU.
@@ -435,7 +433,7 @@ pub fn handle_shootdown_ipi() {
     REQUEST.complete_for(cpu);
 }
 
-fn acquire_serializer(current: CpuId) -> crate::tracked_spin::TrackedSpinLockGuard<'static, ()> {
+fn acquire_serializer() -> crate::tracked_spin::TrackedSpinLockGuard<'static, ()> {
     let deadline = timeout_deadline();
 
     loop {
@@ -449,7 +447,7 @@ fn acquire_serializer(current: CpuId) -> crate::tracked_spin::TrackedSpinLockGua
             crate::smp::dump_cpu_states();
             panic!(
                 "timed out acquiring the TLB shootdown serializer: cpu={}",
-                current.get(),
+                crate::smp::current_cpu_id().get(),
             );
         }
         spin_loop();

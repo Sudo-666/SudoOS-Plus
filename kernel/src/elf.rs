@@ -73,6 +73,8 @@ pub enum ElfKind {
 
 #[derive(Clone, Copy)]
 pub struct LoadSegment {
+    pub range: VirtRange,
+    pub flags: VmAreaFlags,
     pub virtual_address: VirtAddr,
     pub memory_size: usize,
     pub file_offset: usize,
@@ -229,6 +231,8 @@ fn parse_impl(image: &[u8], bias_override: Option<usize>) -> Result<ElfImage, El
                 segments.try_reserve(1).map_err(|_| ElfError::OutOfMemory)?;
                 areas.push(area);
                 segments.push(LoadSegment {
+                    range,
+                    flags,
                     virtual_address: VirtAddr::new(adjusted_virtual_address),
                     memory_size,
                     file_offset,
