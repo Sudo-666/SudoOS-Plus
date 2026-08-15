@@ -7,7 +7,7 @@ use core::{
 use myos_mm::{PAGE_SIZE, PageAllocation, PhysAddr, VirtAddr};
 use virtio_drivers::{
     BufferDirection, Hal,
-    device::blk::{SECTOR_SIZE, VirtIOBlk},
+    device::blk::{BlkReq, BlkResp, SECTOR_SIZE, VirtIOBlk},
     transport::{
         DeviceType, Transport,
         mmio::{MmioTransport, VirtIOHeader},
@@ -335,62 +335,93 @@ unsafe impl Hal for SudoHal {
     }
 }
 
-// BUILDSTORM_BLOCK_IO_FASTPATH_V16
-const BLOCK_IO_BOUNCE_BYTES: usize = 1024 * 1024;
+// Slotted concurrent reads. The single shared bounce buffer and the blocking
+// read_blocks() call serialized every disk read behind BLK_LOCK, and the
+// driver's internal wait busy-spins with interrupts disabled — every CPU
+// wanting a disk block convoyed on the lock with timers off, and the
+// BuildStorm syscall accounting shows several CPUs continuously blocked in
+// read(). The virtqueue holds QUEUE_SIZE descriptors, so the device can
+// service several requests concurrently; give each read its own slot so a
+// submit never waits for an earlier request to complete.
+//
+// A read claims a free slot, submits its descriptor chain, releases the
+// lock and yields. Any CPU that next takes the lock drains completions —
+// the used ring is FIFO, so finished chains must be popped in order and
+// their slots finished (copy to the caller, free per-request DMA buffers)
+// before later chains become reachable.
+const BLK_READ_SLOTS: usize = 5;
+const BLK_SLOT_BUFFER_BYTES: usize = 128 * 1024;
 
-struct BlockIoBounce {
-    allocation: PageAllocation,
-    capacity: usize,
+enum BlkReadSlotState {
+    Free,
+    InFlight {
+        token: u16,
+        len: usize,
+        dst: usize,
+        dma: Option<PageAllocation>,
+    },
+    Done {
+        result: Result<(), BlockError>,
+    },
 }
 
-impl BlockIoBounce {
-    fn new(capacity: usize) -> Result<Self, BlockError> {
-        if capacity == 0 || capacity % SECTOR_SIZE != 0 {
-            return Err(BlockError::InvalidArgument);
-        }
+struct BlkReadSlot {
+    state: BlkReadSlotState,
+    req: BlkReq,
+    resp: BlkResp,
+    buffer: PageAllocation,
+}
 
-        let pages = capacity
-            .checked_add(PAGE_SIZE - 1)
-            .ok_or(BlockError::AddressOverflow)?
+impl BlkReadSlot {
+    fn new() -> Option<Self> {
+        let pages = BLK_SLOT_BUFFER_BYTES
+            .checked_add(PAGE_SIZE - 1)?
             / PAGE_SIZE;
-        let rounded_pages = pages
-            .checked_next_power_of_two()
-            .ok_or(BlockError::AddressOverflow)?;
-        let order = rounded_pages.trailing_zeros() as usize;
+        let rounded = pages.checked_next_power_of_two()?;
         let allocation =
-            page_alloc::allocate(order, PageAllocationOptions::dma32_zeroed())
-                .map_err(|_| BlockError::MetadataOutOfMemory)?;
-
-        if allocation.size() < capacity {
+            page_alloc::allocate(rounded.trailing_zeros() as usize, PageAllocationOptions::dma32_zeroed())
+                .ok()?;
+        if allocation.size() < BLK_SLOT_BUFFER_BYTES {
             let _ = page_alloc::free(allocation);
-            return Err(BlockError::MetadataOutOfMemory);
+            return None;
         }
-
-        Ok(Self {
-            allocation,
-            capacity,
+        Some(Self {
+            state: BlkReadSlotState::Free,
+            req: BlkReq::default(),
+            resp: BlkResp::default(),
+            buffer: allocation,
         })
     }
+}
 
-    fn buffer_mut(&mut self, length: usize) -> Result<&mut [u8], BlockError> {
-        if length == 0 || length > self.capacity {
-            return Err(BlockError::InvalidArgument);
-        }
+/// A submit that failed only because the virtqueue ran out of descriptors
+/// is retried after completions drain; everything else is fatal.
+enum SubmitFailure {
+    QueueFull,
+    Fatal(BlockError),
+}
 
-        let pointer = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(
-            self.allocation.range().start(),
-        )
-        .map_err(|_| BlockError::InvalidArgument)?;
+fn map_submit_error(error: virtio_drivers::Error) -> SubmitFailure {
+    match error {
+        virtio_drivers::Error::QueueFull => SubmitFailure::QueueFull,
+        _ => SubmitFailure::Fatal(BlockError::InvalidArgument),
+    }
+}
 
-        // SAFETY: this device owns the contiguous DMA32 allocation for the
-        // kernel lifetime, and the block lock provides exclusive access.
-        Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
+/// Releases the CPU while waiting for device completions. Called without
+/// the block lock. Callers that arrive with interrupts disabled (block
+/// cache) cannot context-switch and fall back to a plain spin.
+fn wait_for_io() {
+    if crate::arch::interrupt::are_disabled() {
+        core::hint::spin_loop();
+    } else {
+        crate::task::yield_now();
     }
 }
 
 struct VirtioBlockState<T: Transport + Send + 'static> {
     driver: VirtIOBlk<SudoHal, T>,
-    bounce: Option<BlockIoBounce>,
+    read_slots: Vec<BlkReadSlot>,
 }
 
 struct VirtioBlockDevice<T: Transport + Send + 'static> {
@@ -407,17 +438,24 @@ impl<T: Transport + Send + 'static> VirtioBlockDevice<T> {
         read_only: bool,
         mmio_mapping: Option<crate::vm::KernelIoMapping>,
     ) -> Self {
-        let bounce = BlockIoBounce::new(BLOCK_IO_BOUNCE_BYTES).ok();
+        let mut read_slots = Vec::new();
+        if read_slots.try_reserve(BLK_READ_SLOTS).is_ok() {
+            for _ in 0..BLK_READ_SLOTS {
+                let Some(slot) = BlkReadSlot::new() else {
+                    break;
+                };
+                read_slots.push(slot);
+            }
+        }
         crate::println!(
-            "  block DMA bounce: {} KiB",
-            bounce
-                .as_ref()
-                .map_or(0, |buffer| buffer.capacity / 1024),
+            "  block read slots: {} x {} KiB",
+            read_slots.len(),
+            BLK_SLOT_BUFFER_BYTES / 1024,
         );
 
         Self {
             state: IrqSpinLock::new_with_class(
-                VirtioBlockState { driver, bounce },
+                VirtioBlockState { driver, read_slots },
                 BLK_LOCK,
             ),
             block_count,
@@ -426,41 +464,204 @@ impl<T: Transport + Send + 'static> VirtioBlockDevice<T> {
         }
     }
 
+    fn allocation_buffer_mut(
+        allocation: &PageAllocation,
+        length: usize,
+    ) -> Result<&mut [u8], BlockError> {
+        if length == 0 || length > allocation.size() {
+            return Err(BlockError::InvalidArgument);
+        }
+
+        let pointer = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(
+            allocation.range().start(),
+        )
+        .map_err(|_| BlockError::InvalidArgument)?;
+
+        // SAFETY: this device owns the contiguous DMA32 allocation for the
+        // kernel lifetime, and the block lock provides exclusive access.
+        Ok(unsafe { core::slice::from_raw_parts_mut(pointer, length) })
+    }
+
+    /// Pops every slot read the device has finished, in used-ring order,
+    /// copying each into its caller and freeing per-request DMA buffers.
+    fn drain_reads(state: &mut VirtioBlockState<T>) {
+        while let Some(token) = state.driver.peek_used() {
+            let Some(index) = state.read_slots.iter().position(|slot| {
+                matches!(
+                    slot.state,
+                    BlkReadSlotState::InFlight { token: pending, .. } if pending == token
+                )
+            }) else {
+                // The head chain belongs to the blocking writer, which drains
+                // through this helper before waiting for its own token.
+                break;
+            };
+            let slot = &mut state.read_slots[index];
+            let BlkReadSlotState::InFlight { token, len, dst, dma } =
+                core::mem::replace(&mut slot.state, BlkReadSlotState::Free)
+            else {
+                unreachable!("slot token match raced");
+            };
+            let result = {
+                let allocation = match &dma {
+                    Some(allocation) => allocation,
+                    None => &slot.buffer,
+                };
+                match Self::allocation_buffer_mut(allocation, len) {
+                    Ok(buffer) => {
+                        // SAFETY: `req`, `buffer` and `resp` are the exact
+                        // buffers submitted for `token`, and the slot has
+                        // not been reused since the submit.
+                        let complete = unsafe {
+                            state
+                                .driver
+                                .complete_read_blocks(token, &slot.req, buffer, &mut slot.resp)
+                        };
+                        match complete {
+                            Ok(_) => {
+                                // SAFETY: `dst` is the submitting caller's
+                                // output, which stays valid until this slot
+                                // publishes Done. This is its only writer.
+                                unsafe {
+                                    core::ptr::copy_nonoverlapping(
+                                        buffer.as_ptr(),
+                                        dst as *mut u8,
+                                        len,
+                                    );
+                                }
+                                Ok(())
+                            }
+                            Err(_) => Err(BlockError::InvalidArgument),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            if let Some(allocation) = dma {
+                let _ = page_alloc::free(allocation);
+            }
+            slot.state = BlkReadSlotState::Done { result };
+        }
+    }
+
+    /// Fills one free slot with a read request and submits it to the
+    /// device. On success the slot owns the request until it drains.
+    fn submit_read(
+        state: &mut VirtioBlockState<T>,
+        index: usize,
+        block: usize,
+        dst: usize,
+        len: usize,
+        big: &mut Option<(PageAllocation, &'static mut [u8])>,
+    ) -> Result<(), SubmitFailure> {
+        let slot = &mut state.read_slots[index];
+        slot.resp = BlkResp::default();
+        let token = if len <= slot.buffer.size() {
+            let buffer = Self::allocation_buffer_mut(&slot.buffer, len)
+                .map_err(SubmitFailure::Fatal)?;
+            // SAFETY: the slot's req/resp/buffer stay untouched and the
+            // slot is not reused until the token is drained.
+            unsafe {
+                state
+                    .driver
+                    .read_blocks_nb(block, &mut slot.req, buffer, &mut slot.resp)
+            }
+            .map_err(map_submit_error)?
+        } else {
+            // The oversized DMA32 buffer was allocated before the lock was
+            // taken and is handed over only once the submit succeeds.
+            let buffer = big
+                .as_mut()
+                .map(|(_, buffer)| &mut **buffer)
+                .expect("oversized read lost its buffer");
+            unsafe {
+                state
+                    .driver
+                    .read_blocks_nb(block, &mut slot.req, buffer, &mut slot.resp)
+            }
+            .map_err(map_submit_error)?
+        };
+        slot.state = BlkReadSlotState::InFlight {
+            token,
+            len,
+            dst,
+            dma: if len <= slot.buffer.size() {
+                None
+            } else {
+                big.take().map(|(allocation, _)| allocation)
+            },
+        };
+        Ok(())
+    }
+
     fn read_dma(
         &self,
         block: usize,
         output: &mut [u8],
     ) -> Result<(), BlockError> {
-        {
-            let mut state = self.state.lock();
-            let VirtioBlockState { driver, bounce } = &mut *state;
+        // Oversized requests get their own DMA32 buffer, allocated before
+        // the block lock is taken so a request never waits on memory while
+        // holding the lock.
+        let mut big: Option<(PageAllocation, &'static mut [u8])> = None;
+        if output.len() > BLK_SLOT_BUFFER_BYTES {
+            let (allocation, buffer) = dma_buffer(output.len())?;
+            big = Some((allocation, buffer));
+        }
+        let dst = output.as_mut_ptr() as usize;
 
-            if let Some(bounce) = bounce.as_mut() {
-                if output.len() <= bounce.capacity {
-                    let buffer = bounce.buffer_mut(output.len())?;
-                    let result = driver
-                        .read_blocks(block, buffer)
-                        .map_err(|_| BlockError::InvalidArgument);
-                    if result.is_ok() {
-                        output.copy_from_slice(buffer);
+        let mut state = self.state.lock();
+        let index = loop {
+            Self::drain_reads(&mut state);
+            if let Some(free) = state
+                .read_slots
+                .iter()
+                .position(|slot| matches!(slot.state, BlkReadSlotState::Free))
+            {
+                match Self::submit_read(&mut state, free, block, dst, output.len(), &mut big) {
+                    Ok(()) => break free,
+                    Err(SubmitFailure::Fatal(error)) => {
+                        if let Some((allocation, _)) = big {
+                            let _ = page_alloc::free(allocation);
+                        }
+                        return Err(error);
                     }
-                    return result;
+                    // The virtqueue ran out of descriptors; completions
+                    // drain on the next iteration and the submit is retried.
+                    Err(SubmitFailure::QueueFull) => {}
                 }
             }
-        }
+            drop(state);
+            if crate::arch::interrupt::are_disabled() {
+                // Interrupts off: on a uniprocessor no other CPU would ever
+                // drain this ring, so re-take the lock and drain in place.
+                state = self.state.lock();
+                core::hint::spin_loop();
+            } else {
+                wait_for_io();
+                state = self.state.lock();
+            }
+        };
 
-        let (allocation, buffer) = dma_buffer(output.len())?;
-        let result = self
-            .state
-            .lock()
-            .driver
-            .read_blocks(block, buffer)
-            .map_err(|_| BlockError::InvalidArgument);
-        if result.is_ok() {
-            output.copy_from_slice(buffer);
-        }
-        page_alloc::free(allocation)
-            .map_err(|_| BlockError::InvalidArgument)?;
+        let result = loop {
+            Self::drain_reads(&mut state);
+            let slot_state = &mut state.read_slots[index].state;
+            if matches!(slot_state, BlkReadSlotState::Done { .. }) {
+                let BlkReadSlotState::Done { result } =
+                    core::mem::replace(slot_state, BlkReadSlotState::Free)
+                else {
+                    unreachable!("slot state checked as Done");
+                };
+                break result;
+            }
+            drop(state);
+            if crate::arch::interrupt::are_disabled() {
+                state = self.state.lock();
+                core::hint::spin_loop();
+            } else {
+                wait_for_io();
+                state = self.state.lock();
+            }
+        };
         result
     }
 
@@ -469,31 +670,47 @@ impl<T: Transport + Send + 'static> VirtioBlockDevice<T> {
         block: usize,
         input: &[u8],
     ) -> Result<(), BlockError> {
-        {
-            let mut state = self.state.lock();
-            let VirtioBlockState { driver, bounce } = &mut *state;
-
-            if let Some(bounce) = bounce.as_mut() {
-                if input.len() <= bounce.capacity {
-                    let buffer = bounce.buffer_mut(input.len())?;
-                    buffer.copy_from_slice(input);
-                    return driver
-                        .write_blocks(block, buffer)
-                        .map_err(|_| BlockError::InvalidArgument);
-                }
-            }
-        }
-
         let (allocation, buffer) = dma_buffer(input.len())?;
         buffer.copy_from_slice(input);
-        let result = self
-            .state
-            .lock()
-            .driver
-            .write_blocks(block, buffer)
-            .map_err(|_| BlockError::InvalidArgument);
-        page_alloc::free(allocation)
-            .map_err(|_| BlockError::InvalidArgument)?;
+        let mut req = BlkReq::default();
+        let mut resp = BlkResp::default();
+
+        let mut state = self.state.lock();
+        let token = loop {
+            Self::drain_reads(&mut state);
+            match unsafe {
+                state
+                    .driver
+                    .write_blocks_nb(block, &mut req, buffer, &mut resp)
+            } {
+                Ok(token) => break token,
+                Err(virtio_drivers::Error::QueueFull) => core::hint::spin_loop(),
+                Err(_) => {
+                    let _ = page_alloc::free(allocation);
+                    return Err(BlockError::InvalidArgument);
+                }
+            }
+        };
+        // Writes are rare (builds run on tmpfs), so this keeps the lock and
+        // drains read completions while waiting for its own token.
+        let result = loop {
+            Self::drain_reads(&mut state);
+            match state.driver.peek_used() {
+                Some(head) if head == token => {
+                    // SAFETY: `req`, `buffer` and `resp` are the buffers
+                    // submitted above; the used-ring head shows the device
+                    // finished this chain and it has not been popped yet.
+                    let completed = unsafe {
+                        state
+                            .driver
+                            .complete_write_blocks(token, &req, buffer, &mut resp)
+                    };
+                    break completed.map_err(|_| BlockError::InvalidArgument);
+                }
+                _ => core::hint::spin_loop(),
+            }
+        };
+        let _ = page_alloc::free(allocation);
         result
     }
 }

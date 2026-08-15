@@ -3365,11 +3365,26 @@ where
         // Same check-link atomicity as block_current_on_if: the predicate is
         // re-evaluated under SCHEDULER so a racing completion either satisfies
         // it here or wakes the waiter after it is linked.
+        // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25: exit_group / execve sibling
+        // teardown sets forced_exit_status and wakes only tasks that are
+        // already blocked at scan time. A thread that was still running
+        // during the scan must observe the flag here, under the same
+        // SCHEDULER lock the flag write uses, or it blocks after the scan
+        // finished and nothing ever wakes it again (lost wakeup). Callers
+        // that loop must therefore re-check the flag after a false return.
+        // current_user_thread() takes SCHEDULER itself, so fetch the Arc
+        // here; the flag load below runs under SCHEDULER and is therefore
+        // atomic with the teardown scan's flag write (same lock).
+        let user_thread = current_user_thread();
         let mut slot = SCHEDULER.lock();
         let scheduler = slot
             .as_mut()
             .expect("kernel scheduler is not initialized");
-        if should_block() {
+        let forced_exit = user_thread
+            .as_ref()
+            .and_then(|thread| thread.forced_exit_status())
+            .is_some();
+        if !forced_exit && should_block() {
             Some(scheduler.prepare_block(cpu, queue))
         } else {
             None

@@ -357,7 +357,7 @@ static OSCOMP_VERBOSE_USER_TRACE: AtomicBool = AtomicBool::new(false);
 // Keep scoring builds free of syscall-wide atomics and synchronous serial
 // diagnostics. This switch is deliberately compile-time false; it may be
 // enabled locally only while investigating a new image.
-pub(crate) const BUILDSTORM_DIAGNOSTICS: bool = false; // scoring build; enable only while profiling
+pub(crate) const BUILDSTORM_DIAGNOSTICS: bool = false; // profiling build; restore false for scoring runs
 const BUILDSTORM_LATE_SNAPSHOT: bool = false;
 pub(crate) static BUILDSTORM_SAFE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BUILDSTORM_RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -393,8 +393,36 @@ pub(crate) static BUILDSTORM_DESTROY_UNMAPPED: AtomicU64 = AtomicU64::new(0);
 // no-ops, and how often the exec image cache actually serves a repeat exec.
 pub(crate) static BUILDSTORM_MPROTECT_NOOP: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BUILDSTORM_MPROTECT_REAL: AtomicU64 = AtomicU64::new(0);
+// Cycles spent inside the mprotect real-change path (lock, VMA/PTE rewrite,
+// private promotion, shootdown wait).  Real calls dominate buildstorm's
+// mprotect traffic, so their per-call cost decides whether this syscall is a
+// fixable hot bucket.
+pub(crate) static BUILDSTORM_MPROTECT_REAL_CYCLES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BUILDSTORM_EXEC_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static BUILDSTORM_EXEC_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+// execve "swap" phase sub-split: begin_exec / wait_until_single_thread /
+// replace_mm+switch_mm / exec_replace_context.  The swap phase became the
+// top exec bucket; this attributes its cost to the blocking wait or to real
+// address-space switch work.
+pub(crate) static BUILDSTORM_EXEC_SWAP_SUBPHASES: [AtomicU64; 4] =
+    [const { AtomicU64::new(0) }; 4];
+// Multi-threaded exec frequency: how many execs observed thread_count > 1
+// before wait_until_single_thread, and how many siblings they had to retire.
+// Decides whether the wait_single bucket is one slow teardown per spawn or
+// many fast ones.
+pub(crate) static BUILDSTORM_EXEC_MULTI_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BUILDSTORM_EXEC_WAIT_SIBLINGS: AtomicU64 = AtomicU64::new(0);
+// mprotect real-path sub-split: 0 = lock+layout clone, 1 = private-copy
+// promotion, 2 = changed-page walk + PTE/VMA rewrite, 3 = shootdown wait.
+pub(crate) static BUILDSTORM_MPROTECT_SUBS: [AtomicU64; 4] =
+    [const { AtomicU64::new(0) }; 4];
+pub(crate) static BUILDSTORM_MPROTECT_WALKED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BUILDSTORM_MPROTECT_CHANGED: AtomicU64 = AtomicU64::new(0);
+// Present-but-untracked shadow-scan accounting: the tracked-page walk must
+// see every resident page, so this counter must stay zero. It exists to
+// prove the install/track pairing invariant under load.
+pub(crate) static BUILDSTORM_MPROTECT_AB: AtomicU64 = AtomicU64::new(0);
+pub(crate) static BUILDSTORM_MPROTECT_AB_CYCLES: AtomicU64 = AtomicU64::new(0);
 static BUILDSTORM_FUTEX_OP_COUNTS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static BUILDSTORM_FUTEX_WAIT_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static BUILDSTORM_FUTEX_WAIT_TIMED: AtomicU64 = AtomicU64::new(0);
@@ -2935,6 +2963,45 @@ fn final_buildstorm_safe_watchdog_dump(label: &str, reset: bool) {
         swap_cycles,
         drop_cycles,
     );
+    // Sub-phase attribution inside the swap bucket: 0 = begin_exec,
+    // 1 = wait_until_single_thread (blocking teardown of sibling threads),
+    // 2 = replace_mm + user-mm switch, 3 = exec_replace_context + set_tls.
+    let swap_subs = if reset {
+        [
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[0].swap(0, Ordering::AcqRel),
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[1].swap(0, Ordering::AcqRel),
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[2].swap(0, Ordering::AcqRel),
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[3].swap(0, Ordering::AcqRel),
+        ]
+    } else {
+        [
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[0].load(Ordering::Acquire),
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[1].load(Ordering::Acquire),
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[2].load(Ordering::Acquire),
+            BUILDSTORM_EXEC_SWAP_SUBPHASES[3].load(Ordering::Acquire),
+        ]
+    };
+    let (exec_multi, exec_siblings) = if reset {
+        (
+            BUILDSTORM_EXEC_MULTI_COUNT.swap(0, Ordering::AcqRel),
+            BUILDSTORM_EXEC_WAIT_SIBLINGS.swap(0, Ordering::AcqRel),
+        )
+    } else {
+        (
+            BUILDSTORM_EXEC_MULTI_COUNT.load(Ordering::Acquire),
+            BUILDSTORM_EXEC_WAIT_SIBLINGS.load(Ordering::Acquire),
+        )
+    };
+    crate::println!(
+        "buildstorm-watchdog: swap-split label={} begin_exec={} wait_single={} replace_mm={} replace_ctx={} multi={} siblings={}",
+        label,
+        swap_subs[0],
+        swap_subs[1],
+        swap_subs[2],
+        swap_subs[3],
+        exec_multi,
+        exec_siblings,
+    );
     let (destroy_count, destroy_cycles, destroy_pages, destroy_tables, destroy_unmapped) = if reset
     {
         (
@@ -2962,22 +3029,67 @@ fn final_buildstorm_safe_watchdog_dump(label: &str, reset: bool) {
         destroy_tables,
         destroy_unmapped,
     );
-    let (mprotect_noop, mprotect_real) = if reset {
+    let (mprotect_noop, mprotect_real, mprotect_real_cycles) = if reset {
         (
             BUILDSTORM_MPROTECT_NOOP.swap(0, Ordering::AcqRel),
             BUILDSTORM_MPROTECT_REAL.swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_REAL_CYCLES.swap(0, Ordering::AcqRel),
         )
     } else {
         (
             BUILDSTORM_MPROTECT_NOOP.load(Ordering::Acquire),
             BUILDSTORM_MPROTECT_REAL.load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_REAL_CYCLES.load(Ordering::Acquire),
         )
     };
     crate::println!(
-        "buildstorm-watchdog: mprotect label={} noop={} real={}",
+        "buildstorm-watchdog: mprotect label={} noop={} real={} real_cycles={}",
         label,
         mprotect_noop,
         mprotect_real,
+        mprotect_real_cycles,
+    );
+    let mprotect_subs = if reset {
+        [
+            BUILDSTORM_MPROTECT_SUBS[0].swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_SUBS[1].swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_SUBS[2].swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_SUBS[3].swap(0, Ordering::AcqRel),
+        ]
+    } else {
+        [
+            BUILDSTORM_MPROTECT_SUBS[0].load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_SUBS[1].load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_SUBS[2].load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_SUBS[3].load(Ordering::Acquire),
+        ]
+    };
+    let (mprotect_walked, mprotect_changed, mprotect_ab, mprotect_ab_cycles) = if reset {
+        (
+            BUILDSTORM_MPROTECT_WALKED.swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_CHANGED.swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_AB.swap(0, Ordering::AcqRel),
+            BUILDSTORM_MPROTECT_AB_CYCLES.swap(0, Ordering::AcqRel),
+        )
+    } else {
+        (
+            BUILDSTORM_MPROTECT_WALKED.load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_CHANGED.load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_AB.load(Ordering::Acquire),
+            BUILDSTORM_MPROTECT_AB_CYCLES.load(Ordering::Acquire),
+        )
+    };
+    crate::println!(
+        "buildstorm-watchdog: mprotect-split label={} setup={} promote={} walk={} shootdown={} walked={} changed={} ab={} ab_cycles={}",
+        label,
+        mprotect_subs[0],
+        mprotect_subs[1],
+        mprotect_subs[2],
+        mprotect_subs[3],
+        mprotect_walked,
+        mprotect_changed,
+        mprotect_ab,
+        mprotect_ab_cycles,
     );
     let (exec_cache_hits, exec_cache_misses) = if reset {
         (
@@ -4060,6 +4172,19 @@ exit 0
     BUILDSTORM_DESTROY_UNMAPPED.store(0, Ordering::Release);
     BUILDSTORM_MPROTECT_NOOP.store(0, Ordering::Release);
     BUILDSTORM_MPROTECT_REAL.store(0, Ordering::Release);
+    BUILDSTORM_MPROTECT_REAL_CYCLES.store(0, Ordering::Release);
+    for sub in &BUILDSTORM_EXEC_SWAP_SUBPHASES {
+        sub.store(0, Ordering::Release);
+    }
+    BUILDSTORM_EXEC_MULTI_COUNT.store(0, Ordering::Release);
+    BUILDSTORM_EXEC_WAIT_SIBLINGS.store(0, Ordering::Release);
+    for sub in &BUILDSTORM_MPROTECT_SUBS {
+        sub.store(0, Ordering::Release);
+    }
+    BUILDSTORM_MPROTECT_WALKED.store(0, Ordering::Release);
+    BUILDSTORM_MPROTECT_CHANGED.store(0, Ordering::Release);
+    BUILDSTORM_MPROTECT_AB.store(0, Ordering::Release);
+    BUILDSTORM_MPROTECT_AB_CYCLES.store(0, Ordering::Release);
     BUILDSTORM_EXEC_CACHE_HITS.store(0, Ordering::Release);
     BUILDSTORM_EXEC_CACHE_MISSES.store(0, Ordering::Release);
     for count in &BUILDSTORM_FUTEX_OP_COUNTS {
@@ -9579,6 +9704,19 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
             exec_phase_start = Some(now);
         }
     };
+    // Sub-phase attribution for the "swap" exec phase, which became the top
+    // exec bucket: begin_exec / wait_until_single_thread / replace_mm+switch /
+    // exec_replace_context.  Shares the profiling gate via BUILDSTORM_DIAGNOSTICS.
+    let swap_start: core::cell::Cell<Option<u64>> = core::cell::Cell::new(None);
+    let swap_mark = |sub: usize| {
+        if let Some(start) = swap_start.take() {
+            let now = crate::arch::time::counter();
+            if let Some(accumulated) = BUILDSTORM_EXEC_SWAP_SUBPHASES.get(sub) {
+                accumulated.fetch_add(now.wrapping_sub(start), Ordering::Relaxed);
+            }
+            swap_start.set(Some(now));
+        }
+    };
     let exec_stack = thread.user_stack();
     let raw_path = match copy_user_c_string(arguments[0]) {
         Ok(path) => path,
@@ -9856,19 +9994,30 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
 
     exec_mark(2);
+    swap_start.set(Some(crate::arch::time::counter()));
     let process = current_process();
     if !process.begin_exec() {
         return -EAGAIN;
     }
+    swap_mark(0);
     if process.thread_count() > 1 {
+        if crate::user::BUILDSTORM_DIAGNOSTICS
+            && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed)
+        {
+            BUILDSTORM_EXEC_MULTI_COUNT.fetch_add(1, Ordering::Relaxed);
+            BUILDSTORM_EXEC_WAIT_SIBLINGS
+                .fetch_add((process.thread_count() - 1) as u64, Ordering::Relaxed);
+        }
         crate::task::request_process_thread_exit(process.id(), thread.id(), 0);
         process.wait_until_single_thread();
     }
+    swap_mark(1);
     process.files().close_on_exec();
     process.signals().reset_actions_for_exec();
     let old_mm = process.replace_mm(prepared.mm);
     let new_mm = process.mm_arc();
     crate::task::replace_current_user_mm(Arc::clone(&old_mm), Arc::clone(&new_mm));
+    swap_mark(2);
     if thread
         .exec_replace_context(prepared.entry, prepared.stack, prepared.stack_pointer)
         .is_err()
@@ -9895,6 +10044,7 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     // A multithreaded process can still have sibling tasks retiring from the
     // old address space.  They pin it with Arc references; the final owner
     // performs teardown after every CPU has switched away.
+    swap_mark(3);
     exec_mark(3);
     drop(old_mm);
     set_frame_entry(frame, prepared.entry.get());
@@ -10458,11 +10608,18 @@ fn sys_rt_sigsuspend(mask_address: usize, sigsetsize: usize) -> isize {
     // SIGCHLD before deliver_pending_signal() can consume it.
     thread.begin_sigsuspend(temp_mask);
 
-    while process.signals().pending() & !temp_mask == 0 {
-        let _ =
-            crate::task::block_current_on_if_from_user_trap(process.signals().wait_queue(), || {
+    // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25: the forced-exit term mirrors the
+    // futex pattern — without it a thread force-exited during the wake scan
+    // re-blocks after the scan and suspends forever, and the post-block
+    // false return from the trap primitive would spin this loop.
+    while process.signals().pending() & !temp_mask == 0 && thread.forced_exit_status().is_none() {
+        let _ = crate::task::block_current_on_if_from_user_trap(
+            process.signals().wait_queue(),
+            || {
                 process.signals().pending() & !temp_mask == 0
-            });
+                    && thread.forced_exit_status().is_none()
+            },
+        );
     }
 
     // A caught handler stores the pre-suspend mask in UserSignalFrame and
@@ -10795,6 +10952,13 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
                     process.child_wait_queue(),
                     || !process.has_zombie_child(requested) && process.has_child(requested),
                 );
+                // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25: the trap primitive
+                // returns false without blocking when exit_group/execve
+                // teardown set the forced-exit flag while this wait was
+                // being set up; surface it instead of looping forever.
+                if thread.forced_exit_status().is_some() {
+                    return -(crate::syscall::errno::EINTR);
+                }
             }
             Err(_) => return -ECHILD,
         }
@@ -11719,13 +11883,24 @@ fn sys_futex(
                 };
             }
             // The wake sequence closes the check/enqueue race without doing
-            // user-memory access while the scheduler lock is held.
-            let _ = crate::task::block_current_on_if_from_user_trap(
-                &queue.waiters,
-                || queue.wake_sequence.load(Ordering::Acquire) == wake_sequence,
-            );
+            // user-memory access while the scheduler lock is held.  The
+            // forced-exit term makes exit_group/execve sibling teardown
+            // visible to a waiter that raced the teardown wake scan: both the
+            // flag write (under SCHEDULER) and this closure check run under
+            // the same lock, so the scan either observes this task blocked
+            // and wakes it, or the flag is set before the block decision and
+            // the wait never starts.
+            let thread = crate::task::current_user_thread()
+                .expect("futex wait arrived without a current user Thread");
+            let _ = crate::task::block_current_on_if_from_user_trap(&queue.waiters, || {
+                queue.wake_sequence.load(Ordering::Acquire) == wake_sequence
+                    && thread.forced_exit_status().is_none()
+            });
             if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
                 BUILDSTORM_FUTEX_WAIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
+            }
+            if thread.forced_exit_status().is_some() {
+                return -(crate::syscall::errno::EINTR);
             }
             0
         }
@@ -12850,7 +13025,13 @@ fn sys_ppoll(fds_address: usize, nfds: usize, timeout_address: usize) -> isize {
             break 0;
         }
         let thread = crate::task::current_user_thread().expect("ppoll without current Thread");
-        if thread.process().signals().pending() & !thread.blocked_signals() != 0 {
+        if thread.process().signals().pending() & !thread.blocked_signals() != 0
+            || thread.forced_exit_status().is_some()
+        {
+            // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25: an untimed ppoll has no
+            // deadline to break this loop; without the forced-exit term a
+            // force-exited thread sleeps 1 ms at a time here forever and
+            // exit_group can never observe it finishing.
             return -(crate::syscall::errno::EINTR);
         }
         // FileOperations does not yet expose a common poll wait queue.  A
@@ -13319,7 +13500,15 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
 
             if matches!(command, F_SETLKW | F_OFD_SETLKW) {
                 let reported_conflict = AtomicBool::new(false);
+                // SUDOOS_FORCED_EXIT_PIPE_BREAK_V25: the forced-exit term
+                // keeps a teardown target from blocking forever on the global
+                // record-lock queue after the wake scan has already passed.
+                let thread = crate::task::current_user_thread()
+                    .expect("fcntl lock arrived without a current user Thread");
                 POSIX_RECORD_LOCK_WAIT.wait_until(|| {
+                    if thread.forced_exit_status().is_some() {
+                        return true;
+                    }
                     let acquired = fcntl_apply_lock(requested);
                     if acquired {
                         if trace_request {
@@ -13353,6 +13542,9 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
                     false
                 });
                 POSIX_RECORD_LOCK_WAIT.wake_all();
+                if thread.forced_exit_status().is_some() {
+                    return -(crate::syscall::errno::EINTR);
+                }
                 return 0;
             }
             if fcntl_apply_lock(requested) {

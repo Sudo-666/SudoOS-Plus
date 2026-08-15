@@ -1642,6 +1642,28 @@ impl UserMm {
     ) -> Result<(), UserMmRuntimeError> {
         let diag = crate::user::BUILDSTORM_DIAGNOSTICS
             && crate::user::BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed);
+        let diag_start = if diag {
+            Some(crate::arch::time::counter())
+        } else {
+            None
+        };
+        // Sub-phase attribution inside the real path: 0 = lock + layout clone,
+        // 1 = private-copy promotion, 2 = changed-page walk + VMA/PTE rewrite,
+        // 3 = cross-CPU shootdown wait.  Defined here so the marks can live
+        // inside the locked block without borrowing diag_prev mutably twice.
+        let mut diag_prev = diag_start;
+        macro_rules! sub_mark {
+            ($sub:expr) => {
+                if diag {
+                    if let Some(prev) = diag_prev {
+                        let now = crate::arch::time::counter();
+                        crate::user::BUILDSTORM_MPROTECT_SUBS[$sub]
+                            .fetch_add(now.wrapping_sub(prev), Ordering::Relaxed);
+                        diag_prev = Some(now);
+                    }
+                }
+            };
+        }
         let request = {
             let (mut cold, mut hot) = self.lock_both();
 
@@ -1678,7 +1700,7 @@ impl UserMm {
                 return Ok(());
             }
 
-            let old_layout = cold.core.layout().clone();
+            sub_mark!(0);
 
             // Cached file pages are shared only while immutable. If userspace
             // promotes such a mapping to writable, materialize a private copy
@@ -1744,7 +1766,9 @@ impl UserMm {
                         .translate(page.start_address())?
                         .is_some();
                     if present {
-                        let area = old_layout
+                        let area = cold
+                            .core
+                            .layout()
                             .find_area(page.start_address())
                             .ok_or(UserMmRuntimeError::PermissionDenied)?;
                         let replace = hot
@@ -1767,6 +1791,7 @@ impl UserMm {
                     }
                 }
             }
+            sub_mark!(1);
 
             let mut changed_pages = Vec::new();
             let range_pages = range
@@ -1774,46 +1799,86 @@ impl UserMm {
                 .checked_add(PAGE_SIZE - 1)
                 .ok_or(UserMmRuntimeError::AddressOverflow)?
                 / PAGE_SIZE;
+            // Every page that can change is tracked in hot.pages, so at most
+            // one entry per tracked page in the range is pushed. Clamp the
+            // reserve so a huge mostly demand-paged range does not pay for a
+            // pointless multi-megabyte allocation up front.
             changed_pages
-                .try_reserve(range_pages)
+                .try_reserve(range_pages.min(hot.pages.len()).min(4096))
                 .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
-            // mprotect is extremely hot in rustc. Scanning every resident page
-            // in the process for each small stack/allocator protection change
-            // made the operation O(total address-space pages). Walk only the
-            // requested virtual range and query the page table directly.
+            // mprotect is extremely hot in rustc. Walking every page of the
+            // range with a full page-table translate per page made the
+            // operation O(range size) even when nearly all pages are
+            // demand-paged and absent. Every user-visible PTE install is
+            // paired with a hot.pages registration, so the pages that can
+            // change are exactly the tracked pages of the range: iterate
+            // those. Tracked pages whose leaf is absent (PROT_NONE
+            // round-trips, MAP_FIXED leaf retirement) keep the translate-miss
+            // fallback and are restored from their retained backing below.
             let page_table = hot
                 .page_table
                 .as_ref()
                 .ok_or(UserMmRuntimeError::NotMapped)?;
-            let mut address = range.start().get();
-            while address < range.end().get() {
-                let page_address = VirtAddr::new(address);
+            let mut walked_tracked = 0usize;
+            for (&key, mapping) in hot.pages.range(range.start().get()..range.end().get()) {
+                walked_tracked += 1;
+                let page_address = VirtAddr::new(key);
                 let page = VirtPage::from_start_address(page_address)
                     .ok_or(UserMmRuntimeError::InvalidRange)?;
-                let old_area = old_layout.find_area(page_address);
+                let old_area = cold.core.layout().find_area(page_address);
                 let frame = match page_table.translate(page_address)? {
-                    Some(physical) => Some(
-                        PhysFrame::from_start_address(physical)
-                            .ok_or(UserMmRuntimeError::AddressOverflow)?,
-                    ),
-                    None => hot
-                        .pages
-                        .get(&page_address.get())
-                        .map(|mapping| mapping.backing.frame()),
+                    Some(physical) => PhysFrame::from_start_address(physical)
+                        .ok_or(UserMmRuntimeError::AddressOverflow)?,
+                    None => mapping.backing.frame(),
                 };
-                if let Some(frame) = frame {
-                    changed_pages.push((
-                        page,
-                        old_area.expect("mapped user page has no old VMA"),
-                        frame,
-                    ));
-                }
-                address = address
-                    .checked_add(PAGE_SIZE)
-                    .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                changed_pages.push((
+                    page,
+                    old_area.expect("mapped user page has no old VMA"),
+                    frame,
+                ));
             }
 
+            if diag {
+                // Shadow scan: count resident pages the tracked walk cannot
+                // see (present PTE without a hot.pages entry). Install/track
+                // pairing must keep this at zero; it exists to prove that
+                // invariant under load. Timed separately so the walk bucket
+                // stays comparable across runs.
+                let ab_start = crate::arch::time::counter();
+                let mut address = range.start().get();
+                while address < range.end().get() {
+                    if let Ok(Some(_)) = page_table.translate(VirtAddr::new(address)) {
+                        if !hot.pages.contains_key(&address) {
+                            crate::user::BUILDSTORM_MPROTECT_AB
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    match address.checked_add(PAGE_SIZE) {
+                        Some(next) => address = next,
+                        None => break,
+                    }
+                }
+                crate::user::BUILDSTORM_MPROTECT_AB_CYCLES.fetch_add(
+                    crate::arch::time::counter().wrapping_sub(ab_start),
+                    Ordering::Relaxed,
+                );
+                crate::user::BUILDSTORM_MPROTECT_WALKED
+                    .fetch_add(walked_tracked as u64, Ordering::Relaxed);
+                crate::user::BUILDSTORM_MPROTECT_CHANGED
+                    .fetch_add(changed_pages.len() as u64, Ordering::Relaxed);
+            }
+
+            // Snapshot the pre-mutation layout only when a rollback can
+            // happen. VmAreaSet::protect_range is atomic on failure (a failed
+            // call leaves the layout untouched), and the PTE-apply rollback
+            // below can only run when the walk found pages to rewrite. Calls
+            // that change nothing resident skip the full VMA-table clone.
+            let old_layout = if changed_pages.is_empty() {
+                None
+            } else {
+                Some(cold.core.layout().clone())
+            };
             let request = if changed_pages.is_empty() {
                 None
             } else {
@@ -1876,7 +1941,9 @@ impl UserMm {
                 // Calling it a second time can split an already-updated layout
                 // and makes rollback operate on a different topology.
                 if let Err(error) = layout_result {
-                    *cold.core.layout_mut() = old_layout;
+                    if let Some(snapshot) = old_layout {
+                        *cold.core.layout_mut() = snapshot;
+                    }
                     return Err(UserMmError::from(error).into());
                 }
 
@@ -1914,7 +1981,9 @@ impl UserMm {
                             let _ = apply_page_protection(page_table, *page, *frame, *old_area);
                         }
                     }
-                    *cold.core.layout_mut() = old_layout;
+                    if let Some(snapshot) = old_layout {
+                        *cold.core.layout_mut() = snapshot;
+                    }
                     crate::println!(
                         "sudoos-diag: mprotect PTE update failed range=[{:#x},{:#x}) updated={} error={:?}",
                         range.start().get(),
@@ -1927,11 +1996,18 @@ impl UserMm {
                 request
             }
         };
+        sub_mark!(2);
         if let Some(request) = request {
             self.shootdown_user_request(request);
         }
+        sub_mark!(3);
         if diag {
             crate::user::BUILDSTORM_MPROTECT_REAL.fetch_add(1, Ordering::Relaxed);
+            if let Some(start) = diag_start {
+                let now = crate::arch::time::counter();
+                crate::user::BUILDSTORM_MPROTECT_REAL_CYCLES
+                    .fetch_add(now.wrapping_sub(start), Ordering::Relaxed);
+            }
         }
         Ok(())
     }

@@ -1148,6 +1148,31 @@ impl Thread {
             .map_err(|_| ProcessError::ThreadAlreadyExited)?;
         self.exit_status.store(status, Ordering::Relaxed);
         self.lifecycle.store(THREAD_EXITED, Ordering::Release);
+        // Eager group detach: leave the thread group the moment exit state is
+        // published instead of deferring membership removal to the async
+        // reaper's stack teardown.  de_thread-style exec and exit_group wait
+        // on group size; a detach-on-Drop design makes them queue behind
+        // unrelated reclamations (destroy backlog), which prof-8 measured as
+        // the dominant cost of wait_until_single_thread.  Linux detaches in
+        // do_exit for the same reason.
+        let empty = self.process.detach_thread(self.id).unwrap_or(false);
+        if empty {
+            if let Some(parent) = self
+                .process
+                .parent_id()
+                .and_then(crate::process::lookup_process)
+            {
+                let status = self
+                    .exit_status()
+                    .expect("Thread detached before publishing an exit status");
+                if parent
+                    .mark_child_zombie(Arc::clone(&self.process), status)
+                    .is_ok()
+                {
+                    let _ = parent.signals().add_pending(crate::signal::SIGCHLD);
+                }
+            }
+        }
         self.process.complete_vfork();
         self.exited.complete_all();
         Ok(())
@@ -1307,26 +1332,9 @@ impl Drop for Thread {
             self.trap_frame.lock().is_none(),
             "M9-B Thread dropped with an owned trap frame",
         );
-        let process_became_empty = self
-            .process
-            .detach_thread(self.id)
-            .expect("M9-B Thread disappeared from its process thread group");
-        if process_became_empty
-            && let Some(parent) = self
-                .process
-                .parent_id()
-                .and_then(crate::process::lookup_process)
-        {
-            let status = self
-                .exit_status()
-                .expect("Thread dropped before publishing an exit status");
-            if parent
-                .mark_child_zombie(Arc::clone(&self.process), status)
-                .is_ok()
-            {
-                let _ = parent.signals().add_pending(crate::signal::SIGCHLD);
-            }
-        }
+        // Group detach and its empty-transition side effects (fd-table close,
+        // fcntl lock release, zombie marking) already ran eagerly in
+        // Thread::exit; the reaper must not repeat them here.
         LIVE_THREADS.fetch_sub(1, Ordering::AcqRel);
     }
 }
