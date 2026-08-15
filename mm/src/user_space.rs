@@ -102,7 +102,7 @@ pub const DEFAULT_STACK_SP_DISTANCE: usize = PAGE_SIZE * 16;
 pub enum UserFaultPlan {
     MapAnonymous { area: VmArea, page: VirtAddr },
     GrowStack { growth: StackGrowth },
-    CopyOnWriteUnsupported { area: VmArea },
+    RestoreWrite { area: VmArea },
     ProtectionViolation { area: VmArea },
     SegmentationViolation,
     Spurious { area: VmArea },
@@ -115,7 +115,7 @@ impl UserFaultPlan {
             self,
             Self::MapAnonymous { .. }
                 | Self::GrowStack { .. }
-                | Self::CopyOnWriteUnsupported { .. }
+                | Self::RestoreWrite { .. }
         )
     }
 }
@@ -394,7 +394,7 @@ impl<const VMA_CAPACITY: usize> UserAddressSpace<VMA_CAPACITY> {
                     .ok_or(UserMmError::AddressOverflow)?,
             }),
             FaultOutcome::CopyOnWrite { area } => {
-                Ok(UserFaultPlan::CopyOnWriteUnsupported { area })
+                Ok(UserFaultPlan::RestoreWrite { area })
             }
             FaultOutcome::LoadFile { area, .. } => {
                 // The kernel-side ELF loader currently pre-populates file
@@ -797,7 +797,7 @@ mod tests {
         );
         assert_eq!(
             mm.plan_user_fault(fault, VirtAddr::new(0x10_1000)).unwrap(),
-            UserFaultPlan::CopyOnWriteUnsupported { area },
+            UserFaultPlan::RestoreWrite { area },
         );
     }
 

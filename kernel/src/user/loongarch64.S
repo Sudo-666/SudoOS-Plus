@@ -76,7 +76,12 @@ __m7_user_return:
     csrwr $r12, 0x0
     ld.d $r1, $r3, 0
     ld.d $r2, $r3, 8
-    ld.d $r21, $r3, 16
+    /*
+     * Do NOT restore r21 (u0) from the prologue: it names the CPU that ran
+     * __m7_enter_user and is stale after a mid-trap migration.  The trap
+     * return path already restored r21 from the frame, which
+     * return_to_kernel repointed at the destination CPU via KSave3.
+     */
     ld.d $r22, $r3, 24
     ld.d $r23, $r3, 32
     ld.d $r24, $r3, 40

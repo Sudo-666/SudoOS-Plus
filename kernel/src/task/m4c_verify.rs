@@ -33,6 +33,10 @@ static SWITCH_RACE_HOOK_REACHED: AtomicBool = AtomicBool::new(false);
 static SWITCH_RACE_HOOK_RELEASE: AtomicBool = AtomicBool::new(false);
 static SWITCH_RACE_DONE: AtomicBool = AtomicBool::new(false);
 
+static MIGRATION_PIN_ENTERED: AtomicBool = AtomicBool::new(false);
+static MIGRATION_PIN_PEER_RAN: AtomicBool = AtomicBool::new(false);
+static MIGRATION_PIN_DONE: AtomicBool = AtomicBool::new(false);
+
 fn preempt_hog() {
     assert_eq!(crate::smp::current_cpu_id(), CpuId::BOOT);
 
@@ -94,6 +98,35 @@ fn preempt_guard() {
 fn preempt_guard_peer() {
     assert!(GUARD_ENTERED.load(Ordering::Acquire));
     GUARD_PEER_RAN.store(true, Ordering::Release);
+}
+
+fn migration_guard_worker() {
+    let cpu = crate::smp::current_cpu_id();
+    let guard = super::MigrationGuard::new();
+    // MigrationGuard is independent of PreemptGuard: disabling migration
+    // must leave preemption enabled.
+    assert_eq!(super::preempt_count(), 0);
+    MIGRATION_PIN_ENTERED.store(true, Ordering::Release);
+
+    // Voluntary yields may preempt the pinned task onto the local queue; the
+    // placement rules must always resume it on its pinned CPU. A stray steal
+    // or wake-target choice would surface as a CPU change below.
+    for _ in 0..16 {
+        super::yield_now();
+        assert_eq!(
+            crate::smp::current_cpu_id(),
+            cpu,
+            "migration-pinned task resumed on a different CPU",
+        );
+    }
+
+    drop(guard);
+    MIGRATION_PIN_DONE.store(true, Ordering::Release);
+}
+
+fn migration_guard_peer() {
+    assert!(MIGRATION_PIN_ENTERED.load(Ordering::Acquire));
+    MIGRATION_PIN_PEER_RAN.store(true, Ordering::Release);
 }
 
 fn wait_worker() {
@@ -189,8 +222,9 @@ where
         super::yield_now();
         spin_loop();
     }
-
-    super::finish_switch();
+    // yield_now() completes its own switch tail, so no pending transaction
+    // may remain once this loop exits. A bare finish_switch() here is a
+    // pre-transaction-model leftover and would trip the pending-None panic.
 }
 
 fn verify_timer_preemption() {
@@ -230,6 +264,27 @@ fn verify_preempt_disable() {
     wait_until("preempt-disable workers", || {
         GUARD_DONE.load(Ordering::Acquire)
             && GUARD_PEER_RAN.load(Ordering::Acquire)
+            && super::live_kernel_threads() == 0
+    });
+}
+
+fn verify_migration_guard() {
+    MIGRATION_PIN_ENTERED.store(false, Ordering::Release);
+    MIGRATION_PIN_PEER_RAN.store(false, Ordering::Release);
+    MIGRATION_PIN_DONE.store(false, Ordering::Release);
+
+    let target = if super::active_cpu_count() > 1 {
+        CpuId::new(1).expect("CPU1 exceeds MAX_CPUS")
+    } else {
+        CpuId::BOOT
+    };
+
+    super::spawn_internal(migration_guard_worker, Some(target), Some(target));
+    super::spawn_internal(migration_guard_peer, Some(target), Some(target));
+
+    wait_until("migration-guard workers", || {
+        MIGRATION_PIN_DONE.load(Ordering::Acquire)
+            && MIGRATION_PIN_PEER_RAN.load(Ordering::Acquire)
             && super::live_kernel_threads() == 0
     });
 }
@@ -381,6 +436,8 @@ pub(super) fn verify() {
     verify_timer_preemption();
     crate::println!("M4C stage: preempt-disable");
     verify_preempt_disable();
+    crate::println!("M4C stage: migration-guard");
+    verify_migration_guard();
     crate::println!("M4C stage: wait-queue");
     verify_wait_queue();
     crate::println!("M4C stage: completion");

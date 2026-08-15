@@ -12,7 +12,7 @@ use myos_mm::{
 use crate::irq_lock::IrqSpinLock;
 use crate::lockdep::{LockClass, LockRank};
 use crate::runtime_page_table::{RuntimePageTable, RuntimePageTableError};
-use crate::tracked_spin::TrackedSpinLock;
+use crate::tracked_spin::{TrackedSpinLock, TrackedSpinLockGuard};
 
 // Native toolchains keep many shared objects, allocator arenas, thread stacks,
 // and guard mappings live at once. LoongArch rustc crosses 1024 VMAs while
@@ -119,6 +119,8 @@ struct MappedPageSource {
     page: VirtPage,
     physical: PhysAddr,
     kind: ForkPageKind,
+    area: VmArea,
+    present: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -150,18 +152,26 @@ pub(crate) struct FileFaultRequest {
     generation: u64,
 }
 
-struct UserMmState {
+/// Cold MM state: VMA layout and file-mapping metadata. Mutated by
+/// mmap/munmap/mprotect/brk and read by page-fault resolution. Acquired
+/// before `hot`; never held across file I/O, allocation, or TLB waits.
+struct UserMmColdState {
     core: Box<UserAddressSpace<VMA_CAPACITY>>,
-    page_table: Option<RuntimePageTable>,
-    // Resident-page ownership indexed by virtual page address.  Rustc issues
-    // thousands of small mmap/munmap/mprotect operations; an unordered Vec
-    // made each range retirement scan every page in the address space.
-    pages: BTreeMap<usize, MappedPage>,
     // File-backed VMAs indexed by virtual start address. A rustc process can
     // carry hundreds of loader mappings and take hundreds of thousands of
     // file faults; a linear Vec scan here multiplied both numbers together.
     file_mappings: BTreeMap<usize, FileBackedMapping>,
     next_file_generation: u64,
+}
+
+/// Hot MM state: the hardware page table and resident-page ownership.
+/// Mutated on every fault, COW resolution, and unmap; acquired after `cold`.
+struct UserMmHotState {
+    page_table: Option<RuntimePageTable>,
+    // Resident-page ownership indexed by virtual page address.  Rustc issues
+    // thousands of small mmap/munmap/mprotect operations; an unordered Vec
+    // made each range retirement scan every page in the address space.
+    pages: BTreeMap<usize, MappedPage>,
 }
 
 /// Page-table and backing allocations detached under the MM lock.
@@ -188,7 +198,11 @@ impl RetirementBatch {
 }
 
 pub struct UserMm {
-    state: TrackedSpinLock<UserMmState>,
+    /// §7: the former single `user_mm` lock is split so the hot fault path
+    /// (page table + resident pages) is not serialized behind cold VMA and
+    /// file-mapping mutations. Ordering is always cold → hot.
+    cold: TrackedSpinLock<UserMmColdState>,
+    hot: TrackedSpinLock<UserMmHotState>,
     tlb: UserTlbContext,
     root: PhysFrame,
     /// Last TLB generation known synchronized on each CPU. ASIDs let a CPU
@@ -206,7 +220,6 @@ pub enum UserFaultRecovery {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserFaultFailure {
-    CopyOnWriteUnsupported,
     ProtectionViolation,
     SegmentationViolation,
     KernelBug,
@@ -220,8 +233,8 @@ pub enum UserFaultResolution {
 
 impl UserMm {
     pub fn vma_usage(&self) -> (usize, usize) {
-        let state = self.state.lock();
-        (state.core.layout().area_count(), VMA_CAPACITY)
+        let cold = self.cold.lock();
+        (cold.core.layout().area_count(), VMA_CAPACITY)
     }
 
     /// Return the single VMA that completely contains `range`.
@@ -230,8 +243,8 @@ impl UserMm {
     /// anonymous mapping.  Requiring one containing VMA avoids silently
     /// merging mappings with different protections or backing kinds.
     pub fn area_containing(&self, range: VirtRange) -> Option<VmArea> {
-        let state = self.state.lock();
-        let area = state.core.layout().find_area(range.start())?;
+        let cold = self.cold.lock();
+        let area = cold.core.layout().find_area(range.start())?;
         area.range().contains_range(range).then_some(area)
     }
 
@@ -242,8 +255,8 @@ impl UserMm {
         &self,
         address: VirtAddr,
     ) -> Option<(String, usize, usize, u64)> {
-        let state = self.state.lock();
-        let mapping = file_mapping_at(&state.file_mappings, address)?;
+        let cold = self.cold.lock();
+        let mapping = file_mapping_at(&cold.file_mappings, address)?;
         let delta = address.get().checked_sub(mapping.range.start().get())?;
         let file_offset = mapping.file_offset.checked_add(delta as u64)?;
         Some((
@@ -273,15 +286,20 @@ impl UserMm {
             let tlb = core.tlb_context();
             LIVE_ROOTS.fetch_add(1, Ordering::AcqRel);
             Ok(Self {
-                state: TrackedSpinLock::new_preemptible(
-                    UserMmState {
+                cold: TrackedSpinLock::new_preemptible(
+                    UserMmColdState {
                         core,
-                        page_table: Some(page_table),
-                        pages: BTreeMap::new(),
                         file_mappings: BTreeMap::new(),
                         next_file_generation: 1,
                     },
                     LockClass::new("user_mm", LockRank::CrossCpu, 10),
+                ),
+                hot: TrackedSpinLock::new_preemptible(
+                    UserMmHotState {
+                        page_table: Some(page_table),
+                        pages: BTreeMap::new(),
+                    },
+                    LockClass::new("user_mm_hot", LockRank::CrossCpu, 11),
                 ),
                 tlb,
                 root,
@@ -295,13 +313,32 @@ impl UserMm {
         result
     }
 
+    /// Acquires cold then hot (§7). Both guards live for the caller's
+    /// critical section; release order is the reverse (hot then cold).
+    fn lock_both(
+        &self,
+    ) -> (
+        TrackedSpinLockGuard<'_, UserMmColdState>,
+        TrackedSpinLockGuard<'_, UserMmHotState>,
+    ) {
+        let cold = self.cold.lock();
+        let hot = self.hot.lock();
+        (cold, hot)
+    }
+
     pub fn asid(&self) -> AsidToken {
         self.tlb.asid()
     }
 
+    /// Last TLB generation known synchronized on one CPU (§10/§11
+    /// diagnostics and generation checks).
+    pub(crate) fn local_tlb_generation(&self, cpu: crate::smp::CpuId) -> u64 {
+        self.local_tlb_generation[cpu.get()].load(core::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn root_is_private(&self) -> Result<bool, UserMmRuntimeError> {
-        let state = self.state.lock();
-        let page_table = state
+        let hot = self.hot.lock();
+        let page_table = hot
             .page_table
             .as_ref()
             .ok_or(UserMmRuntimeError::NotMapped)?;
@@ -309,16 +346,18 @@ impl UserMm {
             && page_table.root_frame() != crate::vm::kernel_page_table_root()?)
     }
 
-    // FORK_CLONE_COW_V1
-    pub fn fork_clone_eager(&self) -> Result<alloc::boxed::Box<Self>, UserMmRuntimeError> {
+    /// Snapshot-forks this address space: private writable pages are
+    /// converted to reference-counted COW frames with both sides read-only;
+    /// content is never copied here (copy happens lazily on write fault).
+    pub fn fork_clone_cow(&self) -> Result<alloc::boxed::Box<Self>, UserMmRuntimeError> {
         // Allocate the empty root/ASID before taking user_mm. The complete VMA
         // and resident-page snapshot is then captured under one parent lock,
         // so mmap activity in another rustc thread cannot make fork fail or
         // mix two generations of the address space.
         let child = alloc::boxed::Box::new(Self::new(&[])?);
         let (areas, program_break, mapped_pages, file_mappings, next_file_generation, request) = {
-            let mut state = self.state.lock();
-            let layout = state.core.layout();
+            let (mut cold, mut hot) = self.lock_both();
+            let layout = cold.core.layout();
 
             let mut areas = Vec::new();
             areas
@@ -334,9 +373,9 @@ impl UserMm {
             let program_break = layout.program_break();
 
             let mut keys = Vec::new();
-            keys.try_reserve(state.pages.len())
+            keys.try_reserve(hot.pages.len())
                 .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-            keys.extend(state.pages.keys().copied());
+            keys.extend(hot.pages.keys().copied());
 
             let mut mapped_pages = Vec::new();
             mapped_pages
@@ -352,17 +391,17 @@ impl UserMm {
             let result: Result<(), UserMmRuntimeError> = (|| {
                 for key in keys {
                     let (page, physical, kind, area, present) = {
-                        let mapping = state
+                        let mapping = hot
                             .pages
                             .get(&key)
                             .expect("fork page disappeared while user_mm was locked");
-                        let area = state
+                        let area = cold
                             .core
                             .layout()
                             .find_area(mapping.page.start_address())
                             .ok_or(UserMmRuntimeError::PermissionDenied)?;
                         let physical = mapping.backing.physical();
-                        let translated = state
+                        let translated = hot
                             .page_table
                             .as_ref()
                             .ok_or(UserMmRuntimeError::NotMapped)?
@@ -385,53 +424,80 @@ impl UserMm {
                     if matches!(kind, ForkPageKind::Cow) {
                         let frame = PhysFrame::from_start_address(physical)
                             .ok_or(UserMmRuntimeError::AddressOverflow)?;
-                        crate::page_alloc::increment_reference(frame)?;
+                        // Reference acquisition is batched after the walk: one
+                        // global allocator lock acquisition for the whole mm
+                        // instead of one per resident page.
                         retained_cow_frames.push(frame);
-                        let mapping = state
-                            .pages
-                            .get_mut(&key)
-                            .expect("fork page disappeared while converting to COW");
-                        let previous =
-                            core::mem::replace(&mut mapping.backing, PageBacking::Cow(frame));
-                        debug_assert!(matches!(
-                            previous,
-                            PageBacking::Owned(_) | PageBacking::Cow(_)
-                        ));
-
-                        if present && area.flags().is_writable() {
-                            let readonly = VmArea::new(
-                                area.range(),
-                                area.flags().without(VmAreaFlags::WRITE),
-                                area.kind(),
-                            );
-                            apply_page_protection(
-                                state
-                                    .page_table
-                                    .as_mut()
-                                    .ok_or(UserMmRuntimeError::NotMapped)?,
-                                page,
-                                frame,
-                                readonly,
-                            )?;
-                            first_protected.get_or_insert(page.start_address());
-                            last_protected_end = Some(
-                                page.start_address()
-                                    .checked_add(PAGE_SIZE)
-                                    .ok_or(UserMmRuntimeError::AddressOverflow)?,
-                            );
-                        }
                     }
 
                     mapped_pages.push(MappedPageSource {
                         page,
                         physical,
                         kind,
+                        area,
+                        present,
                     });
                 }
                 Ok(())
             })();
 
             if let Err(error) = result {
+                // No references were taken and no page was converted yet.
+                return Err(error);
+            }
+
+            if !retained_cow_frames.is_empty()
+                && let Err(error) =
+                    crate::page_alloc::increment_reference_many(&retained_cow_frames)
+            {
+                return Err(error.into());
+            }
+
+            let conversion_result: Result<(), UserMmRuntimeError> = (|| {
+                for source in &mapped_pages {
+                    if !matches!(source.kind, ForkPageKind::Cow) {
+                        continue;
+                    }
+                    let frame = PhysFrame::from_start_address(source.physical)
+                        .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                    let mapping = hot
+                        .pages
+                        .get_mut(&source.page.start_address().get())
+                        .expect("fork page disappeared while converting to COW");
+                    let previous =
+                        core::mem::replace(&mut mapping.backing, PageBacking::Cow(frame));
+                    debug_assert!(matches!(
+                        previous,
+                        PageBacking::Owned(_) | PageBacking::Cow(_)
+                    ));
+
+                    if source.present && source.area.flags().is_writable() {
+                        let readonly = VmArea::new(
+                            source.area.range(),
+                            source.area.flags().without(VmAreaFlags::WRITE),
+                            source.area.kind(),
+                        );
+                        apply_page_protection(
+                            hot.page_table
+                                .as_mut()
+                                .ok_or(UserMmRuntimeError::NotMapped)?,
+                            source.page,
+                            frame,
+                            readonly,
+                        )?;
+                        first_protected.get_or_insert(source.page.start_address());
+                        last_protected_end = Some(
+                            source.page
+                                .start_address()
+                                .checked_add(PAGE_SIZE)
+                                .ok_or(UserMmRuntimeError::AddressOverflow)?,
+                        );
+                    }
+                }
+                Ok(())
+            })();
+
+            if let Err(error) = conversion_result {
                 // Converted parent pages remain valid COW pages with one
                 // reference; a read-only leaf will become writable on its
                 // next write fault. Only the prospective child references
@@ -443,8 +509,8 @@ impl UserMm {
             }
 
             let request = match (first_protected, last_protected_end) {
-                (Some(start), Some(end)) => match state.core.plan_tlb_request(TlbFlush::Range {
-                    scope: TlbScope::AddressSpace(state.core.asid().id()),
+                (Some(start), Some(end)) => match cold.core.plan_tlb_request(TlbFlush::Range {
+                    scope: TlbScope::AddressSpace(cold.core.asid().id()),
                     range: VirtRange::from_bounds(start.get(), end.get()),
                 }) {
                     Ok(request) => Some(request),
@@ -461,8 +527,8 @@ impl UserMm {
                 areas,
                 program_break,
                 mapped_pages,
-                state.file_mappings.clone(),
-                state.next_file_generation,
+                cold.file_mappings.clone(),
+                cold.next_file_generation,
                 request,
             )
         };
@@ -471,28 +537,26 @@ impl UserMm {
         // writable parent translation must acknowledge the revocation before
         // either address space can run independently.
         if let Some(request) = request {
-            shootdown_user_request(request);
+            self.shootdown_user_request(request);
         }
 
         let child_layout_result: Result<(), UserMmRuntimeError> = (|| {
-            let mut state = child.state.lock();
+            let mut cold = child.cold.lock();
             for area in &areas {
-                state.core.map_area(*area)?;
+                cold.core.map_area(*area)?;
             }
             if let Some(program_break) = program_break {
-                state
-                    .core
+                cold.core
                     .layout_mut()
                     .configure_program_break(program_break.start(), program_break.limit())
                     .map_err(UserMmError::from)?;
-                state
-                    .core
+                cold.core
                     .layout_mut()
                     .set_program_break_and_sync_heap(program_break.current())
                     .map_err(UserMmError::from)?;
             }
-            state.file_mappings = file_mappings;
-            state.next_file_generation = next_file_generation;
+            cold.file_mappings = file_mappings;
+            cold.next_file_generation = next_file_generation;
             Ok(())
         })();
         if let Err(error) = child_layout_result {
@@ -506,9 +570,11 @@ impl UserMm {
             return Err(error);
         }
 
+        // The child mm is not published anywhere yet: one lock acquisition
+        // for the whole mapping loop instead of one per resident page.
+        let (mut cold, mut hot) = child.lock_both();
         for (index, source) in mapped_pages.iter().copied().enumerate() {
-            let mut state = child.state.lock();
-            let area = state
+            let area = cold
                 .core
                 .layout()
                 .find_area(source.page.start_address())
@@ -530,14 +596,15 @@ impl UserMm {
                     ),
                     _ => area,
                 };
-                let page_table = state
+                let page_table = hot
                     .page_table
                     .as_mut()
                     .ok_or(UserMmRuntimeError::NotMapped)?;
                 if let Err(error) =
                     page_table.map_page(source.page, backing.frame(), mapped_area.mapping_options())
                 {
-                    drop(state);
+                    drop(hot);
+                    drop(cold);
                     // The child Drop releases already-installed COW pages;
                     // release this page and every not-yet-installed child
                     // reference explicitly.
@@ -552,7 +619,7 @@ impl UserMm {
                 }
             }
 
-            let previous = state
+            let previous = hot
                 .pages
                 .insert(source.page.start_address().get(), MappedPage {
                     page: source.page,
@@ -560,6 +627,8 @@ impl UserMm {
                 });
             debug_assert!(previous.is_none());
         }
+        drop(hot);
+        drop(cold);
 
         Ok(child)
     }
@@ -570,8 +639,8 @@ impl UserMm {
     ) -> Result<bool, UserMmRuntimeError> {
         #[cfg(target_arch = "riscv64")]
         {
-            let state = self.state.lock();
-            let user = state
+            let hot = self.hot.lock();
+            let user = hot
                 .page_table
                 .as_ref()
                 .ok_or(UserMmRuntimeError::NotMapped)?
@@ -591,8 +660,8 @@ impl UserMm {
     /// Explicitly installs one zeroed page. B3 deliberately does not call this
     /// from the fault path; demand allocation remains behind the B2 planner.
     pub fn populate_page(&self, address: VirtAddr) -> Result<PhysAddr, UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        let area = state
+        let (mut cold, mut hot) = self.lock_both();
+        let area = cold
             .core
             .layout()
             .find_area(address)
@@ -603,12 +672,48 @@ impl UserMm {
         let page =
             VirtPage::from_start_address(page_address).ok_or(UserMmRuntimeError::InvalidRange)?;
 
-        if let Some(physical) = state
+        if let Some(physical) = hot
             .page_table
             .as_ref()
             .ok_or(UserMmRuntimeError::NotMapped)?
             .translate(address)?
         {
+            return Ok(physical);
+        }
+
+        // A fork-Cow-ified page without a PTE keeps its frame: map the
+        // existing frame read-only (content = the parent's fork snapshot)
+        // instead of a fresh zero page. The entry stays Cow; the next write
+        // fault breaks COW through the resolver.
+        let cow_frame = match hot.pages.get(&page.start_address().get()) {
+            Some(MappedPage {
+                backing: PageBacking::Cow(frame),
+                ..
+            }) => Some(*frame),
+            _ => None,
+        };
+        if let Some(frame) = cow_frame {
+            let mapped_area = if area.flags().is_writable() {
+                VmArea::new(
+                    area.range(),
+                    area.flags().without(VmAreaFlags::WRITE),
+                    area.kind(),
+                )
+            } else {
+                area
+            };
+            let offset = address
+                .get()
+                .checked_sub(page_address.get())
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            let physical = frame
+                .start_address()
+                .checked_add(offset)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+            hot.page_table
+                .as_mut()
+                .ok_or(UserMmRuntimeError::NotMapped)?
+                .map_page(page, frame, mapped_area.mapping_options())?;
             return Ok(physical);
         }
 
@@ -627,7 +732,7 @@ impl UserMm {
                 return Err(UserMmRuntimeError::AddressOverflow);
             }
         };
-        let page_table = state
+        let page_table = hot
             .page_table
             .as_mut()
             .ok_or(UserMmRuntimeError::NotMapped)?;
@@ -636,7 +741,7 @@ impl UserMm {
             return Err(error.into());
         }
 
-        let previous = state.pages.insert(page.start_address().get(), MappedPage {
+        let previous = hot.pages.insert(page.start_address().get(), MappedPage {
             page,
             backing: PageBacking::Owned(backing),
         });
@@ -663,19 +768,19 @@ impl UserMm {
             .get()
             .checked_add(input.len())
             .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let mut state = self.state.lock();
+        let (cold, mut hot) = self.lock_both();
 
         let mut copied = 0;
         while copied < input.len() {
             let current = address
                 .checked_add(copied)
                 .ok_or(UserMmRuntimeError::AddressOverflow)?;
-            let area = state
+            let area = cold
                 .core
                 .layout()
                 .find_area(current)
                 .ok_or(UserMmRuntimeError::PermissionDenied)?;
-            let physical = map_zero_page_locked(&mut state, area, current)?;
+            let physical = map_zero_page_locked(&mut hot, area, current)?;
             let in_page = current.get() & (PAGE_SIZE - 1);
             let chunk = min(PAGE_SIZE - in_page, input.len() - copied);
             let destination = crate::arch::memory::phys_access::ram_mut_ptr::<u8>(physical)
@@ -712,16 +817,16 @@ impl UserMm {
         let first_page = address
             .align_down(PAGE_SIZE)
             .ok_or(UserMmRuntimeError::AddressOverflow)?;
-        let mut state = self.state.lock();
+        let (cold, mut hot) = self.lock_both();
 
         let mut page = first_page;
         while page.get() < end {
-            let area = state
+            let area = cold
                 .core
                 .layout()
                 .find_area(page)
                 .ok_or(UserMmRuntimeError::PermissionDenied)?;
-            map_zero_page_locked(&mut state, area, page)?;
+            map_zero_page_locked(&mut hot, area, page)?;
             page = page
                 .checked_add(PAGE_SIZE)
                 .ok_or(UserMmRuntimeError::AddressOverflow)?;
@@ -738,9 +843,9 @@ impl UserMm {
             return Ok(());
         }
 
-        let state = self.state.lock();
-        validate_range(&state, address, output.len(), FaultAccess::Read)?;
-        let page_table = state
+        let (cold, hot) = self.lock_both();
+        validate_range(&cold, address, output.len(), FaultAccess::Read)?;
+        let page_table = hot
             .page_table
             .as_ref()
             .ok_or(UserMmRuntimeError::NotMapped)?;
@@ -779,17 +884,38 @@ impl UserMm {
         // one MM lock in that case. The old path called populate_page() for
         // every page even when present, taking the lock and walking the page
         // table once per page before validating and walking it all over again.
+        //
+        // A resident destination may still sit behind a COW read-only leaf
+        // (a fork-converted private page). Kernel-side writes must break COW
+        // first: writing through the kernel alias would silently modify the
+        // frame every side of the fork shares.
         {
-            let state = self.state.lock();
-            validate_range(&state, address, input.len(), FaultAccess::Write)?;
-            let page_table = state
-                .page_table
-                .as_ref()
-                .ok_or(UserMmRuntimeError::NotMapped)?;
-            match validate_mapped_range(page_table, address, input.len()) {
-                Ok(()) => return copy_to_mapped_pages(page_table, address, input),
-                Err(UserMmRuntimeError::NotMapped) => {}
-                Err(error) => return Err(error),
+            let (mut cold, mut hot) = self.lock_both();
+            validate_range(&cold, address, input.len(), FaultAccess::Write)?;
+            let fully_mapped = {
+                let page_table = hot
+                    .page_table
+                    .as_ref()
+                    .ok_or(UserMmRuntimeError::NotMapped)?;
+                match validate_mapped_range(page_table, address, input.len()) {
+                    Ok(()) => true,
+                    Err(UserMmRuntimeError::NotMapped) => false,
+                    Err(error) => return Err(error),
+                }
+            };
+            if fully_mapped {
+                let requests = Self::break_cow_for_range(&mut cold, &mut hot, address, input.len())?;
+                {
+                    let page_table = hot
+                        .page_table
+                        .as_ref()
+                        .ok_or(UserMmRuntimeError::NotMapped)?;
+                    copy_to_mapped_pages(page_table, address, input)?;
+                }
+                drop(hot);
+                drop(cold);
+                self.flush_local_requests(requests)?;
+                return Ok(());
             }
         }
 
@@ -807,13 +933,73 @@ impl UserMm {
                 .ok_or(UserMmRuntimeError::AddressOverflow)?;
         }
 
-        let state = self.state.lock();
-        let page_table = state
-            .page_table
-            .as_ref()
-            .ok_or(UserMmRuntimeError::NotMapped)?;
-        validate_mapped_range(page_table, address, input.len())?;
-        copy_to_mapped_pages(page_table, address, input)
+        let (mut cold, mut hot) = self.lock_both();
+        validate_range(&cold, address, input.len(), FaultAccess::Write)?;
+        validate_mapped_range(
+            hot.page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?,
+            address,
+            input.len(),
+        )?;
+        let requests = Self::break_cow_for_range(&mut cold, &mut hot, address, input.len())?;
+        {
+            let page_table = hot
+                .page_table
+                .as_ref()
+                .ok_or(UserMmRuntimeError::NotMapped)?;
+            copy_to_mapped_pages(page_table, address, input)?;
+        }
+        drop(hot);
+        drop(cold);
+        self.flush_local_requests(requests)?;
+        Ok(())
+    }
+
+    /// Breaks COW on every Cow-backed page of `[address, address + length)`
+    /// so a subsequent kernel write via the direct map cannot modify a frame
+    /// shared with a fork sibling. Returns the local TLB requests that
+    /// publish the new leaves; the caller must execute them after releasing
+    /// the MM lock.
+    fn break_cow_for_range(
+        cold: &mut UserMmColdState,
+        hot: &mut UserMmHotState,
+        address: usize,
+        length: usize,
+    ) -> Result<Vec<PerMmTlbRequest>, UserMmRuntimeError> {
+        let end = address
+            .checked_add(length)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        let mut requests = Vec::new();
+        let mut page = address & !(PAGE_SIZE - 1);
+        while page < end {
+            if let Some((_, Some(request))) =
+                resolve_cow_write_fault_locked(cold, hot, VirtAddr::new(page), FaultAccess::Write)?
+            {
+                requests.push(request);
+            }
+            page = page
+                .checked_add(PAGE_SIZE)
+                .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        }
+        Ok(requests)
+    }
+
+    /// Executes post-COW-break TLB requests. copy_to_user runs in syscall
+    /// context with interrupts enabled, so this uses the interruptible
+    /// `shootdown_user` path (the IRQ-disabled `_local` variant is reserved
+    /// for fault context). The same-ASID argument applies: replaced leaves
+    /// point at new frames (old translations stay read-only and re-fault
+    /// correctly), restored-write leaves are repaired by spurious recovery
+    /// on remote CPUs.
+    fn flush_local_requests(&self, requests: Vec<PerMmTlbRequest>) -> Result<(), UserMmRuntimeError> {
+        for request in requests {
+            let request = request
+                .local_only(crate::smp::current_cpu_id().get())
+                .map_err(UserMmRuntimeError::from)?;
+            self.shootdown_user_request(request);
+        }
+        Ok(())
     }
 
     pub fn configure_program_break(
@@ -821,9 +1007,8 @@ impl UserMm {
         start: VirtAddr,
         limit: VirtAddr,
     ) -> Result<(), UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        state
-            .core
+        let mut cold = self.cold.lock();
+        cold.core
             .layout_mut()
             .configure_program_break(start, limit)
             .map_err(UserMmError::from)?;
@@ -831,9 +1016,8 @@ impl UserMm {
     }
 
     pub fn program_break(&self) -> Result<VirtAddr, UserMmRuntimeError> {
-        let state = self.state.lock();
-        state
-            .core
+        let cold = self.cold.lock();
+        cold.core
             .layout()
             .program_break()
             .map(|program_break| program_break.current())
@@ -842,12 +1026,12 @@ impl UserMm {
 
     pub fn set_program_break(&self, new_break: VirtAddr) -> Result<VirtAddr, UserMmRuntimeError> {
         let (current, retirement) = {
-            let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
+            let (mut cold, mut hot) = self.lock_both();
+            let old_layout = cold.core.layout().clone();
             let old = old_layout
                 .program_break()
                 .ok_or(UserMmRuntimeError::InvalidRange)?;
-            let current = state
+            let current = cold
                 .core
                 .layout_mut()
                 .set_program_break_and_sync_heap(new_break)
@@ -862,10 +1046,10 @@ impl UserMm {
             if new_end < old_end {
                 let range =
                     VirtRange::new(new_end, old_end).ok_or(UserMmRuntimeError::InvalidRange)?;
-                match retire_range_locked(&mut state, range) {
+                match retire_range_locked(&mut cold, &mut hot, range) {
                     Ok(retirement) => (current, retirement),
                     Err(error) => {
-                        *state.core.layout_mut() = old_layout;
+                        *cold.core.layout_mut() = old_layout;
                         return Err(error);
                     }
                 }
@@ -873,7 +1057,7 @@ impl UserMm {
                 (current, RetirementBatch::empty())
             }
         };
-        finish_retirement(retirement)?;
+        self.finish_retirement(retirement)?;
         Ok(current)
     }
 
@@ -883,8 +1067,8 @@ impl UserMm {
         size: usize,
         flags: VmAreaFlags,
     ) -> Result<VirtAddr, UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        let area = state
+        let mut cold = self.cold.lock();
+        let area = cold
             .core
             .layout_mut()
             .map_anonymous(search, size, PAGE_SIZE, flags)
@@ -897,9 +1081,8 @@ impl UserMm {
         range: VirtRange,
         flags: VmAreaFlags,
     ) -> Result<VirtAddr, UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        state
-            .core
+        let mut cold = self.cold.lock();
+        cold.core
             .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))?;
         Ok(range.start())
     }
@@ -918,13 +1101,12 @@ impl UserMm {
         flags: VmAreaFlags,
     ) -> Result<VirtAddr, UserMmRuntimeError> {
         let retirement = {
-            let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
-            let retained_file_mappings = file_mappings_without_range(&state.file_mappings, range)?;
+            let (mut cold, mut hot) = self.lock_both();
+            let old_layout = cold.core.layout().clone();
+            let retained_file_mappings = file_mappings_without_range(&cold.file_mappings, range)?;
 
             // 1. Remove overlapping VMAs from the topology.
-            state
-                .core
+            cold.core
                 .layout_mut()
                 .unmap_range(range)
                 .map_err(UserMmError::from)?;
@@ -932,29 +1114,28 @@ impl UserMm {
             // 2. Insert the new exact VMA before detaching old PTEs/backings so
             //    that a rollback of this step only needs to restore the layout.
             if let Err(e) =
-                state
-                    .core
+                cold.core
                     .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))
             {
-                *state.core.layout_mut() = old_layout;
+                *cold.core.layout_mut() = old_layout;
                 return Err(UserMmRuntimeError::Core(e));
             }
 
             // 3. Detach old PTEs and backings.  Allocations happen before any
             //    PTE/backing modification, so an error here leaves the state
             //    consistent and a layout rollback is sufficient.
-            match retire_range_locked(&mut state, range) {
+            match retire_range_locked(&mut cold, &mut hot, range) {
                 Ok(retirement) => {
-                    state.file_mappings = retained_file_mappings;
+                    cold.file_mappings = retained_file_mappings;
                     retirement
                 }
                 Err(error) => {
-                    *state.core.layout_mut() = old_layout;
+                    *cold.core.layout_mut() = old_layout;
                     return Err(error);
                 }
             }
         };
-        finish_retirement(retirement)?;
+        self.finish_retirement(retirement)?;
         Ok(range.start())
     }
 
@@ -969,9 +1150,8 @@ impl UserMm {
         range: VirtRange,
         flags: VmAreaFlags,
     ) -> Result<VirtAddr, UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        state
-            .core
+        let mut cold = self.cold.lock();
+        cold.core
             .map_area(VmArea::new(range, flags, myos_mm::VmAreaKind::Anonymous))?;
         Ok(range.start())
     }
@@ -987,8 +1167,8 @@ impl UserMm {
         shared_cache: bool,
         file: myos_vfs::ArcFile,
     ) -> Result<(), UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        let area = state
+        let mut cold = self.cold.lock();
+        let area = cold
             .core
             .layout()
             .find_area(range.start())
@@ -996,8 +1176,8 @@ impl UserMm {
         if !area.range().contains_range(range) {
             return Err(UserMmRuntimeError::InvalidRange);
         }
-        let generation = state.next_file_generation;
-        state.next_file_generation = state.next_file_generation.wrapping_add(1).max(1);
+        let generation = cold.next_file_generation;
+        cold.next_file_generation = cold.next_file_generation.wrapping_add(1).max(1);
         let mapping = FileBackedMapping {
             range,
             file_offset,
@@ -1009,7 +1189,7 @@ impl UserMm {
             shared_cache,
             file,
         };
-        if state
+        if cold
             .file_mappings
             .insert(range.start().get(), mapping)
             .is_some()
@@ -1024,8 +1204,8 @@ impl UserMm {
         address: VirtAddr,
         access: FaultAccess,
     ) -> Result<Option<FileFaultRequest>, UserMmRuntimeError> {
-        let state = self.state.lock();
-        file_fault_request_locked(&state, address, access)
+        let (cold, hot) = self.lock_both();
+        file_fault_request_locked(&cold, &hot, address, access)
     }
 
     /// Collect a sequential fault-around window while taking user_mm once.
@@ -1045,7 +1225,7 @@ impl UserMm {
             .try_reserve(maximum)
             .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
         requests.push(first);
-        let state = self.state.lock();
+        let (cold, hot) = self.lock_both();
         for index in 1..maximum {
             if requests
                 .last()
@@ -1056,7 +1236,7 @@ impl UserMm {
             let Some(page) = first_page.checked_add(index * PAGE_SIZE) else {
                 break;
             };
-            let Some(next) = file_fault_request_locked(&state, page, access)? else {
+            let Some(next) = file_fault_request_locked(&cold, &hot, page, access)? else {
                 break;
             };
             let expected_offset = first_offset
@@ -1124,13 +1304,13 @@ impl UserMm {
         }
 
         let (request, first_spurious, first_unmapped, installed_any) = {
-            let mut state = self.state.lock();
-            let request = state.core.plan_post_install_tlb(first.page)?;
+            let (cold, mut hot) = self.lock_both();
+            let request = cold.core.plan_post_install_tlb(first.page)?;
             let mut first_spurious = false;
             let mut first_unmapped = false;
             let mut installed_any = false;
             for (index, (fault, frame)) in faults.iter().zip(frames.iter()).enumerate() {
-                let still_mapped = file_mapping_at(&state.file_mappings, fault.page)
+                let still_mapped = file_mapping_at(&cold.file_mappings, fault.page)
                     .is_some_and(|mapping| mapping.generation == fault.generation);
                 if !still_mapped {
                     if index == 0 {
@@ -1138,7 +1318,7 @@ impl UserMm {
                     }
                     break;
                 }
-                if state
+                if hot
                     .page_table
                     .as_ref()
                     .ok_or(UserMmRuntimeError::NotMapped)?
@@ -1150,23 +1330,50 @@ impl UserMm {
                     }
                     continue;
                 }
-                let area = state
+                let area = cold
                     .core
                     .layout()
                     .find_area(fault.page)
                     .ok_or(UserMmRuntimeError::NotMapped)?;
                 let page = VirtPage::from_start_address(fault.page)
                     .ok_or(UserMmRuntimeError::InvalidRange)?;
-                state
+                // A writable VMA must not alias a shared cache frame (see
+                // install_file_fault_inner); convert before the PTE install.
+                let (install_frame, install_backing) = if area.flags().is_writable() {
+                    let allocation = crate::page_alloc::allocate(
+                        0,
+                        crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+                    )?;
+                    if let Err(error) =
+                        copy_physical_page(frame.start_address(), allocation.start().start_address())
+                    {
+                        crate::page_alloc::free(allocation)?;
+                        return Err(error);
+                    }
+                    (allocation.start(), PageBacking::Owned(allocation))
+                } else {
+                    (*frame, PageBacking::Shared(*frame))
+                };
+                if let Err(error) = hot
                     .page_table
                     .as_mut()
                     .ok_or(UserMmRuntimeError::NotMapped)?
-                    .map_page(page, *frame, area.mapping_options())?;
-                let previous = state.pages.insert(page.start_address().get(), MappedPage {
+                    .map_page(page, install_frame, area.mapping_options())
+                {
+                    if let PageBacking::Owned(allocation) = install_backing {
+                        crate::page_alloc::free(allocation)?;
+                    }
+                    return Err(error.into());
+                }
+                let owned = matches!(&install_backing, PageBacking::Owned(_));
+                let previous = hot.pages.insert(page.start_address().get(), MappedPage {
                     page,
-                    backing: PageBacking::Shared(*frame),
+                    backing: install_backing,
                 });
                 debug_assert!(previous.is_none());
+                if owned {
+                    LIVE_BACKINGS.fetch_add(1, Ordering::AcqRel);
+                }
                 installed_any = true;
             }
             (request, first_spurious, first_unmapped, installed_any)
@@ -1263,13 +1470,13 @@ impl UserMm {
         };
 
         let outcome: Result<InstallOutcome, UserMmRuntimeError> = (|| {
-            let mut state = self.state.lock();
-            let still_mapped = file_mapping_at(&state.file_mappings, fault.page)
+            let (cold, mut hot) = self.lock_both();
+            let still_mapped = file_mapping_at(&cold.file_mappings, fault.page)
                 .is_some_and(|mapping| mapping.generation == fault.generation);
             if !still_mapped {
                 return Ok(InstallOutcome::Unmapped);
             }
-            if state
+            if hot
                 .page_table
                 .as_ref()
                 .ok_or(UserMmRuntimeError::NotMapped)?
@@ -1278,15 +1485,34 @@ impl UserMm {
             {
                 return Ok(InstallOutcome::Spurious);
             }
-            let area = state
+            let area = cold
                 .core
                 .layout()
                 .find_area(fault.page)
                 .ok_or(UserMmRuntimeError::NotMapped)?;
+            // Defense in depth: the request-time writability gate can race a
+            // concurrent mprotect promotion. A shared cache frame behind a
+            // writable VMA would alias every process mapping the same file
+            // page, so materialize a private copy before the PTE install.
+            if area.flags().is_writable()
+                && let Some(PageBacking::Shared(shared_frame)) = &backing
+            {
+                let allocation = crate::page_alloc::allocate(
+                    0,
+                    crate::page_alloc::PageAllocationOptions::kernel_zeroed(),
+                )?;
+                if let Err(error) =
+                    copy_physical_page(shared_frame.start_address(), allocation.start().start_address())
+                {
+                    crate::page_alloc::free(allocation)?;
+                    return Err(error);
+                }
+                backing = Some(PageBacking::Owned(allocation));
+            }
             let page =
                 VirtPage::from_start_address(fault.page).ok_or(UserMmRuntimeError::InvalidRange)?;
-            let request = state.core.plan_post_install_tlb(fault.page)?;
-            if let Err(error) = state
+            let request = cold.core.plan_post_install_tlb(fault.page)?;
+            if let Err(error) = hot
                 .page_table
                 .as_mut()
                 .ok_or(UserMmRuntimeError::NotMapped)?
@@ -1305,7 +1531,7 @@ impl UserMm {
                 .take()
                 .expect("file-fault backing disappeared after PTE install");
             let owned = matches!(&backing, PageBacking::Owned(_));
-            let previous = state
+            let previous = hot
                 .pages
                 .insert(page.start_address().get(), MappedPage { page, backing });
             debug_assert!(previous.is_none());
@@ -1355,26 +1581,25 @@ impl UserMm {
 
     pub fn unmap_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
-            let mut state = self.state.lock();
-            let old_layout = state.core.layout().clone();
-            let retained_file_mappings = file_mappings_without_range(&state.file_mappings, range)?;
-            state
-                .core
+            let (mut cold, mut hot) = self.lock_both();
+            let old_layout = cold.core.layout().clone();
+            let retained_file_mappings = file_mappings_without_range(&cold.file_mappings, range)?;
+            cold.core
                 .layout_mut()
                 .unmap_range(range)
                 .map_err(UserMmError::from)?;
-            match retire_range_locked(&mut state, range) {
+            match retire_range_locked(&mut cold, &mut hot, range) {
                 Ok(retirement) => {
-                    state.file_mappings = retained_file_mappings;
+                    cold.file_mappings = retained_file_mappings;
                     retirement
                 }
                 Err(error) => {
-                    *state.core.layout_mut() = old_layout;
+                    *cold.core.layout_mut() = old_layout;
                     return Err(error);
                 }
             }
         };
-        finish_retirement(retirement)
+        self.finish_retirement(retirement)
     }
 
     /// Drop resident pages from adjacent anonymous VMAs without removing them.
@@ -1385,13 +1610,13 @@ impl UserMm {
     /// reconstructed on demand, so callers leave non-anonymous VMAs intact.
     pub fn discard_anonymous_range(&self, range: VirtRange) -> Result<(), UserMmRuntimeError> {
         let retirement = {
-            let mut state = self.state.lock();
-            if file_mappings_overlap(&state.file_mappings, range) {
+            let (mut cold, mut hot) = self.lock_both();
+            if file_mappings_overlap(&cold.file_mappings, range) {
                 return Ok(());
             }
             let mut cursor = range.start();
             loop {
-                let area = state
+                let area = cold
                     .core
                     .layout()
                     .find_area(cursor)
@@ -1405,9 +1630,9 @@ impl UserMm {
                 }
                 cursor = next;
             }
-            retire_range_locked(&mut state, range)?
+            retire_range_locked(&mut cold, &mut hot, range)?
         };
-        finish_retirement(retirement)
+        self.finish_retirement(retirement)
     }
 
     pub fn protect_range(
@@ -1415,8 +1640,10 @@ impl UserMm {
         range: VirtRange,
         access: VmAreaFlags,
     ) -> Result<(), UserMmRuntimeError> {
+        let diag = crate::user::BUILDSTORM_DIAGNOSTICS
+            && crate::user::BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed);
         let request = {
-            let mut state = self.state.lock();
+            let (mut cold, mut hot) = self.lock_both();
 
             // glibc/rustc frequently repeats mprotect() over ranges that
             // already have the requested access (allocator arenas and thread
@@ -1430,7 +1657,7 @@ impl UserMm {
             let mut cursor = range.start();
             let mut already_protected = true;
             loop {
-                let Some(area) = state.core.layout().find_area(cursor) else {
+                let Some(area) = cold.core.layout().find_area(cursor) else {
                     already_protected = false;
                     break;
                 };
@@ -1445,20 +1672,37 @@ impl UserMm {
                 cursor = next;
             }
             if already_protected {
+                if diag {
+                    crate::user::BUILDSTORM_MPROTECT_NOOP.fetch_add(1, Ordering::Relaxed);
+                }
                 return Ok(());
             }
 
-            let old_layout = state.core.layout().clone();
+            let old_layout = cold.core.layout().clone();
 
             // Cached file pages are shared only while immutable. If userspace
             // promotes such a mapping to writable, materialize a private copy
             // before changing either the VMA or PTE permissions.
             if requested_access.is_writable() {
+                // Demand-paged pages of the range that are not resident yet
+                // fault in later: demote their registration so those faults
+                // materialize private copies instead of installing a shared
+                // page-cache frame behind a writable PTE. Demoting the whole
+                // overlapping registration is conservative and safe — MAP_PRIVATE
+                // pages that were written stay private for the mm's lifetime.
+                for mapping in cold.file_mappings.values_mut() {
+                    if mapping.shared_cache
+                        && mapping.range.end() > range.start()
+                        && mapping.range.start() < range.end()
+                    {
+                        mapping.shared_cache = false;
+                    }
+                }
                 let mut private_copy_keys = Vec::new();
                 private_copy_keys
-                    .try_reserve(state.pages.len().min(range.size() / PAGE_SIZE + 1))
+                    .try_reserve(hot.pages.len().min(range.size() / PAGE_SIZE + 1))
                     .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-                for (&key, mapping) in state.pages.range(range.start().get()..range.end().get()) {
+                for (&key, mapping) in hot.pages.range(range.start().get()..range.end().get()) {
                     let must_copy = match &mapping.backing {
                         PageBacking::Shared(_) => true,
                         PageBacking::Cow(frame) => crate::page_alloc::reference_count(*frame)? > 1,
@@ -1470,7 +1714,7 @@ impl UserMm {
                 }
                 for key in private_copy_keys {
                     let (page, source, old_cow) = {
-                        let mapping = state
+                        let mapping = hot
                             .pages
                             .get(&key)
                             .expect("writable-promotion page disappeared");
@@ -1493,7 +1737,7 @@ impl UserMm {
                         crate::page_alloc::free(allocation)?;
                         return Err(error);
                     }
-                    let present = state
+                    let present = hot
                         .page_table
                         .as_ref()
                         .ok_or(UserMmRuntimeError::NotMapped)?
@@ -1503,7 +1747,7 @@ impl UserMm {
                         let area = old_layout
                             .find_area(page.start_address())
                             .ok_or(UserMmRuntimeError::PermissionDenied)?;
-                        let replace = state
+                        let replace = hot
                             .page_table
                             .as_mut()
                             .ok_or(UserMmRuntimeError::NotMapped)?
@@ -1513,8 +1757,7 @@ impl UserMm {
                             return Err(error.into());
                         }
                     }
-                    state
-                        .pages
+                    hot.pages
                         .get_mut(&key)
                         .expect("writable-promotion page disappeared")
                         .backing = PageBacking::Owned(allocation);
@@ -1539,7 +1782,7 @@ impl UserMm {
             // in the process for each small stack/allocator protection change
             // made the operation O(total address-space pages). Walk only the
             // requested virtual range and query the page table directly.
-            let page_table = state
+            let page_table = hot
                 .page_table
                 .as_ref()
                 .ok_or(UserMmRuntimeError::NotMapped)?;
@@ -1554,7 +1797,7 @@ impl UserMm {
                         PhysFrame::from_start_address(physical)
                             .ok_or(UserMmRuntimeError::AddressOverflow)?,
                     ),
-                    None => state
+                    None => hot
                         .pages
                         .get(&page_address.get())
                         .map(|mapping| mapping.backing.frame()),
@@ -1574,14 +1817,14 @@ impl UserMm {
             let request = if changed_pages.is_empty() {
                 None
             } else {
-                Some(state.core.plan_tlb_request(TlbFlush::Range {
-                    scope: TlbScope::AddressSpace(state.core.asid().id()),
+                Some(cold.core.plan_tlb_request(TlbFlush::Range {
+                    scope: TlbScope::AddressSpace(cold.core.asid().id()),
                     range,
                 })?)
             };
 
             // Try the full VMA-splitting protect first.
-            let layout_result = state.core.layout_mut().protect_range(range, access);
+            let layout_result = cold.core.layout_mut().protect_range(range, access);
 
             // PTE-only fallback: when VMA capacity is exhausted but the
             // range is fully covered by existing VMAs, update only the
@@ -1594,7 +1837,7 @@ impl UserMm {
             if pte_fallback {
                 // Don't update the VMA layout — just protect existing PTEs.
                 let mut pte_result = Ok(());
-                if let Some(page_table) = state.page_table.as_mut() {
+                if let Some(page_table) = hot.page_table.as_mut() {
                     for (page, old_area, frame) in &changed_pages {
                         // Build a temporary read-only VMA to derive mapping options.
                         let ro_start = page.start_address().get();
@@ -1617,7 +1860,7 @@ impl UserMm {
                 }
                 if let Err(e) = pte_result {
                     // Rollback: restore original PTE flags.
-                    if let Some(page_table) = state.page_table.as_mut() {
+                    if let Some(page_table) = hot.page_table.as_mut() {
                         for (page, old_area, frame) in &changed_pages {
                             let _ = apply_page_protection(page_table, *page, *frame, *old_area);
                         }
@@ -1633,7 +1876,7 @@ impl UserMm {
                 // Calling it a second time can split an already-updated layout
                 // and makes rollback operate on a different topology.
                 if let Err(error) = layout_result {
-                    *state.core.layout_mut() = old_layout;
+                    *cold.core.layout_mut() = old_layout;
                     return Err(UserMmError::from(error).into());
                 }
 
@@ -1643,12 +1886,12 @@ impl UserMm {
                     .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
                 let result: Result<(), RuntimePageTableError> = (|| {
                     for (page, _, frame) in &changed_pages {
-                        let area = state
+                        let area = cold
                             .core
                             .layout()
                             .find_area(page.start_address())
                             .expect("mprotect removed a mapped page's VMA");
-                        let page_table = state
+                        let page_table = hot
                             .page_table
                             .as_mut()
                             .ok_or(RuntimePageTableError::NotMapped)?;
@@ -1659,7 +1902,7 @@ impl UserMm {
                 })();
 
                 if let Err(error) = result {
-                    let page_table = state
+                    let page_table = hot
                         .page_table
                         .as_mut()
                         .expect("mprotect rollback lost the user page table");
@@ -1671,7 +1914,7 @@ impl UserMm {
                             let _ = apply_page_protection(page_table, *page, *frame, *old_area);
                         }
                     }
-                    *state.core.layout_mut() = old_layout;
+                    *cold.core.layout_mut() = old_layout;
                     crate::println!(
                         "sudoos-diag: mprotect PTE update failed range=[{:#x},{:#x}) updated={} error={:?}",
                         range.start().get(),
@@ -1685,7 +1928,10 @@ impl UserMm {
             }
         };
         if let Some(request) = request {
-            shootdown_user_request(request);
+            self.shootdown_user_request(request);
+        }
+        if diag {
+            crate::user::BUILDSTORM_MPROTECT_REAL.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1697,21 +1943,28 @@ impl UserMm {
         user_sp: VirtAddr,
     ) -> Result<UserFaultResolution, UserMmRuntimeError> {
         let (resolution, request) = {
-            let mut state = self.state.lock();
-            if let Some(cow) = resolve_cow_write_fault_locked(&mut state, address, access)? {
+            let (mut cold, mut hot) = self.lock_both();
+            if let Some(cow) = resolve_cow_write_fault_locked(&mut cold, &mut hot, address, access)? {
                 cow
             } else {
-                let present = state
+                let present = match hot
                     .page_table
                     .as_ref()
                     .ok_or(UserMmRuntimeError::NotMapped)?
-                    .translate(address)?
-                    .is_some();
+                    .translate(address)
+                {
+                    Ok(mapping) => mapping.is_some(),
+                    // A non-canonical user address is a SIGSEGV, not a kernel
+                    // error. Report it absent so the fault planner classifies
+                    // it as a segmentation violation instead of panicking.
+                    Err(RuntimePageTableError::InvalidVirtualAddress) => false,
+                    Err(error) => return Err(error.into()),
+                };
                 let fault = PageFault::new(address, access, FaultSource::User, present);
-                match state.core.plan_user_fault(fault, user_sp)? {
+                match cold.core.plan_user_fault(fault, user_sp)? {
                     UserFaultPlan::MapAnonymous { area, page } => {
-                        let request = state.core.plan_post_install_tlb(page)?;
-                        map_zero_page_locked(&mut state, area, page)?;
+                        let request = cold.core.plan_post_install_tlb(page)?;
+                        map_zero_page_locked(&mut hot, area, page)?;
                         if access == FaultAccess::Write
                             && matches!(
                                 area.kind(),
@@ -1729,7 +1982,7 @@ impl UserMm {
                                 if !area.range().contains(next) {
                                     break;
                                 }
-                                if map_zero_page_locked(&mut state, area, next).is_err() {
+                                if map_zero_page_locked(&mut hot, area, next).is_err() {
                                     break;
                                 }
                             }
@@ -1740,18 +1993,17 @@ impl UserMm {
                         )
                     }
                     UserFaultPlan::GrowStack { growth } => {
-                        let request = state.core.plan_post_install_tlb(growth.fault_page())?;
-                        state.core.commit_stack_growth(growth)?;
+                        let request = cold.core.plan_post_install_tlb(growth.fault_page())?;
+                        cold.core.commit_stack_growth(growth)?;
                         if let Err(error) =
-                            map_zero_page_locked(&mut state, growth.new_area(), growth.fault_page())
+                            map_zero_page_locked(&mut hot, growth.new_area(), growth.fault_page())
                         {
-                            let removed = state
+                            let removed = cold
                                 .core
                                 .unmap_exact(growth.new_area().range())
                                 .expect("stack-growth rollback lost the expanded VMA");
                             assert_eq!(removed, growth.new_area());
-                            state
-                                .core
+                            cold.core
                                 .map_area(growth.old_area())
                                 .expect("stack-growth rollback could not restore the old VMA");
                             return Err(error);
@@ -1762,16 +2014,46 @@ impl UserMm {
                         )
                     }
                     UserFaultPlan::Spurious { .. } => {
-                        let request = state.core.plan_post_install_tlb(address)?;
+                        let request = cold.core.plan_post_install_tlb(address)?;
                         (
                             UserFaultResolution::Recovered(UserFaultRecovery::Spurious),
                             Some(request),
                         )
                     }
-                    UserFaultPlan::CopyOnWriteUnsupported { .. } => (
-                        UserFaultResolution::Fatal(UserFaultFailure::CopyOnWriteUnsupported),
-                        None,
-                    ),
+                    UserFaultPlan::RestoreWrite { area } => {
+                        // A write fault on a present read-only leaf inside a
+                        // writable COW-flagged VMA: repair the leaf's write
+                        // permission in place. The refcount-driven COW resolver
+                        // above already owns Cow backings; this arm serves the
+                        // planner's COW-flag classification. Owned backings are
+                        // exclusive by invariant, so no page copy is needed.
+                        let page_address = address
+                            .align_down(PAGE_SIZE)
+                            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                        let page = VirtPage::from_start_address(page_address)
+                            .ok_or(UserMmRuntimeError::InvalidRange)?;
+                        let physical = hot
+                            .page_table
+                            .as_ref()
+                            .ok_or(UserMmRuntimeError::NotMapped)?
+                            .translate(page_address)?
+                            .ok_or(UserMmRuntimeError::NotMapped)?;
+                        let frame = PhysFrame::from_start_address(physical)
+                            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+                        apply_page_protection(
+                            hot.page_table
+                                .as_mut()
+                                .ok_or(UserMmRuntimeError::NotMapped)?,
+                            page,
+                            frame,
+                            area,
+                        )?;
+                        let request = cold.core.plan_post_install_tlb(address)?;
+                        (
+                            UserFaultResolution::Recovered(UserFaultRecovery::Spurious),
+                            Some(request),
+                        )
+                    }
                     UserFaultPlan::ProtectionViolation { .. } => (
                         UserFaultResolution::Fatal(UserFaultFailure::ProtectionViolation),
                         None,
@@ -1789,20 +2071,20 @@ impl UserMm {
         };
 
         if let Some(request) = request {
-            // User faults execute with local interrupts disabled, so they
-            // cannot enter the synchronous remote IPI/ACK path. This path only
-            // installs a previously invalid leaf or repairs a spurious local
-            // translation; no page is unmapped, freed, or permission-revoked.
+            // This path only installs a previously invalid leaf or repairs a
+            // spurious local translation; no page is unmapped, freed, or
+            // permission-revoked. Restrict the post-install request to this
+            // CPU: another CPU using the same mm either observes the new valid
+            // PTE directly or faults on its own stale invalid translation and
+            // performs the same local recovery. munmap/mprotect/retirement
+            // still retain the original full active_cpus mask and use
+            // shootdown_user().
             //
-            // Restrict the post-install request to this CPU. Another CPU using
-            // the same mm either observes the new valid PTE directly or faults
-            // on its own stale invalid translation and performs the same local
-            // recovery. munmap/mprotect/retirement still retain the original
-            // full active_cpus mask and use shootdown_user().
-            let request = request
-                .local_only(crate::smp::current_cpu_id().get())
-                .map_err(UserMmRuntimeError::from)?;
-            crate::tlb::shootdown_user_local(request);
+            // §10 情况A: fault resolution runs with interrupts enabled
+            // (SyscallInterruptGuard in handle_fault), so the flush helper
+            // temporarily disables interrupts around the local-only request
+            // instead of assuming the trap-entry IRQ state.
+            flush_post_install_local(request)?;
             // post-install fault recovery is local-only by construction
         }
         Ok(resolution)
@@ -1839,6 +2121,14 @@ impl UserMm {
             unsafe {
                 crate::vm::activate_user_page_table(self.root, token.id());
             }
+            // QEMU's LoongArch targeted invalidations have proven unreliable
+            // (see arch flush_asid): a generation-gated skip left stale
+            // translations reachable across a switch and corrupted guest
+            // heaps (cagent factorial abort: "unaligned tcache chunk",
+            // fs-create segv). Address-space entry remains a correctness
+            // boundary on LoongArch, so it invalidates the complete local
+            // TLB unconditionally; RISC-V keeps the generation-gated ASID
+            // path. §11 still removes the redundant departure flush.
             #[cfg(target_arch = "loongarch64")]
             crate::arch::memory::paging::flush_asid(token.id());
             #[cfg(target_arch = "riscv64")]
@@ -1882,8 +2172,12 @@ impl UserMm {
         unsafe {
             crate::vm::activate_kernel_page_table()?;
         }
-        #[cfg(target_arch = "loongarch64")]
-        crate::arch::memory::paging::flush_asid(token.id());
+        // §11: departure no longer flushes. The generation stored below
+        // records the state this CPU's TLB reflects for this mm; activation
+        // re-flushes only when the generation has advanced (and every
+        // destructive change's shootdown flushes through the full arch
+        // primitive on both arches), so stale entries can never survive a
+        // re-entry, and an unchanged generation keeps the TLB warm.
 
         loop {
             let generation = self.tlb.tlb_generation();
@@ -1945,9 +2239,16 @@ impl UserMm {
     }
 
     pub fn destroy(&mut self) -> Result<(), UserMmRuntimeError> {
-        let mut state = self.state.lock();
-        state.core.assert_inactive_for_destroy()?;
-        let table_capacity = state
+        let diag = crate::user::BUILDSTORM_DIAGNOSTICS
+            && crate::user::BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed);
+        let diag_start = if diag {
+            Some(crate::arch::time::counter())
+        } else {
+            None
+        };
+        let (cold, mut hot) = self.lock_both();
+        cold.core.assert_inactive_for_destroy()?;
+        let table_capacity = hot
             .page_table
             .as_ref()
             .ok_or(UserMmRuntimeError::NotMapped)?
@@ -1957,52 +2258,52 @@ impl UserMm {
             .try_reserve(table_capacity)
             .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
 
+        // §8 retirement model applied to final teardown: collect every backing
+        // inside the lock, then free in batches once the page-table walk is
+        // done.  Exec teardown retires tens of thousands of pages per exec and
+        // per-page global allocator lock churn (two to three acquisitions each,
+        // with seven other CPUs faulting pages in at the same time) made this
+        // the hottest buildstorm exec phase.  The per-page translate pre-check
+        // and reclaim_empty_tables walk are dropped as well: unmap_page's
+        // NotMapped error covers the already-unmapped leaf case, and
+        // retire_all_private_tables below releases every intermediate table in
+        // a single pass.
+        let mut owned_retired: Vec<PageAllocation> = Vec::new();
+        owned_retired
+            .try_reserve(hot.pages.len())
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        let mut cow_retired: Vec<PhysFrame> = Vec::new();
+        cow_retired
+            .try_reserve(hot.pages.len())
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        let mut shared_retired = 0_usize;
+
         let mut already_unmapped = 0_usize;
-        while let Some((_key, mapping)) = state.pages.pop_first() {
-            let page_table = state
+        while let Some((_key, mapping)) = hot.pages.pop_first() {
+            let page_table = hot
                 .page_table
                 .as_mut()
                 .ok_or(UserMmRuntimeError::NotMapped)?;
-            match page_table.translate(mapping.page.start_address())? {
-                Some(physical) => {
-                    assert_eq!(
-                        physical,
-                        mapping.backing.physical(),
-                        "M8-B3 user leaf returned a different physical address",
-                    );
-                    let frame = page_table.unmap_page(mapping.page)?;
+            match page_table.unmap_page(mapping.page) {
+                Ok(frame) => {
                     assert_eq!(
                         frame,
                         mapping.backing.frame(),
                         "M8-B3 user leaf returned a different physical frame",
                     );
                 }
-                None => {
-                    // MAP_FIXED/munmap may retire the leaf before the final
-                    // owner reaches process teardown. The backing remains
-                    // uniquely owned by this record and still must be freed.
+                // MAP_FIXED/munmap may retire the leaf before the final
+                // owner reaches process teardown. The backing remains
+                // uniquely owned by this record and still must be freed.
+                Err(RuntimePageTableError::NotMapped) => {
                     already_unmapped += 1;
                 }
+                Err(error) => return Err(error.into()),
             }
-            page_table.reclaim_empty_tables(mapping.page, &mut retired)?;
             match mapping.backing {
-                PageBacking::Owned(allocation) => {
-                    let backing_start = allocation.start().start_address().get();
-                    let backing_order = allocation.order();
-                    if let Err(error) = crate::page_alloc::free(allocation) {
-                        crate::println!(
-                            "user-mm: backing free failed page={:#x} phys={:#x} order={} error={:?}",
-                            mapping.page.start_address().get(),
-                            backing_start,
-                            backing_order,
-                            error,
-                        );
-                        return Err(error.into());
-                    }
-                    LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
-                }
-                PageBacking::Cow(frame) => release_cow_frame(frame)?,
-                PageBacking::Shared(_) => {}
+                PageBacking::Owned(allocation) => owned_retired.push(allocation),
+                PageBacking::Cow(frame) => cow_retired.push(frame),
+                PageBacking::Shared(_) => shared_retired += 1,
             }
         }
 
@@ -2013,11 +2314,31 @@ impl UserMm {
             );
         }
 
-        state
-            .page_table
+        hot.page_table
             .as_mut()
             .ok_or(UserMmRuntimeError::NotMapped)?
             .retire_all_private_tables(&mut retired)?;
+
+        // Free the backings in batches: one allocator lock acquisition per
+        // phase instead of two per page.
+        let owned_count = owned_retired.len();
+        if let Err(error) = crate::page_alloc::free_many(owned_retired) {
+            crate::println!(
+                "user-mm: batched backing free failed owned={} error={:?}",
+                owned_count,
+                error,
+            );
+            return Err(error.into());
+        }
+        LIVE_BACKINGS.fetch_sub(owned_count, Ordering::AcqRel);
+
+        let mut freed_scratch: Vec<PageAllocation> = Vec::new();
+        freed_scratch
+            .try_reserve(cow_retired.len())
+            .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
+        let cow_freed =
+            crate::page_alloc::release_many_unreferenced(&cow_retired, &mut freed_scratch)?;
+        LIVE_BACKINGS.fetch_sub(cow_freed, Ordering::AcqRel);
 
         for table in retired.drain(..) {
             let start = table.start().start_address().get();
@@ -2033,7 +2354,7 @@ impl UserMm {
             }
         }
 
-        let page_table = state
+        let page_table = hot
             .page_table
             .as_mut()
             .ok_or(UserMmRuntimeError::NotMapped)?;
@@ -2043,33 +2364,77 @@ impl UserMm {
             "M8-B3 retained private intermediate page tables",
         );
         page_table.release_empty()?;
-        state.page_table = None;
+        hot.page_table = None;
         LIVE_ROOTS.fetch_sub(1, Ordering::AcqRel);
-        let asid = state.core.asid();
-        drop(state);
+        let asid = cold.core.asid();
+        drop(hot);
+        drop(cold);
         release_mm_reservation(asid);
+        if let Some(start) = diag_start {
+            let elapsed = crate::arch::time::counter().wrapping_sub(start);
+            crate::user::BUILDSTORM_DESTROY_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::user::BUILDSTORM_DESTROY_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+            crate::user::BUILDSTORM_DESTROY_PAGES.fetch_add(
+                (owned_count + cow_retired.len() + shared_retired) as u64,
+                Ordering::Relaxed,
+            );
+            crate::user::BUILDSTORM_DESTROY_TABLES
+                .fetch_add(table_capacity as u64, Ordering::Relaxed);
+            crate::user::BUILDSTORM_DESTROY_UNMAPPED
+                .fetch_add(already_unmapped as u64, Ordering::Relaxed);
+        }
         Ok(())
+    }
+
+    /// Frees the pages and page tables a retirement batch collected, after
+    /// every target CPU has acknowledged the accompanying TLB request.
+    fn finish_retirement(&self, retirement: RetirementBatch) -> Result<(), UserMmRuntimeError> {
+        if let Some(request) = retirement.request {
+            self.shootdown_user_request(request);
+        }
+        for backing in retirement.backings {
+            crate::page_alloc::free(backing)?;
+            LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
+        }
+        for frame in retirement.cow_frames {
+            release_cow_frame(frame)?;
+        }
+        for table in retirement.page_tables {
+            crate::page_alloc::free(table)?;
+        }
+        Ok(())
+    }
+
+    /// Executes one per-mm TLB request on behalf of `self`, passing the mm's
+    /// per-CPU local-generation array so the §9 IPI handler can publish the
+    /// seen generation for §11 switch-in flush elision.
+    fn shootdown_user_request(&self, request: myos_mm::PerMmTlbRequest) {
+        if crate::arch::interrupt::are_disabled() || !crate::task::scheduler_is_initialized() {
+            crate::tlb::shootdown_user_local(request);
+        } else {
+            crate::tlb::shootdown_user(request, Some(self.local_tlb_generation.as_ptr()));
+        }
     }
 }
 
 impl Drop for UserMm {
     fn drop(&mut self) {
         let needs_teardown = {
-            let state = self.state.lock();
-            state.page_table.is_some()
+            let hot = self.hot.lock();
+            hot.page_table.is_some()
         };
         if needs_teardown {
             if let Err(error) = self.destroy() {
                 panic!("M8-B3 UserMm teardown failed during drop: {error:?}");
             }
         }
-        let state = self.state.lock();
+        let (cold, hot) = self.lock_both();
         assert!(
-            state.pages.is_empty(),
+            hot.pages.is_empty(),
             "M8-B3 UserMm dropped with owned backing pages",
         );
         assert!(
-            state.core.assert_inactive_for_destroy().is_ok(),
+            cold.core.assert_inactive_for_destroy().is_ok(),
             "M8-B3 UserMm dropped while active on a CPU",
         );
     }
@@ -2098,7 +2463,8 @@ pub fn assert_no_leaks() {
 }
 
 fn resolve_cow_write_fault_locked(
-    state: &mut UserMmState,
+    cold: &mut UserMmColdState,
+    hot: &mut UserMmHotState,
     address: VirtAddr,
     access: FaultAccess,
 ) -> Result<Option<(UserFaultResolution, Option<PerMmTlbRequest>)>, UserMmRuntimeError> {
@@ -2110,30 +2476,34 @@ fn resolve_cow_write_fault_locked(
         .ok_or(UserMmRuntimeError::AddressOverflow)?;
     let page =
         VirtPage::from_start_address(page_address).ok_or(UserMmRuntimeError::InvalidRange)?;
-    let frame = match state.pages.get(&page_address.get()) {
+    let frame = match hot.pages.get(&page_address.get()) {
         Some(MappedPage {
             backing: PageBacking::Cow(frame),
             ..
         }) => *frame,
         _ => return Ok(None),
     };
-    let area = state
+    let area = cold
         .core
         .layout()
         .find_area(page_address)
         .ok_or(UserMmRuntimeError::NotMapped)?;
-    if !area.flags().is_writable()
-        || state
-            .page_table
-            .as_ref()
-            .ok_or(UserMmRuntimeError::NotMapped)?
-            .translate(page_address)?
-            .is_none()
+    let pte_present = match hot
+        .page_table
+        .as_ref()
+        .ok_or(UserMmRuntimeError::NotMapped)?
+        .translate(page_address)
     {
+        Ok(mapping) => mapping.is_some(),
+        // A non-canonical user address is a SIGSEGV, not a kernel error.
+        Err(RuntimePageTableError::InvalidVirtualAddress) => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !area.flags().is_writable() || !pte_present {
         return Ok(None);
     }
 
-    let request = state.core.plan_post_install_tlb(page_address)?;
+    let request = cold.core.plan_post_install_tlb(page_address)?;
     let references = crate::page_alloc::reference_count(frame)?;
     if references > 1 {
         let allocation = crate::page_alloc::allocate(
@@ -2146,7 +2516,7 @@ fn resolve_cow_write_fault_locked(
             crate::page_alloc::free(allocation)?;
             return Err(error);
         }
-        let replaced = match state
+        let replaced = match hot
             .page_table
             .as_mut()
             .ok_or(UserMmRuntimeError::NotMapped)?
@@ -2159,8 +2529,7 @@ fn resolve_cow_write_fault_locked(
             }
         };
         debug_assert_eq!(replaced, frame);
-        state
-            .pages
+        hot.pages
             .get_mut(&page_address.get())
             .expect("COW page disappeared while user_mm was locked")
             .backing = PageBacking::Owned(allocation);
@@ -2168,8 +2537,7 @@ fn resolve_cow_write_fault_locked(
         release_cow_frame(frame)?;
     } else if references == 1 {
         apply_page_protection(
-            state
-                .page_table
+            hot.page_table
                 .as_mut()
                 .ok_or(UserMmRuntimeError::NotMapped)?,
             page,
@@ -2187,7 +2555,7 @@ fn resolve_cow_write_fault_locked(
 }
 
 fn map_zero_page_locked(
-    state: &mut UserMmState,
+    hot: &mut UserMmHotState,
     area: VmArea,
     address: VirtAddr,
 ) -> Result<PhysAddr, UserMmRuntimeError> {
@@ -2197,12 +2565,44 @@ fn map_zero_page_locked(
         .ok_or(UserMmRuntimeError::AddressOverflow)?;
     let page =
         VirtPage::from_start_address(page_address).ok_or(UserMmRuntimeError::InvalidRange)?;
-    if let Some(physical) = state
+    if let Some(physical) = hot
         .page_table
         .as_ref()
         .ok_or(UserMmRuntimeError::NotMapped)?
         .translate(address)?
     {
+        return Ok(physical);
+    }
+
+    // A fork-Cow-ified page without a PTE keeps its frame: map the existing
+    // frame read-only (content = the parent's fork snapshot) instead of a
+    // fresh zero page. The entry stays Cow; the next write fault breaks COW
+    // through the resolver.
+    let cow_frame = match hot.pages.get(&page.start_address().get()) {
+        Some(MappedPage {
+            backing: PageBacking::Cow(frame),
+            ..
+        }) => Some(*frame),
+        _ => None,
+    };
+    if let Some(frame) = cow_frame {
+        let mapped_area = if area.flags().is_writable() {
+            VmArea::new(
+                area.range(),
+                area.flags().without(VmAreaFlags::WRITE),
+                area.kind(),
+            )
+        } else {
+            area
+        };
+        let physical = frame
+            .start_address()
+            .checked_add(offset)
+            .ok_or(UserMmRuntimeError::AddressOverflow)?;
+        hot.page_table
+            .as_mut()
+            .ok_or(UserMmRuntimeError::NotMapped)?
+            .map_page(page, frame, mapped_area.mapping_options())?;
         return Ok(physical);
     }
 
@@ -2215,7 +2615,7 @@ fn map_zero_page_locked(
             return Err(UserMmRuntimeError::AddressOverflow);
         }
     };
-    let page_table = state
+    let page_table = hot
         .page_table
         .as_mut()
         .ok_or(UserMmRuntimeError::NotMapped)?;
@@ -2224,7 +2624,7 @@ fn map_zero_page_locked(
         return Err(error.into());
     }
 
-    let previous = state.pages.insert(page.start_address().get(), MappedPage {
+    let previous = hot.pages.insert(page.start_address().get(), MappedPage {
         page,
         backing: PageBacking::Owned(backing),
     });
@@ -2295,15 +2695,15 @@ fn file_mappings_overlap(mappings: &BTreeMap<usize, FileBackedMapping>, range: V
 }
 
 fn retire_range_locked(
-    state: &mut UserMmState,
+    cold: &mut UserMmColdState,
+    hot: &mut UserMmHotState,
     range: VirtRange,
 ) -> Result<RetirementBatch, UserMmRuntimeError> {
     let mut keys = Vec::new();
     keys.try_reserve(range.size() / PAGE_SIZE + 1)
         .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
     keys.extend(
-        state
-            .pages
+        hot.pages
             .range(range.start().get()..range.end().get())
             .map(|(&key, _)| key),
     );
@@ -2312,12 +2712,12 @@ fn retire_range_locked(
         return Ok(RetirementBatch::empty());
     }
 
-    let page_table = state
+    let page_table = hot
         .page_table
         .as_ref()
         .ok_or(UserMmRuntimeError::NotMapped)?;
     for key in &keys {
-        let mapping = state
+        let mapping = hot
             .pages
             .get(key)
             .expect("retirement key disappeared during preflight");
@@ -2347,17 +2747,17 @@ fn retire_range_locked(
     tables
         .try_reserve(table_capacity)
         .map_err(|_| UserMmRuntimeError::MetadataOutOfMemory)?;
-    let request = state.core.plan_tlb_request(TlbFlush::Range {
-        scope: TlbScope::AddressSpace(state.core.asid().id()),
+    let request = cold.core.plan_tlb_request(TlbFlush::Range {
+        scope: TlbScope::AddressSpace(cold.core.asid().id()),
         range,
     })?;
 
     for key in keys {
-        let mapping = state
+        let mapping = hot
             .pages
             .remove(&key)
             .expect("retirement key disappeared after preflight");
-        let page_table = state
+        let page_table = hot
             .page_table
             .as_mut()
             .expect("retirement preflight lost the user page table");
@@ -2390,23 +2790,6 @@ fn retire_range_locked(
     })
 }
 
-fn finish_retirement(retirement: RetirementBatch) -> Result<(), UserMmRuntimeError> {
-    if let Some(request) = retirement.request {
-        shootdown_user_request(request);
-    }
-    for backing in retirement.backings {
-        crate::page_alloc::free(backing)?;
-        LIVE_BACKINGS.fetch_sub(1, Ordering::AcqRel);
-    }
-    for frame in retirement.cow_frames {
-        release_cow_frame(frame)?;
-    }
-    for table in retirement.page_tables {
-        crate::page_alloc::free(table)?;
-    }
-    Ok(())
-}
-
 fn apply_page_protection(
     page_table: &mut RuntimePageTable,
     page: VirtPage,
@@ -2429,14 +2812,6 @@ fn apply_page_protection(
         Ok(()) => Ok(()),
         Err(RuntimePageTableError::NotMapped) => page_table.map_page(page, frame, options),
         Err(error) => Err(error),
-    }
-}
-
-fn shootdown_user_request(request: myos_mm::PerMmTlbRequest) {
-    if crate::arch::interrupt::are_disabled() || !crate::task::scheduler_is_initialized() {
-        crate::tlb::shootdown_user_local(request);
-    } else {
-        crate::tlb::shootdown_user(request);
     }
 }
 
@@ -2466,14 +2841,15 @@ fn flush_post_install_local(request: PerMmTlbRequest) -> Result<(), UserMmRuntim
 }
 
 fn file_fault_request_locked(
-    state: &UserMmState,
+    cold: &UserMmColdState,
+    hot: &UserMmHotState,
     address: VirtAddr,
     access: FaultAccess,
 ) -> Result<Option<FileFaultRequest>, UserMmRuntimeError> {
-    let Some(mapping) = file_mapping_at(&state.file_mappings, address) else {
+    let Some(mapping) = file_mapping_at(&cold.file_mappings, address) else {
         return Ok(None);
     };
-    let area = state
+    let area = cold
         .core
         .layout()
         .find_area(address)
@@ -2483,14 +2859,18 @@ fn file_fault_request_locked(
         FaultAccess::Write => area.flags().is_writable(),
         FaultAccess::Execute => area.flags().is_executable(),
     };
-    if !allowed
-        || state
-            .page_table
-            .as_ref()
-            .ok_or(UserMmRuntimeError::NotMapped)?
-            .translate(address)?
-            .is_some()
+    let pte_present = match hot
+        .page_table
+        .as_ref()
+        .ok_or(UserMmRuntimeError::NotMapped)?
+        .translate(address)
     {
+        Ok(mapping) => mapping.is_some(),
+        // A non-canonical user address is a SIGSEGV, not a kernel error.
+        Err(RuntimePageTableError::InvalidVirtualAddress) => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !allowed || pte_present {
         return Ok(None);
     }
     let page = address
@@ -2516,7 +2896,10 @@ fn file_fault_request_locked(
             mapping.content_generation,
             file_offset,
         ),
-        shared_cache: mapping.shared_cache,
+        // A shared page-cache frame behind a writable VMA would alias every
+        // process mapping the same file page: user writes would land in the
+        // globally shared frame. Writable areas must fault private copies.
+        shared_cache: mapping.shared_cache && !area.flags().is_writable(),
         generation: mapping.generation,
     }))
 }
@@ -2599,7 +2982,7 @@ fn copy_physical_page(source: PhysAddr, destination: PhysAddr) -> Result<(), Use
 }
 
 fn validate_range(
-    state: &UserMmState,
+    cold: &UserMmColdState,
     address: usize,
     length: usize,
     access: FaultAccess,
@@ -2614,7 +2997,7 @@ fn validate_range(
     let mut cursor = address;
     while cursor < end {
         let virtual_address = VirtAddr::new(cursor);
-        let area = state
+        let area = cold
             .core
             .layout()
             .find_area(virtual_address)

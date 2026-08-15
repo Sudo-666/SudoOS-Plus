@@ -63,6 +63,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
     const SUPERVISOR_EXTERNAL: usize = 9;
 
     crate::task::repair_current_cpu_from_stack();
+    crate::task::note_trap_entry();
     validate_trap_frame(frame);
 
     if frame.is_interrupt() {
@@ -82,6 +83,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
         if frame.previous_mode_was_user() {
             let _ = crate::user::handle_forced_exit(frame);
         }
+        crate::task::note_trap_exit();
         return;
     }
 
@@ -97,6 +99,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             frame.sepc, frame.scause, code, frame.stval,
         ),
     }
+    crate::task::note_trap_exit();
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -118,6 +121,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
     const SUPPORTED_INTERRUPT_BITS: usize = TIMER_INTERRUPT_BIT | IPI_INTERRUPT_BIT;
 
     crate::task::repair_current_cpu_from_stack();
+    crate::task::note_trap_entry();
     validate_trap_frame(frame);
 
     match frame.exception_code() {
@@ -175,6 +179,7 @@ extern "C" fn kernel_arch_trap(frame: &mut crate::arch::trap::TrapFrame) {
             frame.badi,
         ),
     }
+    crate::task::note_trap_exit();
 }
 
 #[unsafe(no_mangle)]

@@ -94,7 +94,13 @@ __m7_user_return:
     csrw sstatus, t0
     ld ra, 0(sp)
     ld gp, 8(sp)
-    ld tp, 16(sp)
+    /*
+     * Do NOT restore tp from the prologue: in kernel mode tp is hardware
+     * per-CPU identity (the logical CPU ID), and the prologue slot holds the
+     * value of whichever CPU ran __m7_enter_user.  A mid-trap migration can
+     * resume this unwind on a different CPU, and the trap-return path above
+     * has already left the destination CPU's tp in the register.
+     */
     ld s0, 24(sp)
     ld s1, 32(sp)
     ld s2, 40(sp)

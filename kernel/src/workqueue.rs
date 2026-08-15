@@ -693,10 +693,9 @@ mod verify {
     }
 
     #[inline(never)]
-    fn verify_delayed_tickless_execution() {
+    fn verify_delayed_idle_execution() {
         let probe = Probe::new();
         let cpu = crate::smp::current_cpu_id();
-        let idle_entries = crate::time::tickless_idle_entries_for(cpu);
         let ticks = crate::time::timer_ticks_for(cpu);
         let before = crate::time::now();
         let handle = queue_delayed(
@@ -715,13 +714,16 @@ mod verify {
             u64::MAX,
             "delayed work callback did not publish its tick sample",
         );
+        // The scheduler clockevent stays active while idle as the fallback
+        // wake mechanism for coalesced reschedule IPIs; the periodic tick
+        // therefore keeps advancing while delayed work is the only deadline.
         assert!(
-            crate::time::tickless_idle_entries_for(cpu) > idle_entries,
-            "delayed work did not pass through tickless idle",
+            ticks_at_hit.wrapping_sub(ticks) >= 1,
+            "scheduler tick did not keep advancing while delayed work was the only deadline",
         );
         assert!(
-            ticks_at_hit.wrapping_sub(ticks) <= 1,
-            "periodic scheduler ticks continued while delayed work was the only deadline",
+            crate::time::scheduler_tick_active_for(cpu),
+            "scheduler tick was not active after delayed work execution",
         );
     }
 
@@ -825,7 +827,7 @@ mod verify {
 
     pub(super) fn worker() {
         verify_immediate_execution();
-        verify_delayed_tickless_execution();
+        verify_delayed_idle_execution();
         verify_synchronous_cancel();
         verify_sleepable_callback();
         verify_blocked_worker_does_not_stall_pool();
@@ -840,7 +842,7 @@ mod verify {
         crate::println!("  worker concurrency : verified");
         crate::println!("  SMP dispatch       : verified");
         crate::println!("  slot reclamation   : verified");
-        crate::println!("  tickless wakeup    : verified");
+        crate::println!("  idle wakeup        : verified");
     }
 }
 

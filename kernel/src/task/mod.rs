@@ -13,19 +13,18 @@ pub use wait_queue::{Completion, WaitOutcome, WaitQueue};
 
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 #[cfg(debug_assertions)]
+use core::hint::{black_box, spin_loop};
 use core::{
-    hint::{black_box, spin_loop},
-    sync::atomic::AtomicBool,
-};
-use core::{
+    cell::UnsafeCell,
     marker::PhantomData,
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 use crate::{
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
     smp::CpuId,
+    tracked_spin::{TrackedSpinLock, TrackedSpinLockGuard},
 };
 use stack::KernelStack;
 
@@ -82,13 +81,19 @@ impl Drop for PreemptGuard {
 
 #[must_use = "dropping the guard re-enables migration"]
 pub struct MigrationGuard {
-    _preempt: PreemptGuard,
+    task: TaskId,
+    _not_send: PhantomData<*mut ()>,
 }
 
 impl MigrationGuard {
+    /// Independent of PreemptGuard: the holder stays preemptible and may be
+    /// scheduled out, but every scheduler placement path (steal, wake,
+    /// enqueue) keeps the task on the CPU recorded at the 0->1 depth edge.
     pub fn new() -> Self {
+        let task = migration_disable_local();
         Self {
-            _preempt: PreemptGuard::new(),
+            task,
+            _not_send: PhantomData,
         }
     }
 }
@@ -96,6 +101,12 @@ impl MigrationGuard {
 impl Default for MigrationGuard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        migration_enable_task(self.task);
     }
 }
 
@@ -110,6 +121,11 @@ impl TaskId {
     pub(crate) const fn from_raw(raw: usize) -> Self {
         Self(raw)
     }
+
+    fn expect_current(self) -> Self {
+        assert_ne!(self.0, NO_CPU, "online CPU has no current task");
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +136,36 @@ enum TaskState {
     Blocked,
     Idle(CpuId),
     Exited,
+}
+
+impl TaskState {
+    // smp-pcpu-v1: task scheduling fields live in atomics so that cross-owner
+    // reads (work stealing under a donor rq lock, registry-held scans) are
+    // sound without taking the global scheduler lock. The CPU id fits in the
+    // high bits because MAX_CPUS <= 8.
+    const fn encode(self) -> u8 {
+        match self {
+            Self::Runnable => 0,
+            Self::Running(cpu) => 1 | (cpu.get() as u8) << 3,
+            Self::SwitchingOut(cpu) => 2 | (cpu.get() as u8) << 3,
+            Self::Blocked => 3,
+            Self::Idle(cpu) => 4 | (cpu.get() as u8) << 3,
+            Self::Exited => 5,
+        }
+    }
+
+    fn decode(raw: u8) -> Self {
+        let cpu = || CpuId::new((raw >> 3) as usize).expect("invalid CPU id in task state");
+        match raw & 0b111 {
+            0 => Self::Runnable,
+            1 => Self::Running(cpu()),
+            2 => Self::SwitchingOut(cpu()),
+            3 => Self::Blocked,
+            4 => Self::Idle(cpu()),
+            5 => Self::Exited,
+            _ => unreachable!("invalid encoded task state"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,25 +186,99 @@ impl TaskKind {
     }
 }
 
+/// Encoded `Option<CpuId>` for atomic scheduling fields.
+const NO_CPU: usize = usize::MAX;
+
+const fn encode_cpu(cpu: Option<CpuId>) -> usize {
+    match cpu {
+        Some(cpu) => cpu.get(),
+        None => NO_CPU,
+    }
+}
+
+fn decode_cpu(raw: usize) -> Option<CpuId> {
+    (raw != NO_CPU).then(|| CpuId::new(raw).expect("invalid CPU id in atomic task field"))
+}
+
 struct Task {
     id: TaskId,
     kind: TaskKind,
-    state: TaskState,
-    context: crate::arch::task::Context,
+    // Scheduling fields shared across owners (rq locks, the per-CPU owner,
+    // the registry).  Atomics keep cross-owner reads sound; see design.md §3.
+    state: AtomicU8,
+    queued_on: AtomicUsize,
+    affinity: AtomicUsize,
+    has_run: AtomicBool,
+    // Everything below is registry-owned: mutated only while holding the
+    // REGISTRY lock, except `context` which the architecture writes through
+    // the UnsafeCell while the task is SwitchingOut/Running and no other
+    // CPU can reference it.
+    //
+    // Preemption and migration-disable depths are Task-owned single
+    // authorities: the running task bumps them locklessly on its own CPU
+    // and every scheduler gate reads them from the task record, so no
+    // CPU-local mirror can drift out of sync across a switch.
+    preempt_disable_depth: AtomicUsize,
+    migration_disable_depth: AtomicUsize,
+    /// Tracked-spin-lock hold count, Task-owned. A force-exit must not
+    /// abandon the interrupted context while this is non-zero: the guard
+    /// would leak and every waiter would spin forever (§10 情况A).
+    tracked_lock_depth: AtomicUsize,
+    /// CPU the task must not leave while `migration_disable_depth > 0`;
+    /// `NO_CPU` when unpinned. Written on the depth 0->1 / 1->0 edges.
+    migration_pinned: AtomicUsize,
+    context: UnsafeCell<crate::arch::task::Context>,
     stack: Option<KernelStack>,
     entry: Option<KernelThreadEntry>,
     user_thread: Option<Arc<crate::process::Thread>>,
     exit_visible: Option<Arc<Completion>>,
     process_cleanup: Option<ProcessCleanup>,
-    affinity: Option<CpuId>,
-    queued_on: Option<CpuId>,
-    has_run: bool,
-    preempt_count: usize,
     wait_channel: Option<usize>,
     wait_queue_address: Option<usize>,
     wait_prev: Option<TaskId>,
     wait_next: Option<TaskId>,
     wake_after_switch: bool,
+}
+
+impl Task {
+    fn state(&self) -> TaskState {
+        TaskState::decode(self.state.load(Ordering::Acquire))
+    }
+
+    fn store_state(&self, state: TaskState) {
+        self.state.store(state.encode(), Ordering::Release);
+    }
+
+    fn queued_on(&self) -> Option<CpuId> {
+        decode_cpu(self.queued_on.load(Ordering::Acquire))
+    }
+
+    fn store_queued_on(&self, cpu: Option<CpuId>) {
+        self.queued_on.store(encode_cpu(cpu), Ordering::Release);
+    }
+
+    fn affinity(&self) -> Option<CpuId> {
+        decode_cpu(self.affinity.load(Ordering::Acquire))
+    }
+
+    fn store_affinity(&self, cpu: Option<CpuId>) {
+        self.affinity.store(encode_cpu(cpu), Ordering::Release);
+    }
+
+    /// CPU recorded by the 0->1 migration-depth edge; `None` while unpinned.
+    fn pinned_cpu(&self) -> Option<CpuId> {
+        decode_cpu(self.migration_pinned.load(Ordering::Acquire))
+    }
+
+    fn context_ptr(&self) -> *mut crate::arch::task::Context {
+        self.context.get()
+    }
+
+    fn context(&self) -> &crate::arch::task::Context {
+        // Read-only diagnostics; the architecture only writes through
+        // context_ptr() while the task is switching.
+        unsafe { &*self.context.get() }
+    }
 }
 
 fn fresh_task_context(
@@ -192,17 +312,20 @@ impl Task {
         Self {
             id: TaskId(0),
             kind: TaskKind::Idle(CpuId::BOOT),
-            state: TaskState::Running(CpuId::BOOT),
-            context: crate::arch::task::Context::default(),
+            state: AtomicU8::new(TaskState::Running(CpuId::BOOT).encode()),
+            context: UnsafeCell::new(crate::arch::task::Context::default()),
             stack: None,
             entry: None,
             user_thread: None,
             exit_visible: None,
             process_cleanup: None,
-            affinity: Some(CpuId::BOOT),
-            queued_on: None,
-            has_run: true,
-            preempt_count: 0,
+            affinity: AtomicUsize::new(encode_cpu(Some(CpuId::BOOT))),
+            queued_on: AtomicUsize::new(NO_CPU),
+            has_run: AtomicBool::new(true),
+            preempt_disable_depth: AtomicUsize::new(0),
+            migration_disable_depth: AtomicUsize::new(0),
+            tracked_lock_depth: AtomicUsize::new(0),
+            migration_pinned: AtomicUsize::new(NO_CPU),
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -215,17 +338,20 @@ impl Task {
         Self {
             id,
             kind: TaskKind::Idle(cpu),
-            state: TaskState::Idle(cpu),
-            context: fresh_task_context(&stack, idle_thread_bootstrap),
+            state: AtomicU8::new(TaskState::Idle(cpu).encode()),
+            context: UnsafeCell::new(fresh_task_context(&stack, idle_thread_bootstrap)),
             stack: Some(stack),
             entry: None,
             user_thread: None,
             exit_visible: None,
             process_cleanup: None,
-            affinity: Some(cpu),
-            queued_on: None,
-            has_run: false,
-            preempt_count: 0,
+            affinity: AtomicUsize::new(encode_cpu(Some(cpu))),
+            queued_on: AtomicUsize::new(NO_CPU),
+            has_run: AtomicBool::new(false),
+            preempt_disable_depth: AtomicUsize::new(0),
+            migration_disable_depth: AtomicUsize::new(0),
+            tracked_lock_depth: AtomicUsize::new(0),
+            migration_pinned: AtomicUsize::new(NO_CPU),
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -248,17 +374,20 @@ impl Task {
         Self {
             id,
             kind,
-            state: TaskState::Runnable,
-            context: fresh_task_context(&stack, kernel_thread_bootstrap),
+            state: AtomicU8::new(TaskState::Runnable.encode()),
+            context: UnsafeCell::new(fresh_task_context(&stack, kernel_thread_bootstrap)),
             stack: Some(stack),
             entry: Some(entry),
             user_thread: None,
             exit_visible: None,
             process_cleanup: None,
-            affinity,
-            queued_on: None,
-            has_run: false,
-            preempt_count: 0,
+            affinity: AtomicUsize::new(encode_cpu(affinity)),
+            queued_on: AtomicUsize::new(NO_CPU),
+            has_run: AtomicBool::new(false),
+            preempt_disable_depth: AtomicUsize::new(0),
+            migration_disable_depth: AtomicUsize::new(0),
+            tracked_lock_depth: AtomicUsize::new(0),
+            migration_pinned: AtomicUsize::new(NO_CPU),
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -281,17 +410,20 @@ impl Task {
         Self {
             id,
             kind: TaskKind::UserThread,
-            state: TaskState::Runnable,
-            context: fresh_task_context(&stack, user_thread_bootstrap),
+            state: AtomicU8::new(TaskState::Runnable.encode()),
+            context: UnsafeCell::new(fresh_task_context(&stack, user_thread_bootstrap)),
             stack: Some(stack),
             entry: None,
             user_thread: Some(thread),
             exit_visible: Some(exit_visible),
             process_cleanup,
-            affinity,
-            queued_on: None,
-            has_run: false,
-            preempt_count: 0,
+            affinity: AtomicUsize::new(encode_cpu(affinity)),
+            queued_on: AtomicUsize::new(NO_CPU),
+            has_run: AtomicBool::new(false),
+            preempt_disable_depth: AtomicUsize::new(0),
+            migration_disable_depth: AtomicUsize::new(0),
+            tracked_lock_depth: AtomicUsize::new(0),
+            migration_pinned: AtomicUsize::new(NO_CPU),
             wait_channel: None,
             wait_queue_address: None,
             wait_prev: None,
@@ -314,7 +446,7 @@ impl Task {
 
     fn destroy_resources(mut self) {
         assert!(
-            self.queued_on.is_none(),
+            self.queued_on().is_none(),
             "destroying task still linked to a run queue: {:?}",
             self.id,
         );
@@ -399,42 +531,818 @@ pub(super) struct WaiterDebugState {
     pub claimed_switching: usize,
 }
 
-struct CpuScheduler {
-    current: Option<TaskId>,
-    idle: Option<TaskId>,
-    loaded_mm: Option<Arc<crate::user_mm::UserMm>>,
-    run_queue: VecDeque<TaskId>,
-    pending: Option<PendingSwitch>,
-    context_switches: u64,
-    preemptions: u64,
-    mm_switches: u64,
-    irq_depth: usize,
-    need_resched: bool,
-    timeslice_remaining: u32,
+// smp-pcpu-v1: per-CPU scheduler storage.  Truly-local fields (irq_depth,
+// timeslice, pending, stats) are written only by the owning CPU;
+// `current`/`idle`/`need_resched` are atomics so cross-CPU diagnostics and
+// remote wakeups stay sound.  Preemption and migration depth live on the
+// Task, not here, so they survive the switch with their owner.  The
+// runqueue owns Runnable tasks.
+struct RunQueue {
+    lock: TrackedSpinLock<VecDeque<TaskId>>,
 }
 
-impl CpuScheduler {
-    fn new() -> Self {
+impl RunQueue {
+    const fn new() -> Self {
         Self {
-            current: None,
-            idle: None,
-            loaded_mm: None,
-            run_queue: VecDeque::with_capacity(MAX_TASKS),
-            pending: None,
-            context_switches: 0,
-            preemptions: 0,
-            mm_switches: 0,
-            irq_depth: 0,
-            need_resched: false,
-            timeslice_remaining: DEFAULT_TIME_SLICE_TICKS,
+            lock: TrackedSpinLock::new_with_class(
+                VecDeque::new(),
+                LockClass::new("runqueue", LockRank::RunQueue, 1),
+            ),
         }
     }
+
+    fn lock(&self) -> TrackedSpinLockGuard<'_, VecDeque<TaskId>> {
+        self.lock.lock()
+    }
+
+    fn try_lock(&self) -> Option<TrackedSpinLockGuard<'_, VecDeque<TaskId>>> {
+        self.lock.try_lock()
+    }
+}
+
+// PendingSwitch is packed into one AtomicU64 so cross-CPU diagnostics
+// (debug dumps, stack-owner repair) read it without racing the owning CPU.
+const PENDING_RAW_NONE: u64 = 0;
+const PENDING_SHIFT: u32 = 11; // MAX_TASKS = 1024 fits in 11 bits
+const PENDING_DISPOSITION_SHIFT: u32 = 22;
+
+fn encode_pending(pending: PendingSwitch) -> u64 {
+    let disposition = match pending.disposition {
+        SwitchDisposition::Yield => 0_u64,
+        SwitchDisposition::Block => 1_u64,
+        SwitchDisposition::Exit => 2_u64,
+    };
+    // No presence bit: a real pending {0, 0} is unreachable (every prepare
+    // asserts previous != next and the idle task never blocks or exits), so
+    // raw == 0 already means "no transaction".  OR-ing a 1 here would alias
+    // the low bit of `previous` and corrupt every decode.
+    (pending.previous.raw() as u64)
+        | (pending.next.raw() as u64) << PENDING_SHIFT
+        | disposition << PENDING_DISPOSITION_SHIFT
+}
+
+fn decode_pending(raw: u64) -> Option<PendingSwitch> {
+    if raw == PENDING_RAW_NONE {
+        return None;
+    }
+    let disposition = match (raw >> PENDING_DISPOSITION_SHIFT) & 0b11 {
+        0 => SwitchDisposition::Yield,
+        1 => SwitchDisposition::Block,
+        2 => SwitchDisposition::Exit,
+        _ => unreachable!("invalid encoded switch disposition"),
+    };
+    Some(PendingSwitch {
+        previous: TaskId::from_raw((raw as usize) & ((1_usize << PENDING_SHIFT) - 1)),
+        next: TaskId::from_raw(((raw >> PENDING_SHIFT) as usize) & ((1_usize << PENDING_SHIFT) - 1)),
+        disposition,
+    })
+}
+
+struct CpuLocal {
+    current: AtomicUsize, // encoded TaskId; NO_CPU when offline
+    idle: AtomicUsize,
+    rq: RunQueue,
+    need_resched: AtomicBool,
+    timeslice_remaining: u32,
+    irq_depth: usize,
+    pending: AtomicU64, // encoded PendingSwitch; 0 = none
+    loaded_mm: UnsafeCell<Option<Arc<crate::user_mm::UserMm>>>,
+    context_switches: AtomicU64,
+    preemptions: AtomicU64,
+    mm_switches: AtomicU64,
+    // §10 TLB-shootdown timeout diagnostics: owned-CPU writes, remote reads
+    // only from the panic path where a racy snapshot is sound by design.
+    irq_mirror: AtomicU8,     // 1 = last known local interrupt state enabled
+    irq_mirror_at: AtomicU64, // time::counter() at the last mirror update
+    in_trap_depth: AtomicUsize, // > 0 while inside kernel_arch_trap (SIE = 0)
+    last_switch: AtomicU64,   // time::counter() at the last committed switch
+    // §10: trap continuations that resumed on a different CPU than the one
+    // that entered them (switch-inside-trap migration) leave the per-CPU
+    // depth unbalanced; the exit side saturates and counts those events.
+    trap_imbalance: AtomicUsize,
+}
+
+impl CpuLocal {
+    const fn new() -> Self {
+        Self {
+            current: AtomicUsize::new(NO_CPU),
+            idle: AtomicUsize::new(NO_CPU),
+            rq: RunQueue::new(),
+            need_resched: AtomicBool::new(false),
+            timeslice_remaining: DEFAULT_TIME_SLICE_TICKS,
+            irq_depth: 0,
+            pending: AtomicU64::new(PENDING_RAW_NONE),
+            loaded_mm: UnsafeCell::new(None),
+            context_switches: AtomicU64::new(0),
+            preemptions: AtomicU64::new(0),
+            mm_switches: AtomicU64::new(0),
+            irq_mirror: AtomicU8::new(0),
+            irq_mirror_at: AtomicU64::new(0),
+            in_trap_depth: AtomicUsize::new(0),
+            last_switch: AtomicU64::new(0),
+            trap_imbalance: AtomicUsize::new(0),
+        }
+    }
+
+    fn pending(&self) -> Option<PendingSwitch> {
+        decode_pending(self.pending.load(Ordering::Acquire))
+    }
+
+    fn store_pending(&self, pending: Option<PendingSwitch>) {
+        self.pending.store(
+            pending.map_or(PENDING_RAW_NONE, encode_pending),
+            Ordering::Release,
+        );
+    }
+
+    /// Loaded-MM accessors use UnsafeCell interior mutability: the owning
+    /// CPU reads/writes it in the scheduling path while remote CPUs may only
+    /// read it from quiescent debug verifiers (after all user tasks exited
+    /// and every switch committed).
+    fn loaded_mm(&self) -> Option<Arc<crate::user_mm::UserMm>> {
+        // SAFETY: see CpuLocal::loaded_mm field contract.
+        unsafe { (*self.loaded_mm.get()).clone() }
+    }
+
+    fn store_loaded_mm(&self, mm: Option<Arc<crate::user_mm::UserMm>>) {
+        // SAFETY: see CpuLocal::loaded_mm field contract.
+        unsafe {
+            *self.loaded_mm.get() = mm;
+        }
+    }
+
+    fn take_loaded_mm(&self) -> Option<Arc<crate::user_mm::UserMm>> {
+        // SAFETY: see CpuLocal::loaded_mm field contract.
+        unsafe { (*self.loaded_mm.get()).take() }
+    }
+}
+
+struct CpuLocalSlot(UnsafeCell<CpuLocal>);
+
+// SAFETY: truly-local fields are mutated only by the owning CPU; cross-CPU
+// accesses use the atomics or the documented accessors on CpuLocal.
+unsafe impl Sync for CpuLocalSlot {}
+
+static CPUS: [CpuLocalSlot; MAX_CPUS] =
+    [const { CpuLocalSlot(UnsafeCell::new(CpuLocal::new())) }; MAX_CPUS];
+
+fn cpu_local(cpu: CpuId) -> &'static CpuLocal {
+    // SAFETY: CPUS is write-once at initialization; readers may be remote
+    // CPUs for atomic/diagnostic fields only.
+    unsafe { &*CPUS[cpu.get()].0.get() }
+}
+
+fn cpu_local_mut(cpu: CpuId) -> &'static mut CpuLocal {
+    debug_assert_eq!(
+        crate::smp::current_cpu_id(),
+        cpu,
+        "cross-CPU CpuLocal mutation"
+    );
+    // SAFETY: truly-local fields are only mutated by the owning CPU.
+    unsafe { &mut *CPUS[cpu.get()].0.get() }
+}
+
+/// Stable base pointer to the registry task table.  The Vec is created with
+/// capacity MAX_TASKS and its length never exceeds MAX_TASKS, so it never
+/// reallocates; a Runnable task's slot is written exactly once (at spawn,
+/// before rq publication) and only taken when the task exits on its own CPU.
+/// This lets the local fast path obtain `&Task` without the REGISTRY lock.
+static TASKS_BASE: AtomicPtr<Option<Task>> = AtomicPtr::new(core::ptr::null_mut());
+
+fn task_ref(id: TaskId) -> &'static Task {
+    let base = TASKS_BASE.load(Ordering::Acquire);
+    assert!(!base.is_null(), "task table not initialized");
+    // SAFETY: the slot is stable (see TASKS_BASE comment) and the caller's
+    // ownership (rq lock / own CPU) guarantees it is not vacant.
+    unsafe { (&*base.add(id.0)).as_ref().expect("task slot is vacant") }
+}
+
+/// Number of discovered CPUs, mirrored for lockless fast paths.
+static DISCOVERED_CPUS: AtomicUsize = AtomicUsize::new(0);
+
+/// Lockless initialization gate for the per-CPU fast paths.  REGISTRY-heavy
+/// paths may still take SCHEDULER directly.
+fn scheduler_ready() -> bool {
+    !TASKS_BASE.load(Ordering::Acquire).is_null()
+}
+
+fn current_of(cpu: CpuId) -> TaskId {
+    assert!(
+        scheduler_ready(),
+        "kernel scheduler is not initialized"
+    );
+    let raw = cpu_local(cpu).current.load(Ordering::Acquire);
+    TaskId::from_raw(raw).expect_current()
+}
+
+fn idle_of(cpu: CpuId) -> TaskId {
+    assert!(
+        scheduler_ready(),
+        "kernel scheduler is not initialized"
+    );
+    let raw = cpu_local(cpu).idle.load(Ordering::Acquire);
+    TaskId::from_raw(raw).expect_current()
+}
+
+// smp-pcpu-v1: rq manipulation runs under the per-CPU runqueue lock only.
+// All callers hold local interrupts disabled (IrqSaveGuard, REGISTRY's
+// IrqSpinLock, or trap context), so a timer hardirq can never preempt an
+// rq critical section.
+
+fn enqueue_task(id: TaskId, cpu: CpuId) {
+    let task = task_ref(id);
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert!(task.queued_on().is_none(), "task was queued more than once");
+    if let Some(affinity) = task.affinity() {
+        assert_eq!(affinity, cpu, "pinned task queued on the wrong CPU");
+    }
+    if let Some(pinned) = task.pinned_cpu() {
+        assert_eq!(pinned, cpu, "migration-pinned task queued on the wrong CPU");
+    }
+    task.store_queued_on(Some(cpu));
+    cpu_local(cpu).rq.lock().push_back(id);
+}
+
+fn dequeue_local_task(cpu: CpuId) -> Option<TaskId> {
+    let id = cpu_local(cpu).rq.lock().pop_front()?;
+    let task = task_ref(id);
+    assert_eq!(task.state(), TaskState::Runnable);
+    assert_eq!(task.queued_on(), Some(cpu));
+    task.store_queued_on(None);
+    Some(id)
+}
+
+fn steal_runnable_task(cpu: CpuId) -> Option<TaskId> {
+    let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+    for donor_index in 0..discovered {
+        let donor = CpuId::new(donor_index).expect("invalid donor CPU");
+        if donor == cpu || !crate::smp::is_scheduler_active(donor) {
+            continue;
+        }
+
+        let mut queue = cpu_local(donor).rq.lock();
+        let position = queue.iter().position(|id| {
+            let task = task_ref(*id);
+            // Linux-style work stealing: a runnable task without explicit
+            // affinity may move after any completed switch-out. The
+            // architecture context carries FP/vector state, and the user
+            // trap anchor is rebuilt from the destination CPU before
+            // returning to user mode.
+            task.state() == TaskState::Runnable
+                && task.affinity().is_none()
+                && task.migration_disable_depth.load(Ordering::Acquire) == 0
+        });
+        let Some(position) = position else {
+            continue;
+        };
+        let id = queue
+            .remove(position)
+            .expect("stealable task disappeared from donor queue");
+        drop(queue);
+
+        let task = task_ref(id);
+        assert_eq!(task.queued_on(), Some(donor));
+        task.store_queued_on(None);
+        return Some(id);
+    }
+
+    None
+}
+
+fn dequeue_next_task(cpu: CpuId) -> Option<TaskId> {
+    dequeue_local_task(cpu).or_else(|| steal_runnable_task(cpu))
+}
+
+fn activate_next_task(id: TaskId, cpu: CpuId) {
+    let task = task_ref(id);
+
+    match task.kind {
+        TaskKind::Idle(owner) => {
+            assert_eq!(owner, cpu, "idle task selected by the wrong CPU");
+            assert_eq!(task.state(), TaskState::Idle(cpu));
+        }
+        TaskKind::KernelThread | TaskKind::SystemThread => {
+            assert_eq!(task.state(), TaskState::Runnable);
+            if let Some(affinity) = task.affinity() {
+                assert_eq!(affinity, cpu, "pinned task selected by the wrong CPU");
+            }
+            task.has_run.store(true, Ordering::Release);
+        }
+        TaskKind::UserThread => {
+            assert_eq!(task.state(), TaskState::Runnable);
+            if let Some(affinity) = task.affinity() {
+                assert_eq!(affinity, cpu, "pinned user task selected by the wrong CPU",);
+            }
+            task.has_run.store(true, Ordering::Release);
+        }
+    }
+
+    assert!(task.queued_on().is_none());
+    task.store_state(TaskState::Running(cpu));
+
+    let local = cpu_local_mut(cpu);
+    local.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+    local.need_resched.store(false, Ordering::Release);
+}
+
+fn context_pair(previous: TaskId, next: TaskId) -> ContextSwitch {
+    (task_ref(previous).context_ptr(), task_ref(next).context_ptr())
+}
+
+fn cpu_runnable_load(cpu: CpuId) -> usize {
+    let queued = cpu_local(cpu).rq.lock().len();
+    let running = (cpu_local(cpu).current.load(Ordering::Acquire) != NO_CPU)
+        .then(|| usize::from(!task_ref(current_of(cpu)).kind.is_idle()))
+        .unwrap_or(0);
+    queued.saturating_add(running)
+}
+
+/// Install the incoming task's user address space on this CPU.  The
+/// previous/next user_mm reads and the loaded-mm bookkeeping are all
+/// CPU-local: the call happens inside the switch transaction while local
+/// interrupts are disabled, before `pending` is published.
+fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) {
+    assert!(
+        crate::arch::interrupt::are_disabled(),
+        "M9-B switch_mm_irqs_off ran with local interrupts enabled",
+    );
+    debug_assert_eq!(
+        crate::smp::current_cpu_id(),
+        cpu,
+        "M9-B switch_mm_irqs_off ran off-CPU"
+    );
+
+    let previous_mm = task_ref(previous).user_mm();
+    let next_mm = task_ref(next).user_mm();
+    let local = cpu_local(cpu);
+    let mut loaded_mm = local.loaded_mm();
+
+    let mismatch = match (&previous_mm, &loaded_mm) {
+        (None, None) => false,
+        (Some(previous), Some(loaded)) => !Arc::ptr_eq(previous, loaded),
+        (Some(_), None) | (None, Some(_)) => true,
+    };
+
+    if mismatch {
+        #[cfg(debug_assertions)]
+        crate::println!(
+            "scheduler: loaded-mm mismatch cpu={} prev_user={} loaded={}; repairing",
+            cpu.get(),
+            previous_mm.is_some(),
+            loaded_mm.is_some(),
+        );
+        // Deactivate stale loaded mm if present.
+        if let Some(stale) = &loaded_mm {
+            stale
+                .deactivate_current_cpu()
+                .unwrap_or_else(|error| panic!("M9-B failed to repair stale mm: {error:?}"));
+        }
+        local.store_loaded_mm(None);
+        loaded_mm = None;
+        // Fall through: the activation path below will set up the
+        // correct mm for the incoming task.
+    }
+
+    if let (Some(loaded), Some(incoming)) = (&loaded_mm, &next_mm)
+        && Arc::ptr_eq(loaded, incoming)
+    {
+        if let Some(thread) = task_ref(next).user_thread.as_ref() {
+            thread.record_cpu(cpu);
+        }
+        return;
+    }
+
+    local
+        .mm_switches
+        .fetch_add(1, Ordering::Relaxed);
+
+    if let Some(loaded) = loaded_mm {
+        loaded
+            .deactivate_current_cpu()
+            .unwrap_or_else(|error| panic!("M9-B failed to leave outgoing mm: {error:?}"));
+        local.store_loaded_mm(None);
+    }
+
+    if let Some(next_mm) = next_mm {
+        next_mm
+            .activate_current_cpu()
+            .unwrap_or_else(|error| panic!("M9-B failed to enter incoming mm: {error:?}"));
+        local.store_loaded_mm(Some(next_mm));
+        if let Some(thread) = task_ref(next).user_thread.as_ref() {
+            thread.record_cpu(cpu);
+        }
+    }
+}
+
+fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
+    assert!(
+        crate::smp::is_scheduler_active(cpu),
+        "inactive CPU attempted to schedule"
+    );
+    assert!(
+        cpu_local(cpu).pending().is_none(),
+        "CPU attempted a nested context switch",
+    );
+
+    if task_ref(current_of(cpu))
+        .preempt_disable_depth
+        .load(Ordering::Acquire)
+        != 0
+    {
+        // The running task holds preemption disabled: switching it out would
+        // leak the pin onto the next task. Yield is only a hint; stay local.
+        return None;
+    }
+
+    #[cfg(debug_assertions)]
+    if crate::tracked_spin::preemptible_lock_depth(cpu) != 0 {
+        // Yield is a hint: refusing to switch a preemptible-lock holder keeps
+        // the per-CPU lockdep stack LIFO-consistent (see prepare_preempt_local).
+        return None;
+    }
+
+    let previous = current_of(cpu);
+    assert_eq!(task_ref(previous).state(), TaskState::Running(cpu));
+
+    let Some(next) = dequeue_next_task(cpu) else {
+        // A runnable current task must never yield to the idle task.
+        // Linux keeps the sole runnable task selected; idle is only a
+        // fallback for block/exit or when the current task is already idle.
+        //
+        // Switching a runnable task to idle and re-enqueuing it in
+        // switch-tail creates a runnable-without-wakeup window under
+        // NO_HZ. Treat yield as a hint and continue locally when there is
+        // no alternative task.
+        let local = cpu_local_mut(cpu);
+        local.need_resched.store(false, Ordering::Release);
+        local.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+        return None;
+    };
+
+    assert_ne!(previous, next, "CPU selected its current task as next");
+    task_ref(previous).store_state(TaskState::SwitchingOut(cpu));
+    activate_next_task(next, cpu);
+    switch_mm_irqs_off(cpu, previous, next);
+    {
+        let local = cpu_local_mut(cpu);
+        local.need_resched.store(false, Ordering::Release);
+        local.store_pending(Some(PendingSwitch {
+            previous,
+            next,
+            disposition: SwitchDisposition::Yield,
+        }));
+        local.context_switches.fetch_add(1, Ordering::Relaxed);
+        local
+            .last_switch
+            .store(crate::arch::time::counter(), Ordering::Relaxed);
+    }
+
+    Some(context_pair(previous, next))
+}
+
+fn prepare_preempt_local(cpu: CpuId) -> Option<ContextSwitch> {
+    assert!(
+        crate::smp::is_scheduler_active(cpu),
+        "inactive CPU attempted to preempt",
+    );
+    {
+        let local = cpu_local(cpu);
+        if local.irq_depth != 0 {
+            return None;
+        }
+        // An interrupt can be delivered after the hardware stack changed but
+        // before switch-tail commits `pending.next` as current. The existing
+        // switch owns this CPU; defer the tick instead of nesting a second
+        // context switch into the same per-CPU transaction.
+        if local.pending().is_some() {
+            return None;
+        }
+        if task_ref(current_of(cpu))
+            .preempt_disable_depth
+            .load(Ordering::Acquire)
+            != 0
+        {
+            return None;
+        }
+        if !local.need_resched.load(Ordering::Acquire) {
+            return None;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    if crate::tracked_spin::preemptible_lock_depth(cpu) != 0 {
+        // The per-CPU LIFO lockdep stack requires that a tracked-lock holder
+        // is never switched away mid-critical-section: a later task would push
+        // its own entries above the suspended holder's, and the holder's
+        // release would then pop the wrong instance. Preemptible locks carry
+        // no migration guard, so the preempt gate enforces it here instead.
+        // need_resched stays armed and the tick is retried at the next
+        // IRQ exit, once the lock is released.
+        return None;
+    }
+
+    let previous = current_of(cpu);
+    assert_eq!(task_ref(previous).state(), TaskState::Running(cpu));
+
+    let Some(next) = dequeue_next_task(cpu) else {
+        let local = cpu_local_mut(cpu);
+        local.need_resched.store(false, Ordering::Release);
+        local.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+        return None;
+    };
+
+    assert_ne!(previous, next, "CPU selected its current task as next");
+    task_ref(previous).store_state(TaskState::SwitchingOut(cpu));
+    activate_next_task(next, cpu);
+    switch_mm_irqs_off(cpu, previous, next);
+    {
+        let local = cpu_local_mut(cpu);
+        local.need_resched.store(false, Ordering::Release);
+        local.store_pending(Some(PendingSwitch {
+            previous,
+            next,
+            disposition: SwitchDisposition::Yield,
+        }));
+        local.context_switches.fetch_add(1, Ordering::Relaxed);
+        local
+            .last_switch
+            .store(crate::arch::time::counter(), Ordering::Relaxed);
+        local.preemptions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    Some(context_pair(previous, next))
+}
+
+/// Switch-tail commit for the lockless Yield disposition: only the local rq
+/// and task atomics are touched, no REGISTRY.
+fn complete_yield_switch(cpu: CpuId, pending: PendingSwitch, running_sp: usize) -> bool {
+    assert_eq!(
+        current_of(cpu),
+        pending.previous,
+        "scheduler current changed before the hardware stack switch committed",
+    );
+    assert_eq!(
+        task_ref(pending.next).state(),
+        TaskState::Running(cpu),
+        "incoming task was not Running before switch commit",
+    );
+    #[cfg(debug_assertions)]
+    assert!(
+        task_ref(pending.next).stack.is_none()
+            || task_ref(pending.next).stack_contains(running_sp),
+        "incoming hardware SP is outside the selected task stack: task={:?} sp={running_sp:#x}",
+        pending.next,
+    );
+    cpu_local(cpu)
+        .current
+        .store(pending.next.raw(), Ordering::Release);
+    assert_eq!(
+        task_ref(pending.previous).state(),
+        TaskState::SwitchingOut(cpu),
+    );
+
+    if task_ref(pending.previous).kind.is_idle() {
+        task_ref(pending.previous).store_state(TaskState::Idle(cpu));
+    } else {
+        task_ref(pending.previous).store_state(TaskState::Runnable);
+        enqueue_task(pending.previous, cpu);
+    }
+    task_ref(pending.next).kind.is_idle()
+}
+
+fn assert_schedulable(cpu: CpuId) {
+    let local = cpu_local(cpu);
+    assert_eq!(
+        local.irq_depth, 0,
+        "task attempted to schedule in IRQ context"
+    );
+    assert_eq!(
+        task_ref(current_of(cpu))
+            .preempt_disable_depth
+            .load(Ordering::Acquire),
+        0,
+        "task attempted to schedule with preemption disabled: cpu={} current={:?} tracked={:?}",
+        cpu.get(),
+        current_of(cpu),
+        crate::tracked_spin::held_diagnostic(cpu)
+    );
+}
+
+fn timer_ticks_local(cpu: CpuId, ticks: u64) {
+    if ticks == 0 {
+        return;
+    }
+    let current = current_of(cpu);
+    if task_ref(current).kind.is_idle() {
+        return;
+    }
+    let elapsed = u32::try_from(ticks).unwrap_or(u32::MAX);
+    let local = cpu_local_mut(cpu);
+    if elapsed < local.timeslice_remaining {
+        local.timeslice_remaining -= elapsed;
+    } else {
+        local.timeslice_remaining = 0;
+        local.need_resched.store(true, Ordering::Release);
+    }
+}
+
+/// Lockless preemption pin. The Task-owned depth is the single authority:
+/// the running task bumps it on its own CPU and every scheduler gate reads
+/// it from the task record, so the count cannot drift across a switch the
+/// way a CpuLocal mirror could.
+fn preempt_disable_local() -> TaskId {
+    assert!(
+        scheduler_ready(),
+        "preemption used before scheduler initialization"
+    );
+    let cpu = crate::smp::current_cpu_id();
+    let task = current_of(cpu);
+    let running_sp = crate::arch::task::current_stack_pointer();
+    assert!(
+        task_ref(task).stack.is_none() || task_ref(task).stack_contains(running_sp),
+        "preemption pin recorded on a foreign stack: task={task:?} sp={running_sp:#x}",
+    );
+    task_ref(task)
+        .preempt_disable_depth
+        .fetch_add(1, Ordering::AcqRel);
+    task
+}
+
+fn preempt_enable_local(task: TaskId) {
+    assert!(
+        scheduler_ready(),
+        "preemption used before scheduler initialization"
+    );
+    let cpu = crate::smp::current_cpu_id();
+    let current = current_of(cpu);
+    assert_eq!(
+        current, task,
+        "preemption guard task disagrees with scheduler current",
+    );
+    let previous = task_ref(task)
+        .preempt_disable_depth
+        .fetch_sub(1, Ordering::AcqRel);
+    assert!(previous >= 1, "preempt counter underflowed");
+    let should_schedule = previous == 1
+        && cpu_local(cpu).irq_depth == 0
+        && cpu_local(cpu).need_resched.load(Ordering::Acquire);
+    if should_schedule && crate::arch::interrupt::are_enabled() {
+        preempt_schedule();
+    }
+}
+
+/// Lockless migration pin. The Task-owned depth is the single authority;
+/// the 0->1 edge records the CPU the task must not leave. Unlike a
+/// PreemptGuard this does not disable preemption: the pinned task may be
+/// scheduled out and is resumed on the recorded CPU by the steal/wake
+/// placement rules.
+fn migration_disable_local() -> TaskId {
+    assert!(
+        scheduler_ready(),
+        "migration pin used before scheduler initialization"
+    );
+    let cpu = crate::smp::current_cpu_id();
+    let task = current_of(cpu);
+    let previous = task_ref(task)
+        .migration_disable_depth
+        .fetch_add(1, Ordering::AcqRel);
+    if previous == 0 {
+        task_ref(task)
+            .migration_pinned
+            .store(cpu.get(), Ordering::Release);
+    }
+    task
+}
+
+fn migration_enable_task(task: TaskId) {
+    assert!(
+        scheduler_ready(),
+        "migration pin used before scheduler initialization"
+    );
+    let cpu = crate::smp::current_cpu_id();
+    let current = current_of(cpu);
+    assert_eq!(
+        current, task,
+        "migration guard task disagrees with scheduler current",
+    );
+    let depth = task_ref(task)
+        .migration_disable_depth
+        .fetch_sub(1, Ordering::AcqRel);
+    assert!(depth >= 1, "migration depth underflowed");
+    if depth == 1 {
+        task_ref(task)
+            .migration_pinned
+            .store(NO_CPU, Ordering::Release);
+    }
+}
+
+/// Tracked-spin-lock hold accounting, Task-owned. A preemptible lock may be
+/// held across a switch (the holder migrates), so the depth must live on the
+/// task, not on a CPU. `handle_forced_exit` consults it before abandoning an
+/// interrupted context: abandoning a context that holds a tracked lock leaks
+/// the guard and leaves every waiter spinning (§10 情况A).
+pub(crate) fn note_tracked_lock_acquire() {
+    if !scheduler_ready() {
+        return;
+    }
+    let task = current_of(crate::smp::current_cpu_id());
+    task_ref(task)
+        .tracked_lock_depth
+        .fetch_add(1, Ordering::AcqRel);
+}
+
+pub(crate) fn note_tracked_lock_release() {
+    if !scheduler_ready() {
+        return;
+    }
+    let task = current_of(crate::smp::current_cpu_id());
+    let depth = task_ref(task)
+        .tracked_lock_depth
+        .fetch_sub(1, Ordering::AcqRel);
+    assert!(depth >= 1, "tracked-lock depth underflowed");
+}
+
+pub(crate) fn current_tracked_lock_depth() -> usize {
+    if !scheduler_ready() {
+        return 0;
+    }
+    let task = current_of(crate::smp::current_cpu_id());
+    task_ref(task).tracked_lock_depth.load(Ordering::Acquire)
+}
+
+fn work_available(cpu: CpuId) -> bool {
+    // rq locks carry a rank above Timer, so they must never be held with
+    // local interrupts enabled.  Idle polling arrives with IRQs on.
+    let _irq_guard = crate::context::IrqSaveGuard::new();
+
+    if !cpu_local(cpu).rq.lock().is_empty() {
+        return true;
+    }
+
+    let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+    (0..discovered).any(|donor_index| {
+        let donor = CpuId::new(donor_index).expect("invalid donor CPU");
+        donor != cpu
+            && crate::smp::is_scheduler_active(donor)
+            && cpu_local(donor).rq.lock().iter().any(|id| {
+                let task = task_ref(*id);
+                task.state() == TaskState::Runnable
+                    && task.affinity().is_none()
+                    && task.migration_disable_depth.load(Ordering::Acquire) == 0
+            })
+    })
+}
+
+fn context_switches_total() -> u64 {
+    let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+    (0..discovered)
+        .map(|index| {
+            cpu_local(CpuId::new(index).expect("scheduler CPU index is invalid"))
+                .context_switches
+                .load(Ordering::Relaxed)
+        })
+        .sum()
+}
+
+fn mm_switches_total() -> u64 {
+    let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+    (0..discovered)
+        .map(|index| {
+            cpu_local(CpuId::new(index).expect("scheduler CPU index is invalid"))
+                .mm_switches
+                .load(Ordering::Relaxed)
+        })
+        .sum()
+}
+
+fn preemptions_total() -> u64 {
+    let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+    (0..discovered)
+        .map(|index| {
+            cpu_local(CpuId::new(index).expect("scheduler CPU index is invalid"))
+                .preemptions
+                .load(Ordering::Relaxed)
+        })
+        .sum()
+}
+
+fn registered_cpu_mask() -> usize {
+    let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+    (0..discovered).fold(0_usize, |mask, index| {
+        let local = cpu_local(CpuId::new(index).expect("scheduler CPU index is invalid"));
+        if local.current.load(Ordering::Acquire) != NO_CPU
+            && local.idle.load(Ordering::Acquire) != NO_CPU
+        {
+            mask | (1_usize << index)
+        } else {
+            mask
+        }
+    })
 }
 
 struct Scheduler {
     tasks: Vec<Option<Task>>,
     retired_tasks: Vec<Task>,
-    cpus: [CpuScheduler; MAX_CPUS],
     discovered_cpus: usize,
     live_kernel_threads: usize,
     live_user_threads: usize,
@@ -448,10 +1356,6 @@ impl Scheduler {
         tasks.push(Some(Task::boot()));
         assert!(tasks.capacity() >= MAX_TASKS);
 
-        let mut cpus = core::array::from_fn(|_| CpuScheduler::new());
-        cpus[CpuId::BOOT.get()].current = Some(TaskId(0));
-        cpus[CpuId::BOOT.get()].idle = Some(TaskId(0));
-
         for logical in 1..discovered_cpus {
             let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
             let stack = KernelStack::allocate().unwrap_or_else(|error| {
@@ -462,7 +1366,6 @@ impl Scheduler {
             });
             let id = TaskId(tasks.len());
             tasks.push(Some(Task::idle(id, cpu, stack)));
-            cpus[cpu.get()].idle = Some(id);
         }
 
         let retired_tasks = Vec::with_capacity(MAX_TASKS);
@@ -471,7 +1374,6 @@ impl Scheduler {
         Self {
             tasks,
             retired_tasks,
-            cpus,
             discovered_cpus,
             live_kernel_threads: 0,
             live_user_threads: 0,
@@ -492,18 +1394,6 @@ impl Scheduler {
             .unwrap_or_else(|| panic!("task {:?} does not exist", id))
     }
 
-    fn current(&self, cpu: CpuId) -> TaskId {
-        self.cpus[cpu.get()]
-            .current
-            .expect("online CPU has no current task")
-    }
-
-    fn idle(&self, cpu: CpuId) -> TaskId {
-        self.cpus[cpu.get()]
-            .idle
-            .expect("discovered CPU has no idle task")
-    }
-
     fn allocate_task_id(&self) -> TaskId {
         if let Some((index, _)) = self
             .tasks
@@ -522,15 +1412,6 @@ impl Scheduler {
         TaskId(self.tasks.len())
     }
 
-    fn cpu_runnable_load(&self, cpu: CpuId) -> usize {
-        let queued = self.cpus[cpu.get()].run_queue.len();
-        let current = self.cpus[cpu.get()].current;
-        let running = current
-            .map(|id| usize::from(!self.task(id).kind.is_idle()))
-            .unwrap_or(0);
-        queued.saturating_add(running)
-    }
-
     fn choose_target_cpu(&self) -> CpuId {
         (0..self.discovered_cpus)
             .filter_map(CpuId::new)
@@ -538,7 +1419,7 @@ impl Scheduler {
             // Count the task already running on each CPU as well as queued
             // work; considering only queue length repeatedly selected CPU0
             // while other CPUs were idle during parallel rustc builds.
-            .min_by_key(|cpu| (self.cpu_runnable_load(*cpu), cpu.get()))
+            .min_by_key(|cpu| (cpu_runnable_load(*cpu), cpu.get()))
             .expect("scheduler has no active CPU")
     }
 
@@ -577,9 +1458,9 @@ impl Scheduler {
             self.tasks[id.0] = Some(task);
         }
 
-        self.enqueue(id, target);
+        enqueue_task(id, target);
         if request_reschedule {
-            self.cpus[target.get()].need_resched = true;
+            cpu_local(target).need_resched.store(true, Ordering::Release);
         }
         if kind.is_counted_kernel_thread() {
             self.live_kernel_threads += 1;
@@ -639,8 +1520,8 @@ impl Scheduler {
         if let Some((thread, status)) = late_forced_exit {
             thread.request_forced_exit(status);
         }
-        self.enqueue(id, target);
-        self.cpus[target.get()].need_resched = true;
+        enqueue_task(id, target);
+        cpu_local(target).need_resched.store(true, Ordering::Release);
         self.live_user_threads = self
             .live_user_threads
             .checked_add(1)
@@ -649,289 +1530,22 @@ impl Scheduler {
         (id, target)
     }
 
-    fn switch_mm_irqs_off(&mut self, cpu: CpuId, previous: TaskId, next: TaskId) {
-        assert!(
-            crate::arch::interrupt::are_disabled(),
-            "M9-B switch_mm_irqs_off ran with local interrupts enabled",
-        );
-
-        let previous_mm = self.task(previous).user_mm();
-        let next_mm = self.task(next).user_mm();
-        let mut loaded_mm = self.cpus[cpu.get()].loaded_mm.as_ref().cloned();
-
-        let mismatch = match (&previous_mm, &loaded_mm) {
-            (None, None) => false,
-            (Some(previous), Some(loaded)) => !Arc::ptr_eq(previous, loaded),
-            (Some(_), None) | (None, Some(_)) => true,
-        };
-
-        if mismatch {
-            #[cfg(debug_assertions)]
-            crate::println!(
-                "scheduler: loaded-mm mismatch cpu={} prev_user={} loaded={}; repairing",
-                cpu.get(),
-                previous_mm.is_some(),
-                loaded_mm.is_some(),
-            );
-            // Deactivate stale loaded mm if present.
-            if let Some(stale) = &loaded_mm {
-                stale
-                    .deactivate_current_cpu()
-                    .unwrap_or_else(|error| panic!("M9-B failed to repair stale mm: {error:?}"));
-            }
-            self.cpus[cpu.get()].loaded_mm = None;
-            loaded_mm = None;
-            // Fall through: the activation path below will set up the
-            // correct mm for the incoming task.
-        }
-
-        if let (Some(loaded), Some(incoming)) = (&loaded_mm, &next_mm)
-            && Arc::ptr_eq(loaded, incoming)
-        {
-            if let Some(thread) = self.task(next).user_thread.as_ref() {
-                thread.record_cpu(cpu);
-            }
-            return;
-        }
-
-        self.cpus[cpu.get()].mm_switches = self.cpus[cpu.get()]
-            .mm_switches
-            .checked_add(1)
-            .expect("M9-B MM switch counter overflowed");
-
-        if let Some(loaded) = loaded_mm {
-            loaded
-                .deactivate_current_cpu()
-                .unwrap_or_else(|error| panic!("M9-B failed to leave outgoing mm: {error:?}"));
-            self.cpus[cpu.get()].loaded_mm = None;
-        }
-
-        if let Some(next_mm) = next_mm {
-            next_mm
-                .activate_current_cpu()
-                .unwrap_or_else(|error| panic!("M9-B failed to enter incoming mm: {error:?}"));
-            self.cpus[cpu.get()].loaded_mm = Some(next_mm);
-            if let Some(thread) = self.task(next).user_thread.as_ref() {
-                thread.record_cpu(cpu);
-            }
-        }
-    }
-
-    fn enqueue(&mut self, id: TaskId, cpu: CpuId) {
-        {
-            let task = self.task_mut(id);
-            assert_eq!(task.state, TaskState::Runnable);
-            assert!(task.queued_on.is_none(), "task was queued more than once");
-            if let Some(affinity) = task.affinity {
-                assert_eq!(affinity, cpu, "pinned task queued on the wrong CPU");
-            }
-            task.queued_on = Some(cpu);
-        }
-
-        self.cpus[cpu.get()].run_queue.push_back(id);
-    }
-
-    fn dequeue_local(&mut self, cpu: CpuId) -> Option<TaskId> {
-        let id = self.cpus[cpu.get()].run_queue.pop_front()?;
-        let task = self.task_mut(id);
-
-        assert_eq!(task.state, TaskState::Runnable);
-        assert_eq!(task.queued_on, Some(cpu));
-        task.queued_on = None;
-        Some(id)
-    }
-
-    fn steal_runnable(&mut self, cpu: CpuId) -> Option<TaskId> {
-        for donor_index in 0..self.discovered_cpus {
-            let donor = CpuId::new(donor_index).expect("invalid donor CPU");
-            if donor == cpu || !crate::smp::is_scheduler_active(donor) {
-                continue;
-            }
-
-            let position = self.cpus[donor.get()].run_queue.iter().position(|id| {
-                let task = self.task(*id);
-                // Linux-style work stealing: a runnable task without explicit
-                // affinity may move after any completed switch-out. The
-                // architecture context carries FP/vector state, and the user
-                // trap anchor is rebuilt from the destination CPU before
-                // returning to user mode.
-                task.state == TaskState::Runnable && task.affinity.is_none()
-            });
-
-            let Some(position) = position else {
-                continue;
-            };
-
-            let id = self.cpus[donor.get()]
-                .run_queue
-                .remove(position)
-                .expect("stealable task disappeared from donor queue");
-            let task = self.task_mut(id);
-            assert_eq!(task.queued_on, Some(donor));
-            task.queued_on = None;
-            return Some(id);
-        }
-
-        None
-    }
-
-    fn dequeue_next(&mut self, cpu: CpuId) -> Option<TaskId> {
-        self.dequeue_local(cpu).or_else(|| self.steal_runnable(cpu))
-    }
-
-    fn activate_next(&mut self, id: TaskId, cpu: CpuId) {
-        let task = self.task_mut(id);
-
-        match task.kind {
-            TaskKind::Idle(owner) => {
-                assert_eq!(owner, cpu, "idle task selected by the wrong CPU");
-                assert_eq!(task.state, TaskState::Idle(cpu));
-            }
-            TaskKind::KernelThread | TaskKind::SystemThread => {
-                assert_eq!(task.state, TaskState::Runnable);
-                if let Some(affinity) = task.affinity {
-                    assert_eq!(affinity, cpu, "pinned task selected by the wrong CPU");
-                }
-                task.has_run = true;
-            }
-            TaskKind::UserThread => {
-                assert_eq!(task.state, TaskState::Runnable);
-                if let Some(affinity) = task.affinity {
-                    assert_eq!(affinity, cpu, "pinned user task selected by the wrong CPU",);
-                }
-                task.has_run = true;
-            }
-        }
-
-        assert!(task.queued_on.is_none());
-        task.state = TaskState::Running(cpu);
-
-        self.cpus[cpu.get()].timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
-        self.cpus[cpu.get()].need_resched = false;
-    }
-
-    fn prepare_yield(&mut self, cpu: CpuId) -> Option<ContextSwitch> {
-        assert!(
-            crate::smp::is_scheduler_active(cpu),
-            "inactive CPU attempted to schedule"
-        );
-        assert!(
-            self.cpus[cpu.get()].pending.is_none(),
-            "CPU attempted a nested context switch",
-        );
-
-        let previous = self.current(cpu);
-        assert_eq!(self.task(previous).state, TaskState::Running(cpu));
-
-        let Some(next) = self.dequeue_next(cpu) else {
-            // A runnable current task must never yield to the idle task.
-            // Linux keeps the sole runnable task selected; idle is only a
-            // fallback for block/exit or when the current task is already idle.
-            //
-            // Switching a runnable task to idle and re-enqueuing it in
-            // switch-tail creates a runnable-without-wakeup window under
-            // NO_HZ. Treat yield as a hint and continue locally when there is
-            // no alternative task.
-            let cpu_state = &mut self.cpus[cpu.get()];
-            cpu_state.need_resched = false;
-            cpu_state.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
-            return None;
-        };
-
-        assert_ne!(previous, next, "CPU selected its current task as next");
-        self.cpus[cpu.get()].need_resched = false;
-        self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
-        self.activate_next(next, cpu);
-        self.switch_mm_irqs_off(cpu, previous, next);
-        self.cpus[cpu.get()].pending = Some(PendingSwitch {
-            previous,
-            next,
-            disposition: SwitchDisposition::Yield,
-        });
-        self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
-            .context_switches
-            .checked_add(1)
-            .expect("context switch counter overflowed");
-
-        Some(self.context_pair(previous, next))
-    }
-
-    fn prepare_preempt(&mut self, cpu: CpuId) -> Option<ContextSwitch> {
-        assert!(
-            crate::smp::is_scheduler_active(cpu),
-            "inactive CPU attempted to preempt",
-        );
-        let cpu_state = &self.cpus[cpu.get()];
-        if cpu_state.irq_depth != 0 {
-            return None;
-        }
-        // An interrupt can be delivered after the hardware stack changed but
-        // before switch-tail commits `pending.next` as current. The existing
-        // switch owns this CPU; defer the tick instead of nesting a second
-        // context switch into the same per-CPU transaction.
-        if cpu_state.pending.is_some() {
-            return None;
-        }
-
-        let current = self.current(cpu);
-        if self.task(current).preempt_count != 0 {
-            return None;
-        }
-
-        if !cpu_state.need_resched {
-            return None;
-        }
-
-        let previous = current;
-        assert_eq!(self.task(previous).state, TaskState::Running(cpu));
-
-        let Some(next) = self.dequeue_next(cpu) else {
-            self.cpus[cpu.get()].need_resched = false;
-            self.cpus[cpu.get()].timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
-            return None;
-        };
-
-        assert_ne!(previous, next, "CPU selected its current task as next");
-        self.cpus[cpu.get()].need_resched = false;
-        self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
-        self.activate_next(next, cpu);
-        self.switch_mm_irqs_off(cpu, previous, next);
-        self.cpus[cpu.get()].pending = Some(PendingSwitch {
-            previous,
-            next,
-            disposition: SwitchDisposition::Yield,
-        });
-        self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
-            .context_switches
-            .checked_add(1)
-            .expect("context switch counter overflowed");
-        self.cpus[cpu.get()].preemptions = self.cpus[cpu.get()]
-            .preemptions
-            .checked_add(1)
-            .expect("preemption counter overflowed");
-
-        Some(self.context_pair(previous, next))
-    }
-
     fn prepare_block(&mut self, cpu: CpuId, queue: &WaitQueue) -> ContextSwitch {
         let channel = queue.channel();
         assert_ne!(channel, 0, "wait channel zero is reserved");
-        assert!(
-            self.cpus[cpu.get()].pending.is_none(),
-            "nested switch attempted"
-        );
-        assert_eq!(
-            self.cpus[cpu.get()].irq_depth,
-            0,
-            "IRQ context attempted to block"
-        );
-        let previous = self.current(cpu);
+        {
+            let local = cpu_local(cpu);
+            assert!(local.pending().is_none(), "nested switch attempted");
+            assert_eq!(local.irq_depth, 0, "IRQ context attempted to block");
+        }
+        let previous = current_of(cpu);
         let previous_task = self.task(previous);
         assert_eq!(
-            previous_task.preempt_count, 0,
+            previous_task.preempt_disable_depth.load(Ordering::Acquire),
+            0,
             "preemption-disabled task attempted to block",
         );
-        assert_eq!(previous_task.state, TaskState::Running(cpu));
+        assert_eq!(previous_task.state(), TaskState::Running(cpu));
         assert!(
             !previous_task.kind.is_idle(),
             "idle task attempted to block on a wait queue",
@@ -950,37 +1564,50 @@ impl Scheduler {
             !previous_task.wake_after_switch,
             "running task retained a stale wake claim: task={previous:?}",
         );
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            crate::tracked_spin::preemptible_lock_depth(cpu),
+            0,
+            "task attempted to block while holding a preemptible tracked lock: cpu={} task={previous:?}",
+            cpu.get(),
+        );
 
-        let next = self.dequeue_next(cpu).unwrap_or_else(|| self.idle(cpu));
+        let next = dequeue_next_task(cpu).unwrap_or_else(|| idle_of(cpu));
         assert_ne!(previous, next);
         {
             let task = self.task_mut(previous);
-            task.state = TaskState::SwitchingOut(cpu);
+            task.store_state(TaskState::SwitchingOut(cpu));
             task.wake_after_switch = false;
         }
         self.link_waiter(queue, previous, channel);
-        self.activate_next(next, cpu);
-        self.switch_mm_irqs_off(cpu, previous, next);
-        self.cpus[cpu.get()].pending = Some(PendingSwitch {
-            previous,
-            next,
-            disposition: SwitchDisposition::Block,
-        });
-        self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
-            .context_switches
-            .checked_add(1)
-            .expect("context switch counter overflowed");
-        self.context_pair(previous, next)
+        activate_next_task(next, cpu);
+        switch_mm_irqs_off(cpu, previous, next);
+        {
+            let local = cpu_local_mut(cpu);
+            local.store_pending(Some(PendingSwitch {
+                previous,
+                next,
+                disposition: SwitchDisposition::Block,
+            }));
+            local.context_switches.fetch_add(1, Ordering::Relaxed);
+            local
+                .last_switch
+                .store(crate::arch::time::counter(), Ordering::Relaxed);
+        local
+            .last_switch
+            .store(crate::arch::time::counter(), Ordering::Relaxed);
+        }
+        context_pair(previous, next)
     }
 
     fn prepare_exit(&mut self, cpu: CpuId) -> ContextSwitch {
         assert!(
-            self.cpus[cpu.get()].pending.is_none(),
+            cpu_local(cpu).pending().is_none(),
             "CPU attempted a nested context switch",
         );
 
-        let previous = self.current(cpu);
-        assert_eq!(self.task(previous).state, TaskState::Running(cpu));
+        let previous = current_of(cpu);
+        assert_eq!(self.task(previous).state(), TaskState::Running(cpu));
         assert!(
             !self.task(previous).kind.is_idle(),
             "idle task attempted to exit",
@@ -999,78 +1626,53 @@ impl Scheduler {
                 "exiting task retained a pending wake claim: task={previous:?}",
             );
         }
-        let next = self.dequeue_next(cpu).unwrap_or_else(|| self.idle(cpu));
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            crate::tracked_spin::preemptible_lock_depth(cpu),
+            0,
+            "task attempted to exit while holding a preemptible tracked lock: cpu={} task={previous:?}",
+            cpu.get(),
+        );
+        let next = dequeue_next_task(cpu).unwrap_or_else(|| idle_of(cpu));
         assert_ne!(previous, next);
 
-        self.task_mut(previous).state = TaskState::SwitchingOut(cpu);
-        self.activate_next(next, cpu);
-        self.switch_mm_irqs_off(cpu, previous, next);
-        self.cpus[cpu.get()].pending = Some(PendingSwitch {
-            previous,
-            next,
-            disposition: SwitchDisposition::Exit,
-        });
-        self.cpus[cpu.get()].context_switches = self.cpus[cpu.get()]
-            .context_switches
-            .checked_add(1)
-            .expect("context switch counter overflowed");
-
-        self.context_pair(previous, next)
-    }
-
-    fn context_pair(&mut self, previous: TaskId, next: TaskId) -> ContextSwitch {
-        let previous_pointer = {
-            let task = self.task_mut(previous);
-            core::ptr::addr_of_mut!(task.context)
-        };
-        let next_pointer = {
-            let task = self.task(next);
-            core::ptr::addr_of!(task.context)
-        };
-
-        (previous_pointer, next_pointer)
-    }
-
-    /// Resolve the CPU which owns the stack currently executing switch-tail.
-    ///
-    /// Before `complete_switch`, scheduler.current still names the outgoing
-    /// task, so a CPU with a pending switch must be matched against
-    /// `pending.next`. This makes CPU identity independent of an RV user trap
-    /// anchor that may have been built before the task migrated.
-    fn switch_tail_cpu_for_stack(&self, running_sp: usize) -> Option<CpuId> {
-        let mut owner = None;
-        for index in 0..self.discovered_cpus {
-            let cpu = CpuId::new(index).expect("scheduler CPU index is invalid");
-            let Some(task) = self.cpus[index]
-                .pending
-                .map(|pending| pending.next)
-                .or(self.cpus[index].current)
-            else {
-                continue;
-            };
-            if self.task(task).stack_contains(running_sp) {
-                assert!(owner.is_none(), "kernel stack is assigned to multiple CPUs");
-                owner = Some(cpu);
-            }
+        self.task_mut(previous)
+            .store_state(TaskState::SwitchingOut(cpu));
+        activate_next_task(next, cpu);
+        switch_mm_irqs_off(cpu, previous, next);
+        {
+            let local = cpu_local_mut(cpu);
+            local.store_pending(Some(PendingSwitch {
+                previous,
+                next,
+                disposition: SwitchDisposition::Exit,
+            }));
+            local.context_switches.fetch_add(1, Ordering::Relaxed);
+            local
+                .last_switch
+                .store(crate::arch::time::counter(), Ordering::Relaxed);
+        local
+            .last_switch
+            .store(crate::arch::time::counter(), Ordering::Relaxed);
         }
-        owner
+        context_pair(previous, next)
     }
 
-    fn complete_switch(&mut self, cpu: CpuId, running_sp: usize) -> CompletedSwitch {
-        let Some(pending) = self.cpus[cpu.get()].pending.take() else {
-            return CompletedSwitch {
-                retired_task_added: false,
-                exit_visible: None,
-            };
-        };
-
+    /// Switch-tail commit for Block/Exit: both dispositions mutate
+    /// registry-owned task state and must run under REGISTRY.
+    fn complete_registry_switch(
+        &mut self,
+        cpu: CpuId,
+        pending: PendingSwitch,
+        running_sp: usize,
+    ) -> (CompletedSwitch, bool) {
         assert_eq!(
-            self.current(cpu),
+            current_of(cpu),
             pending.previous,
             "scheduler current changed before the hardware stack switch committed",
         );
         assert_eq!(
-            self.task(pending.next).state,
+            self.task(pending.next).state(),
             TaskState::Running(cpu),
             "incoming task was not Running before switch commit",
         );
@@ -1083,21 +1685,16 @@ impl Scheduler {
             "incoming hardware SP is outside the selected task stack: task={:?} sp={running_sp:#x}",
             pending.next,
         );
-        self.cpus[cpu.get()].current = Some(pending.next);
+        cpu_local(cpu)
+            .current
+            .store(pending.next.raw(), Ordering::Release);
         assert_eq!(
-            self.task(pending.previous).state,
+            self.task(pending.previous).state(),
             TaskState::SwitchingOut(cpu),
         );
 
         match pending.disposition {
-            SwitchDisposition::Yield => {
-                if self.task(pending.previous).kind.is_idle() {
-                    self.task_mut(pending.previous).state = TaskState::Idle(cpu);
-                } else {
-                    self.task_mut(pending.previous).state = TaskState::Runnable;
-                    self.enqueue(pending.previous, cpu);
-                }
-            }
+            SwitchDisposition::Yield => unreachable!("yield resolved without the registry"),
             SwitchDisposition::Block => {
                 let wake_after_switch = self.task(pending.previous).wake_after_switch;
 
@@ -1111,25 +1708,26 @@ impl Scheduler {
                         task.wake_after_switch = false;
                         task.wait_channel = None;
                         task.wait_queue_address = None;
-                        task.state = TaskState::Runnable;
+                        task.store_state(TaskState::Runnable);
                     }
-                    self.enqueue(pending.previous, cpu);
+                    enqueue_task(pending.previous, cpu);
                     // The wake IPI may have arrived while local interrupts were
                     // disabled for the context switch. Preserve the scheduling
                     // request in software so progress does not depend on an
                     // interrupt-controller edge being replayed.
-                    self.cpus[cpu.get()].need_resched = true;
+                    cpu_local(cpu).need_resched.store(true, Ordering::Release);
                 } else {
                     let task = self.task_mut(pending.previous);
                     assert!(
                         task.wait_channel.is_some(),
                         "blocking task reached schedule-tail without a wait channel",
                     );
-                    task.state = TaskState::Blocked;
+                    task.store_state(TaskState::Blocked);
                 }
             }
             SwitchDisposition::Exit => {
-                self.task_mut(pending.previous).state = TaskState::Exited;
+                self.task_mut(pending.previous)
+                    .store_state(TaskState::Exited);
                 if self.task(pending.previous).kind.is_counted_kernel_thread() {
                     self.live_kernel_threads = self
                         .live_kernel_threads
@@ -1147,7 +1745,7 @@ impl Scheduler {
                     .take()
                     .expect("exited task disappeared before reclamation");
                 assert_eq!(task.id, pending.previous);
-                assert_eq!(task.state, TaskState::Exited);
+                assert_eq!(task.state(), TaskState::Exited);
                 let exit_visible = if matches!(task.kind, TaskKind::UserThread) {
                     Some(ExitVisible {
                         completion: task
@@ -1170,7 +1768,7 @@ impl Scheduler {
                 self.retired_tasks.push(task);
                 TASKS_RETIRED.fetch_add(1, Ordering::Relaxed);
                 // Publish the flush/barrier lifetime before making the task
-                // visible to the reaper.  The scheduler lock prevents a consumer
+                // visible to the reaper.  The REGISTRY lock prevents a consumer
                 // from detaching the task between these two publications.
                 RETIRED_OUTSTANDING
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -1182,17 +1780,23 @@ impl Scheduler {
                         value.checked_add(1)
                     })
                     .expect("retired backlog counter overflowed");
-                return CompletedSwitch {
-                    retired_task_added: true,
-                    exit_visible,
-                };
+                return (
+                    CompletedSwitch {
+                        retired_task_added: true,
+                        exit_visible,
+                    },
+                    self.task(pending.next).kind.is_idle(),
+                );
             }
         }
 
-        CompletedSwitch {
-            retired_task_added: false,
-            exit_visible: None,
-        }
+        (
+            CompletedSwitch {
+                retired_task_added: false,
+                exit_visible: None,
+            },
+            self.task(pending.next).kind.is_idle(),
+        )
     }
 
     fn take_retired_task(&mut self) -> Option<Task> {
@@ -1207,21 +1811,21 @@ impl Scheduler {
 
     #[cfg(debug_assertions)]
     fn clear_current_affinity(&mut self, cpu: CpuId) {
-        let current = self.current(cpu);
-        let task = self.task_mut(current);
+        let current = current_of(cpu);
+        let task = self.task(current);
 
-        assert_eq!(task.state, TaskState::Running(cpu));
+        assert_eq!(task.state(), TaskState::Running(cpu));
         assert!(
             !task.kind.is_idle(),
             "idle task affinity must remain fixed to its CPU",
         );
-        task.affinity = None;
+        task.store_affinity(None);
     }
 
     #[cfg(debug_assertions)]
     fn task_is_runnable_on(&self, id: TaskId, cpu: CpuId) -> bool {
         let task = self.task(id);
-        task.state == TaskState::Runnable && task.queued_on == Some(cpu)
+        task.state() == TaskState::Runnable && task.queued_on() == Some(cpu)
     }
 
     #[cfg(debug_assertions)]
@@ -1233,12 +1837,12 @@ impl Scheduler {
 
         let (source, has_run, affinity) = {
             let task = self.task(id);
-            assert_eq!(task.state, TaskState::Runnable);
+            assert_eq!(task.state(), TaskState::Runnable);
             (
-                task.queued_on
+                task.queued_on()
                     .expect("runnable migration task is not queued"),
-                task.has_run,
-                task.affinity,
+                task.has_run.load(Ordering::Acquire),
+                task.affinity(),
             )
         };
 
@@ -1249,29 +1853,30 @@ impl Scheduler {
         );
         assert_ne!(source, target, "migration source and target are identical");
 
-        let position = self.cpus[source.get()]
-            .run_queue
-            .iter()
-            .position(|candidate| *candidate == id)
-            .expect("migration task disappeared from its source run queue");
-        let removed = self.cpus[source.get()]
-            .run_queue
-            .remove(position)
-            .expect("migration task removal failed");
+        let removed = {
+            let mut queue = cpu_local(source).rq.lock();
+            let position = queue
+                .iter()
+                .position(|candidate| *candidate == id)
+                .expect("migration task disappeared from its source run queue");
+            queue
+                .remove(position)
+                .expect("migration task removal failed")
+        };
         assert_eq!(removed, id);
 
         {
-            let task = self.task_mut(id);
-            assert_eq!(task.queued_on, Some(source));
-            task.queued_on = None;
-            // Retarget affinity and queue ownership in the same scheduler
+            let task = self.task(id);
+            assert_eq!(task.queued_on(), Some(source));
+            task.store_queued_on(None);
+            // Retarget affinity and queue ownership in the same REGISTRY
             // critical section. This prevents a work-stealing CPU from racing
             // the explicit hand-off between source removal and target enqueue.
-            task.affinity = Some(target);
+            task.store_affinity(Some(target));
         }
 
-        self.enqueue(id, target);
-        self.cpus[target.get()].need_resched = true;
+        enqueue_task(id, target);
+        cpu_local(target).need_resched.store(true, Ordering::Release);
         source
     }
 
@@ -1283,16 +1888,19 @@ impl Scheduler {
             crate::smp::CpuState::Starting,
             "secondary scheduler registration occurred in the wrong lifecycle state",
         );
-        assert!(
-            self.cpus[cpu.get()].current.is_none(),
+        assert_eq!(
+            cpu_local(cpu).current.load(Ordering::Acquire),
+            NO_CPU,
             "secondary CPU registered twice",
         );
 
-        let idle = self.idle(cpu);
-        assert_eq!(self.task(idle).state, TaskState::Idle(cpu));
-        self.task_mut(idle).state = TaskState::Running(cpu);
-        self.task_mut(idle).has_run = true;
-        self.cpus[cpu.get()].current = Some(idle);
+        let idle = idle_of(cpu);
+        assert_eq!(self.task(idle).state(), TaskState::Idle(cpu));
+        self.task_mut(idle).store_state(TaskState::Running(cpu));
+        self.task_mut(idle).has_run.store(true, Ordering::Release);
+        cpu_local(cpu)
+            .current
+            .store(idle.raw(), Ordering::Release);
     }
 
     fn activate_secondary(&mut self, cpu: CpuId) {
@@ -1304,27 +1912,13 @@ impl Scheduler {
             "secondary activation occurred in the wrong lifecycle state",
         );
 
-        let idle = self.idle(cpu);
-        assert_eq!(self.current(cpu), idle);
-        assert_eq!(self.task(idle).state, TaskState::Running(cpu));
+        let idle = idle_of(cpu);
+        assert_eq!(current_of(cpu), idle);
+        assert_eq!(self.task(idle).state(), TaskState::Running(cpu));
         assert!(
-            self.cpus[cpu.get()].pending.is_none(),
+            cpu_local(cpu).pending().is_none(),
             "CPU became active during a switch",
         );
-    }
-
-    fn registered_cpu_mask(&self) -> usize {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .enumerate()
-            .fold(0_usize, |mask, (index, cpu)| {
-                if cpu.current.is_some() && cpu.idle.is_some() {
-                    mask | (1_usize << index)
-                } else {
-                    mask
-                }
-            })
     }
 
     fn retired_task_count(&self) -> usize {
@@ -1332,19 +1926,19 @@ impl Scheduler {
     }
 
     fn secondary_idle_context(&self, cpu: CpuId) -> *const crate::arch::task::Context {
-        let idle = self.idle(cpu);
-        assert_eq!(self.current(cpu), idle);
-        core::ptr::addr_of!(self.task(idle).context)
+        let idle = idle_of(cpu);
+        assert_eq!(current_of(cpu), idle);
+        task_ref(idle).context_ptr()
     }
 
     fn current_entry(&self, cpu: CpuId) -> KernelThreadEntry {
-        self.task(self.current(cpu))
+        task_ref(current_of(cpu))
             .entry
             .expect("current task is not a kernel thread")
     }
 
     fn current_user_thread(&self, cpu: CpuId) -> Option<Arc<crate::process::Thread>> {
-        self.task(self.current(cpu)).user_thread.as_ref().cloned()
+        task_ref(current_of(cpu)).user_thread.as_ref().cloned()
     }
 
     fn request_process_thread_exit(
@@ -1368,7 +1962,7 @@ impl Scheduler {
             }
 
             thread.request_forced_exit(status);
-            match task.state {
+            match task.state() {
                 TaskState::Blocked => {
                     if let Some(address) = task.wait_queue_address {
                         wake.push((task.id, address));
@@ -1382,7 +1976,7 @@ impl Scheduler {
                 }
                 TaskState::Running(cpu) => target_mask |= 1_usize << cpu.get(),
                 TaskState::Runnable => {
-                    if let Some(cpu) = task.queued_on {
+                    if let Some(cpu) = task.queued_on() {
                         target_mask |= 1_usize << cpu.get();
                     }
                 }
@@ -1404,23 +1998,7 @@ impl Scheduler {
 
     #[cfg(debug_assertions)]
     fn current_stack_contains(&self, cpu: CpuId, address: usize) -> bool {
-        self.task(self.current(cpu)).stack_contains(address)
-    }
-
-    fn work_available(&self, cpu: CpuId) -> bool {
-        if !self.cpus[cpu.get()].run_queue.is_empty() {
-            return true;
-        }
-
-        (0..self.discovered_cpus).any(|donor_index| {
-            let donor = CpuId::new(donor_index).expect("invalid donor CPU");
-            donor != cpu
-                && crate::smp::is_scheduler_active(donor)
-                && self.cpus[donor.get()].run_queue.iter().any(|id| {
-                    let task = self.task(*id);
-                    task.state == TaskState::Runnable && task.affinity.is_none()
-                })
-        })
+        task_ref(current_of(cpu)).stack_contains(address)
     }
 
     fn link_waiter(&mut self, queue: &WaitQueue, id: TaskId, channel: usize) {
@@ -1429,7 +2007,7 @@ impl Scheduler {
 
         {
             let task = self.task(id);
-            assert!(matches!(task.state, TaskState::SwitchingOut(_)));
+            assert!(matches!(task.state(), TaskState::SwitchingOut(_)));
             assert!(task.wait_channel.is_none());
             assert!(task.wait_queue_address.is_none());
             assert!(task.wait_prev.is_none() && task.wait_next.is_none());
@@ -1524,69 +2102,90 @@ impl Scheduler {
     ) -> (usize, usize) {
         assert!((1..=MAX_TASKS).contains(&maximum));
         let channel = queue.channel();
-        let mut list = queue.waiters.lock();
+        // Phase 1 (WaitQueue lock held): unlink waiters and transition their
+        // state.  Target selection and Runnable publication happen in phase 2
+        // after the waiters lock is dropped, because choose_target_cpu and the
+        // rq locks (rank 25) must never run under a WaitQueue lock (rank 30).
         let mut target_mask = 0;
         let mut count = 0;
+        let mut woken_list: Vec<(TaskId, bool)> = Vec::new();
 
-        while count < maximum {
-            let id = match target {
-                Some(target) => {
-                    if count != 0 || !self.waiter_is_linked(&list, target, channel) {
-                        break;
+        {
+            let mut list = queue.waiters.lock();
+
+            while count < maximum {
+                let id = match target {
+                    Some(target) => {
+                        if count != 0 || !self.waiter_is_linked(&list, target, channel) {
+                            break;
+                        }
+                        target
                     }
-                    target
-                }
-                None => match list.head {
-                    Some(head) => head,
-                    None => break,
-                },
-            };
+                    None => match list.head {
+                        Some(head) => head,
+                        None => break,
+                    },
+                };
 
-            self.unlink_waiter_locked(&mut list, id, channel);
-            match self.task(id).state {
-                TaskState::Blocked => {
-                    let target_cpu = if matches!(self.task(id).kind, TaskKind::UserThread) {
-                        // A blocked user task owns no live CPU/trap anchor.
-                        // Rebalance only at this safe boundary; running and
-                        // timer-preempted user tasks remain fixed.
-                        self.choose_target_cpu()
-                    } else {
-                        self.task(id)
-                            .affinity
-                            .unwrap_or_else(|| self.choose_target_cpu())
-                    };
-                    {
+                self.unlink_waiter_locked(&mut list, id, channel);
+                match self.task(id).state() {
+                    TaskState::Blocked => {
+                        let is_user_thread = matches!(self.task(id).kind, TaskKind::UserThread);
                         let task = self.task_mut(id);
                         assert!(!task.wake_after_switch);
                         assert!(task.wait_prev.is_none() && task.wait_next.is_none());
                         task.wait_channel = None;
                         task.wait_queue_address = None;
-                        task.state = TaskState::Runnable;
-                        if matches!(task.kind, TaskKind::UserThread) {
-                            task.affinity = Some(target_cpu);
-                        }
+                        task.store_state(TaskState::Runnable);
+                        woken_list.push((id, is_user_thread));
+                        count += 1;
                     }
-                    self.enqueue(id, target_cpu);
-                    self.cpus[target_cpu.get()].need_resched = true;
-                    target_mask |= 1_usize << target_cpu.get();
-                    count += 1;
+                    TaskState::SwitchingOut(cpu) => {
+                        let task = self.task_mut(id);
+                        assert!(!task.wake_after_switch, "waiter was claimed twice");
+                        assert!(task.wait_prev.is_none() && task.wait_next.is_none());
+                        // The queue link is already gone, but switch-tail still
+                        // owns wait_channel until the old stack is no longer live.
+                        task.wake_after_switch = true;
+                        target_mask |= 1_usize << cpu.get();
+                        count += 1;
+                    }
+                    state => panic!("invalid waiter state during wakeup: {state:?}"),
                 }
-                TaskState::SwitchingOut(cpu) => {
-                    let task = self.task_mut(id);
-                    assert!(!task.wake_after_switch, "waiter was claimed twice");
-                    assert!(task.wait_prev.is_none() && task.wait_next.is_none());
-                    // The queue link is already gone, but switch-tail still
-                    // owns wait_channel until the old stack is no longer live.
-                    task.wake_after_switch = true;
-                    target_mask |= 1_usize << cpu.get();
-                    count += 1;
-                }
-                state => panic!("invalid waiter state during wakeup: {state:?}"),
-            }
 
-            if target.is_some() {
-                break;
+                if target.is_some() {
+                    break;
+                }
             }
+        }
+
+        // Phase 2 (WaitQueue lock released): choose the landing CPU and
+        // publish Runnable tasks into the target runqueues.  The whole wakeup
+        // remains serialized by REGISTRY, so no other path can observe the
+        // unqueued Runnable window.
+        for (id, is_user_thread) in woken_list {
+            let target_cpu = if let Some(pinned) = self.task(id).pinned_cpu() {
+                // A migration-pinned task must resume on the CPU recorded at
+                // pin time, regardless of queue balance.
+                pinned
+            } else if is_user_thread {
+                // A blocked user task owns no live CPU/trap anchor.
+                // Rebalance only at this safe boundary; running and
+                // timer-preempted user tasks remain fixed.
+                self.choose_target_cpu()
+            } else {
+                self.task(id)
+                    .affinity()
+                    .unwrap_or_else(|| self.choose_target_cpu())
+            };
+            if is_user_thread {
+                self.task(id).store_affinity(Some(target_cpu));
+            }
+            enqueue_task(id, target_cpu);
+            cpu_local(target_cpu)
+                .need_resched
+                .store(true, Ordering::Release);
+            target_mask |= 1_usize << target_cpu.get();
         }
 
         (count, target_mask)
@@ -1601,7 +2200,7 @@ impl Scheduler {
                 continue;
             }
 
-            match task.state {
+            match task.state() {
                 TaskState::Blocked => {
                     assert!(!task.wake_after_switch);
                     state.blocked += 1;
@@ -1622,180 +2221,6 @@ impl Scheduler {
         state
     }
 
-    #[cfg(debug_assertions)]
-    fn run_queue_len(&self, cpu: CpuId) -> usize {
-        self.cpus[cpu.get()].run_queue.len()
-    }
-
-    fn irq_enter(&mut self, cpu: CpuId) {
-        let state = &mut self.cpus[cpu.get()];
-        state.irq_depth = state
-            .irq_depth
-            .checked_add(1)
-            .expect("IRQ nesting counter overflowed");
-    }
-
-    fn irq_exit(&mut self, cpu: CpuId) -> bool {
-        let (irq_depth_zero, need_resched) = {
-            let state = &mut self.cpus[cpu.get()];
-            state.irq_depth = state
-                .irq_depth
-                .checked_sub(1)
-                .expect("IRQ nesting counter underflowed");
-            (state.irq_depth == 0, state.need_resched)
-        };
-        let current = self.current(cpu);
-        irq_depth_zero && self.task(current).preempt_count == 0 && need_resched
-    }
-
-    fn timer_ticks(&mut self, cpu: CpuId, ticks: u64) {
-        if ticks == 0 {
-            return;
-        }
-        let current = self.current(cpu);
-        if self.task(current).kind.is_idle() {
-            return;
-        }
-        let elapsed = u32::try_from(ticks).unwrap_or(u32::MAX);
-        let state = &mut self.cpus[cpu.get()];
-        if elapsed < state.timeslice_remaining {
-            state.timeslice_remaining -= elapsed;
-        } else {
-            state.timeslice_remaining = 0;
-            state.need_resched = true;
-        }
-    }
-
-    fn request_reschedule(&mut self, cpu: CpuId) {
-        if crate::smp::is_scheduler_active(cpu) {
-            self.cpus[cpu.get()].need_resched = true;
-        }
-    }
-
-    fn preempt_disable(&mut self, cpu: CpuId, running_sp: usize) -> (TaskId, CpuId) {
-        let scheduled = self.current(cpu);
-        let (current, actual_cpu) = if self.task(scheduled).stack.is_none()
-            || self.task(scheduled).stack_contains(running_sp)
-        {
-            (scheduled, cpu)
-        } else {
-            let mut owner = None;
-            for task in self.tasks.iter().flatten() {
-                if !task.stack_contains(running_sp) {
-                    continue;
-                }
-                let owner_cpu = match task.state {
-                    TaskState::Running(owner_cpu) | TaskState::Idle(owner_cpu) => owner_cpu,
-                    TaskState::SwitchingOut(owner_cpu)
-                        if self.cpus[owner_cpu.get()]
-                            .pending
-                            .is_some_and(|pending| pending.next == task.id) =>
-                    {
-                        owner_cpu
-                    }
-                    state => panic!(
-                        "executing stack belongs to a non-running task: task={:?} state={state:?} sp={running_sp:#x}",
-                        task.id,
-                    ),
-                };
-                assert!(
-                    owner.is_none(),
-                    "kernel stack belongs to multiple live tasks"
-                );
-                owner = Some((task.id, owner_cpu));
-            }
-            owner.unwrap_or_else(|| {
-                panic!(
-                    "preemption pin could not resolve executing stack: cpu={} scheduled={scheduled:?} sp={running_sp:#x}",
-                    cpu.get(),
-                )
-            })
-        };
-        assert!(
-            self.current(actual_cpu) == current
-                || self.cpus[actual_cpu.get()]
-                    .pending
-                    .is_some_and(|pending| pending.next == current),
-            "stack-resolved task is not assigned to its recorded CPU",
-        );
-        let task = self.task_mut(current);
-        task.preempt_count = task
-            .preempt_count
-            .checked_add(1)
-            .expect("preempt counter overflowed");
-        (current, actual_cpu)
-    }
-
-    fn preempt_enable_task(&mut self, current: TaskId) -> Option<CpuId> {
-        let running_cpu = match self.task(current).state {
-            TaskState::Running(cpu) | TaskState::Idle(cpu) => cpu,
-            state => panic!(
-                "preemption guard released by a non-running task: task={current:?} state={state:?}",
-            ),
-        };
-        assert_eq!(
-            self.current(running_cpu),
-            current,
-            "preemption guard task disagrees with scheduler current",
-        );
-        let count_zero = {
-            let task = self.task_mut(current);
-            task.preempt_count = task
-                .preempt_count
-                .checked_sub(1)
-                .expect("preempt counter underflowed");
-            task.preempt_count == 0
-        };
-        (count_zero
-            && self.cpus[running_cpu.get()].irq_depth == 0
-            && self.cpus[running_cpu.get()].need_resched)
-            .then_some(running_cpu)
-    }
-
-    fn assert_schedulable(&self, cpu: CpuId) {
-        let state = &self.cpus[cpu.get()];
-        assert_eq!(
-            state.irq_depth, 0,
-            "task attempted to schedule in IRQ context"
-        );
-        assert_eq!(
-            self.task(self.current(cpu)).preempt_count,
-            0,
-            "task attempted to schedule with preemption disabled: cpu={} current={:?} tracked={:?}",
-            cpu.get(),
-            self.current(cpu),
-            crate::tracked_spin::held_diagnostic(cpu)
-        );
-    }
-
-    fn preempt_count(&self, cpu: CpuId) -> usize {
-        self.task(self.current(cpu)).preempt_count
-    }
-
-    fn irq_depth(&self, cpu: CpuId) -> usize {
-        self.cpus[cpu.get()].irq_depth
-    }
-
-    fn can_preempt_in_task_context(&self, cpu: CpuId) -> bool {
-        self.cpus[cpu.get()].irq_depth == 0
-    }
-
-    fn context_switches_total(&self) -> u64 {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .map(|cpu| cpu.context_switches)
-            .sum()
-    }
-
-    fn mm_switches_total(&self) -> u64 {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .map(|cpu| cpu.mm_switches)
-            .sum()
-    }
-
     fn assert_user_mm_quiescent(&self) {
         assert_eq!(self.live_user_threads, 0, "M9-B leaked a live user task");
         assert!(
@@ -1809,23 +2234,17 @@ impl Scheduler {
             self.retired_tasks
                 .iter()
                 .filter(|task| matches!(task.kind, TaskKind::UserThread))
-                .all(|task| { task.state == TaskState::Exited && task.exit_visible.is_none() }),
+                .all(|task| { task.state() == TaskState::Exited && task.exit_visible.is_none() }),
             "M9-B retained a non-retired user task in the reaper queue",
         );
-        for (index, cpu) in self.cpus.iter().take(self.discovered_cpus).enumerate() {
+        for index in 0..self.discovered_cpus {
             assert!(
-                cpu.loaded_mm.is_none(),
+                cpu_local(CpuId::new(index).expect("scheduler CPU index is invalid"))
+                    .loaded_mm()
+                    .is_none(),
                 "M9-B CPU {index} retained a loaded user MM",
             );
         }
-    }
-
-    fn preemptions_total(&self) -> u64 {
-        self.cpus
-            .iter()
-            .take(self.discovered_cpus)
-            .map(|cpu| cpu.preemptions)
-            .sum()
     }
 }
 
@@ -1928,16 +2347,9 @@ pub(crate) fn thread_count_summary() -> alloc::string::String {
 
 pub(crate) fn print_lifecycle_stress_progress(label: &str, iteration: usize) {
     let cpu = crate::smp::current_cpu_id();
-    let (boot_sp, current, current_sp) = {
-        let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        let current = scheduler.current(cpu);
-        (
-            scheduler.task(TaskId(0)).context.saved_stack_pointer(),
-            current,
-            scheduler.task(current).context.saved_stack_pointer(),
-        )
-    };
+    let current = current_of(cpu);
+    let boot_sp = task_ref(TaskId(0)).context().saved_stack_pointer();
+    let current_sp = task_ref(current).context().saved_stack_pointer();
     crate::println!(
         "G2_PROGRESS {} iteration={} cpu={} current={:?} boot_saved_sp={:#x} current_saved_sp={:#x} free_pages={}",
         label,
@@ -1951,10 +2363,14 @@ pub(crate) fn print_lifecycle_stress_progress(label: &str, iteration: usize) {
 }
 
 pub(crate) fn print_task_debug_dump() {
-    let (tasks, cpus) = {
+    // smp-pcpu-v1: the task-table snapshot still runs under REGISTRY (it
+    // serializes spawn/exit slot writes); the per-CPU half is lockless —
+    // atomics plus a try_lock probe of each runqueue so a wedged owner
+    // cannot deadlock the panic diagnostic.
+    let tasks = {
         let slot = SCHEDULER.lock();
         let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        let tasks = scheduler
+        scheduler
             .tasks
             .iter()
             .flatten()
@@ -1962,9 +2378,9 @@ pub(crate) fn print_task_debug_dump() {
                 (
                     task.id,
                     task.kind,
-                    task.state,
+                    task.state(),
                     task.wait_channel,
-                    task.queued_on,
+                    task.queued_on(),
                     task.user_thread.as_ref().map(|thread| {
                         (
                             thread.process().id().get(),
@@ -1976,23 +2392,27 @@ pub(crate) fn print_task_debug_dump() {
                     }),
                 )
             })
-            .collect::<Vec<_>>();
-        let cpus = scheduler
-            .cpus
-            .iter()
-            .take(scheduler.discovered_cpus)
-            .enumerate()
-            .map(|(index, cpu)| {
+            .collect::<Vec<_>>()
+    };
+    let cpus = {
+        let discovered = DISCOVERED_CPUS.load(Ordering::Acquire);
+        (0..discovered)
+            .map(|index| {
+                let cpu = CpuId::new(index).expect("scheduler CPU index is invalid");
+                let local = cpu_local(cpu);
+                let runnable = local
+                    .rq
+                    .try_lock()
+                    .map_or(-1, |queue| queue.len() as isize);
                 (
                     index,
-                    cpu.current,
-                    cpu.run_queue.len(),
-                    cpu.need_resched,
-                    cpu.pending,
+                    TaskId::from_raw(local.current.load(Ordering::Acquire)),
+                    runnable,
+                    local.need_resched.load(Ordering::Acquire),
+                    local.pending(),
                 )
             })
-            .collect::<Vec<_>>();
-        (tasks, cpus)
+            .collect::<Vec<_>>()
     };
     crate::println!("sudoos-diag: task-debug-dump begin");
     for (id, kind, state, wait_channel, queued_on, user) in tasks {
@@ -2022,12 +2442,27 @@ pub(crate) fn print_task_debug_dump() {
 
 pub fn initialize() {
     let discovered = crate::smp::discovered_cpu_count();
-    let scheduler = Scheduler::new(discovered);
+    let mut scheduler = Scheduler::new(discovered);
 
     {
         let mut slot = SCHEDULER.lock();
 
         assert!(slot.is_none(), "kernel scheduler was initialized twice");
+        // smp-pcpu-v1 publication point: the lockless fast paths are allowed
+        // to execute the moment the task table goes live.  The idle-task IDs
+        // are stable for the lifetime of the registry (task 0 is the boot
+        // idle, tasks 1..discovered are the secondary idles).
+        TASKS_BASE.store(scheduler.tasks.as_mut_ptr(), Ordering::Release);
+        DISCOVERED_CPUS.store(discovered, Ordering::Release);
+        let boot = cpu_local(CpuId::BOOT);
+        boot.current.store(TaskId(0).raw(), Ordering::Release);
+        boot.idle.store(TaskId(0).raw(), Ordering::Release);
+        for logical in 1..discovered {
+            let cpu = CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+            cpu_local(cpu)
+                .idle
+                .store(TaskId(logical).raw(), Ordering::Release);
+        }
         *slot = Some(scheduler);
     }
 
@@ -2054,24 +2489,34 @@ pub fn initialize() {
 
 pub fn irq_enter() {
     let cpu = crate::smp::current_cpu_id();
-    if !crate::smp::is_online(cpu) {
+    if !crate::smp::is_online(cpu) || !scheduler_ready() {
         return;
     }
-    let mut slot = SCHEDULER.lock();
-    if let Some(scheduler) = slot.as_mut() {
-        scheduler.irq_enter(cpu);
-    }
+    // smp-pcpu-v1: IRQ depth is truly-local CpuLocal state.
+    let local = cpu_local_mut(cpu);
+    local.irq_depth = local
+        .irq_depth
+        .checked_add(1)
+        .expect("IRQ nesting counter overflowed");
 }
 
 pub fn irq_exit() {
     let cpu = crate::smp::current_cpu_id();
-    if !crate::smp::is_online(cpu) {
+    if !crate::smp::is_online(cpu) || !scheduler_ready() {
         return;
     }
     let should_preempt = {
-        let mut slot = SCHEDULER.lock();
-        slot.as_mut()
-            .is_some_and(|scheduler| scheduler.irq_exit(cpu))
+        let local = cpu_local_mut(cpu);
+        local.irq_depth = local
+            .irq_depth
+            .checked_sub(1)
+            .expect("IRQ nesting counter underflowed");
+        local.irq_depth == 0
+            && task_ref(current_of(cpu))
+                .preempt_disable_depth
+                .load(Ordering::Acquire)
+                == 0
+            && local.need_resched.load(Ordering::Acquire)
     };
 
     if should_preempt {
@@ -2084,17 +2529,16 @@ pub fn on_timer_ticks(ticks: u64) {
         return;
     }
     let cpu = crate::smp::current_cpu_id();
-    let mut slot = SCHEDULER.lock();
-    if let Some(scheduler) = slot.as_mut() {
-        scheduler.timer_ticks(cpu, ticks);
+    if !scheduler_ready() {
+        return;
     }
+    timer_ticks_local(cpu, ticks);
 }
 
 pub fn request_reschedule_local() {
     let cpu = crate::smp::current_cpu_id();
-    let mut slot = SCHEDULER.lock();
-    if let Some(scheduler) = slot.as_mut() {
-        scheduler.request_reschedule(cpu);
+    if scheduler_ready() && crate::smp::is_scheduler_active(cpu) {
+        cpu_local(cpu).need_resched.store(true, Ordering::Release);
     }
 }
 
@@ -2113,11 +2557,8 @@ pub(crate) fn request_process_thread_exit(
 }
 
 fn request_reschedule_on(cpu: CpuId) {
-    {
-        let mut slot = SCHEDULER.lock();
-        slot.as_mut()
-            .expect("kernel scheduler is not initialized")
-            .request_reschedule(cpu);
+    if scheduler_ready() && crate::smp::is_scheduler_active(cpu) {
+        cpu_local(cpu).need_resched.store(true, Ordering::Release);
     }
 
     if cpu != crate::smp::current_cpu_id() {
@@ -2126,121 +2567,191 @@ fn request_reschedule_on(cpu: CpuId) {
 }
 
 pub fn preempt_disable() -> TaskId {
-    repair_current_cpu_from_stack();
-    let cpu = crate::smp::current_cpu_id();
-    let running_sp = crate::arch::task::current_stack_pointer();
-    let mut slot = SCHEDULER.lock();
-    let (task, actual_cpu) = slot
-        .as_mut()
-        .expect("preemption used before scheduler initialization")
-        .preempt_disable(cpu, running_sp);
-    if actual_cpu != cpu {
-        crate::arch::smp::set_current_cpu_id(actual_cpu.get());
-    }
-    task
+    preempt_disable_local()
 }
 
 pub fn preempt_enable() {
-    repair_current_cpu_from_stack();
     let task = current_task_id();
     preempt_enable_task(task);
 }
 
 fn preempt_enable_task(task: TaskId) {
-    repair_current_cpu_from_stack();
-    let should_schedule_now = {
-        let mut slot = SCHEDULER.lock();
-        let scheduler = slot
-            .as_mut()
-            .expect("preemption used before scheduler initialization");
-        scheduler.preempt_enable_task(task)
-    };
-
-    if let Some(cpu) = should_schedule_now {
-        if crate::smp::current_cpu_id() != cpu {
-            crate::arch::smp::set_current_cpu_id(cpu.get());
-        }
-        if crate::arch::interrupt::are_enabled() {
-            preempt_schedule();
-        }
-    }
+    preempt_enable_local(task);
 }
 
 pub fn preempt_count() -> usize {
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("preemption queried before scheduler initialization")
-        .preempt_count(cpu)
+    task_ref(current_of(cpu))
+        .preempt_disable_depth
+        .load(Ordering::Acquire)
 }
 
 pub(crate) fn current_task_diagnostic() -> (TaskId, &'static str, usize) {
+    // Panic-path diagnostic: repair identity from the executing stack before
+    // reporting, since an RV user trap anchor may still name a stale CPU.
     repair_current_cpu_from_stack();
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    let scheduler = slot
-        .as_ref()
-        .expect("scheduler diagnostic before initialization");
-    let id = scheduler.current(cpu);
-    let task = scheduler.task(id);
+    let id = current_of(cpu);
+    let task = task_ref(id);
     let kind = match task.kind {
         TaskKind::Idle(_) => "idle",
         TaskKind::KernelThread => "kernel",
         TaskKind::SystemThread => "system",
         TaskKind::UserThread => "user",
     };
-    (id, kind, task.preempt_count)
+    (id, kind, task.preempt_disable_depth.load(Ordering::Acquire))
 }
 
 pub fn irq_depth() -> usize {
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("IRQ depth queried before scheduler initialization")
-        .irq_depth(cpu)
+    cpu_local(cpu).irq_depth
+}
+
+/// §10 diagnostic mirror: records the last known local interrupt state.
+/// Updated at IrqSaveGuard boundaries, trap entries/exits, idle transitions
+/// and explicit interrupt state changes. Read cross-CPU only from panic paths.
+pub(crate) fn note_irq_state(enabled: bool) {
+    // Early boot runs before tp carries a valid logical CPU id; the mirror is
+    // meaningless then and must not fault.
+    let raw = crate::arch::smp::current_cpu_id();
+    if raw >= crate::smp::MAX_CPUS {
+        return;
+    }
+    let cpu = CpuId::new(raw).expect("guarded logical CPU ID exceeds MAX_CPUS");
+    let local = cpu_local(cpu);
+    local.irq_mirror.store(enabled as u8, Ordering::Relaxed);
+    local
+        .irq_mirror_at
+        .store(crate::arch::time::counter(), Ordering::Relaxed);
+}
+
+pub(crate) fn note_trap_entry() {
+    let raw = crate::arch::smp::current_cpu_id();
+    if raw >= crate::smp::MAX_CPUS {
+        return;
+    }
+    let cpu = CpuId::new(raw).expect("guarded logical CPU ID exceeds MAX_CPUS");
+    cpu_local(cpu).in_trap_depth.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn note_trap_exit() {
+    let raw = crate::arch::smp::current_cpu_id();
+    if raw >= crate::smp::MAX_CPUS {
+        return;
+    }
+    let cpu = CpuId::new(raw).expect("guarded logical CPU ID exceeds MAX_CPUS");
+    let local = cpu_local(cpu);
+    // A switch inside a trap carries the trap continuation to another CPU:
+    // the entry was counted on the source CPU and this exit runs on the
+    // destination. Saturate and record the imbalance instead of panicking —
+    // this is a diagnostic mirror, and the migration is by design.
+    let previous = local.in_trap_depth.load(Ordering::Relaxed);
+    if previous == 0 {
+        local.trap_imbalance.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    local.in_trap_depth.store(previous - 1, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CpuDiagnostic {
+    pub task: usize,
+    pub task_state: &'static str,
+    pub preempt_depth: usize,
+    pub migration_depth: usize,
+    pub migration_pinned: usize,
+    pub irq_mirror: u8,
+    pub irq_mirror_at: u64,
+    pub irq_depth: usize,
+    pub in_trap_depth: usize,
+    pub trap_imbalance: usize,
+    pub switches: u64,
+    pub last_switch: u64,
+    pub need_resched: bool,
+    pub rq_len: Option<usize>,
+    pub loaded_mm: bool,
+    pub loaded_asid: usize,
+    pub mm_local_generation: u64,
+}
+
+/// §10 cross-CPU panic-path snapshot for the TLB shootdown timeout dump.
+/// Racy reads of live CPUs are diagnostic-only: every shared field is an
+/// atomic or an owned-CPU scalar that the panic dump may observe mid-update.
+pub(crate) fn cpu_diagnostic(cpu: CpuId) -> CpuDiagnostic {
+    let local = cpu_local(cpu);
+    let mut diagnostic = CpuDiagnostic {
+        irq_mirror: local.irq_mirror.load(Ordering::Relaxed),
+        irq_mirror_at: local.irq_mirror_at.load(Ordering::Relaxed),
+        irq_depth: local.irq_depth,
+        in_trap_depth: local.in_trap_depth.load(Ordering::Relaxed),
+        trap_imbalance: local.trap_imbalance.load(Ordering::Relaxed),
+        switches: local.context_switches.load(Ordering::Relaxed),
+        last_switch: local.last_switch.load(Ordering::Relaxed),
+        need_resched: local.need_resched.load(Ordering::Relaxed),
+        ..CpuDiagnostic::default()
+    };
+
+    if scheduler_ready() {
+        let raw = local.current.load(Ordering::Acquire);
+        if raw != NO_CPU {
+            let current = TaskId::from_raw(raw);
+            diagnostic.task = current.raw();
+            let task = task_ref(current);
+            diagnostic.task_state = match TaskState::decode(task.state.load(Ordering::Acquire)) {
+                TaskState::Runnable => "runnable",
+                TaskState::Running(_) => "running",
+                TaskState::SwitchingOut(_) => "switching-out",
+                TaskState::Blocked => "blocked",
+                TaskState::Idle(_) => "idle",
+                TaskState::Exited => "exited",
+            };
+            diagnostic.preempt_depth = task.preempt_disable_depth.load(Ordering::Acquire);
+            diagnostic.migration_depth = task.migration_disable_depth.load(Ordering::Acquire);
+            diagnostic.migration_pinned = task.migration_pinned.load(Ordering::Acquire);
+        }
+
+        // SAFETY: panic-path racy read of the loaded-mm slot. Only the
+        // discriminant and the mm's atomic generation mirrors are consumed;
+        // the Arc is never cloned or dereferenced for non-atomic state.
+        let mm = unsafe { (&*local.loaded_mm.get()).as_ref() };
+        if let Some(mm) = mm {
+            diagnostic.loaded_mm = true;
+            diagnostic.loaded_asid = usize::from(mm.asid().id().get());
+            diagnostic.mm_local_generation = mm.local_tlb_generation(cpu);
+        }
+
+        if let Some(rq) = local.rq.try_lock() {
+            diagnostic.rq_len = Some(rq.len());
+        }
+    }
+
+    diagnostic
 }
 
 pub(crate) fn current_task_id() -> TaskId {
-    repair_current_cpu_from_stack();
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .current(cpu)
+    current_of(cpu)
 }
 
-/// Re-establish architecture per-CPU identity from the scheduler-owned stack.
+/// Complete an in-flight switch from trap context when a trap lands after the
+/// hardware stack switch but before the normal Rust switch-tail committed it.
 ///
-/// RISC-V temporarily gives `tp` to user TLS and restores it through a trap
-/// anchor. A task that migrated after an older anchor was prepared can enter
-/// with the source CPU value. Stack ownership is the authoritative identity
-/// and is independent of user register state.
+/// Per-CPU identity needs no repair here: on RISC-V `tp` is per-CPU hardware
+/// state that switch.S never touches and the user-trap anchor is rebuilt under
+/// SIE-clear at every sret, and on LoongArch `current_cpu_id()` reads the
+/// per-core CSR rather than the task-owned r21 register. A trap-top scan over
+/// every CPU's `current`/`pending` is a hot-path violation of the A1.5
+/// invariant and can only write stale cross-CPU data into a correct identity.
 pub(crate) fn repair_current_cpu_from_stack() {
-    if !scheduler_is_initialized() {
+    if !scheduler_ready() {
         return;
     }
-    let running_sp = crate::arch::task::current_stack_pointer();
-    let owner = {
-        let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        scheduler.switch_tail_cpu_for_stack(running_sp)
-    };
-    if let Some(cpu) = owner {
-        crate::arch::smp::set_current_cpu_id(cpu.get());
-        let pending = {
-            let slot = SCHEDULER.lock();
-            slot.as_ref()
-                .expect("kernel scheduler is not initialized")
-                .cpus[cpu.get()]
-            .pending
-            .is_some()
-        };
-        if pending {
-            // The trap landed after the hardware stack switch and before the
-            // normal Rust switch-tail committed it. Complete that transaction
-            // before the trap path can request another yield/preemption.
-            finish_switch();
-        }
+    let cpu = crate::smp::current_cpu_id();
+    if cpu_local(cpu).pending().is_some() {
+        // The trap landed after the hardware stack switch and before the
+        // normal Rust switch-tail committed it. Complete that transaction
+        // before the trap path can request another yield/preemption.
+        finish_switch();
     }
 }
 
@@ -2252,9 +2763,16 @@ where
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
     let switch = {
+        assert_schedulable(cpu);
+        // The blocking decision must be atomic with waiter linkage: this
+        // check and wake_waiters both run under SCHEDULER, so a completion
+        // racing the check is either visible here or finds the linked waiter.
+        // Closures must therefore not acquire locks whose holders wake
+        // waiters while still holding them (all call sites are audited).
         let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.assert_schedulable(cpu);
+        let scheduler = slot
+            .as_mut()
+            .expect("kernel scheduler is not initialized");
         if should_block() {
             Some(scheduler.prepare_block(cpu, queue))
         } else {
@@ -2262,6 +2780,7 @@ where
         }
     };
     let Some((previous, next)) = switch else {
+        drop(interrupt_guard);
         return false;
     };
     #[cfg(debug_assertions)]
@@ -2336,10 +2855,10 @@ pub(super) fn task_is_runnable_on(id: TaskId, cpu: CpuId) -> bool {
 
 #[cfg(debug_assertions)]
 fn run_queue_len(cpu: CpuId) -> usize {
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .run_queue_len(cpu)
+    // rq locks carry a rank above Timer, so they must never be held with
+    // local interrupts enabled.
+    let _irq_guard = crate::context::IrqSaveGuard::new();
+    cpu_local(cpu).rq.lock().len()
 }
 
 #[cfg(debug_assertions)]
@@ -2392,12 +2911,7 @@ pub fn finalize_cpu_bringup() {
     assert_eq!(crate::smp::current_cpu_id(), CpuId::BOOT);
     assert!(crate::arch::interrupt::are_enabled());
 
-    let registered_mask = {
-        let slot = SCHEDULER.lock();
-        slot.as_ref()
-            .expect("kernel scheduler is not initialized")
-            .registered_cpu_mask()
-    };
+    let registered_mask = registered_cpu_mask();
 
     crate::smp::assert_bringup_complete();
 
@@ -2536,14 +3050,14 @@ pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
 }
 
 pub(crate) fn scheduler_is_initialized() -> bool {
-    SCHEDULER.lock().is_some()
+    // smp-pcpu-v1: lockless gate.  TrackedSpinLock's debug path calls this
+    // before taking any lock; an SCHEDULER acquisition here would recurse
+    // whenever a rq lock is taken under REGISTRY.
+    scheduler_ready()
 }
 
 pub(crate) fn user_mm_switches() -> u64 {
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .mm_switches_total()
+    mm_switches_total()
 }
 
 pub(crate) fn assert_user_mm_quiescent() {
@@ -2557,21 +3071,22 @@ pub(crate) fn replace_current_user_mm(
     old_mm: Arc<crate::user_mm::UserMm>,
     new_mm: Arc<crate::user_mm::UserMm>,
 ) {
+    // smp-pcpu-v1: loaded_mm is truly-local CpuLocal state.  The IRQ-save
+    // guard pins the CPU for the whole repair, satisfying the exclusive
+    // quiescent-write contract of the accessors.
     let _interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
-    let mut slot = SCHEDULER.lock();
-    let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-    let current = scheduler.current(cpu);
     assert!(
-        scheduler.task(current).user_thread.is_some(),
+        task_ref(current_of(cpu)).user_thread.is_some(),
         "attempted to replace mm outside a user task",
     );
+    let local = cpu_local(cpu);
     // Release/contest: repair loaded-mm tracking if it diverged.
     // The exec path may arrive with a stale or missing CPU loaded-mm
     // after a fatal fault or rapid task switches; panicking here kills
     // the entire contest run.
-    let loaded_matches = scheduler.cpus[cpu.get()]
-        .loaded_mm
+    let loaded_matches = local
+        .loaded_mm()
         .as_ref()
         .map_or(false, |loaded| Arc::ptr_eq(loaded, &old_mm));
     if !loaded_matches {
@@ -2581,11 +3096,11 @@ pub(crate) fn replace_current_user_mm(
             cpu.get(),
         );
         // Deactivate whatever is currently loaded (if anything).
-        if let Some(stale) = scheduler.cpus[cpu.get()].loaded_mm.take() {
+        if let Some(stale) = local.take_loaded_mm() {
             let _ = stale.deactivate_current_cpu();
         }
     }
-    if let Some(ref current_loaded) = scheduler.cpus[cpu.get()].loaded_mm {
+    if let Some(ref current_loaded) = local.loaded_mm() {
         if Arc::ptr_eq(current_loaded, &old_mm) {
             old_mm
                 .deactivate_current_cpu()
@@ -2595,7 +3110,7 @@ pub(crate) fn replace_current_user_mm(
     new_mm
         .activate_current_cpu()
         .unwrap_or_else(|error| crate::println!("exec: failed to enter new mm: {error:?}"));
-    scheduler.cpus[cpu.get()].loaded_mm = Some(new_mm);
+    local.store_loaded_mm(Some(new_mm));
 }
 
 pub fn spawn_kernel_thread(entry: KernelThreadEntry) -> TaskId {
@@ -2615,12 +3130,7 @@ pub(crate) fn run_kernel_thread_sync(entry: KernelThreadEntry) {
         "synchronous kernel-thread launcher must run on the boot CPU",
     );
     let caller_is_idle = {
-        let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        scheduler
-            .task(scheduler.current(CpuId::BOOT))
-            .kind
-            .is_idle()
+        task_ref(current_of(CpuId::BOOT)).kind.is_idle()
     };
     assert!(
         caller_is_idle,
@@ -2657,10 +3167,8 @@ pub(crate) fn run_verifier_thread(entry: KernelThreadEntry) {
     );
 
     let caller_is_idle = {
-        let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        let current = scheduler.current(CpuId::BOOT);
-        scheduler.task(current).kind.is_idle()
+        let current = current_of(CpuId::BOOT);
+        task_ref(current).kind.is_idle()
     };
     assert!(
         caller_is_idle,
@@ -2810,12 +3318,11 @@ pub fn yield_now() {
 
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
-    let switch = {
-        let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.assert_schedulable(cpu);
-        scheduler.prepare_yield(cpu)
-    };
+    // smp-pcpu-v1: the Yield fast path never touches the REGISTRY.  Local rq
+    // locks carry a rank above Timer, so the switch runs with IRQs off via
+    // the guard above and the atomic per-CPU transaction below.
+    assert_schedulable(cpu);
+    let switch = prepare_yield_local(cpu);
 
     let Some((previous, next)) = switch else {
         return;
@@ -2834,12 +3341,8 @@ pub fn yield_now() {
 pub(crate) fn yield_from_user_trap() {
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
-    let switch = {
-        let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.assert_schedulable(cpu);
-        scheduler.prepare_yield(cpu)
-    };
+    assert_schedulable(cpu);
+    let switch = prepare_yield_local(cpu);
     let Some((previous, next)) = switch else {
         return;
     };
@@ -2858,9 +3361,14 @@ where
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
     let switch = {
+        assert_schedulable(cpu);
+        // Same check-link atomicity as block_current_on_if: the predicate is
+        // re-evaluated under SCHEDULER so a racing completion either satisfies
+        // it here or wakes the waiter after it is linked.
         let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.assert_schedulable(cpu);
+        let scheduler = slot
+            .as_mut()
+            .expect("kernel scheduler is not initialized");
         if should_block() {
             Some(scheduler.prepare_block(cpu, queue))
         } else {
@@ -2894,14 +3402,12 @@ fn preempt_schedule_irq() {
 }
 
 fn preempt_schedule_disabled() {
+    if !scheduler_ready() {
+        return;
+    }
     let cpu = crate::smp::current_cpu_id();
-    let switch = {
-        let mut slot = SCHEDULER.lock();
-        let Some(scheduler) = slot.as_mut() else {
-            return;
-        };
-        scheduler.prepare_preempt(cpu)
-    };
+    // smp-pcpu-v1: the Preempt fast path never touches the REGISTRY.
+    let switch = prepare_preempt_local(cpu);
 
     let Some((previous, next)) = switch else {
         return;
@@ -2917,36 +3423,20 @@ fn exit_current() -> ! {
     crate::context::assert_interrupts_enabled();
 
     let _interrupt_guard = crate::context::IrqSaveGuard::new();
-    let running_sp = crate::arch::task::current_stack_pointer();
-    // P0: always determine the actual CPU from the exiting task's kernel
-    // stack instead of trusting `current_cpu_id()`.  On RISC-V the `tp`
-    // register can become stale when a task is preempted between building
-    // the sscratch anchor and executing `sret` after migration — the anchor
-    // caches the source CPU's tp, and the next user→kernel transition
-    // loads that stale value.
-    let actual_cpu = {
-        let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        let mut owner = None;
-        for index in 0..scheduler.discovered_cpus {
-            let candidate = CpuId::new(index).expect("scheduler CPU index is invalid");
-            let task = scheduler.current(candidate);
-            if scheduler.task(task).stack_contains(running_sp) {
-                assert!(owner.is_none(), "kernel stack is current on multiple CPUs");
-                owner = Some(candidate);
-            }
-        }
-        owner.unwrap_or_else(|| {
-            panic!("exiting task stack has no scheduler owner: sp={running_sp:#x}",)
-        })
-    };
-    // Always repair tp — it may have been corrupted by a stale anchor.
+    // Per-CPU identity is trustworthy without any stack scan: RISC-V `tp` is
+    // per-CPU hardware state (switch.S never touches it, and the user-trap
+    // anchor is rebuilt from the register under SIE-clear at sret), and
+    // LoongArch reads the per-core identity CSR. A scan over every CPU's
+    // `current` would be a hot-path A1.5 violation and could only overwrite a
+    // correct identity with stale cross-CPU data.
+    let actual_cpu = crate::smp::current_cpu_id();
     crate::arch::smp::set_current_cpu_id(actual_cpu.get());
     let (previous, next) = {
+        assert_schedulable(actual_cpu);
         let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        scheduler.assert_schedulable(actual_cpu);
-        scheduler.prepare_exit(actual_cpu)
+        slot.as_mut()
+            .expect("kernel scheduler is not initialized")
+            .prepare_exit(actual_cpu)
     };
     // SAFETY: the exiting task remains allocated and marked SwitchingOut
     // until the incoming context calls finish_switch() from a different stack.
@@ -2957,31 +3447,58 @@ fn exit_current() -> ! {
 
 fn finish_switch() {
     let running_sp = crate::arch::task::current_stack_pointer();
-    let (cpu, completed, current_is_idle) = {
-        let mut slot = SCHEDULER.lock();
-        let scheduler = slot.as_mut().expect("kernel scheduler is not initialized");
-        let cpu = scheduler
-            .switch_tail_cpu_for_stack(running_sp)
-            .unwrap_or_else(crate::smp::current_cpu_id);
-        // RISC-V uses tp as kernel CPU identity but temporarily lends it to
-        // userspace TLS. Repair it before any switch-tail code indexes
-        // per-CPU scheduler, preemption, IPI, or lock state.
-        crate::arch::smp::set_current_cpu_id(cpu.get());
-        let completed = scheduler.complete_switch(cpu, running_sp);
-        let current = scheduler.current(cpu);
-        let current_is_idle = scheduler.task(current).kind.is_idle();
-        (cpu, completed, current_is_idle)
+    // The switch tail runs on the CPU that performed the hardware switch.
+    // Its identity is trustworthy without any stack scan: RISC-V `tp` is
+    // per-CPU hardware state that switch.S never touches (the user-trap
+    // anchor is rebuilt from the register under SIE-clear at sret), and
+    // LoongArch reads the per-core identity CSR. A scan over every CPU's
+    // current/pending would violate the A1.5 hot-path invariant and could
+    // only corrupt a correct identity with stale cross-CPU data.
+    let cpu = crate::smp::current_cpu_id();
+    crate::arch::smp::set_current_cpu_id(cpu.get());
+    // smp-pcpu-v1 dispatch: Yield commits locklessly with only local rq and
+    // task atomics; Block/Exit mutate registry-owned task state and take the
+    // global REGISTRY for the commit.
+    // The secondary's first switch into its idle context has no recorded
+    // per-CPU transaction: register_secondary already committed
+    // current/state under REGISTRY before the bootstrap switch. After a CPU
+    // activates, every switch tail must carry a recorded transaction.
+    let Some(pending) = cpu_local(cpu).pending() else {
+        assert!(
+            !crate::smp::is_scheduler_active(cpu),
+            "switch tail without a pending switch"
+        );
+        return;
     };
-
-    let _ = cpu;
+    let (completed, current_is_idle) = match pending.disposition {
+        SwitchDisposition::Yield => {
+            let is_idle = complete_yield_switch(cpu, pending, running_sp);
+            (
+                CompletedSwitch {
+                    retired_task_added: false,
+                    exit_visible: None,
+                },
+                is_idle,
+            )
+        }
+        SwitchDisposition::Block | SwitchDisposition::Exit => {
+            let mut slot = SCHEDULER.lock();
+            slot.as_mut()
+                .expect("kernel scheduler is not initialized")
+                .complete_registry_switch(cpu, pending, running_sp)
+        }
+    };
+    // The hardware switch has committed; retire the per-CPU transaction so
+    // the next local prepare can proceed.
+    cpu_local(cpu).store_pending(None);
 
     // The switch tail still owns the IRQ-save guard, but no longer owns the
-    // scheduler lock. Restore policy ticks here to preserve Timer < Scheduler.
+    // registry lock. Restore policy ticks here to preserve Timer < Scheduler.
     if !current_is_idle {
         crate::time::leave_idle();
     }
     if let Some(exit_visible) = completed.exit_visible {
-        // The hardware switch has committed and the scheduler lock is no
+        // The hardware switch has committed and the registry lock is no
         // longer held. The retired Task deliberately retains Thread/Process
         // ownership until the reaper has destroyed the old kernel stack.
         USER_TASKS_EXIT_VISIBLE.fetch_add(1, Ordering::Release);
@@ -3104,27 +3621,20 @@ fn synchronize_retired_tasks() {
 
 fn current_entry() -> KernelThreadEntry {
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .current_entry(cpu)
+    task_ref(current_of(cpu))
+        .entry
+        .expect("current task has no kernel-thread entry")
 }
 
 fn current_cpu_has_work() -> bool {
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .work_available(cpu)
+    work_available(cpu)
 }
 
 #[cfg(debug_assertions)]
 fn current_stack_contains(address: usize) -> bool {
     let cpu = crate::smp::current_cpu_id();
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .current_stack_contains(cpu, address)
+    task_ref(current_of(cpu)).stack_contains(address)
 }
 
 #[cfg(debug_assertions)]
@@ -3160,9 +3670,7 @@ pub(crate) fn synchronize_user_task_reclamation() {
     // until its completion wake becomes observable.
     let caller_is_idle = {
         let cpu = crate::smp::current_cpu_id();
-        let slot = SCHEDULER.lock();
-        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
-        scheduler.task(scheduler.current(cpu)).kind.is_idle()
+        task_ref(current_of(cpu)).kind.is_idle()
     };
     if caller_is_idle {
         while retired_task_outstanding() != 0 {
@@ -3207,18 +3715,12 @@ fn live_kernel_threads() -> usize {
 
 #[cfg(debug_assertions)]
 fn context_switches() -> u64 {
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .context_switches_total()
+    context_switches_total()
 }
 
 #[cfg(debug_assertions)]
 pub(super) fn preemptions() -> u64 {
-    let slot = SCHEDULER.lock();
-    slot.as_ref()
-        .expect("kernel scheduler is not initialized")
-        .preemptions_total()
+    preemptions_total()
 }
 
 unsafe extern "C" fn user_thread_bootstrap() -> ! {
@@ -3297,6 +3799,7 @@ unsafe extern "C" fn idle_thread_bootstrap() -> ! {
     // SAFETY: secondary initialization installed its trap vector, local timer,
     // IPI source and permanent guarded idle stack before entering this context.
     unsafe { crate::arch::interrupt::enable() };
+    note_irq_state(true);
 
     // Publish scheduler eligibility before IPI readiness. The boot CPU waits
     // for the IPI-ready mask before leaving bring-up, so an active secondary
@@ -3321,11 +3824,13 @@ fn idle_loop() -> ! {
 
 fn idle_until_interrupt() {
     crate::arch::interrupt::disable();
+    note_irq_state(false);
 
     if current_cpu_has_work() || retired_task_backlog() != 0 {
         // SAFETY: this CPU is already in a fully initialized idle context; the
         // caller will immediately leave the idle path and schedule/reap work.
         unsafe { crate::arch::interrupt::enable() };
+        note_irq_state(true);
         IDLE_EXITS[crate::smp::current_cpu_id().get()].fetch_add(1, Ordering::AcqRel);
         return;
     }
@@ -3345,6 +3850,7 @@ fn idle_until_interrupt() {
     // SAFETY: the idle task has a valid trap frame, local interrupt sources are
     // configured, and work was rechecked with local interrupts disabled.
     unsafe { crate::arch::cpu::enable_and_wait_for_interrupt() };
+    note_irq_state(true);
 
     IDLE_EXITS[cpu.get()].fetch_add(1, Ordering::AcqRel);
 }
@@ -3369,49 +3875,13 @@ pub fn boot_idle_loop() -> ! {
 }
 
 #[cfg(debug_assertions)]
-static WORKER_PROGRESS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static WORKER_PROGRESS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 #[cfg(debug_assertions)]
-static WORKER_STACKS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-    AtomicUsize::new(0),
-];
+static WORKER_STACKS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 #[cfg(debug_assertions)]
-static WORKER_CPUS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-];
+static WORKER_CPUS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 #[cfg(debug_assertions)]
-static EXPECTED_CPUS: [AtomicUsize; MAX_CPUS] = [
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-    AtomicUsize::new(usize::MAX),
-];
+static EXPECTED_CPUS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(usize::MAX) }; MAX_CPUS];
 #[cfg(debug_assertions)]
 static WORKER_READY_MASK: AtomicUsize = AtomicUsize::new(0);
 #[cfg(debug_assertions)]
@@ -3507,10 +3977,47 @@ fn worker_6() {
 fn worker_7() {
     verification_worker(7);
 }
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_8() {
+    verification_worker(8);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_9() {
+    verification_worker(9);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_10() {
+    verification_worker(10);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_11() {
+    verification_worker(11);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_12() {
+    verification_worker(12);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_13() {
+    verification_worker(13);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_14() {
+    verification_worker(14);
+}
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+fn worker_15() {
+    verification_worker(15);
+}
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, target_arch = "riscv64"))]
 const WORKER_ENTRIES: [KernelThreadEntry; MAX_CPUS] = [
     worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7,
+];
+#[cfg(all(debug_assertions, target_arch = "loongarch64"))]
+const WORKER_ENTRIES: [KernelThreadEntry; MAX_CPUS] = [
+    worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7,
+    worker_8, worker_9, worker_10, worker_11, worker_12, worker_13, worker_14, worker_15,
 ];
 
 #[cfg(debug_assertions)]
@@ -3561,12 +4068,11 @@ fn wait_for_workers(worker_count: usize) {
         );
         // Remote completion counters are plain atomic publications, not wake
         // events. Keep this debug verifier runnable instead of relying on a
-        // periodic timer to escape WFI.
+        // periodic timer to escape WFI.  yield_now() completes its own switch
+        // tail, so no pending transaction may remain once this loop exits.
         yield_now();
         spin_loop();
     }
-
-    finish_switch();
 }
 
 #[cfg(debug_assertions)]

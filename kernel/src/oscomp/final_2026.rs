@@ -30,6 +30,11 @@ pub fn run_lifecycle_stress() -> bool {
     crate::user::verify_task_lifecycle_stress()
 }
 
+pub fn run_cow_stress() -> bool {
+    crate::println!("sudoos-diag: entering COW stress runner");
+    crate::user::verify_cow_stress()
+}
+
 // CLOUD_FINAL_IMAGE_CONTRACT_V1
 fn report_final_image_contract() {
     let paths = [

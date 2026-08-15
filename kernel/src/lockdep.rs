@@ -24,6 +24,10 @@ pub enum LockRank {
     /// rank remains after Timer and before Scheduler.
     WorkQueue = 17,
     Scheduler = 20,
+    /// Per-CPU runqueue lock. The registry (Scheduler rank) may enqueue a
+    /// woken task, so RunQueue stays after Scheduler; waitqueue links are
+    /// manipulated before a task becomes Runnable, so WaitQueue follows.
+    RunQueue = 25,
     WaitQueue = 30,
     /// Process and thread-group metadata. Process state may lead into VM
     /// state, but VM teardown must not call back into this rank.
@@ -227,7 +231,13 @@ pub fn before_unlock(class: LockClass, instance: LockInstanceId, current: CpuId)
     }
     let state = &HELD_LOCKS[current.get()];
     let depth = state.depth.load(Ordering::Relaxed);
-    assert!(depth != 0, "unlock with empty held-lock stack");
+    assert!(
+        depth != 0,
+        "unlock with empty held-lock stack: releasing={}@{:#x} cpu={}",
+        class.name,
+        instance.raw(),
+        current.get(),
+    );
 
     // SAFETY: local IRQs are still disabled while IrqSpinLock drops its guard.
     let entries = unsafe { &mut *state.entries.get() };
@@ -266,6 +276,11 @@ pub fn record_irq_off(cycles: u64) {
         return;
     }
     update_max(&MAX_IRQ_OFF_CYCLES, cycles);
+}
+
+/// §10 panic-path snapshot of the longest recorded IRQ-off section.
+pub fn max_irq_off_cycles() -> u64 {
+    MAX_IRQ_OFF_CYCLES.load(Ordering::Acquire)
 }
 
 pub fn dump_current_cpu() {
@@ -307,9 +322,33 @@ pub fn dump_current_cpu() {
     }
 }
 
-#[cfg(debug_assertions)]
-pub fn max_irq_off_cycles() -> u64 {
-    MAX_IRQ_OFF_CYCLES.load(Ordering::Acquire)
+/// Panic-path diagnostic: snapshot every CPU's lockdep stack.
+///
+/// A push/pop CPU divergence (stale `tp` mid-hold) leaves a dangling entry on
+/// the push CPU's stack while the release CPU pops an empty stack. Dumping all
+/// CPUs reveals which lock was pushed where. Racy snapshots of live CPUs are
+/// acceptable for diagnosis only.
+pub fn dump_all_cpus() {
+    let discovered = crate::smp::discovered_cpu_count().min(MAX_CPUS);
+    crate::println!("lockdep[all]: discovered CPUs {discovered}");
+    for cpu_index in 0..discovered {
+        let state = &HELD_LOCKS[cpu_index];
+        let depth = state.depth.load(Ordering::Acquire);
+        if depth == 0 {
+            crate::println!("lockdep[all]: cpu {cpu_index}: depth 0");
+            continue;
+        }
+        let entries = unsafe { &*state.entries.get() };
+        let count = core::cmp::min(depth, MAX_HELD_LOCKS);
+        crate::println!("lockdep[all]: cpu {cpu_index}: depth {depth}");
+        for (index, held) in entries.iter().take(count).enumerate() {
+            crate::println!(
+                "    #{index}: {}@{:#x}",
+                held.class.name,
+                held.instance.raw(),
+            );
+        }
+    }
 }
 
 #[cfg(debug_assertions)]

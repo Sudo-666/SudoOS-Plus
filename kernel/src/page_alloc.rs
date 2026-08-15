@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::ptr::write_bytes;
 
 use myos_mm::{AllocationClass, BuddyAllocator, BuddyError, PageAllocation, PhysFrame};
@@ -202,6 +203,32 @@ pub fn increment_reference(frame: PhysFrame) -> Result<u32, GlobalPageAllocatorE
     Ok(allocator.increment_reference(frame)?)
 }
 
+/// Increments the reference count of a batch of frames under one allocator
+/// lock.  COW fork retires one global lock acquisition per resident page;
+/// with seven other CPUs faulting pages in, that churn dominated fork's
+/// per-page cost.  All-or-nothing: on failure the already-incremented prefix
+/// is rolled back so the caller never sees a half-applied batch.
+pub fn increment_reference_many(frames: &[PhysFrame]) -> Result<(), GlobalPageAllocatorError> {
+    let mut slot = PAGE_ALLOCATOR.lock();
+
+    let allocator = slot
+        .as_mut()
+        .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+    let mut done = 0_usize;
+    for frame in frames {
+        if let Err(error) = allocator.increment_reference(*frame) {
+            for frame in &frames[..done] {
+                let _ = allocator.decrement_reference(*frame);
+            }
+            return Err(error.into());
+        }
+        done += 1;
+    }
+
+    Ok(())
+}
+
 pub fn decrement_reference(frame: PhysFrame) -> Result<u32, GlobalPageAllocatorError> {
     let slot = PAGE_ALLOCATOR.lock();
 
@@ -244,6 +271,98 @@ pub fn free_unreferenced_frame(frame: PhysFrame) -> Result<(), GlobalPageAllocat
     allocator.finish_free(&allocation)?;
 
     Ok(())
+}
+
+/// Frees a batch of allocations with one lock acquisition per phase instead of
+/// two per allocation.  Exec teardown retires tens of thousands of pages at
+/// once; per-page locking turned that into the hottest global-lock churn in
+/// buildstorm.  The caller moves the vector in; nothing is allocated here.
+pub fn free_many(allocations: Vec<PageAllocation>) -> Result<(), GlobalPageAllocatorError> {
+    {
+        let mut slot = PAGE_ALLOCATOR.lock();
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        let mut begun = 0_usize;
+        for allocation in &allocations {
+            if let Err(error) = allocator.begin_free(allocation) {
+                for allocation in &allocations[..begun] {
+                    let _ = allocator.cancel_free(allocation);
+                }
+                return Err(error.into());
+            }
+            begun += 1;
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    for allocation in &allocations {
+        if let Err(error) = poison_allocation(allocation, FREED_POISON) {
+            let mut slot = PAGE_ALLOCATOR.lock();
+            let allocator = slot
+                .as_mut()
+                .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+            for allocation in &allocations {
+                let _ = allocator.cancel_free(allocation);
+            }
+
+            return Err(error);
+        }
+    }
+
+    let mut slot = PAGE_ALLOCATOR.lock();
+
+    let allocator = slot
+        .as_mut()
+        .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+    for allocation in &allocations {
+        allocator.finish_free(allocation)?;
+    }
+
+    Ok(())
+}
+
+/// Decrements the reference count of a batch of frames and frees the ones that
+/// reach zero, all under one allocator lock.  `scratch` is a caller-provided
+/// Vec reused across calls; it is cleared and filled with the begin-freed
+/// allocations.  Returns the number of frames actually freed.
+pub fn release_many_unreferenced(
+    frames: &[PhysFrame],
+    scratch: &mut Vec<PageAllocation>,
+) -> Result<usize, GlobalPageAllocatorError> {
+    scratch.clear();
+
+    {
+        let mut slot = PAGE_ALLOCATOR.lock();
+        let allocator = slot
+            .as_mut()
+            .ok_or(GlobalPageAllocatorError::NotInitialized)?;
+
+        for frame in frames {
+            if allocator.decrement_reference(*frame)? == 0 {
+                scratch.push(allocator.begin_free_unreferenced_frame(*frame)?);
+            }
+        }
+
+        #[cfg(debug_assertions)]
+        for allocation in scratch.iter() {
+            if let Err(error) = poison_allocation(allocation, FREED_POISON) {
+                for allocation in scratch.iter() {
+                    let _ = allocator.cancel_free(allocation);
+                }
+                return Err(error);
+            }
+        }
+
+        for allocation in scratch.iter() {
+            allocator.finish_free(allocation)?;
+        }
+    }
+
+    Ok(scratch.len())
 }
 
 pub fn total_free_pages() -> Result<usize, GlobalPageAllocatorError> {

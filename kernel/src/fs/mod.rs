@@ -452,6 +452,12 @@ pub fn mount(
                 *target_node.state.lock() = NodeState::Directory(BTreeMap::new());
             }
             install_ext4_snapshot(&target_node, device)?;
+            // Honor a read-only mount: the create/write/remove paths gate on
+            // the node flag, which the snapshot install resets for the lazy
+            // overlay case.
+            target_node
+                .read_only
+                .store(flags & 1 != 0, Ordering::Release);
             insert_mount(source, target, fs_type, flags)
         }
         MountFsType::Vfat => {
@@ -2300,6 +2306,7 @@ pub fn verify() {
     // read-only ext4 root that this native parser supports: 1 KiB blocks,
     // one group descriptor, one inode table, and an extent-backed empty root dir.
     let mut super_sector = [0_u8; 512];
+    super_sector[20..24].copy_from_slice(&1_u32.to_le_bytes()); // s_first_data_block => 1 KiB layout
     super_sector[24..28].copy_from_slice(&0_u32.to_le_bytes()); // s_log_block_size => 1024
     super_sector[32..36].copy_from_slice(&8_u32.to_le_bytes()); // s_blocks_per_group
     super_sector[40..44].copy_from_slice(&16_u32.to_le_bytes()); // s_inodes_per_group

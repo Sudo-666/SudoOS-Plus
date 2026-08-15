@@ -8,6 +8,7 @@ pub enum RunMode {
     FinalBuildstorm,
     FinalBuildstormDiag,
     LifecycleStress,
+    CowStress,
     FinalAll,
 }
 
@@ -19,6 +20,7 @@ impl RunMode {
             Self::FinalBuildstorm => "final-buildstorm",
             Self::FinalBuildstormDiag => "final-buildstorm-diag",
             Self::LifecycleStress => "lifecycle-stress",
+            Self::CowStress => "cow-stress",
             Self::FinalAll => "final-all",
         }
     }
@@ -31,6 +33,7 @@ fn parse_mode(value: &str) -> Option<RunMode> {
         "final-buildstorm" => Some(RunMode::FinalBuildstorm),
         "final-buildstorm-diag" => Some(RunMode::FinalBuildstormDiag),
         "lifecycle-stress" => Some(RunMode::LifecycleStress),
+        "cow-stress" => Some(RunMode::CowStress),
         "final-all" => Some(RunMode::FinalAll),
         _ => None,
     }
@@ -81,6 +84,7 @@ pub fn run(mode: RunMode) -> bool {
         RunMode::FinalBuildstorm => final_2026::run_buildstorm(),
         RunMode::FinalBuildstormDiag => final_2026::run_buildstorm_diag(),
         RunMode::LifecycleStress => final_2026::run_lifecycle_stress(),
+        RunMode::CowStress => final_2026::run_cow_stress(),
         RunMode::FinalAll => final_2026::run_all(),
     }
 }

@@ -103,9 +103,18 @@ pub fn set_current_cpu_id(cpu: usize) {
 pub fn current_cpu_id() -> usize {
     let cpu: usize;
 
-    // SAFETY: this only reads the kernel-owned r21/u0 value.
+    // SAFETY: CSR_PERCPU_ID_SAVE is per-core hardware state written by
+    // set_current_cpu_id during boot on every core, and is never task state.
+    // Unlike r21 (which switch.S saves/restores and which therefore follows a
+    // migrated task), the CSR always names the CPU that is executing, so
+    // per-CPU identity needs no stack-scan repair at trap/switch boundaries.
     unsafe {
-        asm!("or {cpu}, $r21, $r0", cpu = out(reg) cpu, options(nomem, nostack));
+        asm!(
+            "csrrd {cpu}, {percpu_id_save}",
+            cpu = out(reg) cpu,
+            percpu_id_save = const CSR_PERCPU_ID_SAVE,
+            options(nomem, nostack),
+        );
     }
 
     cpu

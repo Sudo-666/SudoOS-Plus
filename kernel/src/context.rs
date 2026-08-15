@@ -10,8 +10,10 @@ pub struct IrqSaveGuard {
 
 impl IrqSaveGuard {
     pub fn new() -> Self {
+        let state = crate::arch::interrupt::save_and_disable();
+        crate::task::note_irq_state(false);
         Self {
-            state: crate::arch::interrupt::save_and_disable(),
+            state,
             #[cfg(debug_assertions)]
             disabled_at: crate::arch::time::counter(),
             _not_send: PhantomData,
@@ -36,6 +38,7 @@ impl Drop for IrqSaveGuard {
             }
         }
         crate::arch::interrupt::restore(self.state);
+        crate::task::note_irq_state(self.state.was_enabled());
     }
 }
 

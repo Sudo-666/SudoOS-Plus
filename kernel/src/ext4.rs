@@ -942,8 +942,31 @@ impl Ext4FileSystem {
             return Err(Ext4Error::BadExtentTree);
         }
         if depth != 0 {
+            // Internal entries store the child's first logical block (ei_block)
+            // and the child node's physical block (ei_leaf).  Walking every
+            // child for each 1 MiB chunk read made fragmented files O(tree) per
+            // chunk; skip children that cannot overlap the requested range.
+            let request_end = file_offset
+                .checked_add(output.len() as u64)
+                .ok_or(Ext4Error::AddressOverflow)?;
             for index in 0..entries {
                 let entry = 12 + index * 12;
+                let child_logical = u64::from(le_u32(node, entry)?);
+                let child_start = child_logical
+                    .checked_mul(self.block_size)
+                    .ok_or(Ext4Error::AddressOverflow)?;
+                let child_end = if index + 1 < entries {
+                    let next = 12 + (index + 1) * 12;
+                    u64::from(le_u32(node, next)?)
+                        .checked_mul(self.block_size)
+                        .ok_or(Ext4Error::AddressOverflow)?
+                } else {
+                    // The last child extends past every plausible read.
+                    request_end
+                };
+                if child_end <= file_offset || child_start >= request_end {
+                    continue;
+                }
                 let leaf_lo = u64::from(le_u32(node, entry + 4)?);
                 let leaf_hi = u64::from(le_u16(node, entry + 8)?);
                 let leaf = (leaf_hi << 32) | leaf_lo;

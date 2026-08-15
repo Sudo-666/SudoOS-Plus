@@ -40,6 +40,9 @@ struct IpiMailbox {
     coalesced: AtomicU64,
     handled_batches: AtomicU64,
     spurious_interrupts: AtomicU64,
+    // §10 TLB-shootdown timeout diagnostics: last handler entry/exit times.
+    last_entry: AtomicU64,
+    last_exit: AtomicU64,
 }
 
 impl IpiMailbox {
@@ -51,6 +54,8 @@ impl IpiMailbox {
             coalesced: AtomicU64::new(0),
             handled_batches: AtomicU64::new(0),
             spurious_interrupts: AtomicU64::new(0),
+            last_entry: AtomicU64::new(0),
+            last_exit: AtomicU64::new(0),
         }
     }
 
@@ -61,6 +66,8 @@ impl IpiMailbox {
         self.coalesced.store(0, Ordering::Release);
         self.handled_batches.store(0, Ordering::Release);
         self.spurious_interrupts.store(0, Ordering::Release);
+        self.last_entry.store(0, Ordering::Release);
+        self.last_exit.store(0, Ordering::Release);
     }
     /// Publishes one message into the per-CPU software mailbox.
     ///
@@ -151,6 +158,9 @@ pub fn handle_current() {
 
     let mailbox = &MAILBOXES[cpu.get()];
     mailbox.interrupts.fetch_add(1, Ordering::Relaxed);
+    mailbox
+        .last_entry
+        .store(crate::arch::time::counter(), Ordering::Relaxed);
     fence(Ordering::Acquire);
 
     let mut handled_any = false;
@@ -186,6 +196,24 @@ pub fn handle_current() {
     if !handled_any {
         mailbox.spurious_interrupts.fetch_add(1, Ordering::Relaxed);
     }
+    mailbox
+        .last_exit
+        .store(crate::arch::time::counter(), Ordering::Relaxed);
+}
+
+/// §10 cross-CPU panic-path snapshot of one mailbox.
+pub(crate) fn mailbox_diagnostic(cpu: CpuId) -> (usize, u64, u64, u64, u64, u64, u64, u64) {
+    let mailbox = &MAILBOXES[cpu.get()];
+    (
+        mailbox.pending.load(Ordering::Acquire),
+        mailbox.interrupts.load(Ordering::Acquire),
+        mailbox.doorbells.load(Ordering::Acquire),
+        mailbox.coalesced.load(Ordering::Acquire),
+        mailbox.handled_batches.load(Ordering::Acquire),
+        mailbox.spurious_interrupts.load(Ordering::Acquire),
+        mailbox.last_entry.load(Ordering::Acquire),
+        mailbox.last_exit.load(Ordering::Acquire),
+    )
 }
 
 pub fn interrupt_count(cpu: CpuId) -> u64 {

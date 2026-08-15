@@ -12,23 +12,31 @@ use myos_mm::{
 #[cfg(debug_assertions)]
 use myos_mm::{AsidToken, UserAddressSpace};
 
-use crate::{
-    lockdep::{LockClass, LockRank},
-    smp::{CpuId, MAX_CPUS},
-    tracked_spin::TrackedSpinLock,
-};
+use crate::smp::{CpuId, MAX_CPUS};
 
 const SHOOTDOWN_TIMEOUT_SECONDS: u64 = 30;
 const RANGE_PAGE_FLUSH_LIMIT: usize = 32;
+// §9: per-CPU inbox depth. Concurrent shootdowns targeting the same CPU
+// share its inbox; more in-flight requests than RING_SLOTS make later
+// initiators spin (bounded by the shootdown timeout) instead of blocking
+// unrelated CPUs behind one global serializer.
+const TLB_RING_SLOTS: usize = 4;
 
-const REQUEST_FREE: u8 = 0;
-const REQUEST_PUBLISHING: u8 = 1;
-const REQUEST_READY: u8 = 2;
+const SLOT_FREE: u8 = 0;
+const SLOT_PUBLISHING: u8 = 1;
+const SLOT_READY: u8 = 2;
+
+/// Index that means "this CPU index has no acquired inbox slot".
+const SLOT_NONE: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct TlbRequest {
     shootdown: TlbShootdown,
     targets: usize,
+    // Base pointer of the owning UserMm's local_tlb_generation array, or
+    // null for kernel-address-space requests. The IPI handler stores the
+    // request generation into element [cpu] after flushing.
+    seen: *const AtomicU64,
 }
 
 impl TlbRequest {
@@ -41,10 +49,20 @@ impl TlbRequest {
     }
 }
 
-struct TlbRequestSlot {
+/// §9 per-CPU TLB request slot.
+///
+/// The initiating CPU CASes SLOT_FREE -> SLOT_PUBLISHING (exclusive write
+/// access), writes the payload, and publishes SLOT_READY with Release. The
+/// owning CPU's IPI handler reads the immutable request, flushes locally,
+/// updates the per-mm seen generation, and publishes its ack bit with
+/// Release. The initiator spins on the ack bit, then swaps the slot back to
+/// SLOT_FREE. A wedged target leaves its slot READY forever: subsequent
+/// shootdowns to that CPU fill the remaining ring and then time out with
+/// the §10 rich dump.
+struct TlbSlot {
     state: AtomicU8,
     payload: UnsafeCell<MaybeUninit<TlbRequest>>,
-    completed: AtomicUsize,
+    acked: AtomicUsize,
 
     // Atomic diagnostic mirrors. Panic paths may read these without racing
     // payload publication or slot reuse.
@@ -55,21 +73,20 @@ struct TlbRequestSlot {
     diagnostic_end: AtomicUsize,
 }
 
-// REQUEST_PUBLISHING grants the serializer owner exclusive write access.
-// REQUEST_READY publishes an immutable request to IPI readers. The owner does
-// not return the slot to REQUEST_FREE until every target published completion.
-// SAFETY: REQUEST_PUBLISHING grants the serializer exclusive mutation
-// access to `request`. Publishing REQUEST_READY with Release makes the
-// initialized request immutable and visible to IPI readers; the owner
-// does not reuse the slot until every target has atomically completed.
-unsafe impl Sync for TlbRequestSlot {}
+// SAFETY: SLOT_PUBLISHING grants the acquiring initiator exclusive mutation
+// access to `payload`. Publishing SLOT_READY with Release makes the request
+// immutable and visible to the owning CPU's IPI handler, which stops
+// accessing the payload before it publishes its ack bit. The initiator does
+// not reuse the slot until it observes the ack, so payload reuse and reads
+// never race.
+unsafe impl Sync for TlbSlot {}
 
-impl TlbRequestSlot {
+impl TlbSlot {
     const fn new() -> Self {
         Self {
-            state: AtomicU8::new(REQUEST_FREE),
+            state: AtomicU8::new(SLOT_FREE),
             payload: UnsafeCell::new(MaybeUninit::uninit()),
-            completed: AtomicUsize::new(0),
+            acked: AtomicUsize::new(0),
             diagnostic_id: AtomicU64::new(0),
             diagnostic_targets: AtomicUsize::new(0),
             diagnostic_kind: AtomicU8::new(0),
@@ -78,25 +95,16 @@ impl TlbRequestSlot {
         }
     }
 
-    fn begin_publish(&self) {
-        assert_eq!(
-            self.state.compare_exchange(
-                REQUEST_FREE,
-                REQUEST_PUBLISHING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ),
-            Ok(REQUEST_FREE),
-            "TLB request slot was not free while holding the serializer",
-        );
-        self.completed.store(0, Ordering::Relaxed);
-    }
-
     fn publish(&self, request: TlbRequest) {
         assert_eq!(
             self.state.load(Ordering::Acquire),
-            REQUEST_PUBLISHING,
+            SLOT_PUBLISHING,
             "TLB request was published without slot ownership",
+        );
+        assert_eq!(
+            self.acked.load(Ordering::Acquire),
+            0,
+            "TLB slot was reused with a stale ack bit",
         );
 
         let (kind, start, end) = describe_flush(request.flush());
@@ -107,59 +115,54 @@ impl TlbRequestSlot {
         self.diagnostic_start.store(start, Ordering::Relaxed);
         self.diagnostic_end.store(end, Ordering::Relaxed);
 
-        // SAFETY: REQUEST_PUBLISHING gives the serializer owner exclusive
-        // write access. Readers cannot access the payload until REQUEST_READY.
+        // SAFETY: SLOT_PUBLISHING gives the initiator exclusive write
+        // access. The owning CPU cannot read the payload until SLOT_READY.
         unsafe {
             (*self.payload.get()).write(request);
         }
-        self.state.store(REQUEST_READY, Ordering::Release);
+        self.state.store(SLOT_READY, Ordering::Release);
     }
 
     fn request(&self) -> TlbRequest {
         assert_eq!(
             self.state.load(Ordering::Acquire),
-            REQUEST_READY,
+            SLOT_READY,
             "TLB IPI observed no published request",
         );
 
         // SAFETY: the Acquire state load observes the initialized immutable
         // request. The slot cannot be reused until this CPU publishes its
-        // completion bit after it has stopped accessing the payload.
+        // ack bit after it has stopped accessing the payload.
         unsafe { *(*self.payload.get()).assume_init_ref() }
     }
 
-    fn complete_for(&self, cpu: CpuId) {
+    fn ack(&self, cpu: CpuId) {
         let bit = cpu_bit(cpu);
-        let previous = self.completed.fetch_or(bit, Ordering::AcqRel);
+        let previous = self.acked.fetch_or(bit, Ordering::AcqRel);
         assert_eq!(
             previous & bit,
             0,
-            "CPU completed one TLB request twice: request={} cpu={}",
+            "CPU acknowledged one TLB request twice: request={} cpu={}",
             self.diagnostic_id.load(Ordering::Acquire),
             cpu.get(),
         );
     }
+}
 
-    fn release(&self, expected_targets: usize) {
-        assert_eq!(
-            self.completed.load(Ordering::Acquire),
-            expected_targets,
-            "TLB request released before every target completed",
-        );
-        assert_eq!(
-            self.state.swap(REQUEST_FREE, Ordering::AcqRel),
-            REQUEST_READY,
-            "TLB request slot had an invalid release state",
-        );
+/// §9 per-CPU TLB inbox: the request ring one CPU's IPI handler drains.
+struct TlbInbox {
+    slots: [TlbSlot; TLB_RING_SLOTS],
+}
+
+impl TlbInbox {
+    const fn new() -> Self {
+        Self {
+            slots: [const { TlbSlot::new() }; TLB_RING_SLOTS],
+        }
     }
 }
 
-static SHOOTDOWN_SERIALIZER: TrackedSpinLock<()> = TrackedSpinLock::new_with_class(
-    (),
-    LockClass::new("tlb_shootdown_serializer", LockRank::CrossCpu, 2),
-);
-
-static REQUEST: TlbRequestSlot = TlbRequestSlot::new();
+static INBOXES: [TlbInbox; MAX_CPUS] = [const { TlbInbox::new() }; MAX_CPUS];
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(0);
 
 static REMOTE_FLUSH_COUNTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
@@ -231,10 +234,11 @@ pub fn shootdown(flush: TlbFlush) {
     crate::context::assert_interrupts_enabled();
     crate::context::assert_task_context();
 
-    // The serializer guard pins this task. Acquire it before sampling CPU
-    // identity and target masks so no second, redundant MigrationGuard is
-    // needed around the request.
-    let serializer = acquire_serializer();
+    // §9: MigrationGuard replaces the global serializer. It pins this task
+    // to the CPU recorded at the 0->1 depth edge, so CPU identity and
+    // target masks stay valid for the whole request without serializing
+    // unrelated shootdowns. The holder stays preemptible and interruptible.
+    let _migration = crate::task::MigrationGuard::new();
     let current = crate::smp::current_cpu_id();
     let current_bit = cpu_bit(current);
 
@@ -264,11 +268,15 @@ pub fn shootdown(flush: TlbFlush) {
         .wrapping_add(1);
     assert_ne!(request_id, 0, "TLB request ID wrapped to zero");
 
-    REQUEST.begin_publish();
-    REQUEST.publish(TlbRequest {
-        shootdown: TlbShootdown::new(flush, request_id),
+    let pending = publish_to_inboxes(
+        TlbRequest {
+            shootdown: TlbShootdown::new(flush, request_id),
+            targets,
+            seen: core::ptr::null(),
+        },
         targets,
-    });
+        request_id,
+    );
 
     // Page-table stores before this function and request publication above
     // must be visible before a target observes the mailbox message.
@@ -280,22 +288,21 @@ pub fn shootdown(flush: TlbFlush) {
     // completion mask.
     flush_local(flush);
 
-    wait_for_completion(request_id, targets);
+    wait_for_completion(&pending);
     fence(Ordering::Acquire);
 
-    REQUEST.release(targets);
+    free_slots(&pending);
     COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-
-    drop(serializer);
 }
 
 /// Executes one synchronous, exact-target TLB request for a user address space.
 ///
 /// The request must be created by `UserAddressSpace::plan_tlb_request()` after
-/// the page-table/VMA locks have been released.  This function reuses the
-/// kernel request slot, serializer, mailbox bit, timeout, and ACK protocol.
+/// the page-table/VMA locks have been released. `seen` is the owning mm's
+/// per-CPU local-generation array: the IPI handler stores the request
+/// generation there so §11 switch-in logic can skip redundant flushes.
 #[track_caller]
-pub fn shootdown_user(request: PerMmTlbRequest) {
+pub fn shootdown_user(request: PerMmTlbRequest, seen: Option<*const AtomicU64>) {
     validate_user_request(request);
     crate::context::assert_interrupts_enabled();
     crate::context::assert_task_context();
@@ -309,10 +316,10 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
         return;
     }
 
-    // Pin through the serializer before reading current CPU. Even a local-only
-    // request uses this short critical section so the target comparison cannot
-    // race migration.
-    let serializer = acquire_serializer();
+    // §9: pin with MigrationGuard before reading current CPU. Even a
+    // local-only request uses this short critical section so the target
+    // comparison cannot race migration.
+    let _migration = crate::task::MigrationGuard::new();
     let current = crate::smp::current_cpu_id();
     let current_bit = cpu_bit(current);
     let online = crate::smp::online_cpu_mask();
@@ -342,7 +349,6 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
             flush_local(flush);
         }
         COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-        drop(serializer);
         return;
     }
 
@@ -353,23 +359,25 @@ pub fn shootdown_user(request: PerMmTlbRequest) {
         .wrapping_add(1);
     assert_ne!(request_id, 0, "TLB request ID wrapped to zero");
 
-    REQUEST.begin_publish();
-    REQUEST.publish(TlbRequest {
-        shootdown: TlbShootdown::new(flush, request_id),
+    let pending = publish_to_inboxes(
+        TlbRequest {
+            shootdown: TlbShootdown::new(flush, request_id),
+            targets,
+            seen: seen.map_or(core::ptr::null(), |base| base),
+        },
         targets,
-    });
+        request_id,
+    );
     fence(Ordering::SeqCst);
     for_each_cpu(targets, crate::smp::send_tlb_shootdown);
 
     if requested & current_bit != 0 {
         flush_local(flush);
     }
-    wait_for_completion(request_id, targets);
+    wait_for_completion(&pending);
     fence(Ordering::Acquire);
-    REQUEST.release(targets);
+    free_slots(&pending);
     COMPLETED_SHOOTDOWNS.fetch_add(1, Ordering::Relaxed);
-
-    drop(serializer);
 }
 
 /// Executes an ASID-scoped request that is known to target only this CPU.
@@ -401,86 +409,176 @@ pub fn shootdown_user_local(request: PerMmTlbRequest) {
 
 pub fn handle_shootdown_ipi() {
     let cpu = crate::smp::current_cpu_id();
-    let request = REQUEST.request();
     let bit = cpu_bit(cpu);
 
-    assert_ne!(
-        request.targets & bit,
-        0,
-        "CPU received a TLB request that did not target it: \
-         request={} cpu={} targets={:#x}",
-        request.id(),
-        cpu.get(),
-        request.targets,
-    );
+    // §9: drain every READY request in this CPU's inbox. The handler takes
+    // no locks, allocates nothing, sleeps nowhere, and waits on nobody —
+    // it flushes locally, records the per-mm seen generation, and ACKs.
+    for slot in &INBOXES[cpu.get()].slots {
+        if slot.state.load(Ordering::Acquire) != SLOT_READY {
+            continue;
+        }
+        if slot.acked.load(Ordering::Acquire) & bit != 0 {
+            continue;
+        }
+        let request = slot.request();
 
-    flush_local(request.flush());
-    fence(Ordering::SeqCst);
+        assert_ne!(
+            request.targets & bit,
+            0,
+            "CPU received a TLB request that did not target it: \
+             request={} cpu={} targets={:#x}",
+            request.id(),
+            cpu.get(),
+            request.targets,
+        );
 
-    REMOTE_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
-    match request.flush() {
-        TlbFlush::All { .. } => {
-            REMOTE_FULL_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
+        flush_local(request.flush());
+        fence(Ordering::SeqCst);
+
+        if !request.seen.is_null() {
+            // SAFETY: the owning UserMm cannot be destroyed while this
+            // request targets this CPU — the §8 retirement model frees
+            // nothing before every target acknowledges, and the initiator
+            // holds the mm alive for the whole request. The array is
+            // indexed by logical CPU id.
+            unsafe {
+                (&*request.seen.add(cpu.get())).store(request.id(), Ordering::Release);
+            }
         }
-        TlbFlush::Page { .. } => {
-            REMOTE_PAGE_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
+
+        REMOTE_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
+        match request.flush() {
+            TlbFlush::All { .. } => {
+                REMOTE_FULL_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
+            }
+            TlbFlush::Page { .. } => {
+                REMOTE_PAGE_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
+            }
+            TlbFlush::Range { .. } => {
+                REMOTE_RANGE_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
+            }
         }
-        TlbFlush::Range { .. } => {
-            REMOTE_RANGE_FLUSH_COUNTS[cpu.get()].fetch_add(1, Ordering::Relaxed);
-        }
+
+        slot.ack(cpu);
     }
-
-    REQUEST.complete_for(cpu);
 }
 
-fn acquire_serializer() -> crate::tracked_spin::TrackedSpinLockGuard<'static, ()> {
+/// One in-flight initiator view: which inbox slot was acquired per target.
+struct PendingShootdown {
+    request_id: u64,
+    targets: usize,
+    // slots[cpu] = inbox slot index, or SLOT_NONE when cpu is not a target.
+    slots: [u8; MAX_CPUS],
+}
+
+/// Acquires one inbox slot per target CPU and publishes the request there.
+///
+/// Slot acquisition spins per-CPU: a full inbox on one target only stalls
+/// requests that need that CPU, never unrelated shootdowns.
+fn publish_to_inboxes(request: TlbRequest, targets: usize, request_id: u64) -> PendingShootdown {
+    let mut pending = PendingShootdown {
+        request_id,
+        targets,
+        slots: [SLOT_NONE; MAX_CPUS],
+    };
+
+    for_each_cpu(targets, |cpu| {
+        let slot_index = acquire_slot(cpu, request_id);
+        pending.slots[cpu.get()] = slot_index;
+        INBOXES[cpu.get()].slots[slot_index as usize].publish(request);
+    });
+
+    pending
+}
+
+fn acquire_slot(cpu: CpuId, request_id: u64) -> u8 {
     let deadline = timeout_deadline();
 
     loop {
-        if let Some(serializer) = SHOOTDOWN_SERIALIZER.try_lock() {
-            return serializer;
+        for (index, slot) in INBOXES[cpu.get()].slots.iter().enumerate() {
+            if slot
+                .state
+                .compare_exchange(SLOT_FREE, SLOT_PUBLISHING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                slot.acked.store(0, Ordering::Relaxed);
+                return index as u8;
+            }
         }
 
         if deadline_reached(crate::arch::time::counter(), deadline) {
-            dump();
-            crate::ipi::dump();
-            crate::smp::dump_cpu_states();
+            dump_rich();
             panic!(
-                "timed out acquiring the TLB shootdown serializer: cpu={}",
-                crate::smp::current_cpu_id().get(),
+                "TLB inbox exhausted: request={request_id} target={} \
+                 (all {} ring slots in flight for 30s)",
+                cpu.get(),
+                TLB_RING_SLOTS,
             );
         }
         spin_loop();
     }
 }
 
-fn wait_for_completion(request_id: u64, targets: usize) {
+fn wait_for_completion(pending: &PendingShootdown) {
     let deadline = timeout_deadline();
 
     loop {
-        let completed = REQUEST.completed.load(Ordering::Acquire);
+        let mut completed = 0_usize;
+        for_each_cpu(pending.targets, |cpu| {
+            let slot = &INBOXES[cpu.get()].slots[pending.slots[cpu.get()] as usize];
+            let acked = slot.acked.load(Ordering::Acquire);
+            assert_eq!(
+                acked & !cpu_bit(cpu),
+                0,
+                "TLB slot acknowledged on an unexpected CPU: \
+                 request={} target={} acked={acked:#x}",
+                pending.request_id,
+                cpu.get(),
+            );
+            if acked != 0 {
+                completed |= cpu_bit(cpu);
+            }
+        });
+
         assert_eq!(
-            completed & !targets,
+            completed & !pending.targets,
             0,
             "TLB request completed on an unexpected CPU: \
-             request={request_id} targets={targets:#x} completed={completed:#x}",
+             request={} targets={:#x} completed={completed:#x}",
+            pending.request_id,
+            pending.targets,
         );
-        if completed == targets {
+        if completed == pending.targets {
             return;
         }
 
         if deadline_reached(crate::arch::time::counter(), deadline) {
-            dump();
-            crate::ipi::dump();
-            crate::smp::dump_cpu_states();
+            dump_rich();
             panic!(
-                "TLB request timed out: request={request_id} targets={targets:#x} \
+                "TLB request timed out: request={} targets={:#x} \
                  completed={completed:#x} pending={:#x}",
-                targets & !completed,
+                pending.request_id,
+                pending.targets,
+                pending.targets & !completed,
             );
         }
         spin_loop();
     }
+}
+
+/// Returns every acquired slot to SLOT_FREE after all acks were observed.
+fn free_slots(pending: &PendingShootdown) {
+    for_each_cpu(pending.targets, |cpu| {
+        let slot = &INBOXES[cpu.get()].slots[pending.slots[cpu.get()] as usize];
+        assert_eq!(
+            slot.state.swap(SLOT_FREE, Ordering::AcqRel),
+            SLOT_READY,
+            "TLB slot had an invalid release state: request={} cpu={}",
+            pending.request_id,
+            cpu.get(),
+        );
+    });
 }
 
 fn validate_flush(flush: TlbFlush) {
@@ -601,6 +699,18 @@ fn flush_all_local(scope: TlbScope) {
 fn flush_page_local(scope: TlbScope, address: VirtAddr) {
     match scope {
         TlbScope::AddressSpace(address_space) if address_space != AddressSpaceId::KERNEL => {
+            // §11: QEMU's LoongArch targeted op-4/op-6 invalidations have
+            // proven unreliable (see arch flush_asid), so invalidate the
+            // complete ASID there; RISC-V keeps the selective page path.
+            // The activate_current_cpu generation gate's
+            // "seen == generation implies clean" claim depends on every
+            // shootdown flush actually removing stale translations.
+            #[cfg(target_arch = "loongarch64")]
+            {
+                let _ = address; // full-ASID invalidation ignores the address
+                crate::arch::memory::paging::flush_asid(address_space);
+            }
+            #[cfg(target_arch = "riscv64")]
             crate::arch::memory::paging::flush_asid_page(address_space, address);
         }
         TlbScope::Local | TlbScope::AllCpus | TlbScope::AddressSpace(_) => {
@@ -617,6 +727,16 @@ fn flush_range_local(scope: TlbScope, range: VirtRange) {
     if pages > RANGE_PAGE_FLUSH_LIMIT {
         flush_all_local(scope);
         return;
+    }
+    // §11: a per-page loop would repeat LoongArch's full-ASID invalidation
+    // once per page; perform a single complete invalidation instead (see
+    // flush_page_local). RISC-V keeps the selective per-page path.
+    #[cfg(target_arch = "loongarch64")]
+    if let TlbScope::AddressSpace(address_space) = scope {
+        if address_space != AddressSpaceId::KERNEL {
+            crate::arch::memory::paging::flush_asid(address_space);
+            return;
+        }
     }
     let mut address = range.start();
     while address.get() < range.end().get() {
@@ -673,27 +793,108 @@ fn deadline_reached(now: u64, deadline: u64) -> bool {
     now.wrapping_sub(deadline) < (1_u64 << 63)
 }
 
-pub fn dump() {
-    let state = REQUEST.state.load(Ordering::Acquire);
-    let state_name = match state {
-        REQUEST_FREE => "free",
-        REQUEST_PUBLISHING => "publishing",
-        REQUEST_READY => "ready",
-        _ => "invalid",
-    };
+/// §10 rich per-CPU dump for TLB shootdown timeout classification.
+///
+/// Prints, per CPU: current task + decoded state, preempt/migration
+/// depths, the last mirrored interrupt state and its age, irq_depth,
+/// in-trap depth, context switches and last switch age, need_resched,
+/// run-queue length, loaded mm/asid/mm generation, and the IPI mailbox
+/// counters with last entry/exit ages. All cross-CPU reads are racy
+/// snapshots taken from a panic path, diagnostic-only by design.
+fn dump_rich() {
+    dump();
+    crate::ipi::dump();
+    crate::smp::dump_cpu_states();
 
-    crate::println!("TLB request:");
+    let now = crate::arch::time::counter();
     crate::println!(
-        "  state={} id={} kind={} targets={:#x} completed={:#x} \
-         start={:#x} end={:#x}",
-        state_name,
-        REQUEST.diagnostic_id.load(Ordering::Acquire),
-        flush_kind_name(REQUEST.diagnostic_kind.load(Ordering::Acquire)),
-        REQUEST.diagnostic_targets.load(Ordering::Acquire),
-        REQUEST.completed.load(Ordering::Acquire),
-        REQUEST.diagnostic_start.load(Ordering::Acquire),
-        REQUEST.diagnostic_end.load(Ordering::Acquire),
+        "TLB timeout per-CPU diagnostics: now={} max_irq_off_cycles={}",
+        now,
+        crate::lockdep::max_irq_off_cycles(),
     );
+    for logical in 0..crate::smp::discovered_cpu_count() {
+        let cpu = CpuId::new(logical).expect("TLB diagnostic CPU exceeds MAX_CPUS");
+        let d = crate::task::cpu_diagnostic(cpu);
+        let (pending, irqs, doorbells, coalesced, batches, spurious, entry, exit) =
+            crate::ipi::mailbox_diagnostic(cpu);
+        crate::println!(
+            "  cpu{logical} task={:#x} state={} preempt={} mig={} pinned={} \
+             irq_mirror={} ({} ticks ago) irq_depth={} in_trap={} trap_imbalance={} \
+             switches={} last_switch={} ({} ticks ago) need_resched={} \
+             rq_len={} mm={} asid={} mm_gen={}",
+            d.task,
+            d.task_state,
+            d.preempt_depth,
+            d.migration_depth,
+            d.migration_pinned,
+            d.irq_mirror,
+            ticks_ago(now, d.irq_mirror_at),
+            d.irq_depth,
+            d.in_trap_depth,
+            d.trap_imbalance,
+            d.switches,
+            d.last_switch,
+            ticks_ago(now, d.last_switch),
+            d.need_resched,
+            d.rq_len.map_or(-1_i64, |len| len as i64),
+            d.loaded_mm,
+            d.loaded_asid,
+            d.mm_local_generation,
+        );
+        crate::println!(
+            "         ipi pending={:#x} irq={} doorbell={} coalesced={} \
+             batches={} spurious={} entry={} ({} ticks ago) exit={} ({} ticks ago)",
+            pending,
+            irqs,
+            doorbells,
+            coalesced,
+            batches,
+            spurious,
+            entry,
+            ticks_ago(now, entry),
+            exit,
+            ticks_ago(now, exit),
+        );
+    }
+    crate::lockdep::dump_all_cpus();
+}
+
+fn ticks_ago(now: u64, then: u64) -> u64 {
+    if then == 0 {
+        return 0;
+    }
+    now.wrapping_sub(then)
+}
+
+pub fn dump() {
+    crate::println!("TLB inboxes:");
+    for (logical, inbox) in INBOXES
+        .iter()
+        .enumerate()
+        .take(crate::smp::discovered_cpu_count())
+    {
+        for (index, slot) in inbox.slots.iter().enumerate() {
+            let state = slot.state.load(Ordering::Acquire);
+            if state == SLOT_FREE {
+                continue;
+            }
+            let state_name = match state {
+                SLOT_PUBLISHING => "publishing",
+                SLOT_READY => "ready",
+                _ => "invalid",
+            };
+            crate::println!(
+                "  cpu{logical} slot{index} state={state_name} id={} kind={} \
+                 targets={:#x} acked={:#x} start={:#x} end={:#x}",
+                slot.diagnostic_id.load(Ordering::Acquire),
+                flush_kind_name(slot.diagnostic_kind.load(Ordering::Acquire)),
+                slot.diagnostic_targets.load(Ordering::Acquire),
+                slot.acked.load(Ordering::Acquire),
+                slot.diagnostic_start.load(Ordering::Acquire),
+                slot.diagnostic_end.load(Ordering::Acquire),
+            );
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -749,10 +950,12 @@ pub fn verify_request_model() {
         );
     }
 
-    assert_eq!(
-        REQUEST.state.load(Ordering::Acquire),
-        REQUEST_FREE,
-        "TLB request verifier leaked the request slot",
+    assert!(
+        INBOXES.iter().all(|inbox| inbox
+            .slots
+            .iter()
+            .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_FREE)),
+        "TLB request verifier leaked an inbox slot",
     );
 
     crate::println!("TLB request v2 test:");
@@ -801,7 +1004,7 @@ pub fn verify_request_model() {
             address: VirtAddr::new(0),
         })
         .expect("M8-B1 verifier could not plan per-mm TLB request");
-    shootdown_user(per_mm_request);
+    shootdown_user(per_mm_request, None);
 
     assert_eq!(
         completed_shootdowns(),
@@ -835,10 +1038,12 @@ pub fn verify_request_model() {
     user_mm
         .assert_inactive_for_destroy()
         .expect("M8-B1 verifier leaked active CPU membership");
-    assert_eq!(
-        REQUEST.state.load(Ordering::Acquire),
-        REQUEST_FREE,
-        "M8-B1 verifier leaked the shared request slot",
+    assert!(
+        INBOXES.iter().all(|inbox| inbox
+            .slots
+            .iter()
+            .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_FREE)),
+        "M8-B1 verifier leaked a shared inbox slot",
     );
 
     crate::println!("M8-B1 per-mm TLB test:");

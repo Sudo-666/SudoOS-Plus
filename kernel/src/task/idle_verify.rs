@@ -129,7 +129,7 @@ fn idle_gate_worker() {
 
     // Do not manipulate the local clockevent here.  Blocking the final
     // runnable worker forces the normal idle path to perform its IRQ-disabled
-    // work recheck and call time::enter_idle().
+    // work recheck with the periodic scheduler tick still armed.
     GATE_PHASE.store(GATE_ARMED, Ordering::Release);
     CLEANUP_QUEUE.wait_until(|| CLEANUP_ALLOWED.load(Ordering::Acquire));
 }
@@ -156,8 +156,8 @@ pub(super) fn before_arch_wait(cpu: CpuId) {
         "deterministic idle gate was reached with local interrupts enabled",
     );
     assert!(
-        !crate::time::scheduler_tick_active_for(cpu),
-        "deterministic idle gate was reached with the scheduler tick active",
+        crate::time::scheduler_tick_active_for(cpu),
+        "deterministic idle gate was reached with the scheduler tick inactive",
     );
 
     // CPU0 publishes the blocked task and sends the sole reschedule IPI before
@@ -215,28 +215,24 @@ pub(super) fn verify(cpu_count: usize) {
     assert!(crate::smp::is_ipi_ready(target));
     reset_state(target);
 
-    // Allocate and initially block the measured worker before the tickless
+    // Allocate and initially block the measured worker before the idle gate
     // window.  Kernel-stack vmalloc/TLB activity is therefore outside it.
     super::spawn_internal(wake_worker, Some(target), Some(target));
     wait_for_flag(&WAKE_WORKER_READY, "wake worker did not start");
     wait_for_blocked(&RUN_QUEUE, 1, "wake worker did not block");
 
-    // CPU1 may already be in legitimate NO_HZ idle.  Do not require an
-    // initially active tick.  Wake it with a pre-measurement worker and let
-    // that worker block so the real idle path owns the next tick stop.
-    let idle_entries_before = crate::time::tickless_idle_entries_for(target);
+    // Wake the target with a pre-measurement worker and let that worker
+    // block so the real idle path owns the next IRQ-disabled recheck.  The
+    // periodic scheduler tick stays armed while idle: it is the level-
+    // triggered fallback that must survive into the idle gate.
     super::spawn_internal(idle_gate_worker, Some(target), Some(target));
     wait_for_gate(
         GATE_RECHECK_PASSED,
         "target CPU did not pass the IRQ-disabled idle recheck",
     );
     assert!(
-        crate::time::tickless_idle_entries_for(target) > idle_entries_before,
-        "target CPU reached the idle gate without a new tickless-idle entry",
-    );
-    assert!(
-        !crate::time::scheduler_tick_active_for(target),
-        "target scheduler tick was unexpectedly active at the idle gate",
+        crate::time::scheduler_tick_active_for(target),
+        "target scheduler tick was unexpectedly inactive at the idle gate",
     );
 
     let ticks_before = crate::time::timer_ticks_for(target);
