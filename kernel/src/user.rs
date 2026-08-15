@@ -276,7 +276,7 @@ static POSIX_RECORD_LOCKS: crate::irq_lock::IrqSpinLock<Vec<PosixRecordLock>> =
     );
 static POSIX_RECORD_LOCK_WAIT: crate::task::WaitQueue = crate::task::WaitQueue::new();
 
-// BUILDSTORM_SHARED_MMAP_WRITEBACK_V1
+// SUDOOS_SHARED_MMAP_WRITEBACK_V1
 //
 // File mappings are eagerly populated into UserMm-owned pages.  Writable
 // MAP_SHARED mappings therefore need an explicit backing-file writeback before
@@ -3198,7 +3198,7 @@ fn final_buildstorm_late_snapshot() {
     }
 }
 
-// SUDOOS_BUILDSTORM_XTASK_TMPFS_V3
+// SUDOOS_XTASK_TMPFS_V3
 //
 // The public final image contains the real TGOSKits source tree and Rust
 // toolchain but may omit the prebuilt tg-xtask. Building it inside the ext4
@@ -4211,7 +4211,7 @@ exit 0
             crate::smp::CpuId::BOOT,
         );
     }
-    // SUDOOS_BUILDSTORM_XTASK_TMPFS_V3: prepare/reuse the real xtask in tmpfs.
+    // SUDOOS_XTASK_TMPFS_V3: prepare/reuse the real xtask in tmpfs.
     prepare_buildstorm_xtask_bootstrap(&environment);
     // SUDOOS_BUILDSTORM_RESTORE_PRODUCTION_V2
     // The scoring branch must execute the evaluator script from the mounted

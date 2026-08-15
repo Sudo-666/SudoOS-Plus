@@ -2172,7 +2172,7 @@ impl UserMm {
         crate::context::assert_interrupts_disabled();
         let cpu = crate::smp::current_cpu_id().get();
 
-        // SUDOOS_BUILDSTORM_ROOTFIX_ASID_SCOPE_V1
+        // SUDOOS_ASID_SCOPE_V1
         // Snapshot generation under the global allocator, then release it
         // before taking user_mm or installing page-table hardware state.
         let current_asid_generation = {

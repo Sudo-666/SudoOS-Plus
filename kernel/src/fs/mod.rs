@@ -22,7 +22,7 @@ const MOUNT_LOCK: LockClass = LockClass::new("vfs.mounts", LockRank::Vfs, 2);
 const MAX_COMPONENT_LEN: usize = 255;
 const MAX_SYMLINK_FOLLOWS: usize = 40;
 const BLOCK_CACHE_BLOCKS: usize = 32;
-// SUDOOS_BUILDSTORM_ROOTFIX_EXT4_NEGATIVE_DENTRY_V1
+// SUDOOS_EXT4_NEGATIVE_DENTRY_V1
 // Keep failed ext4 component probes bounded per directory.
 const MAX_NEGATIVE_DENTRIES: usize = 256;
 
@@ -185,7 +185,7 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<myos_vfs::ArcFile, Errno> {
     }
 
     let node = {
-        // SUDOOS_BUILDSTORM_ROOTFIX_FS_READ_FASTPATH_V1
+        // SUDOOS_FS_READ_FASTPATH_V1
         // Only O_CREAT needs namespace-wide lookup+insert serialization.
         // Existing-node opens are protected by per-node locks and no longer
         // disable local IRQs behind the global VFS tree lock.
