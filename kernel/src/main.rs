@@ -496,6 +496,10 @@ fn kernel_main(boot: BootInfo) -> ! {
     storage::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     partition::verify();
+    // mmc::verify 只跑 mock 逻辑（无硬件/架构依赖），riscv64 也执行，
+    // 便于在 QEMU 上验证 DW-MMC 状态机。
+    #[cfg(debug_assertions)]
+    mmc::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     virtio::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]

@@ -1,8 +1,17 @@
-//! 多功能控制器（MMC/SD）主机发现。
+//! 多功能控制器（MMC/SD）主机。
 //!
-//! C6：从设备树收集 DesignWare MMC 主机（`snps,dw-mshc`，JH7110）并把
-//! 配置存入静态区，供后续驱动（C7 DW-MMC 主控、C8 SD 协议）消费。
+//! - C6：从设备树收集 DesignWare MMC 主机（`snps,dw-mshc`，JH7110）并把
+//!   配置存入静态区；
+//! - C7：轮询 DW-MMC 主控（`dw_mmc`）；
+//! - C8：SD 卡初始化 + 只读块（`sd`）。
+//!
 //! VisionFive 2 上 `mmc0` 是板载 eMMC、`mmc1` 是 TF 卡槽。
+
+pub mod dw_mmc;
+pub mod registers;
+
+#[cfg(debug_assertions)]
+mod mock;
 
 use alloc::vec::Vec;
 
@@ -56,4 +65,9 @@ pub fn removable_host() -> Option<myos_fdt::MmcHostConfig> {
         .iter()
         .find(|host| !host.non_removable())
         .copied()
+}
+
+#[cfg(debug_assertions)]
+pub fn verify() {
+    dw_mmc::verify();
 }
