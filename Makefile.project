@@ -642,5 +642,45 @@ smoke-loongarch64-sdcard:
 
 smoke-sdcard-all: smoke-riscv64-sdcard smoke-loongarch64-sdcard
 
+# ── C3: disposable ext4 contest fixture smoke ─────────────────────────────
+# Generates a 32 MiB raw ext4 fixture (make-contest-fixture.sh), validates it
+# on the host (check-contest-fixture.py), boots the kernel with it attached,
+# and requires CONTEST_FIXTURE: arch=<arch> + FIXTURE_OSCOMP_PASS. Exercises
+# BlockDevice -> ext4 -> VFS mount -> file reads on QEMU without an official
+# judge image. The loongarch target additionally requires the parked
+# qemu-loongarch direct-boot FDT fallback to boot the kernel.
+FIXTURE_DIR := build/fixtures
+FIXTURE_LOG_DIR := build/fixtures/logs
+
+.PHONY: smoke-contest-fixture-riscv64 smoke-contest-fixture-loongarch64 smoke-contest-fixture-all
+smoke-contest-fixture-riscv64: kernel-rv
+	@mkdir -p $(FIXTURE_DIR) $(FIXTURE_LOG_DIR)
+	@scripts/make-contest-fixture.sh --arch riscv64 --output $(FIXTURE_DIR)/contest-rv.ext4
+	@python3 scripts/check-contest-fixture.py --arch riscv64 --image $(FIXTURE_DIR)/contest-rv.ext4
+	@python3 scripts/qemu_log_wait.py --log $(FIXTURE_LOG_DIR)/contest-rv.log \
+		--success-pattern "CONTEST_FIXTURE: arch=riscv64" \
+		--success-pattern "FIXTURE_OSCOMP_PASS" \
+		--failure-regex '^panicked at .*' --timeout 90 -- \
+		qemu-system-riscv64 -machine virt -kernel kernel-rv -m 256M -nographic -smp 1 \
+		-bios default \
+		-drive file=$(FIXTURE_DIR)/contest-rv.ext4,if=none,format=raw,id=x0 \
+		-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+		-no-reboot -monitor none -display none -serial file:$(FIXTURE_LOG_DIR)/contest-rv.log
+
+smoke-contest-fixture-loongarch64: kernel-la
+	@mkdir -p $(FIXTURE_DIR) $(FIXTURE_LOG_DIR)
+	@scripts/make-contest-fixture.sh --arch loongarch64 --output $(FIXTURE_DIR)/contest-la.ext4
+	@python3 scripts/check-contest-fixture.py --arch loongarch64 --image $(FIXTURE_DIR)/contest-la.ext4
+	@python3 scripts/qemu_log_wait.py --log $(FIXTURE_LOG_DIR)/contest-la.log \
+		--success-pattern "CONTEST_FIXTURE: arch=loongarch64" \
+		--success-pattern "FIXTURE_OSCOMP_PASS" \
+		--failure-regex '^panicked at .*' --timeout 90 -- \
+		qemu-system-loongarch64 -machine virt -kernel kernel-la -m 2G -nographic -smp 1 \
+		-drive file=$(FIXTURE_DIR)/contest-la.ext4,if=none,format=raw,id=x0 \
+		-device virtio-blk-pci,drive=x0 \
+		-no-reboot -monitor none -display none -serial file:$(FIXTURE_LOG_DIR)/contest-la.log
+
+smoke-contest-fixture-all: smoke-contest-fixture-riscv64 smoke-contest-fixture-loongarch64
+
 verify-m14-vendor-userland: m14-vendor-userland-audit busybox-initramfs-vendor check smoke-all smoke-smp-all smoke-riscv64-vendor-initramfs
 	@echo "M14 vendor userland verifier complete"

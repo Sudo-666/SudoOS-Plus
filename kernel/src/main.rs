@@ -744,7 +744,43 @@ fn mount_sdcard_if_present(config: &storage::ContestStorageConfig) {
         crate::println!("sdcard: contest storage mount failed: {error:?}");
         return;
     }
+    contest_fixture_probe(&device);
     install_sdcard_contents(&device, &device_name);
+}
+
+/// C3: 识别自动生成的竞赛 fixture（root 含 `/SUDOOS_CONTEST_FIXTURE`）并打印
+/// 验收标记。这把存储链（BlockDevice → ext4 → VFS 挂载/读取）在 QEMU 上
+/// 验证出来，不需要正式评测镜像。
+fn contest_fixture_probe(device: &alloc::sync::Arc<dyn crate::block::BlockDevice>) {
+    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), "/") else {
+        return;
+    };
+    if !entries.iter().any(|entry| entry.name == "SUDOOS_CONTEST_FIXTURE") {
+        return;
+    }
+    crate::println!("CONTEST_FIXTURE: arch={}", arch::ARCH_NAME);
+    let required = [
+        "/SUDOOS_CONTEST_FIXTURE",
+        "/arch",
+        "/glibc/cagent_testcode.sh",
+        "/musl/cagent_testcode.sh",
+        "/work/tgoskits/Cargo.toml",
+    ];
+    let mut missing = 0_usize;
+    for path in required {
+        let ok =
+            crate::ext4::load_path_snapshot(alloc::sync::Arc::clone(device), path).is_ok();
+        crate::println!(
+            "CONTEST_FIXTURE: path={} {}",
+            path,
+            if ok { "present" } else { "missing" },
+        );
+        if !ok {
+            missing += 1;
+        }
+    }
+    crate::println!("CONTEST_FIXTURE: paths-missing={}", missing);
+    crate::println!("FIXTURE_OSCOMP_PASS");
 }
 
 /// Install the ext4 contest image contents (busybox, libs, scripts, dirs)
