@@ -5,6 +5,7 @@
 #![no_main]
 
 mod block;
+mod boot_ramdisk;
 mod bootargs;
 mod call_function;
 mod console;
@@ -472,6 +473,8 @@ fn kernel_main(boot: BootInfo) -> ! {
     fs::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     block::verify();
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
+    boot_ramdisk::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     storage::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
