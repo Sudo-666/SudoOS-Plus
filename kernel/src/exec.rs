@@ -102,6 +102,15 @@ const AT_CLKTCK: usize = 17;
 const AT_PLATFORM: usize = 15;
 const AT_HWCAP: usize = 16;
 const AT_HWCAP2: usize = 26;
+// LoongArch QEMU TCG reads qemu_getauxval(AT_HWCAP) and refuses to start
+// without HWCAP_LOONGARCH_UAL (unaligned access support, Linux bit 2).
+// Other capability bits (FPU/LSX/LASX/...) stay unadvertised: TCG must not
+// be told to emit instructions the guest CPU state does not back.
+#[cfg(target_arch = "loongarch64")]
+const ELF_HWCAP: usize = 1 << 2;
+
+#[cfg(not(target_arch = "loongarch64"))]
+const ELF_HWCAP: usize = 0;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 const AT_EXECFN: usize = 31;
@@ -1092,7 +1101,7 @@ fn build_initial_stack(
         (AT_EGID, 0),
         (AT_CLKTCK, 100),
         (AT_PLATFORM, platform_ptr),
-        (AT_HWCAP, 0),
+        (AT_HWCAP, ELF_HWCAP),
         (AT_HWCAP2, 0),
         (AT_SECURE, 0),
         (AT_RANDOM, random_ptr),
