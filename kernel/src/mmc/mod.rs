@@ -78,9 +78,10 @@ pub fn initialize_storage() {
         return;
     };
     crate::println!(
-        "mmc: probing removable host mmc{} base={:#018x}",
+        "VF2-TF00 host=mmc{} base={:#018x} bus-width={}",
         host.alias_index().unwrap_or(u8::MAX),
         host.base(),
+        host.bus_width(),
     );
     // SAFETY: host.base 来自设备树校验过的 MMIO 区域，内核生命周期内有效。
     let io = unsafe { dw_mmc::MmioRegisterIo::new(host.base()) };
@@ -89,25 +90,40 @@ pub fn initialize_storage() {
     match controller.reset() {
         Ok(()) => {}
         Err(error) => {
-            crate::println!("mmc: controller reset failed ({error:?}) — no card");
+            crate::println!("VF2-TF01 reset-failed={error:?} no-card");
             return;
         }
     }
     controller.disable_interrupts();
     if let Err(error) = controller.set_clock(400_000) {
-        crate::println!("mmc: init clock setup failed ({error:?}) — no card");
+        crate::println!("VF2-TF01 init-clock-failed={error:?} no-card");
         return;
     }
     let info = match sd::initialize_card(&mut controller) {
         Ok(info) => info,
         Err(error) => {
-            crate::println!("mmc: no SD card on removable host ({error:?})");
+            crate::println!("VF2-TF01 init-failed={error:?} no-card");
             return;
         }
     };
+    let block_count = info.block_count;
+    crate::println!(
+        "VF2-TF01 card rca={:#x} sdhc={} blocks={} bus-width={}",
+        info.rca,
+        info.is_sdhc,
+        info.block_count,
+        info.bus_width,
+    );
     match block::register_mmcblk1(controller, info) {
-        Ok(()) => crate::println!("mmc: registered=/dev/mmcblk1"),
-        Err(error) => crate::println!("mmc: register mmcblk1 failed ({error:?})"),
+        Ok(()) => {
+            crate::println!("VF2-TF02 registered=/dev/mmcblk1");
+            crate::println!(
+                "VF2-TF03 block-size={} blocks={} read-only",
+                block::sd_block_size(),
+                block_count,
+            );
+        }
+        Err(error) => crate::println!("VF2-TF02 register-failed={error:?}"),
     }
 }
 

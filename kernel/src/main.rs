@@ -780,18 +780,24 @@ fn mount_sdcard_if_present(config: &storage::ContestStorageConfig) {
 fn register_boot_ramdisks(regions: &[myos_fdt::BootRamdiskRegion]) {
     for region in regions {
         crate::println!(
-            "ramdisk: region [{:#018x}, {:#018x}) block-size={} read-only={}",
+            "LS2K-RAMDISK00 region=[{:#018x}, {:#018x}) size={} block-size={} read-only={}",
             region.base(),
             region.end().unwrap_or(usize::MAX),
+            region.size(),
             region.block_size(),
             region.read_only(),
         );
-        if let Err(error) = crate::boot_ramdisk::register_boot_ramdisk(
+        match crate::boot_ramdisk::register_boot_ramdisk(
             myos_mm::PhysAddr::new(region.base()),
             region.size(),
             region.block_size(),
         ) {
-            crate::println!("ramdisk: register ram0 failed: {error:?}");
+            Ok(()) => {
+                crate::println!("LS2K-RAMDISK01 registered=/dev/ram0");
+            }
+            Err(error) => {
+                crate::println!("ramdisk: register ram0 failed: {error:?}");
+            }
         }
     }
 }

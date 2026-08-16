@@ -89,6 +89,11 @@ pub fn register_mmcblk1<I: MmcRegisterIo>(
     block::register_device("mmcblk1", device as Arc<dyn BlockDevice>)
 }
 
+/// 日志用：SD 卡块大小（512）。
+pub fn sd_block_size() -> usize {
+    SD_BLOCK_SIZE
+}
+
 fn mmc_to_block(error: MmcError) -> BlockError {
     match error {
         MmcError::Timeout | MmcError::CrcError => BlockError::InvalidArgument,
