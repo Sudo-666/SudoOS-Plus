@@ -167,9 +167,10 @@ pub(super) fn before_block_context_switch(queue: &WaitQueue, cpu: CpuId) {
     }
 
     // The scheduler lock has been released, but the intended outgoing task is
-    // still SwitchingOut and local interrupts remain disabled. Bound the test
-    // hook itself so a verifier defect becomes a precise panic rather than an
-    // unbounded CPU stall hidden behind the outer QEMU timeout.
+    // still mid-transaction (Running with the CPU's phase Preparing) and
+    // local interrupts remain disabled. Bound the test hook itself so a
+    // verifier defect becomes a precise panic rather than an unbounded CPU
+    // stall hidden behind the outer QEMU timeout.
     SWITCH_RACE_HOOK_REACHED.store(true, Ordering::Release);
     let deadline = super::verification_deadline();
     while !SWITCH_RACE_HOOK_RELEASE.load(Ordering::Acquire) {
@@ -388,7 +389,7 @@ fn verify_switching_out_wakeup() {
 
     super::spawn_internal(switching_race_worker, Some(target), Some(target));
 
-    wait_until("a waiter to enter SwitchingOut", || {
+    wait_until("a waiter to enter its switch transaction", || {
         SWITCH_RACE_HOOK_REACHED.load(Ordering::Acquire)
     });
     crate::println!("M4C switch-race: hook reached");
@@ -401,8 +402,8 @@ fn verify_switching_out_wakeup() {
     SWITCH_RACE_CONDITION.store(true, Ordering::Release);
     assert_eq!(SWITCH_RACE_QUEUE.wake_one(), 1);
 
-    // A claimed SwitchingOut waiter is no longer eligible for another wake,
-    // even though schedule-tail has not yet converted it back to Runnable.
+    // A claimed mid-transaction waiter is no longer eligible for another
+    // wake, even though schedule-tail has not yet converted it to Runnable.
     assert_eq!(SWITCH_RACE_QUEUE.wake_one(), 0);
     assert_eq!(SWITCH_RACE_QUEUE.waiter_count(), 0);
     let claimed = SWITCH_RACE_QUEUE.debug_state();
@@ -414,7 +415,7 @@ fn verify_switching_out_wakeup() {
     SWITCH_RACE_HOOK_RELEASE.store(true, Ordering::Release);
     crate::println!("M4C switch-race: hook released");
 
-    wait_until("the SwitchingOut waiter to converge to runnable", || {
+    wait_until("the mid-transaction waiter to converge to runnable", || {
         SWITCH_RACE_DONE.load(Ordering::Acquire) && super::live_kernel_threads() == 0
     });
     crate::println!("M4C switch-race: worker completed");

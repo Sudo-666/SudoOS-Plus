@@ -26,7 +26,7 @@ const CS8: u32 = 0x0000_0030;
 const B38400: u32 = 0x0000_000f;
 
 static CONSOLE_TTY: IrqSpinLock<TtyState> = IrqSpinLock::new_with_class(TtyState::new(), TTY_LOCK);
-static TTY_READ_WAIT: WaitQueue = WaitQueue::new();
+static TTY_READ_WAIT: WaitQueue = WaitQueue::named("tty_read");
 
 struct TtyState {
     buffer: [u8; TTY_BUFFER],
@@ -152,6 +152,17 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
         if crate::task::current_user_thread()
             .and_then(|t| t.forced_exit_status())
             .is_some()
+        {
+            return Err(Errno::Eintr);
+        }
+        // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: surface interrupting signals as
+        // EINTR instead of re-blocking, so the trap-return path can deliver
+        // them.
+        if crate::task::current_user_thread()
+            .as_deref()
+            .is_some_and(|t| {
+                crate::signal::has_interrupting_signal(&t.process(), t.blocked_signals())
+            })
         {
             return Err(Errno::Eintr);
         }

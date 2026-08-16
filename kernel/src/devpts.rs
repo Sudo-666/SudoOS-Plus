@@ -134,6 +134,17 @@ impl FileOperations for PtyMaster {
             {
                 return Err(Errno::Eintr);
             }
+            // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: surface interrupting signals as
+            // EINTR instead of re-blocking, so the trap-return path can
+            // deliver them.
+            if crate::task::current_user_thread()
+                .as_deref()
+                .is_some_and(|t| {
+                    crate::signal::has_interrupting_signal(&t.process(), t.blocked_signals())
+                })
+            {
+                return Err(Errno::Eintr);
+            }
         }
     }
 
@@ -221,6 +232,17 @@ impl FileOperations for PtySlave {
             {
                 return Err(Errno::Eintr);
             }
+            // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: surface interrupting signals as
+            // EINTR instead of re-blocking, so the trap-return path can
+            // deliver them.
+            if crate::task::current_user_thread()
+                .as_deref()
+                .is_some_and(|t| {
+                    crate::signal::has_interrupting_signal(&t.process(), t.blocked_signals())
+                })
+            {
+                return Err(Errno::Eintr);
+            }
         }
     }
 
@@ -295,8 +317,8 @@ pub fn create_pty_pair(
         output: IrqSpinLock::new_with_class(PtyRingBuffer::new(), PTY_LOCK),
         master_closed: AtomicBool::new(false),
         slave_closed: AtomicBool::new(false),
-        input_wait: WaitQueue::new(),
-        output_wait: WaitQueue::new(),
+        input_wait: WaitQueue::named("pts_in"),
+        output_wait: WaitQueue::named("pts_out"),
     });
 
     let nonblock_flag = if flags.contains(OpenFlags::O_NONBLOCK) {

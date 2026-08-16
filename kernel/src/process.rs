@@ -75,6 +75,12 @@ impl ThreadId {
     pub const fn get(self) -> usize {
         self.0
     }
+
+    /// Sentinel that can never match an allocated thread id. Used by
+    /// force-exit scans that must spare no thread.
+    pub const fn none() -> Self {
+        Self(usize::MAX)
+    }
 }
 
 /// Process-wide descriptor-table anchor.
@@ -199,7 +205,7 @@ impl SignalState {
                 [crate::signal::KernelSigAction::default(); 64],
                 PROCESS_SIGNAL_ACTION_LOCK,
             ),
-            waiters: WaitQueue::new(),
+            waiters: WaitQueue::named("sig_wait"),
         }
     }
 
@@ -481,19 +487,19 @@ impl Process {
             credentials: Credentials::bootstrap(),
             fs: FsContext::bootstrap(),
             relations: IrqSpinLock::new_with_class(ProcessRelations::new(), PROCESS_RELATION_LOCK),
-            child_wait: WaitQueue::new(),
+            child_wait: WaitQueue::named("child_wait"),
             process_group: AtomicIsize::new(id.get() as isize),
             session: AtomicIsize::new(id.get() as isize),
             thread_group: IrqSpinLock::new_with_class(
                 ThreadGroup::new(),
                 PROCESS_THREAD_GROUP_LOCK,
             ),
-            thread_exit: WaitQueue::new(),
+            thread_exit: WaitQueue::named("thread_exit"),
             group_exit_state: AtomicUsize::new(GROUP_EXIT_NONE),
             group_exit_status: AtomicIsize::new(0),
             exec_in_progress: AtomicBool::new(false),
             vfork_pending: AtomicBool::new(false),
-            vfork_done: Completion::new(),
+            vfork_done: Completion::named("vfork_done"),
             real_itimer_handle: IrqSpinLock::new_with_class(None, PROCESS_ITIMER_LOCK),
         });
         register_process(&process);
@@ -814,7 +820,7 @@ impl Process {
             lifecycle: AtomicU8::new(THREAD_READY),
             exit_status: AtomicIsize::new(0),
             forced_exit_status: AtomicIsize::new(NO_FORCED_EXIT),
-            exited: Completion::new(),
+            exited: Completion::named("thread_exited"),
         });
         LIVE_THREADS.fetch_add(1, Ordering::AcqRel);
         Ok(thread)
@@ -873,7 +879,7 @@ impl Process {
             lifecycle: AtomicU8::new(THREAD_READY),
             exit_status: AtomicIsize::new(0),
             forced_exit_status: AtomicIsize::new(NO_FORCED_EXIT),
-            exited: Completion::new(),
+            exited: Completion::named("thread_exited"),
         });
         LIVE_THREADS.fetch_add(1, Ordering::AcqRel);
         Ok(thread)

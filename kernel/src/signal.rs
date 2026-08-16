@@ -14,6 +14,9 @@ pub const SIG_BLOCK: usize = 0;
 pub const SIG_UNBLOCK: usize = 1;
 pub const SIG_SETMASK: usize = 2;
 
+const SIG_DFL: usize = 0;
+const SIG_IGN: usize = 1;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
 pub struct KernelSigAction {
@@ -52,8 +55,41 @@ pub fn send_signal(pid: ProcessId, signal: u32) -> Result<(), myos_vfs::Errno> {
         // SIGCHLD wakeups are harmlessly coalesced with zombie publication.
         process.child_wait_queue().wake_all();
         crate::net::socket::wake_all_waiters();
+        // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: signal delivery runs on the
+        // trap-return path, so a target blocked on any other queue (pipe,
+        // futex, epoll, sigsuspend, …) would sleep through the signal and
+        // never take its default action. Wake its waiters directly; running
+        // and runnable tasks observe the pending signal on their own.
+        crate::task::wake_process_blocked_waiters(pid);
+        // SUDOOS_KILL_WAKE_REBLOCK_V1: SIGKILL is unblockable and always
+        // terminating. Tasks blocked in non-trap waits (nanosleep,
+        // completions) would re-block after the wake and sleep through the
+        // signal; publish a forced exit so every blocking primitive breaks.
+        if signal == SIGKILL {
+            crate::task::force_process_thread_exit(pid, -(signal as isize));
+        }
     }
     result
+}
+
+/// True when the process has a pending, unblocked signal that must interrupt
+/// an interruptible wait. Mirrors wait4's filter: caught signals and
+/// default-terminating signals interrupt; SIG_IGN and the default-ignored
+/// SIGCHLD never do, so child-exit notification storms cannot turn into
+/// spurious EINTRs under parallel builds.
+pub fn has_interrupting_signal(process: &crate::process::Process, blocked: u64) -> bool {
+    let pending = process.signals().pending() & !blocked;
+    if pending == 0 {
+        return false;
+    }
+    (1_u32..64).any(|signal| {
+        let bit = 1_u64 << (signal - 1);
+        if pending & bit == 0 {
+            return false;
+        }
+        let action = process.signals().action(signal).unwrap_or_default();
+        action.handler != SIG_IGN && !(action.handler == SIG_DFL && signal == SIGCHLD)
+    })
 }
 
 #[allow(dead_code)]

@@ -15,6 +15,24 @@ pub fn current_stack_pointer() -> usize {
     stack_pointer
 }
 
+/// Return address of the caller's caller: the first function frame executes
+/// this helper's own `ret`, so ra still holds the caller's call site when the
+/// asm block reads it. Used only to attribute blocked waiters to their block
+/// call sites in scheduler diagnostics.
+#[inline(never)]
+pub fn return_address() -> usize {
+    let return_address: usize;
+    // SAFETY: reading ra has no side effects and does not access memory.
+    unsafe {
+        core::arch::asm!(
+            "mv {return_address}, ra",
+            return_address = out(reg) return_address,
+            options(nomem, nostack),
+        );
+    }
+    return_address
+}
+
 /// Switch from `previous` to `next` using the ordinary kernel-thread context.
 ///
 /// # Safety

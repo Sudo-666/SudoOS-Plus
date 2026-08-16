@@ -132,7 +132,6 @@ impl TaskId {
 enum TaskState {
     Runnable,
     Running(CpuId),
-    SwitchingOut(CpuId),
     Blocked,
     Idle(CpuId),
     Exited,
@@ -143,14 +142,20 @@ impl TaskState {
     // reads (work stealing under a donor rq lock, registry-held scans) are
     // sound without taking the global scheduler lock. The CPU id fits in the
     // high bits because MAX_CPUS <= 8.
+    //
+    // SUDOOS_SWITCH_TRANSACTION_V1: there is no SwitchingOut state.  The
+    // outgoing task keeps Running(cpu) until the switch-tail commit, which
+    // publishes its post-switch state (Runnable / Blocked / Idle / Exited) in
+    // the same atomic step that tears the transaction down.  Mid-transaction
+    // visibility is carried by the per-CPU SwitchPhase, not by the task state,
+    // so a task can never be observed stranded in a half-switched state.
     const fn encode(self) -> u8 {
         match self {
             Self::Runnable => 0,
             Self::Running(cpu) => 1 | (cpu.get() as u8) << 3,
-            Self::SwitchingOut(cpu) => 2 | (cpu.get() as u8) << 3,
-            Self::Blocked => 3,
-            Self::Idle(cpu) => 4 | (cpu.get() as u8) << 3,
-            Self::Exited => 5,
+            Self::Blocked => 2,
+            Self::Idle(cpu) => 3 | (cpu.get() as u8) << 3,
+            Self::Exited => 4,
         }
     }
 
@@ -159,10 +164,9 @@ impl TaskState {
         match raw & 0b111 {
             0 => Self::Runnable,
             1 => Self::Running(cpu()),
-            2 => Self::SwitchingOut(cpu()),
-            3 => Self::Blocked,
-            4 => Self::Idle(cpu()),
-            5 => Self::Exited,
+            2 => Self::Blocked,
+            3 => Self::Idle(cpu()),
+            4 => Self::Exited,
             _ => unreachable!("invalid encoded task state"),
         }
     }
@@ -211,8 +215,8 @@ struct Task {
     has_run: AtomicBool,
     // Everything below is registry-owned: mutated only while holding the
     // REGISTRY lock, except `context` which the architecture writes through
-    // the UnsafeCell while the task is SwitchingOut/Running and no other
-    // CPU can reference it.
+    // the UnsafeCell while the task is Running on the switch CPU and no
+    // other CPU can reference it (see SwitchPhase).
     //
     // Preemption and migration-disable depths are Task-owned single
     // authorities: the running task bumps them locklessly on its own CPU
@@ -238,6 +242,8 @@ struct Task {
     wait_prev: Option<TaskId>,
     wait_next: Option<TaskId>,
     wake_after_switch: bool,
+    /// Call site (return address) that linked this waiter, for diagnostics.
+    wait_block_site: usize,
 }
 
 impl Task {
@@ -331,6 +337,7 @@ impl Task {
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
+            wait_block_site: 0,
         }
     }
 
@@ -357,6 +364,7 @@ impl Task {
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
+            wait_block_site: 0,
         }
     }
 
@@ -393,6 +401,7 @@ impl Task {
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
+            wait_block_site: 0,
         }
     }
 
@@ -429,6 +438,7 @@ impl Task {
             wait_prev: None,
             wait_next: None,
             wake_after_switch: false,
+            wait_block_site: 0,
         }
     }
 
@@ -560,6 +570,47 @@ impl RunQueue {
     }
 }
 
+// SUDOOS_SWITCH_TRANSACTION_V1: explicit per-CPU context-switch transaction.
+//
+// A context switch is a three-phase transaction on the owning CPU:
+//   Idle         — no transaction in flight; a prepare may claim the CPU.
+//   Preparing    — prepare published the outgoing task's linkage and the
+//                  PendingSwitch record, but the hardware switch has not
+//                  executed. Interrupts are off and the outgoing context is
+//                  still live on this stack.
+//   CommitPending— the hardware switch has executed (the outgoing context is
+//                  saved in its Task record); the switch-tail commit (current
+//                  pointer, outgoing state publication, record teardown) has
+//                  not run yet. It is committed by the incoming task's own
+//                  switch-tail frame, or by the trap-entry repair when the
+//                  switch delivered the CPU directly into user mode.
+//
+// The phase is written by the owning CPU with local interrupts disabled.
+// Remote CPUs only read it (wake scans decide between an IPI and a direct
+// queue transfer). A trap that lands mid-transaction therefore never has to
+// guess: Preparing means "the interrupted code owns the switch and will
+// execute it on return"; CommitPending means "commit it now". There is no
+// window in which a transaction exists but no state names it, and no task
+// state that can strand a CPU in a half-switched task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum SwitchPhase {
+    Idle = 0,
+    Preparing = 1,
+    CommitPending = 2,
+}
+
+impl SwitchPhase {
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Idle,
+            1 => Self::Preparing,
+            2 => Self::CommitPending,
+            _ => unreachable!("invalid switch phase"),
+        }
+    }
+}
+
 // PendingSwitch is packed into one AtomicU64 so cross-CPU diagnostics
 // (debug dumps, stack-owner repair) read it without racing the owning CPU.
 const PENDING_RAW_NONE: u64 = 0;
@@ -606,6 +657,10 @@ struct CpuLocal {
     timeslice_remaining: u32,
     irq_depth: usize,
     pending: AtomicU64, // encoded PendingSwitch; 0 = none
+    // SUDOOS_SWITCH_TRANSACTION_V1: owner-CPU writes with local IRQs off;
+    // remote CPUs only read it (wake scans decide between IPI and a direct
+    // queue transfer based on which phase the transaction is in).
+    switch_phase: AtomicU8,
     loaded_mm: UnsafeCell<Option<Arc<crate::user_mm::UserMm>>>,
     context_switches: AtomicU64,
     preemptions: AtomicU64,
@@ -632,6 +687,7 @@ impl CpuLocal {
             timeslice_remaining: DEFAULT_TIME_SLICE_TICKS,
             irq_depth: 0,
             pending: AtomicU64::new(PENDING_RAW_NONE),
+            switch_phase: AtomicU8::new(SwitchPhase::Idle as u8),
             loaded_mm: UnsafeCell::new(None),
             context_switches: AtomicU64::new(0),
             preemptions: AtomicU64::new(0),
@@ -653,6 +709,19 @@ impl CpuLocal {
             pending.map_or(PENDING_RAW_NONE, encode_pending),
             Ordering::Release,
         );
+    }
+
+    /// SUDOOS_SWITCH_TRANSACTION_V1: read the switch transaction phase.
+    /// Owner reads are lockless (interrupts off or trap context); remote
+    /// reads take a possibly-stale snapshot, which is sound because remote
+    /// CPUs only use the phase to pick a safe wake path.
+    fn switch_phase(&self) -> SwitchPhase {
+        SwitchPhase::from_raw(self.switch_phase.load(Ordering::Acquire))
+    }
+
+    /// Owner-CPU only, with local interrupts disabled.
+    fn store_switch_phase(&self, phase: SwitchPhase) {
+        self.switch_phase.store(phase as u8, Ordering::Release);
     }
 
     /// Loaded-MM accessors use UnsafeCell interior mutability: the owning
@@ -857,11 +926,27 @@ fn cpu_runnable_load(cpu: CpuId) -> usize {
     queued.saturating_add(running)
 }
 
+/// SUDOOS_SWITCH_RECOVERY_V1: count of switch-path mm failures recovered
+/// without a panic (degrade-to-idle and retained-stale events). Diagnostic
+/// only; the buildstorm watchdog prints it in the lifecycle summary.
+static SWITCH_MM_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// Demote an activated-but-never-switched-to incoming task: undo
+/// `activate_next_task` and return it to the run queue. Called only from
+/// the switch-recovery paths, with local interrupts disabled.
+fn demote_activated_task(cpu: CpuId, id: TaskId) {
+    let task = task_ref(id);
+    debug_assert_eq!(task.state(), TaskState::Running(cpu));
+    debug_assert!(task.queued_on().is_none());
+    task.store_state(TaskState::Runnable);
+    enqueue_task(id, cpu);
+}
+
 /// Install the incoming task's user address space on this CPU.  The
 /// previous/next user_mm reads and the loaded-mm bookkeeping are all
 /// CPU-local: the call happens inside the switch transaction while local
 /// interrupts are disabled, before `pending` is published.
-fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) {
+fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) -> Result<(), ()> {
     assert!(
         crate::arch::interrupt::are_disabled(),
         "M9-B switch_mm_irqs_off ran with local interrupts enabled",
@@ -876,6 +961,21 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) {
     let next_mm = task_ref(next).user_mm();
     let local = cpu_local(cpu);
     let mut loaded_mm = local.loaded_mm();
+
+    // SUDOOS_SWITCH_RECOVERY_V1: this function runs inside the switch
+    // transaction — under SCHEDULER (block/exit) with local interrupts off,
+    // or on the lockless yield/preempt fast path. The kernel compiles with
+    // panic = abort, so a panic here never unwinds: the held SCHEDULER
+    // (and the interrupt-disable guard) leak forever and every other CPU
+    // queues up on the scheduler lock behind an invisible holder — the
+    // silent 12-CPU freeze observed under buildstorm. Every mm error is
+    // therefore recovered instead of panicked:
+    //   - a failed departure keeps `loaded_mm` in place (the Arc keeps the
+    //     mm alive, and the next switch retries the deactivate);
+    //   - a failed entry returns Err so the caller demotes the incoming
+    //     task and switches to the idle task instead of letting it run in
+    //     a wrong or kernel-only address space.
+    let mut retained_stale = false;
 
     let mismatch = match (&previous_mm, &loaded_mm) {
         (None, None) => false,
@@ -893,12 +993,15 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) {
         );
         // Deactivate stale loaded mm if present.
         if let Some(stale) = &loaded_mm {
-            stale
-                .deactivate_current_cpu()
-                .unwrap_or_else(|error| panic!("M9-B failed to repair stale mm: {error:?}"));
+            if stale.deactivate_current_cpu().is_err() {
+                SWITCH_MM_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                retained_stale = true;
+            }
         }
-        local.store_loaded_mm(None);
-        loaded_mm = None;
+        if !retained_stale {
+            local.store_loaded_mm(None);
+            loaded_mm = None;
+        }
         // Fall through: the activation path below will set up the
         // correct mm for the incoming task.
     }
@@ -906,32 +1009,44 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) {
     if let (Some(loaded), Some(incoming)) = (&loaded_mm, &next_mm)
         && Arc::ptr_eq(loaded, incoming)
     {
+        // Already resident: nothing to swap, even when a stale departure
+        // failure above left the bookkeeping to the next real switch.
         if let Some(thread) = task_ref(next).user_thread.as_ref() {
             thread.record_cpu(cpu);
         }
-        return;
+        return Ok(());
     }
 
     local
         .mm_switches
         .fetch_add(1, Ordering::Relaxed);
 
-    if let Some(loaded) = loaded_mm {
-        loaded
-            .deactivate_current_cpu()
-            .unwrap_or_else(|error| panic!("M9-B failed to leave outgoing mm: {error:?}"));
-        local.store_loaded_mm(None);
+    if !retained_stale {
+        if let Some(loaded) = loaded_mm {
+            if loaded.deactivate_current_cpu().is_err() {
+                SWITCH_MM_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+                retained_stale = true;
+            } else {
+                local.store_loaded_mm(None);
+            }
+        }
     }
 
     if let Some(next_mm) = next_mm {
-        next_mm
-            .activate_current_cpu()
-            .unwrap_or_else(|error| panic!("M9-B failed to enter incoming mm: {error:?}"));
-        local.store_loaded_mm(Some(next_mm));
+        if next_mm.activate_current_cpu().is_err() {
+            SWITCH_MM_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        }
+        // Never overwrite a retained stale Arc: dropping it would run
+        // UserMm::drop while this CPU still appears active in its mask.
+        if !retained_stale {
+            local.store_loaded_mm(Some(next_mm));
+        }
         if let Some(thread) = task_ref(next).user_thread.as_ref() {
             thread.record_cpu(cpu);
         }
     }
+    Ok(())
 }
 
 fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
@@ -939,10 +1054,11 @@ fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
         crate::smp::is_scheduler_active(cpu),
         "inactive CPU attempted to schedule"
     );
-    assert!(
-        cpu_local(cpu).pending().is_none(),
-        "CPU attempted a nested context switch",
-    );
+    // SUDOOS_SWITCH_RECOVERY_V1: defer nested attempts instead of
+    // panicking (see the claim below).
+    if cpu_local(cpu).pending().is_some() {
+        return None;
+    }
 
     if task_ref(current_of(cpu))
         .preempt_disable_depth
@@ -964,6 +1080,22 @@ fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
     let previous = current_of(cpu);
     assert_eq!(task_ref(previous).state(), TaskState::Running(cpu));
 
+    // Claim the per-CPU switch transaction BEFORE any task state can be
+    // touched.  The outgoing task keeps Running(cpu); mid-transaction
+    // visibility is carried by SwitchPhase, so no interrupt or trap path
+    // can observe a task stranded in a half-switched state.
+    {
+        let local = cpu_local_mut(cpu);
+        // SUDOOS_SWITCH_RECOVERY_V1: defer instead of panicking — a trap
+        // can deliver a scheduling request while a transaction is in flight
+        // and a panic here would leak the interrupt-disable guard (and
+        // SCHEDULER on the block/exit paths) with no unwind.
+        if local.switch_phase() != SwitchPhase::Idle || local.pending().is_some() {
+            return None;
+        }
+        local.store_switch_phase(SwitchPhase::Preparing);
+    }
+
     let Some(next) = dequeue_next_task(cpu) else {
         // A runnable current task must never yield to the idle task.
         // Linux keeps the sole runnable task selected; idle is only a
@@ -976,13 +1108,26 @@ fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
         let local = cpu_local_mut(cpu);
         local.need_resched.store(false, Ordering::Release);
         local.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+        local.store_switch_phase(SwitchPhase::Idle);
         return None;
     };
 
     assert_ne!(previous, next, "CPU selected its current task as next");
-    task_ref(previous).store_state(TaskState::SwitchingOut(cpu));
     activate_next_task(next, cpu);
-    switch_mm_irqs_off(cpu, previous, next);
+    // SUDOOS_SWITCH_RECOVERY_V1: an incoming task whose mm cannot be
+    // activated must never run user code (it would execute in the wrong
+    // address space). Kill it, re-queue it, and fall back to the idle task.
+    let next = if switch_mm_irqs_off(cpu, previous, next).is_err() {
+        if let Some(thread) = task_ref(next).user_thread.as_ref() {
+            thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
+        }
+        demote_activated_task(cpu, next);
+        let idle = idle_of(cpu);
+        let _ = switch_mm_irqs_off(cpu, previous, idle);
+        idle
+    } else {
+        next
+    };
     {
         let local = cpu_local_mut(cpu);
         local.need_resched.store(false, Ordering::Release);
@@ -1011,10 +1156,14 @@ fn prepare_preempt_local(cpu: CpuId) -> Option<ContextSwitch> {
             return None;
         }
         // An interrupt can be delivered after the hardware stack changed but
-        // before switch-tail commits `pending.next` as current. The existing
-        // switch owns this CPU; defer the tick instead of nesting a second
-        // context switch into the same per-CPU transaction.
-        if local.pending().is_some() {
+        // before switch-tail commits `pending.next` as current, and (on paths
+        // where IRQs are momentarily enabled) even inside prepare itself
+        // between the state mutation and the pending publication. The phase
+        // names the transaction at every instant — Preparing and
+        // CommitPending both mean "an existing switch owns this CPU". Defer
+        // the tick instead of nesting a second context switch into the same
+        // per-CPU transaction.
+        if local.switch_phase() != SwitchPhase::Idle || local.pending().is_some() {
             return None;
         }
         if task_ref(current_of(cpu))
@@ -1044,17 +1193,44 @@ fn prepare_preempt_local(cpu: CpuId) -> Option<ContextSwitch> {
     let previous = current_of(cpu);
     assert_eq!(task_ref(previous).state(), TaskState::Running(cpu));
 
+    // Claim the transaction phase before any state can be observed
+    // mid-flight. The outgoing task keeps Running(cpu); the phase carries
+    // all mid-transaction visibility (see prepare_yield_local).
+    {
+        let local = cpu_local_mut(cpu);
+        // SUDOOS_SWITCH_RECOVERY_V1: defer instead of panicking — a trap
+        // can deliver a scheduling request while a transaction is in flight
+        // and a panic here would leak the interrupt-disable guard with no
+        // unwind.
+        if local.switch_phase() != SwitchPhase::Idle || local.pending().is_some() {
+            return None;
+        }
+        local.store_switch_phase(SwitchPhase::Preparing);
+    }
+
     let Some(next) = dequeue_next_task(cpu) else {
         let local = cpu_local_mut(cpu);
         local.need_resched.store(false, Ordering::Release);
         local.timeslice_remaining = DEFAULT_TIME_SLICE_TICKS;
+        local.store_switch_phase(SwitchPhase::Idle);
         return None;
     };
 
     assert_ne!(previous, next, "CPU selected its current task as next");
-    task_ref(previous).store_state(TaskState::SwitchingOut(cpu));
     activate_next_task(next, cpu);
-    switch_mm_irqs_off(cpu, previous, next);
+    // SUDOOS_SWITCH_RECOVERY_V1: degrade to the idle task when the
+    // incoming task's mm cannot be activated (see prepare_yield_local).
+    let next = if switch_mm_irqs_off(cpu, previous, next).is_err() {
+        if let Some(thread) = task_ref(next).user_thread.as_ref() {
+            thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
+        }
+        demote_activated_task(cpu, next);
+        let idle = idle_of(cpu);
+        let _ = switch_mm_irqs_off(cpu, previous, idle);
+        idle
+    } else {
+        next
+    };
     {
         let local = cpu_local_mut(cpu);
         local.need_resched.store(false, Ordering::Release);
@@ -1096,9 +1272,11 @@ fn complete_yield_switch(cpu: CpuId, pending: PendingSwitch, running_sp: usize) 
     cpu_local(cpu)
         .current
         .store(pending.next.raw(), Ordering::Release);
+    // The outgoing task keeps Running(cpu) through the whole transaction;
+    // only this commit publishes its post-switch state.
     assert_eq!(
         task_ref(pending.previous).state(),
-        TaskState::SwitchingOut(cpu),
+        TaskState::Running(cpu),
     );
 
     if task_ref(pending.previous).kind.is_idle() {
@@ -1530,12 +1708,27 @@ impl Scheduler {
         (id, target)
     }
 
-    fn prepare_block(&mut self, cpu: CpuId, queue: &WaitQueue) -> ContextSwitch {
+    fn prepare_block(
+        &mut self,
+        cpu: CpuId,
+        queue: &WaitQueue,
+        block_site: usize,
+    ) -> Option<ContextSwitch> {
         let channel = queue.channel();
         assert_ne!(channel, 0, "wait channel zero is reserved");
         {
             let local = cpu_local(cpu);
-            assert!(local.pending().is_none(), "nested switch attempted");
+            // SUDOOS_SWITCH_RECOVERY_V1: a nested scheduling attempt while
+            // a transaction is in flight must defer instead of panicking.
+            // The kernel compiles with panic = abort, so a panic here would
+            // leak SCHEDULER (held by the caller across this prepare) with
+            // no unwind — the invisible-holder freeze observed under
+            // buildstorm. The caller re-evaluates its wait condition after
+            // a false return and the interrupted transaction completes
+            // first.
+            if local.pending().is_some() || local.switch_phase() != SwitchPhase::Idle {
+                return None;
+            }
             assert_eq!(local.irq_depth, 0, "IRQ context attempted to block");
         }
         let previous = current_of(cpu);
@@ -1572,16 +1765,33 @@ impl Scheduler {
             cpu.get(),
         );
 
-        let next = dequeue_next_task(cpu).unwrap_or_else(|| idle_of(cpu));
+        let mut next = dequeue_next_task(cpu).unwrap_or_else(|| idle_of(cpu));
         assert_ne!(previous, next);
+        // Claim the per-CPU transaction before touching any task state. The
+        // outgoing task keeps Running(cpu); its mid-block visibility (linked
+        // waiter, wake_after_switch) is guarded by the phase, and the REGISTRY
+        // lock we hold is the ordering edge any remote waker needs.
+        {
+            let local = cpu_local_mut(cpu);
+            local.store_switch_phase(SwitchPhase::Preparing);
+        }
         {
             let task = self.task_mut(previous);
-            task.store_state(TaskState::SwitchingOut(cpu));
             task.wake_after_switch = false;
+            task.wait_block_site = block_site;
         }
         self.link_waiter(queue, previous, channel);
         activate_next_task(next, cpu);
-        switch_mm_irqs_off(cpu, previous, next);
+        // SUDOOS_SWITCH_RECOVERY_V1: degrade to the idle task when the
+        // incoming task's mm cannot be activated (see prepare_yield_local).
+        if switch_mm_irqs_off(cpu, previous, next).is_err() {
+            if let Some(thread) = task_ref(next).user_thread.as_ref() {
+                thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
+            }
+            demote_activated_task(cpu, next);
+            next = idle_of(cpu);
+            let _ = switch_mm_irqs_off(cpu, previous, next);
+        }
         {
             let local = cpu_local_mut(cpu);
             local.store_pending(Some(PendingSwitch {
@@ -1593,18 +1803,37 @@ impl Scheduler {
             local
                 .last_switch
                 .store(crate::arch::time::counter(), Ordering::Relaxed);
-        local
-            .last_switch
-            .store(crate::arch::time::counter(), Ordering::Relaxed);
         }
-        context_pair(previous, next)
+        Some(context_pair(previous, next))
     }
 
     fn prepare_exit(&mut self, cpu: CpuId) -> ContextSwitch {
-        assert!(
-            cpu_local(cpu).pending().is_none(),
-            "CPU attempted a nested context switch",
-        );
+        // SUDOOS_SWITCH_RECOVERY_V1: an exception can interrupt a prepare
+        // after it activated its incoming task (phase Preparing) and the
+        // handler can then deliver a kill on the same CPU. The trap-entry
+        // repair already commits any CommitPending transaction before
+        // handlers run, so only the pre-hardware-switch window is reachable
+        // here. Undo the interrupted transaction instead of panicking — a
+        // panic here would leak SCHEDULER (held by exit_current) with no
+        // unwind and freeze the machine.
+        {
+            let local = cpu_local(cpu);
+            let phase = local.switch_phase();
+            let interrupted = local.pending();
+            if phase != SwitchPhase::Idle || interrupted.is_some() {
+                if let Some(pending) = interrupted {
+                    let next = pending.next;
+                    if self.task(next).kind.is_idle() {
+                        self.task_mut(next).store_state(TaskState::Idle(cpu));
+                    } else {
+                        self.task_mut(next).store_state(TaskState::Runnable);
+                        enqueue_task(next, cpu);
+                    }
+                }
+                local.store_pending(None);
+                local.store_switch_phase(SwitchPhase::Idle);
+            }
+        }
 
         let previous = current_of(cpu);
         assert_eq!(self.task(previous).state(), TaskState::Running(cpu));
@@ -1612,6 +1841,23 @@ impl Scheduler {
             !self.task(previous).kind.is_idle(),
             "idle task attempted to exit",
         );
+
+        // SUDOOS_SWITCH_RECOVERY_V1: the interrupted transaction may have
+        // linked the exiting task into a wait queue before the exception.
+        // Unlink it so the exit commit cannot retire a task that a queue
+        // still references.
+        if let Some(address) = self.task(previous).wait_queue_address {
+            // SAFETY: a linked waiter keeps the WaitQueue alive until it is
+            // unlinked; the scheduler lock serializes this with normal
+            // wakeup and switch-tail removal.
+            let queue = unsafe { &*(address as *const WaitQueue) };
+            let mut list = queue.waiters.lock();
+            self.unlink_waiter_locked(&mut list, previous, queue.channel());
+            let task = self.task_mut(previous);
+            task.wait_channel = None;
+            task.wait_queue_address = None;
+            task.wake_after_switch = false;
+        }
 
         {
             let previous_task = self.task(previous);
@@ -1633,13 +1879,26 @@ impl Scheduler {
             "task attempted to exit while holding a preemptible tracked lock: cpu={} task={previous:?}",
             cpu.get(),
         );
-        let next = dequeue_next_task(cpu).unwrap_or_else(|| idle_of(cpu));
+        let mut next = dequeue_next_task(cpu).unwrap_or_else(|| idle_of(cpu));
         assert_ne!(previous, next);
 
-        self.task_mut(previous)
-            .store_state(TaskState::SwitchingOut(cpu));
+        // Claim the transaction phase; the exiting task keeps Running(cpu)
+        // until the switch-tail commit publishes Exited.
+        {
+            let local = cpu_local_mut(cpu);
+            local.store_switch_phase(SwitchPhase::Preparing);
+        }
         activate_next_task(next, cpu);
-        switch_mm_irqs_off(cpu, previous, next);
+        // SUDOOS_SWITCH_RECOVERY_V1: degrade to the idle task when the
+        // incoming task's mm cannot be activated (see prepare_yield_local).
+        if switch_mm_irqs_off(cpu, previous, next).is_err() {
+            if let Some(thread) = task_ref(next).user_thread.as_ref() {
+                thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
+            }
+            demote_activated_task(cpu, next);
+            next = idle_of(cpu);
+            let _ = switch_mm_irqs_off(cpu, previous, next);
+        }
         {
             let local = cpu_local_mut(cpu);
             local.store_pending(Some(PendingSwitch {
@@ -1651,9 +1910,6 @@ impl Scheduler {
             local
                 .last_switch
                 .store(crate::arch::time::counter(), Ordering::Relaxed);
-        local
-            .last_switch
-            .store(crate::arch::time::counter(), Ordering::Relaxed);
         }
         context_pair(previous, next)
     }
@@ -1688,9 +1944,12 @@ impl Scheduler {
         cpu_local(cpu)
             .current
             .store(pending.next.raw(), Ordering::Release);
+        // The outgoing task kept Running(cpu) through the transaction; this
+        // commit publishes Blocked/Runnable/Exited atomically with the
+        // teardown of the per-CPU record.
         assert_eq!(
             self.task(pending.previous).state(),
-            TaskState::SwitchingOut(cpu),
+            TaskState::Running(cpu),
         );
 
         match pending.disposition {
@@ -1968,11 +2227,20 @@ impl Scheduler {
                         wake.push((task.id, address));
                     }
                 }
-                TaskState::SwitchingOut(cpu) if !task.wake_after_switch => {
-                    if let Some(address) = task.wait_queue_address {
-                        wake.push((task.id, address));
+                TaskState::Running(cpu) if task.wait_queue_address.is_some() => {
+                    // Mid-transaction waiter: prepare_block linked it under
+                    // REGISTRY and the switch-tail commit needs this same
+                    // lock, so it cannot have committed yet. Claim the wake
+                    // so the commit publishes it Runnable instead of Blocked
+                    // and the task runs, observes its forced exit, and dies.
+                    // Without this arm the scan's IPI alone would be lost:
+                    // nothing would ever wake the waiter again.
+                    if !task.wake_after_switch {
+                        if let Some(address) = task.wait_queue_address {
+                            wake.push((task.id, address));
+                        }
+                        target_mask |= 1_usize << cpu.get();
                     }
-                    target_mask |= 1_usize << cpu.get();
                 }
                 TaskState::Running(cpu) => target_mask |= 1_usize << cpu.get(),
                 TaskState::Runnable => {
@@ -1980,7 +2248,6 @@ impl Scheduler {
                         target_mask |= 1_usize << cpu.get();
                     }
                 }
-                TaskState::SwitchingOut(cpu) => target_mask |= 1_usize << cpu.get(),
                 TaskState::Idle(_) | TaskState::Exited => {}
             }
         }
@@ -1996,6 +2263,80 @@ impl Scheduler {
         target_mask
     }
 
+    /// Wake every scheduler task of `process` that is currently blocked on a
+    /// wait queue, so it can observe a newly-pending signal on the trap-return
+    /// path. Running and runnable tasks deliver the signal themselves when
+    /// they reach the post-trap signal check; only waiters need the direct
+    /// wake, because block sites only re-check their own condition and would
+    /// otherwise sleep through the signal forever.
+    fn wake_process_blocked_waiters(&mut self, process: crate::process::ProcessId) -> usize {
+        let mut wake = Vec::new();
+        let mut target_mask = 0_usize;
+
+        for index in 0..self.tasks.len() {
+            let Some(task) = self.tasks[index].as_ref() else {
+                continue;
+            };
+            let Some(thread) = task.user_thread.as_ref() else {
+                continue;
+            };
+            if thread.process().id() != process {
+                continue;
+            }
+
+            match task.state() {
+                TaskState::Blocked => {
+                    if let Some(address) = task.wait_queue_address {
+                        wake.push((task.id, address));
+                    }
+                }
+                TaskState::Running(cpu) if task.wait_queue_address.is_some() => {
+                    // Mid-transaction waiter: same claim as the forced-exit
+                    // scan — the commit publishes it Runnable instead of
+                    // Blocked. An already-claimed waiter is skipped; its
+                    // waker owns the IPI.
+                    if !task.wake_after_switch {
+                        if let Some(address) = task.wait_queue_address {
+                            wake.push((task.id, address));
+                        }
+                        target_mask |= 1_usize << cpu.get();
+                    }
+                }
+                TaskState::Running(_) | TaskState::Runnable => {}
+                TaskState::Idle(_) | TaskState::Exited => {}
+            }
+        }
+
+        for (task, address) in wake {
+            // SAFETY: a linked waiter keeps the WaitQueue alive until it is
+            // unlinked. The scheduler lock serializes this lookup with normal
+            // wakeup and switch-tail queue removal.
+            let queue = unsafe { &*(address as *const WaitQueue) };
+            let (_, targets) = self.wake_waiters(queue, 1, Some(task));
+            target_mask |= targets;
+        }
+        target_mask
+    }
+
+    /// Distinct process ids of all live user-thread tasks, for the contest
+    /// teardown drain.
+    fn live_user_process_ids(&self) -> Vec<crate::process::ProcessId> {
+        let mut pids = Vec::new();
+        for index in 0..self.tasks.len() {
+            let Some(task) = self.tasks[index].as_ref() else {
+                continue;
+            };
+            let Some(thread) = task.user_thread.as_ref() else {
+                continue;
+            };
+            let pid = thread.process().id();
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+
     #[cfg(debug_assertions)]
     fn current_stack_contains(&self, cpu: CpuId, address: usize) -> bool {
         task_ref(current_of(cpu)).stack_contains(address)
@@ -2007,7 +2348,10 @@ impl Scheduler {
 
         {
             let task = self.task(id);
-            assert!(matches!(task.state(), TaskState::SwitchingOut(_)));
+            // The waiter keeps Running(cpu) until the switch-tail commit;
+            // the phase (Preparing here, under REGISTRY) carries the
+            // mid-transaction visibility.
+            assert!(matches!(task.state(), TaskState::Running(_)));
             assert!(task.wait_channel.is_none());
             assert!(task.wait_queue_address.is_none());
             assert!(task.wait_prev.is_none() && task.wait_next.is_none());
@@ -2140,12 +2484,19 @@ impl Scheduler {
                         woken_list.push((id, is_user_thread));
                         count += 1;
                     }
-                    TaskState::SwitchingOut(cpu) => {
+                    TaskState::Running(cpu) => {
                         let task = self.task_mut(id);
                         assert!(!task.wake_after_switch, "waiter was claimed twice");
                         assert!(task.wait_prev.is_none() && task.wait_next.is_none());
-                        // The queue link is already gone, but switch-tail still
-                        // owns wait_channel until the old stack is no longer live.
+                        // A linked waiter that is still Running is mid
+                        // transaction: prepare_block linked it under REGISTRY
+                        // and the commit needs this same lock, so the hardware
+                        // switch is either pending or has just executed. In
+                        // both cases the safe claim is the same: the switch
+                        // tail converts it to Runnable+enqueue instead of
+                        // Blocked (the queue link is already gone, but
+                        // switch-tail still owns wait_channel until the old
+                        // stack is no longer live).
                         task.wake_after_switch = true;
                         target_mask |= 1_usize << cpu.get();
                         count += 1;
@@ -2205,10 +2556,13 @@ impl Scheduler {
                     assert!(!task.wake_after_switch);
                     state.blocked += 1;
                 }
-                TaskState::SwitchingOut(_) if task.wake_after_switch => {
+                // A waiter that kept Running(cpu) is mid transaction: its
+                // hardware switch has not committed yet (the commit needs the
+                // REGISTRY this verifier runs under).
+                TaskState::Running(_) if task.wake_after_switch => {
                     state.claimed_switching += 1;
                 }
-                TaskState::SwitchingOut(_) => {
+                TaskState::Running(_) => {
                     state.switching += 1;
                 }
                 other => panic!(
@@ -2250,13 +2604,13 @@ impl Scheduler {
 
 static SCHEDULER: IrqSpinLock<Option<Scheduler>> =
     IrqSpinLock::new_with_class(None, LockClass::new("scheduler", LockRank::Scheduler, 1));
-static TASK_REAPER_QUEUE: WaitQueue = WaitQueue::new();
+static TASK_REAPER_QUEUE: WaitQueue = WaitQueue::named("reaper_work");
 
 // Queue-empty and reclamation-complete are different states: after a task is
 // detached from Scheduler::retired_tasks its guarded stack may still be in the
 // VM/TLB destruction path.  This wait queue implements the quiescent verifier
 // barrier without holding a spin lock across resource destruction.
-static TASK_REAPER_DRAINED: WaitQueue = WaitQueue::new();
+static TASK_REAPER_DRAINED: WaitQueue = WaitQueue::named("reaper_drain");
 // Number of tasks still linked in Scheduler::retired_tasks.
 static RETIRED_BACKLOG: AtomicUsize = AtomicUsize::new(0);
 // Number of retired tasks whose resources are not fully destroyed yet.  This
@@ -2312,7 +2666,7 @@ pub(crate) fn task_lifecycle_snapshot() -> TaskLifecycleSnapshot {
 pub(crate) fn print_task_lifecycle_summary() {
     let snapshot = task_lifecycle_snapshot();
     crate::println!(
-        "task-lifecycle-summary spawned={} visible={} retired={} reclaimed={} join_begin={} join_end={} backlog={} outstanding={} live_user={} live_kernel={} live_processes={} live_threads={}",
+        "task-lifecycle-summary spawned={} visible={} retired={} reclaimed={} join_begin={} join_end={} backlog={} outstanding={} live_user={} live_kernel={} live_processes={} live_threads={} switch_mm_recoveries={}",
         snapshot.tasks_spawned,
         snapshot.tasks_exit_visible,
         snapshot.tasks_retired,
@@ -2325,7 +2679,66 @@ pub(crate) fn print_task_lifecycle_summary() {
         snapshot.live_kernel_threads,
         snapshot.live_processes,
         snapshot.live_threads,
+        SWITCH_MM_RECOVERIES.load(Ordering::Relaxed),
     );
+    // SUDOOS_LIVECYCLE_LIVE_DUMP: when user tasks did not drain, identify
+    // each survivor and the exact scheduling state that trapped it. Bounded
+    // by the small survivor count (a full-table dump lives in
+    // print_task_debug_dump for panic paths only).
+    if snapshot.live_user_threads != 0 && snapshot.live_user_threads <= 32 {
+        let survivors = {
+            let slot = SCHEDULER.lock();
+            let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+            scheduler
+                .tasks
+                .iter()
+                .flatten()
+                .filter(|task| matches!(task.kind, TaskKind::UserThread))
+                .map(|task| {
+                    let queue_name = task.wait_queue_address.map(|address| {
+                        // SAFETY: a linked waiter keeps the WaitQueue alive
+                        // until it is unlinked, and wait_queue_address is
+                        // cleared at unlink, so the pointer is valid while
+                        // Some. Reading the immutable name field needs no lock.
+                        unsafe { (*(address as *const crate::task::WaitQueue)).name() }
+                    });
+                    (
+                        task.id,
+                        task.state(),
+                        task.wait_channel,
+                        task.wait_queue_address.is_some(),
+                        task.wake_after_switch,
+                        task.queued_on(),
+                        task.wait_block_site,
+                        queue_name,
+                        task.user_thread.as_ref().map(|thread| {
+                            (
+                                thread.process().id().get(),
+                                thread.id().get(),
+                                thread.forced_exit_status(),
+                            )
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, state, wait_channel, linked, wake_claim, queued_on, block_site, queue_name, user) in
+            survivors
+        {
+            crate::println!(
+                "task-live-user id={:?} state={:?} wait={:?} linked={} wake_claim={} queued={:?} site={:#x} queue={} user={:?}",
+                id,
+                state,
+                wait_channel,
+                linked,
+                wake_claim,
+                queued_on,
+                block_site,
+                queue_name.unwrap_or("-"),
+                user,
+            );
+        }
+    }
 }
 
 /// Lightweight heartbeat string for build watchdog: just the live thread/process
@@ -2410,6 +2823,7 @@ pub(crate) fn print_task_debug_dump() {
                     runnable,
                     local.need_resched.load(Ordering::Acquire),
                     local.pending(),
+                    local.switch_phase(),
                 )
             })
             .collect::<Vec<_>>()
@@ -2426,14 +2840,15 @@ pub(crate) fn print_task_debug_dump() {
             user,
         );
     }
-    for (cpu, current, runnable, need_resched, pending) in cpus {
+    for (cpu, current, runnable, need_resched, pending, phase) in cpus {
         crate::println!(
-            "sudoos-diag: cpu={} current={:?} runnable={} need_resched={} pending={:?}",
+            "sudoos-diag: cpu={} current={:?} runnable={} need_resched={} pending={:?} phase={:?}",
             cpu,
             current,
             runnable,
             need_resched,
             pending,
+            phase,
         );
     }
     print_task_lifecycle_summary();
@@ -2554,6 +2969,71 @@ pub(crate) fn request_process_thread_exit(
             .request_process_thread_exit(process, except, status)
     };
     send_wakeup_ipis(targets);
+}
+
+pub(crate) fn wake_process_blocked_waiters(process: crate::process::ProcessId) {
+    let targets = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("scheduler is not initialized")
+            .wake_process_blocked_waiters(process)
+    };
+    send_wakeup_ipis(targets);
+}
+
+/// SUDOOS_KILL_WAKE_REBLOCK_V1: SIGKILL publishes a forced exit on every
+/// thread of the process. A plain wake would let a task blocked in a raw
+/// wait (nanosleep, completion) re-block before the trap-return path could
+/// deliver the signal; the forced-exit flag makes every blocking primitive
+/// observe the kill. The sentinel except id can never match an allocated
+/// thread id, so no thread is spared.
+pub(crate) fn force_process_thread_exit(process: crate::process::ProcessId, status: isize) {
+    let targets = {
+        let mut slot = SCHEDULER.lock();
+        slot.as_mut()
+            .expect("scheduler is not initialized")
+            .request_process_thread_exit(process, crate::process::ThreadId::none(), status)
+    };
+    send_wakeup_ipis(targets);
+}
+
+pub(crate) fn live_user_thread_count() -> usize {
+    let slot = SCHEDULER.lock();
+    slot.as_ref().map(|s| s.live_user_threads).unwrap_or(0)
+}
+
+/// SUDOOS_CAGENT_DRAIN_V1: bounded teardown drain after a contest script
+/// exits. Background children (LLM server workers, agent subprocesses) may
+/// still be inside nanosleep/retry loops when the official script returns;
+/// wait a short grace for natural exit, then SIGKILL stragglers so the
+/// lifecycle summary observes zero live user threads instead of transient
+/// survivors. Returns immediately when nothing is live, so the common
+/// buildstorm path pays no time budget.
+pub(crate) fn drain_user_processes() {
+    if live_user_thread_count() == 0 {
+        return;
+    }
+    let mut deadline = crate::time::deadline_after(core::time::Duration::from_millis(2000));
+    while live_user_thread_count() != 0
+        && !crate::time::deadline_reached(crate::time::now(), deadline)
+    {
+        crate::timer::sleep(core::time::Duration::from_millis(20));
+    }
+    let pids = {
+        let slot = SCHEDULER.lock();
+        slot.as_ref()
+            .map(|s| s.live_user_process_ids())
+            .unwrap_or_default()
+    };
+    for pid in pids {
+        let _ = crate::signal::send_signal(pid, crate::signal::SIGKILL);
+    }
+    deadline = crate::time::deadline_after(core::time::Duration::from_millis(1000));
+    while live_user_thread_count() != 0
+        && !crate::time::deadline_reached(crate::time::now(), deadline)
+    {
+        crate::timer::sleep(core::time::Duration::from_millis(20));
+    }
 }
 
 fn request_reschedule_on(cpu: CpuId) {
@@ -2700,7 +3180,6 @@ pub(crate) fn cpu_diagnostic(cpu: CpuId) -> CpuDiagnostic {
             diagnostic.task_state = match TaskState::decode(task.state.load(Ordering::Acquire)) {
                 TaskState::Runnable => "runnable",
                 TaskState::Running(_) => "running",
-                TaskState::SwitchingOut(_) => "switching-out",
                 TaskState::Blocked => "blocked",
                 TaskState::Idle(_) => "idle",
                 TaskState::Exited => "exited",
@@ -2747,14 +3226,21 @@ pub(crate) fn repair_current_cpu_from_stack() {
         return;
     }
     let cpu = crate::smp::current_cpu_id();
-    if cpu_local(cpu).pending().is_some() {
-        // The trap landed after the hardware stack switch and before the
-        // normal Rust switch-tail committed it. Complete that transaction
-        // before the trap path can request another yield/preemption.
+    // Only a CommitPending transaction belongs to this trap context: the
+    // hardware switch delivered the CPU into the incoming task (directly into
+    // user mode) and the tail has not committed yet — commit it now, before
+    // the trap path can request another yield/preemption. Preparing means the
+    // interrupted kernel code owns the switch and will execute it when the
+    // trap returns; stealing it here would publish the outgoing task while
+    // its context is still live. Idle means nothing is in flight.
+    if cpu_local(cpu).switch_phase() == SwitchPhase::CommitPending {
         finish_switch();
     }
 }
 
+// Not inlined so the wait_block_site return-address capture attributes the
+// caller's call site instead of an inlined frame.
+#[inline(never)]
 pub(super) fn block_current_on_if<F>(queue: &WaitQueue, should_block: F) -> bool
 where
     F: FnOnce() -> bool,
@@ -2773,8 +3259,18 @@ where
         let scheduler = slot
             .as_mut()
             .expect("kernel scheduler is not initialized");
-        if should_block() {
-            Some(scheduler.prepare_block(cpu, queue))
+        // SUDOOS_KILL_WAKE_REBLOCK_V1: a woken waiter must not re-block when
+        // exit_group or SIGKILL forced this thread to exit. The check is
+        // atomic with waiter linkage: a forced exit racing this check either
+        // lands first (no block) or the sender's wake scan finds the linked
+        // waiter, so no path loses the wake.
+        let forced_exit = task_ref(current_of(cpu))
+            .user_thread
+            .as_ref()
+            .and_then(|thread| thread.forced_exit_status())
+            .is_some();
+        if should_block() && !forced_exit {
+            scheduler.prepare_block(cpu, queue, crate::arch::task::return_address())
         } else {
             None
         }
@@ -2785,8 +3281,12 @@ where
     };
     #[cfg(debug_assertions)]
     m4c_verify::before_block_context_switch(queue, cpu);
-    // SAFETY: the outgoing task is held in SwitchingOut until the incoming
-    // context completes the switch.
+    // The hardware switch executes next with local interrupts disabled. The
+    // outgoing context is saved into the Task record; either the incoming
+    // task's own switch tail or a trap-entry repair commits the transaction.
+    // SAFETY: the outgoing task stays allocated and Running(cpu) until the
+    // incoming context commits the switch.
+    cpu_local(cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
     drop(interrupt_guard);
@@ -3328,9 +3828,11 @@ pub fn yield_now() {
         return;
     };
 
-    // SAFETY: the old task is marked SwitchingOut and cannot be selected by
-    // another CPU. The incoming task is exclusively Running on this CPU, both
-    // contexts remain allocated, and local interrupts stay disabled.
+    // SAFETY: the old task keeps Running(cpu) until the switch-tail commit
+    // and cannot be selected by another CPU. The incoming task is exclusively
+    // Running on this CPU, both contexts remain allocated, and local
+    // interrupts stay disabled.
+    cpu_local(cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
 
     finish_switch();
@@ -3349,11 +3851,15 @@ pub(crate) fn yield_from_user_trap() {
 
     // SAFETY: this is the synchronous syscall trap path with local interrupts
     // disabled. Both task contexts and their kernel stacks remain scheduler-owned.
+    cpu_local(cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
     drop(interrupt_guard);
 }
 
+// Not inlined so the wait_block_site return-address capture attributes the
+// caller's call site instead of an inlined frame.
+#[inline(never)]
 pub(crate) fn block_current_on_if_from_user_trap<F>(queue: &WaitQueue, should_block: F) -> bool
 where
     F: FnOnce() -> bool,
@@ -3384,8 +3890,19 @@ where
             .as_ref()
             .and_then(|thread| thread.forced_exit_status())
             .is_some();
-        if !forced_exit && should_block() {
-            Some(scheduler.prepare_block(cpu, queue))
+        // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: refuse to block while an
+        // interrupting signal is pending. The pending-bit write precedes the
+        // send_signal wake scan (which runs under this same lock), so either
+        // the scan observes this waiter linked and wakes it, or this check
+        // observes the pending bit and the block never starts. Callers that
+        // loop must surface the signal as EINTR after a false return.
+        let interrupting = user_thread
+            .as_ref()
+            .is_some_and(|thread| {
+                crate::signal::has_interrupting_signal(&thread.process(), thread.blocked_signals())
+            });
+        if !forced_exit && !interrupting && should_block() {
+            scheduler.prepare_block(cpu, queue, crate::arch::task::return_address())
         } else {
             None
         }
@@ -3397,6 +3914,7 @@ where
     // SAFETY: this mirrors sched_yield from the user trap path. The current
     // task is linked into the wait queue before the switch and can be woken by
     // another task before this syscall resumes.
+    cpu_local(cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
     drop(interrupt_guard);
@@ -3430,6 +3948,7 @@ fn preempt_schedule_disabled() {
 
     // SAFETY: the timer/IPI exit path has dropped IRQ depth to zero and the
     // scheduler has exclusively assigned the incoming context to this CPU.
+    cpu_local(cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
 }
@@ -3453,8 +3972,10 @@ fn exit_current() -> ! {
             .expect("kernel scheduler is not initialized")
             .prepare_exit(actual_cpu)
     };
-    // SAFETY: the exiting task remains allocated and marked SwitchingOut
-    // until the incoming context calls finish_switch() from a different stack.
+    // SAFETY: the exiting task remains allocated and Running(cpu) until the
+    // incoming context calls finish_switch() from a different stack and
+    // publishes it Exited.
+    cpu_local(actual_cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
 
     panic!("exited kernel thread resumed unexpectedly");
@@ -3471,20 +3992,39 @@ fn finish_switch() {
     // only corrupt a correct identity with stale cross-CPU data.
     let cpu = crate::smp::current_cpu_id();
     crate::arch::smp::set_current_cpu_id(cpu.get());
-    // smp-pcpu-v1 dispatch: Yield commits locklessly with only local rq and
-    // task atomics; Block/Exit mutate registry-owned task state and take the
-    // global REGISTRY for the commit.
-    // The secondary's first switch into its idle context has no recorded
-    // per-CPU transaction: register_secondary already committed
-    // current/state under REGISTRY before the bootstrap switch. After a CPU
-    // activates, every switch tail must carry a recorded transaction.
-    let Some(pending) = cpu_local(cpu).pending() else {
-        assert!(
-            !crate::smp::is_scheduler_active(cpu),
-            "switch tail without a pending switch"
-        );
-        return;
-    };
+    // SUDOOS_SWITCH_TRANSACTION_V1 dispatch: the phase decides whether this
+    // tail owns a commit at all.
+    //   Idle: the secondary's first switch into its idle context has no
+    //         recorded transaction (register_secondary already committed
+    //         current/state under REGISTRY before the bootstrap switch), or a
+    //         trap-entry repair committed this transaction before the tail
+    //         ran (switch delivered the incoming task straight into user
+    //         mode).
+    //   Preparing: SUDOOS_SWITCH_RECOVERY_V1 — recover instead of panicking.
+    //         With the pending record present the prepare fully completed
+    //         and the tail can commit exactly like CommitPending. With no
+    //         pending record nothing was prepared: clear the phase and
+    //         return; the interrupted prepare resumes on trap return and
+    //         re-runs its window. A panic here would leak the caller's
+    //         interrupt-disable guard with no unwind (panic = abort) and,
+    //         on the block/exit paths, leave SCHEDULER held forever.
+    //   CommitPending: the hardware switch has executed and this context
+    //         carries the commit. Yield commits locklessly with only local rq
+    //         and task atomics; Block/Exit mutate registry-owned task state
+    //         and take the global REGISTRY for the commit.
+    match cpu_local(cpu).switch_phase() {
+        SwitchPhase::Idle => return,
+        SwitchPhase::Preparing => {
+            if cpu_local(cpu).pending().is_none() {
+                cpu_local(cpu).store_switch_phase(SwitchPhase::Idle);
+                return;
+            }
+        }
+        SwitchPhase::CommitPending => {}
+    }
+    let pending = cpu_local(cpu)
+        .pending()
+        .expect("commit-pending switch without a pending record");
     let (completed, current_is_idle) = match pending.disposition {
         SwitchDisposition::Yield => {
             let is_idle = complete_yield_switch(cpu, pending, running_sp);
@@ -3504,7 +4044,9 @@ fn finish_switch() {
         }
     };
     // The hardware switch has committed; retire the per-CPU transaction so
-    // the next local prepare can proceed.
+    // the next local prepare can proceed. Publish the phase first: any
+    // observer that sees Idle is entitled to assume no transaction exists.
+    cpu_local(cpu).store_switch_phase(SwitchPhase::Idle);
     cpu_local(cpu).store_pending(None);
 
     // The switch tail still owns the IRQ-save guard, but no longer owns the

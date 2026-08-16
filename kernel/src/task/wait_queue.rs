@@ -85,6 +85,9 @@ fn timeout_callback(argument: usize) {
 /// kernel object is constant-size and cannot consume kilobytes of kernel stack.
 pub struct WaitQueue {
     channel: AtomicUsize,
+    /// Diagnostic tag: lets the lifecycle survivor dump attribute a blocked
+    /// waiter to the owning queue. Empty for const-constructed statics.
+    name: &'static str,
     pub(super) waiters: IrqSpinLock<WaitList>,
 }
 
@@ -92,11 +95,29 @@ impl WaitQueue {
     pub const fn new() -> Self {
         Self {
             channel: AtomicUsize::new(0),
+            name: "",
             waiters: IrqSpinLock::new_with_class(
                 WaitList::new(),
                 LockClass::new("task_wait_queue", LockRank::WaitQueue, 1),
             ),
         }
+    }
+
+    /// Runtime-constructed queues take a diagnostic name so scheduler dumps
+    /// can distinguish e.g. per-process `child_wait` from `vfork_done`.
+    pub const fn named(name: &'static str) -> Self {
+        Self {
+            channel: AtomicUsize::new(0),
+            name,
+            waiters: IrqSpinLock::new_with_class(
+                WaitList::new(),
+                LockClass::new("task_wait_queue", LockRank::WaitQueue, 1),
+            ),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
     }
 
     pub fn wait_until<F>(&self, condition: F)
@@ -263,6 +284,15 @@ impl Completion {
         Self {
             done: AtomicUsize::new(0),
             waiters: WaitQueue::new(),
+        }
+    }
+
+    /// Runtime-constructed completions take a diagnostic name for scheduler
+    /// dumps (see `WaitQueue::named`).
+    pub const fn named(name: &'static str) -> Self {
+        Self {
+            done: AtomicUsize::new(0),
+            waiters: WaitQueue::named(name),
         }
     }
 

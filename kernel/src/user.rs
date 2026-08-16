@@ -274,7 +274,7 @@ static POSIX_RECORD_LOCKS: crate::irq_lock::IrqSpinLock<Vec<PosixRecordLock>> =
         Vec::new(),
         crate::lockdep::LockClass::new("fcntl.record.locks", crate::lockdep::LockRank::Vfs, 93),
     );
-static POSIX_RECORD_LOCK_WAIT: crate::task::WaitQueue = crate::task::WaitQueue::new();
+static POSIX_RECORD_LOCK_WAIT: crate::task::WaitQueue = crate::task::WaitQueue::named("fcntl_lock");
 
 // SUDOOS_SHARED_MMAP_WRITEBACK_V1
 //
@@ -2467,6 +2467,9 @@ pub fn verify_final_cagent() -> bool {
 
     SDCARD_CONTEST_RAN.store(false, Ordering::Release);
     crate::task::run_kernel_thread_sync(verify_final_cagent_thread);
+    // The drain blocks on timer waits, which the boot idle context must not
+    // do: run it on a spawned kernel thread while the idle caller spins.
+    crate::task::run_kernel_thread_sync(crate::task::drain_user_processes);
     crate::task::synchronize_user_task_reclamation();
     crate::task::print_task_lifecycle_summary();
     SDCARD_CONTEST_RAN.load(Ordering::Acquire)
@@ -2479,6 +2482,7 @@ pub fn verify_final_buildstorm() -> bool {
     }
     SDCARD_CONTEST_RAN.store(false, Ordering::Release);
     crate::task::run_kernel_thread_sync(verify_final_buildstorm_production_thread);
+    crate::task::run_kernel_thread_sync(crate::task::drain_user_processes);
     crate::task::synchronize_user_task_reclamation();
     crate::task::print_task_lifecycle_summary();
     SDCARD_CONTEST_RAN.load(Ordering::Acquire)
@@ -2491,6 +2495,7 @@ pub fn verify_final_buildstorm_diag() -> bool {
     }
     SDCARD_CONTEST_RAN.store(false, Ordering::Release);
     crate::task::run_kernel_thread_sync(verify_final_buildstorm_diagnostic_thread);
+    crate::task::run_kernel_thread_sync(crate::task::drain_user_processes);
     crate::task::synchronize_user_task_reclamation();
     crate::task::print_task_lifecycle_summary();
     SDCARD_CONTEST_RAN.load(Ordering::Acquire)
@@ -3976,7 +3981,10 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
         // a silent `>/dev/null 2>&1` failure is attributable to new/build/run
         // or to command-substitution capture.  This diagnostic mode never
         // emits the evaluator's BUILDSTORM_* scoring markers.
-        let diagnostic = r#"
+        // SUDOOS_DIAG_FULL_COMPILE_V1: retired — kept as reference for the
+        // mini-diagnostic steps; diag mode now falls through to the
+        // production compile (see below).
+        let _diagnostic = r#"
 rm -rf /tmp/minibuild-diag
 uname -m >/dev/null 2>&1
 rustc --version >/dev/null 2>&1
@@ -4087,26 +4095,15 @@ exit 0
             crate::smp::CpuId::BOOT,
         );
 
-        let diagnostic_result = run_rootfs_program_with_cwd(
-            "/bin/sh",
-            &["sh", "-c", diagnostic],
-            &environment,
-            Some("/"),
+        // SUDOOS_DIAG_FULL_COMPILE_V1: the mini diagnostic never exercises the
+        // heavy workspace compile, so a scheduler wedge mid-compile hides
+        // behind console silence. Fall through to the production evaluator
+        // script instead: the lifecycle watchdog above dumps full task/phase
+        // state every 120s while the real compile runs, converting a silent
+        // wedge into an attributable snapshot.
+        crate::println!(
+            "sudoos-diag: final-buildstorm-diag: watchdog armed; running production compile"
         );
-
-        OSCOMP_LIFECYCLE_TRACE.store(false, Ordering::Release);
-        OSCOMP_VERBOSE_USER_TRACE.store(false, Ordering::Release);
-
-        match diagnostic_result {
-            Ok(code) => {
-                crate::println!("sudoos-diag: final-buildstorm: diagnostic exit={}", code)
-            }
-            Err(error) => crate::println!(
-                "sudoos-diag: final-buildstorm: diagnostic exec failed: {:?}",
-                error,
-            ),
-        }
-        return;
     }
     let mut environment = vec![
         "PATH=/tmp/sudoos-buildstorm-bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin",
@@ -10935,17 +10932,7 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
                 // wait4 fail intermittently under parallel builds.
                 let thread = crate::task::current_user_thread()
                     .expect("wait4 arrived without a current user Thread");
-                let pending = process.signals().pending() & !thread.blocked_signals();
-                let interrupting = (1_u32..64).any(|signal| {
-                    let bit = 1_u64 << (signal - 1);
-                    if pending & bit == 0 {
-                        return false;
-                    }
-                    let action = process.signals().action(signal).unwrap_or_default();
-                    action.handler != SIG_IGN
-                        && !(action.handler == SIG_DFL && signal == crate::signal::SIGCHLD)
-                });
-                if interrupting {
+                if crate::signal::has_interrupting_signal(&process, thread.blocked_signals()) {
                     return -EINTR;
                 }
                 let _ = crate::task::block_current_on_if_from_user_trap(
@@ -11138,7 +11125,7 @@ static EPOLL_STATE: crate::irq_lock::IrqSpinLock<EpollState> =
         EpollState {
             instances: Vec::new(),
             registrations: Vec::new(),
-            waiters: crate::task::WaitQueue::new(),
+            waiters: crate::task::WaitQueue::named("epoll"),
         },
         crate::lockdep::LockClass::new("epoll.state", crate::lockdep::LockRank::Vfs, 94),
     );
@@ -11714,6 +11701,13 @@ impl FutexQueue {
             wake_sequence: AtomicUsize::new(0),
         }
     }
+
+    fn named() -> Self {
+        Self {
+            waiters: crate::task::WaitQueue::named("futex"),
+            wake_sequence: AtomicUsize::new(0),
+        }
+    }
 }
 
 static FUTEX_QUEUES: crate::irq_lock::IrqSpinLock<
@@ -11738,7 +11732,7 @@ fn get_futex_queue_by_key(key: (usize, usize)) -> alloc::sync::Arc<FutexQueue> {
     if let Some(q) = queues.get(&key) {
         alloc::sync::Arc::clone(q)
     } else {
-        let q = alloc::sync::Arc::new(FutexQueue::new());
+        let q = alloc::sync::Arc::new(FutexQueue::named());
         queues.insert(key, alloc::sync::Arc::clone(&q));
         q
     }
@@ -11866,6 +11860,14 @@ fn sys_futex(
                 let outcome = queue.waiters.wait_until_deadline(deadline, || {
                     queue.wake_sequence.load(Ordering::Acquire) != wake_sequence
                         || thread.forced_exit_status().is_some()
+                        // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: the send_signal wake
+                        // scan wakes this waiter, but the condition is the
+                        // only thing that can stop the deadline loop from
+                        // re-blocking.
+                        || crate::signal::has_interrupting_signal(
+                            &thread.process(),
+                            thread.blocked_signals(),
+                        )
                 });
                 // exit_group/execve sibling teardown wakes the task's current
                 // wait queue.  Surface that wake to the syscall epilogue so
@@ -11873,6 +11875,12 @@ fn sys_futex(
                 // of re-entering a millisecond polling sleep until a possibly
                 // far-future pthread deadline.
                 if thread.forced_exit_status().is_some() {
+                    return -(crate::syscall::errno::EINTR);
+                }
+                // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: surface interrupting signals
+                // as EINTR so the trap-return path can deliver them.
+                if crate::signal::has_interrupting_signal(&thread.process(), thread.blocked_signals())
+                {
                     return -(crate::syscall::errno::EINTR);
                 }
                 return match outcome {
@@ -11900,6 +11908,13 @@ fn sys_futex(
                 BUILDSTORM_FUTEX_WAIT_BLOCKED.fetch_add(1, Ordering::Relaxed);
             }
             if thread.forced_exit_status().is_some() {
+                return -(crate::syscall::errno::EINTR);
+            }
+            // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: surface interrupting signals as
+            // EINTR instead of re-blocking, so the trap-return path can
+            // deliver them.
+            if crate::signal::has_interrupting_signal(&thread.process(), thread.blocked_signals())
+            {
                 return -(crate::syscall::errno::EINTR);
             }
             0
@@ -13506,7 +13521,16 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
                 let thread = crate::task::current_user_thread()
                     .expect("fcntl lock arrived without a current user Thread");
                 POSIX_RECORD_LOCK_WAIT.wait_until(|| {
-                    if thread.forced_exit_status().is_some() {
+                    if thread.forced_exit_status().is_some()
+                        // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: POSIX F_SETLKW must
+                        // release the waiter for an interrupting signal; the
+                        // wake scan reaches this queue, so only the condition
+                        // can stop the wait from re-blocking.
+                        || crate::signal::has_interrupting_signal(
+                            &thread.process(),
+                            thread.blocked_signals(),
+                        )
+                    {
                         return true;
                     }
                     let acquired = fcntl_apply_lock(requested);
@@ -13543,6 +13567,12 @@ fn sys_fcntl(fd: usize, command: usize, argument: usize) -> isize {
                 });
                 POSIX_RECORD_LOCK_WAIT.wake_all();
                 if thread.forced_exit_status().is_some() {
+                    return -(crate::syscall::errno::EINTR);
+                }
+                // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: POSIX F_SETLKW reports
+                // EINTR when interrupted by a signal.
+                if crate::signal::has_interrupting_signal(&thread.process(), thread.blocked_signals())
+                {
                     return -(crate::syscall::errno::EINTR);
                 }
                 return 0;

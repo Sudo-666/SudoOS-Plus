@@ -41,8 +41,8 @@ impl Pipe {
                 },
                 PIPE_LOCK,
             ),
-            read_wait: WaitQueue::new(),
-            write_wait: WaitQueue::new(),
+            read_wait: WaitQueue::named("pipe_read"),
+            write_wait: WaitQueue::named("pipe_write"),
             read_epoch: AtomicU64::new(0),
             write_epoch: AtomicU64::new(0),
         })
@@ -74,6 +74,14 @@ impl Pipe {
                     .and_then(|t| t.forced_exit_status())
                     .is_some()
                 {
+                    return Err(Errno::Eintr);
+                }
+                // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: an interrupting signal must
+                // surface as EINTR; otherwise the loop re-blocks and the
+                // pending signal is never delivered on the trap-return path.
+                if crate::task::current_user_thread().as_deref().is_some_and(|t| {
+                    crate::signal::has_interrupting_signal(&t.process(), t.blocked_signals())
+                }) {
                     return Err(Errno::Eintr);
                 }
                 continue;
@@ -133,6 +141,13 @@ impl Pipe {
                     .and_then(|t| t.forced_exit_status())
                     .is_some()
                 {
+                    return Err(Errno::Eintr);
+                }
+                // SUDOOS_SIGNAL_WAKE_BLOCKED_V1: surface interrupting
+                // signals as EINTR instead of re-blocking.
+                if crate::task::current_user_thread().as_deref().is_some_and(|t| {
+                    crate::signal::has_interrupting_signal(&t.process(), t.blocked_signals())
+                }) {
                     return Err(Errno::Eintr);
                 }
                 continue;

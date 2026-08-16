@@ -294,8 +294,8 @@ static NEXT_SOCKET_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_EPHEMERAL_PORT: AtomicUsize = AtomicUsize::new(49152);
 static SOCKET_TABLE: IrqSpinLock<BTreeMap<usize, SocketInner>> =
     IrqSpinLock::new_with_class(BTreeMap::new(), SOCKET_TABLE_LOCK);
-static SOCKET_ACCEPT_WAIT: WaitQueue = WaitQueue::new();
-static SOCKET_IO_WAIT: WaitQueue = WaitQueue::new();
+static SOCKET_ACCEPT_WAIT: WaitQueue = WaitQueue::named("sock_accept");
+static SOCKET_IO_WAIT: WaitQueue = WaitQueue::named("sock_io");
 static SOCKET_IO_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 fn socket_io_wake() {

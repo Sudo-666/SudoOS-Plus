@@ -365,7 +365,7 @@ pub fn sleep_until(deadline: MonotonicInstant) {
 
     let context = SleepContext {
         complete: AtomicBool::new(false),
-        waiters: WaitQueue::new(),
+        waiters: WaitQueue::named("timer_sleep"),
     };
     let handle = arm_at(
         deadline,
