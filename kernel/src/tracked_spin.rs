@@ -218,6 +218,19 @@ impl<T> TrackedSpinLock<T> {
         }
     }
 
+    /// P0-2A: exclusive access for an exclusively borrowed lock object.
+    ///
+    /// `&mut self` proves that no safe concurrent locker/guard can exist,
+    /// therefore taking the payload without acquiring the runtime spin lock
+    /// is sound. Intended for object final destruction / unpublished setup
+    /// so that a final Arc drop never becomes a hidden cross-CPU lock
+    /// acquisition.
+    pub fn get_mut(&mut self) -> &mut T {
+        // SAFETY: the exclusive borrow of TrackedSpinLock excludes every
+        // safe concurrent lock()/try_lock() caller and guard.
+        unsafe { self.inner.get_mut_unchecked() }
+    }
+
     pub fn try_lock(&self) -> Option<TrackedSpinLockGuard<'_, T>> {
         #[cfg(debug_assertions)]
         {

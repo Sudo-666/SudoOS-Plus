@@ -733,11 +733,16 @@ impl CpuLocal {
         unsafe { (*self.loaded_mm.get()).clone() }
     }
 
-    fn store_loaded_mm(&self, mm: Option<Arc<crate::user_mm::UserMm>>) {
+    /// P0-3A: explicit swap of the loaded-mm slot. The previous Arc is
+    /// handed to the caller instead of being dropped by the assignment —
+    /// `store_loaded_mm(None)` used to hide a potential final UserMm
+    /// destruction inside a SCHEDULER-held, IRQ-off switch window.
+    fn replace_loaded_mm(
+        &self,
+        mm: Option<Arc<crate::user_mm::UserMm>>,
+    ) -> Option<Arc<crate::user_mm::UserMm>> {
         // SAFETY: see CpuLocal::loaded_mm field contract.
-        unsafe {
-            *self.loaded_mm.get() = mm;
-        }
+        unsafe { core::mem::replace(&mut *self.loaded_mm.get(), mm) }
     }
 
     fn take_loaded_mm(&self) -> Option<Arc<crate::user_mm::UserMm>> {
@@ -946,7 +951,21 @@ fn demote_activated_task(cpu: CpuId, id: TaskId) {
 /// previous/next user_mm reads and the loaded-mm bookkeeping are all
 /// CPU-local: the call happens inside the switch transaction while local
 /// interrupts are disabled, before `pending` is published.
-fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) -> Result<(), ()> {
+///
+/// P0-3C: the loaded-mm slot is taken up front and never left empty. Every
+/// Arc that leaves the slot is either parked via `detach` (ownership
+/// handoff — its final destruction runs in the reaper with SCHEDULER
+/// released, never inside a SCHEDULER-held IRQ-off switch window) or
+/// restored into the slot before this function returns. The sink closure
+/// keeps the push and any queue bookkeeping atomic at the call site: the
+/// SCHEDULER-held paths route through defer_mm_drop (backlog counter
+/// incremented with the push), the lockless paths through a stack Vec.
+fn switch_mm_irqs_off(
+    cpu: CpuId,
+    previous: TaskId,
+    next: TaskId,
+    mut detach: impl FnMut(Arc<crate::user_mm::UserMm>),
+) -> Result<(), ()> {
     assert!(
         crate::arch::interrupt::are_disabled(),
         "M9-B switch_mm_irqs_off ran with local interrupts enabled",
@@ -960,7 +979,9 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) -> Result<(), 
     let previous_mm = task_ref(previous).user_mm();
     let next_mm = task_ref(next).user_mm();
     let local = cpu_local(cpu);
-    let mut loaded_mm = local.loaded_mm();
+    // P0-3C: take the slot. `retained` below names the Arc that must end
+    // up resident in the slot on every return path of this function.
+    let mut retained = local.take_loaded_mm();
 
     // SUDOOS_SWITCH_RECOVERY_V1: this function runs inside the switch
     // transaction — under SCHEDULER (block/exit) with local interrupts off,
@@ -970,47 +991,48 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) -> Result<(), 
     // queues up on the scheduler lock behind an invisible holder — the
     // silent 12-CPU freeze observed under buildstorm. Every mm error is
     // therefore recovered instead of panicked:
-    //   - a failed departure keeps `loaded_mm` in place (the Arc keeps the
-    //     mm alive, and the next switch retries the deactivate);
+    //   - a failed departure keeps the stale Arc in `retained` (restored
+    //     into the slot below; the next switch retries the deactivate);
     //   - a failed entry returns Err so the caller demotes the incoming
     //     task and switches to the idle task instead of letting it run in
     //     a wrong or kernel-only address space.
-    let mut retained_stale = false;
-
-    let mismatch = match (&previous_mm, &loaded_mm) {
+    let mismatch = match (&previous_mm, &retained) {
         (None, None) => false,
         (Some(previous), Some(loaded)) => !Arc::ptr_eq(previous, loaded),
         (Some(_), None) | (None, Some(_)) => true,
     };
 
+    // Deactivate a stale loaded mm (one that is not the outgoing task's
+    // own) if present. A failed departure is put back into `retained`.
+    let mut departure_failed = false;
     if mismatch {
         #[cfg(debug_assertions)]
         crate::println!(
             "scheduler: loaded-mm mismatch cpu={} prev_user={} loaded={}; repairing",
             cpu.get(),
             previous_mm.is_some(),
-            loaded_mm.is_some(),
+            retained.is_some(),
         );
-        // Deactivate stale loaded mm if present.
-        if let Some(stale) = &loaded_mm {
+        if let Some(stale) = retained.take() {
             if stale.deactivate_current_cpu().is_err() {
                 SWITCH_MM_RECOVERIES.fetch_add(1, Ordering::Relaxed);
-                retained_stale = true;
+                retained = Some(stale);
+                departure_failed = true;
+            } else {
+                detach(stale);
             }
-        }
-        if !retained_stale {
-            local.store_loaded_mm(None);
-            loaded_mm = None;
         }
         // Fall through: the activation path below will set up the
         // correct mm for the incoming task.
     }
 
-    if let (Some(loaded), Some(incoming)) = (&loaded_mm, &next_mm)
+    if let (Some(loaded), Some(incoming)) = (&retained, &next_mm)
         && Arc::ptr_eq(loaded, incoming)
     {
         // Already resident: nothing to swap, even when a stale departure
         // failure above left the bookkeeping to the next real switch.
+        // P0-3C: the slot was taken at the top; put the resident Arc back.
+        local.replace_loaded_mm(retained);
         if let Some(thread) = task_ref(next).user_thread.as_ref() {
             thread.record_cpu(cpu);
         }
@@ -1021,13 +1043,17 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) -> Result<(), 
         .mm_switches
         .fetch_add(1, Ordering::Relaxed);
 
-    if !retained_stale {
-        if let Some(loaded) = loaded_mm {
+    // Departure: deactivate the outgoing task's own mm. A failed departure
+    // puts the Arc back into `retained` so this CPU never drops an mm that
+    // still counts it active.
+    if !departure_failed {
+        if let Some(loaded) = retained.take() {
             if loaded.deactivate_current_cpu().is_err() {
                 SWITCH_MM_RECOVERIES.fetch_add(1, Ordering::Relaxed);
-                retained_stale = true;
+                retained = Some(loaded);
+                departure_failed = true;
             } else {
-                local.store_loaded_mm(None);
+                detach(loaded);
             }
         }
     }
@@ -1035,21 +1061,33 @@ fn switch_mm_irqs_off(cpu: CpuId, previous: TaskId, next: TaskId) -> Result<(), 
     if let Some(next_mm) = next_mm {
         if next_mm.activate_current_cpu().is_err() {
             SWITCH_MM_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+            // P0-3C: restore whatever must stay resident (a retained stale
+            // Arc, or nothing) before returning the failure.
+            local.replace_loaded_mm(retained);
             return Err(());
         }
         // Never overwrite a retained stale Arc: dropping it would run
         // UserMm::drop while this CPU still appears active in its mask.
-        if !retained_stale {
-            local.store_loaded_mm(Some(next_mm));
+        if retained.is_none() {
+            local.replace_loaded_mm(Some(next_mm));
         }
         if let Some(thread) = task_ref(next).user_thread.as_ref() {
             thread.record_cpu(cpu);
         }
+    } else {
+        // The incoming task has no user mm: restore any retained Arc.
+        local.replace_loaded_mm(retained);
     }
     Ok(())
 }
 
-fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
+/// P0-3C: `detached` collects MMs that leave the loaded-mm slot during this
+/// lockless prepare. They are parked by the caller after the switch commits
+/// (see defer_detached_mms) — never dropped in the IRQ-off prepare window.
+fn prepare_yield_local(
+    cpu: CpuId,
+    detached: &mut Vec<Arc<crate::user_mm::UserMm>>,
+) -> Option<ContextSwitch> {
     assert!(
         crate::smp::is_scheduler_active(cpu),
         "inactive CPU attempted to schedule"
@@ -1117,13 +1155,13 @@ fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
     // SUDOOS_SWITCH_RECOVERY_V1: an incoming task whose mm cannot be
     // activated must never run user code (it would execute in the wrong
     // address space). Kill it, re-queue it, and fall back to the idle task.
-    let next = if switch_mm_irqs_off(cpu, previous, next).is_err() {
+    let next = if switch_mm_irqs_off(cpu, previous, next, |mm| detached.push(mm)).is_err() {
         if let Some(thread) = task_ref(next).user_thread.as_ref() {
             thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
         }
         demote_activated_task(cpu, next);
         let idle = idle_of(cpu);
-        let _ = switch_mm_irqs_off(cpu, previous, idle);
+        let _ = switch_mm_irqs_off(cpu, previous, idle, |mm| detached.push(mm));
         idle
     } else {
         next
@@ -1145,7 +1183,13 @@ fn prepare_yield_local(cpu: CpuId) -> Option<ContextSwitch> {
     Some(context_pair(previous, next))
 }
 
-fn prepare_preempt_local(cpu: CpuId) -> Option<ContextSwitch> {
+/// P0-3C: `detached` collects MMs that leave the loaded-mm slot during this
+/// lockless prepare. They are parked by the caller after the switch commits
+/// (see defer_detached_mms) — never dropped in the IRQ-off prepare window.
+fn prepare_preempt_local(
+    cpu: CpuId,
+    detached: &mut Vec<Arc<crate::user_mm::UserMm>>,
+) -> Option<ContextSwitch> {
     assert!(
         crate::smp::is_scheduler_active(cpu),
         "inactive CPU attempted to preempt",
@@ -1220,13 +1264,13 @@ fn prepare_preempt_local(cpu: CpuId) -> Option<ContextSwitch> {
     activate_next_task(next, cpu);
     // SUDOOS_SWITCH_RECOVERY_V1: degrade to the idle task when the
     // incoming task's mm cannot be activated (see prepare_yield_local).
-    let next = if switch_mm_irqs_off(cpu, previous, next).is_err() {
+    let next = if switch_mm_irqs_off(cpu, previous, next, |mm| detached.push(mm)).is_err() {
         if let Some(thread) = task_ref(next).user_thread.as_ref() {
             thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
         }
         demote_activated_task(cpu, next);
         let idle = idle_of(cpu);
-        let _ = switch_mm_irqs_off(cpu, previous, idle);
+        let _ = switch_mm_irqs_off(cpu, previous, idle, |mm| detached.push(mm));
         idle
     } else {
         next
@@ -1521,6 +1565,10 @@ fn registered_cpu_mask() -> usize {
 struct Scheduler {
     tasks: Vec<Option<Task>>,
     retired_tasks: Vec<Task>,
+    /// P0-3B: MMs detached from a switch under SCHEDULER. The queue is an
+    /// ownership handoff only — Arcs are pushed here and their final
+    /// destruction happens in the reaper with the scheduler lock released.
+    deferred_mms: Vec<Arc<crate::user_mm::UserMm>>,
     discovered_cpus: usize,
     live_kernel_threads: usize,
     live_user_threads: usize,
@@ -1549,9 +1597,17 @@ impl Scheduler {
         let retired_tasks = Vec::with_capacity(MAX_TASKS);
         assert!(retired_tasks.capacity() >= MAX_TASKS);
 
+        // P0-3B: same ownership-handoff model as retired_tasks. The initial
+        // capacity covers a full task set of detached MMs without ever
+        // growing (and therefore allocating) inside a SCHEDULER critical
+        // section.
+        let deferred_mms = Vec::with_capacity(MAX_TASKS);
+        assert!(deferred_mms.capacity() >= MAX_TASKS);
+
         Self {
             tasks,
             retired_tasks,
+            deferred_mms,
             discovered_cpus,
             live_kernel_threads: 0,
             live_user_threads: 0,
@@ -1784,13 +1840,17 @@ impl Scheduler {
         activate_next_task(next, cpu);
         // SUDOOS_SWITCH_RECOVERY_V1: degrade to the idle task when the
         // incoming task's mm cannot be activated (see prepare_yield_local).
-        if switch_mm_irqs_off(cpu, previous, next).is_err() {
+        // P0-3C: detached MMs go straight onto the SCHEDULER-held deferred
+        // queue — defer_mm_drop increments the backlog counter atomically
+        // with the push, and the reaper performs the final drop with the
+        // scheduler lock released.
+        if switch_mm_irqs_off(cpu, previous, next, |mm| self.defer_mm_drop(mm)).is_err() {
             if let Some(thread) = task_ref(next).user_thread.as_ref() {
                 thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
             }
             demote_activated_task(cpu, next);
             next = idle_of(cpu);
-            let _ = switch_mm_irqs_off(cpu, previous, next);
+            let _ = switch_mm_irqs_off(cpu, previous, next, |mm| self.defer_mm_drop(mm));
         }
         {
             let local = cpu_local_mut(cpu);
@@ -1829,6 +1889,21 @@ impl Scheduler {
                         self.task_mut(next).store_state(TaskState::Runnable);
                         enqueue_task(next, cpu);
                     }
+                }
+                // §18: Preparing without a pending record means the
+                // interrupt landed between activate_next_task and the
+                // PendingSwitch publication — the activated incoming task
+                // has no recoverable descriptor. The invariant the recovery
+                // relies on: the outgoing task is still Running(cpu).
+                // (If stress ever trips this, give Preparing its own
+                // preparing_next descriptor instead of relaxing the check.)
+                #[cfg(debug_assertions)]
+                if phase == SwitchPhase::Preparing && interrupted.is_none() {
+                    assert_eq!(
+                        self.task(current_of(cpu)).state(),
+                        TaskState::Running(cpu),
+                        "Preparing-without-pending interrupted a switch whose outgoing task is no longer Running",
+                    );
                 }
                 local.store_pending(None);
                 local.store_switch_phase(SwitchPhase::Idle);
@@ -1891,13 +1966,17 @@ impl Scheduler {
         activate_next_task(next, cpu);
         // SUDOOS_SWITCH_RECOVERY_V1: degrade to the idle task when the
         // incoming task's mm cannot be activated (see prepare_yield_local).
-        if switch_mm_irqs_off(cpu, previous, next).is_err() {
+        // P0-3C: detached MMs go straight onto the SCHEDULER-held deferred
+        // queue — defer_mm_drop increments the backlog counter atomically
+        // with the push, and the reaper performs the final drop with the
+        // scheduler lock released.
+        if switch_mm_irqs_off(cpu, previous, next, |mm| self.defer_mm_drop(mm)).is_err() {
             if let Some(thread) = task_ref(next).user_thread.as_ref() {
                 thread.request_forced_exit(-(crate::signal::SIGKILL as isize));
             }
             demote_activated_task(cpu, next);
             next = idle_of(cpu);
-            let _ = switch_mm_irqs_off(cpu, previous, next);
+            let _ = switch_mm_irqs_off(cpu, previous, next, |mm| self.defer_mm_drop(mm));
         }
         {
             let local = cpu_local_mut(cpu);
@@ -2066,6 +2145,28 @@ impl Scheduler {
             })
             .expect("retired backlog counter underflowed");
         Some(task)
+    }
+
+    /// P0-3B: ownership handoff for an MM detached during a switch. The Arc
+    /// is parked, never dropped here — final destruction runs in the reaper
+    /// with SCHEDULER released (see take_deferred_mm / drain_retired_queue).
+    fn defer_mm_drop(&mut self, mm: Arc<crate::user_mm::UserMm>) {
+        assert!(
+            self.deferred_mms.len() < self.deferred_mms.capacity(),
+            "deferred-mm queue exhausted",
+        );
+        self.deferred_mms.push(mm);
+        DEFERRED_MM_BACKLOG.fetch_add(1, Ordering::Release);
+    }
+
+    fn take_deferred_mm(&mut self) -> Option<Arc<crate::user_mm::UserMm>> {
+        let mm = self.deferred_mms.pop()?;
+        DEFERRED_MM_BACKLOG
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_sub(1)
+            })
+            .expect("deferred-mm backlog counter underflowed");
+        Some(mm)
     }
 
     #[cfg(debug_assertions)]
@@ -2613,6 +2714,10 @@ static TASK_REAPER_QUEUE: WaitQueue = WaitQueue::named("reaper_work");
 static TASK_REAPER_DRAINED: WaitQueue = WaitQueue::named("reaper_drain");
 // Number of tasks still linked in Scheduler::retired_tasks.
 static RETIRED_BACKLOG: AtomicUsize = AtomicUsize::new(0);
+// P0-3B: MMs detached from a switch and parked in the scheduler's
+// deferred_mms queue. Part of the runtime reaper/idle protocol, like
+// RETIRED_BACKLOG.
+static DEFERRED_MM_BACKLOG: AtomicUsize = AtomicUsize::new(0);
 // Number of retired tasks whose resources are not fully destroyed yet.  This
 // includes both queued tasks and tasks currently owned by a reaper worker.
 static RETIRED_OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
@@ -3567,10 +3672,79 @@ pub(crate) fn assert_user_mm_quiescent() {
         .assert_user_mm_quiescent();
 }
 
+/// P0-4: MMs detached by replace_current_user_mm. Fixed slots avoid
+/// allocating for the one-or-two Arcs an exec can detach, and keep every
+/// final UserMm destruction out of the IRQ-off mm-swap window — the caller
+/// drops the set inside its named task-context reclaim window (see
+/// reclaim_detached_mms).
+pub(crate) struct DetachedMms {
+    first: Option<Arc<crate::user_mm::UserMm>>,
+    second: Option<Arc<crate::user_mm::UserMm>>,
+}
+
+impl DetachedMms {
+    fn new() -> Self {
+        Self {
+            first: None,
+            second: None,
+        }
+    }
+
+    fn push(&mut self, mm: Arc<crate::user_mm::UserMm>) {
+        if self.first.is_none() {
+            self.first = Some(mm);
+        } else {
+            assert!(self.second.is_none(), "detached-mm set exhausted");
+            self.second = Some(mm);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+}
+
+/// P0-4 (doc §15-B): the exec task-context reclaim window. The caller
+/// provably holds no Scheduler/Process/VFS/MM lock here and the task
+/// record is fully switched to the new mm. Final UserMm destruction may
+/// free many pages and release page tables; the PreemptGuard pins this
+/// kernel continuation on-CPU while IRQs are serviced around the drop so
+/// timer wakeups and TLB ACKs keep progressing — the exact hazard the
+/// 30 s shootdown deadlines tripped over before.
+pub(crate) fn reclaim_detached_mms(
+    mut detached: DetachedMms,
+    extra: Option<Arc<crate::user_mm::UserMm>>,
+) {
+    if detached.is_empty() && extra.is_none() {
+        return;
+    }
+    let preempt_guard = PreemptGuard::new();
+    if crate::arch::interrupt::are_enabled() {
+        // RISC-V syscall body: already an IRQ-serviced task context.
+        drop(extra);
+        drop(detached);
+    } else {
+        // LoongArch syscall body runs with IE=0 throughout (the trap entry
+        // saves/restores CRMD without ever touching IE inside handlers).
+        // Open the named reclaim window: temporarily enable local IRQs for
+        // the teardown, then restore the original trap IRQ state.
+        let state = crate::arch::interrupt::save_and_disable();
+        // SAFETY: syscall/trap context on the current task's kernel stack;
+        // the saved state is restored right after the drops below.
+        unsafe { crate::arch::interrupt::enable() };
+        note_irq_state(true);
+        drop(extra);
+        drop(detached);
+        crate::arch::interrupt::restore(state);
+        note_irq_state(state.was_enabled());
+    }
+    drop(preempt_guard);
+}
+
 pub(crate) fn replace_current_user_mm(
     old_mm: Arc<crate::user_mm::UserMm>,
     new_mm: Arc<crate::user_mm::UserMm>,
-) {
+) -> DetachedMms {
     // smp-pcpu-v1: loaded_mm is truly-local CpuLocal state.  The IRQ-save
     // guard pins the CPU for the whole repair, satisfying the exclusive
     // quiescent-write contract of the accessors.
@@ -3581,6 +3755,13 @@ pub(crate) fn replace_current_user_mm(
         "attempted to replace mm outside a user task",
     );
     let local = cpu_local(cpu);
+
+    // P0-4: no Arc is ever dropped inside this IRQ-off repair window.
+    // Every mm that leaves the loaded-mm slot is handed back to the
+    // caller, whose task-context reclaim window performs the final
+    // destruction with IRQs serviced (see reclaim_detached_mms).
+    let mut detached = DetachedMms::new();
+
     // Release/contest: repair loaded-mm tracking if it diverged.
     // The exec path may arrive with a stale or missing CPU loaded-mm
     // after a fatal fault or rapid task switches; panicking here kills
@@ -3596,8 +3777,9 @@ pub(crate) fn replace_current_user_mm(
             cpu.get(),
         );
         // Deactivate whatever is currently loaded (if anything).
-        if let Some(stale) = local.take_loaded_mm() {
+        if let Some(stale) = local.replace_loaded_mm(None) {
             let _ = stale.deactivate_current_cpu();
+            detached.push(stale);
         }
     }
     if let Some(ref current_loaded) = local.loaded_mm() {
@@ -3610,7 +3792,13 @@ pub(crate) fn replace_current_user_mm(
     new_mm
         .activate_current_cpu()
         .unwrap_or_else(|error| crate::println!("exec: failed to enter new mm: {error:?}"));
-    local.store_loaded_mm(Some(new_mm));
+    // P0-4: hand back whatever the slot held. In the common exec path this
+    // is the departed old_mm; after a mismatch repair it is the stale mm
+    // (the slot was cleared above and replace returns None there).
+    if let Some(departed) = local.replace_loaded_mm(Some(new_mm)) {
+        detached.push(departed);
+    }
+    detached
 }
 
 pub fn spawn_kernel_thread(entry: KernelThreadEntry) -> TaskId {
@@ -3816,13 +4004,18 @@ fn spawn_queued_without_reschedule(
 pub fn yield_now() {
     crate::context::assert_interrupts_enabled();
 
+    // P0-3C: stack sink for MMs detached during the IRQ-off switch prepare.
+    // Vec::new() allocates nothing; the first push happens only on a real
+    // mm-switch detach event, and the caller parks the Arcs after the
+    // switch commits (see defer_detached_mms).
+    let mut detached = Vec::new();
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
     // smp-pcpu-v1: the Yield fast path never touches the REGISTRY.  Local rq
     // locks carry a rank above Timer, so the switch runs with IRQs off via
     // the guard above and the atomic per-CPU transaction below.
     assert_schedulable(cpu);
-    let switch = prepare_yield_local(cpu);
+    let switch = prepare_yield_local(cpu, &mut detached);
 
     let Some((previous, next)) = switch else {
         return;
@@ -3837,14 +4030,18 @@ pub fn yield_now() {
 
     finish_switch();
     drop(interrupt_guard);
+    defer_detached_mms(detached);
     reap_retired_tasks();
 }
 
 pub(crate) fn yield_from_user_trap() {
+    // P0-3C: see yield_now — the sink allocates nothing until an mm-switch
+    // detach actually occurs inside the prepare.
+    let mut detached = Vec::new();
     let interrupt_guard = crate::context::IrqSaveGuard::new();
     let cpu = crate::smp::current_cpu_id();
     assert_schedulable(cpu);
-    let switch = prepare_yield_local(cpu);
+    let switch = prepare_yield_local(cpu, &mut detached);
     let Some((previous, next)) = switch else {
         return;
     };
@@ -3855,6 +4052,7 @@ pub(crate) fn yield_from_user_trap() {
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
     drop(interrupt_guard);
+    defer_detached_mms(detached);
 }
 
 // Not inlined so the wait_block_site return-address capture attributes the
@@ -3939,8 +4137,11 @@ fn preempt_schedule_disabled() {
         return;
     }
     let cpu = crate::smp::current_cpu_id();
+    // P0-3C: see yield_now — the sink allocates nothing until an mm-switch
+    // detach actually occurs inside the prepare.
+    let mut detached = Vec::new();
     // smp-pcpu-v1: the Preempt fast path never touches the REGISTRY.
-    let switch = prepare_preempt_local(cpu);
+    let switch = prepare_preempt_local(cpu, &mut detached);
 
     let Some((previous, next)) = switch else {
         return;
@@ -3951,6 +4152,7 @@ fn preempt_schedule_disabled() {
     cpu_local(cpu).store_switch_phase(SwitchPhase::CommitPending);
     unsafe { crate::arch::task::switch(previous, next) };
     finish_switch();
+    defer_detached_mms(detached);
 }
 
 fn exit_current() -> ! {
@@ -4061,27 +4263,72 @@ fn finish_switch() {
         USER_TASKS_EXIT_VISIBLE.fetch_add(1, Ordering::Release);
         exit_visible.completion.complete_all();
     }
-    if completed.retired_task_added {
+    // §14: wake the reaper for both reclamation backlogs. The registry lock
+    // (Block/Exit) is released by now, and the yield/preempt branch never
+    // held it — the wake must not run while SCHEDULER is still held.
+    if completed.retired_task_added || deferred_mm_backlog() != 0 {
         TASK_REAPER_QUEUE.wake_one();
     }
 }
 
+/// P0-3D: deferred scheduler-side destruction. Retired tasks and detached
+/// MMs are handed off while holding only SCHEDULER and destroyed after it
+/// is released, so neither a retired task's resource teardown nor a final
+/// UserMm destruction ever runs inside the scheduler critical section.
 fn drain_retired_queue() {
+    // The mm handoff stream scales with the number of switching CPUs:
+    // every cross-process switch parks one detached Arc, so twelve
+    // pushers each hold SCHEDULER once per push while a single reaper
+    // pops. One mm per acquisition cannot outrun the pushers' combined
+    // share of the lock (observed: the queue marched to capacity under
+    // the storm). Sweep the whole mm queue in one acquisition instead;
+    // the Arcs are dropped only after release. The buffer is allocated
+    // outside the lock and its capacity equals the queue's, so nothing
+    // grows while SCHEDULER is held.
+    let mut mms = Vec::with_capacity(MAX_TASKS);
     loop {
-        // Phase 1: detach one dead task while holding only the scheduler lock.
-        let retired = {
+        // Phase 1a: handoff every queued mm under one SCHEDULER hold.
+        {
             let mut slot = SCHEDULER.lock();
-            slot.as_mut()
-                .expect("kernel scheduler is not initialized")
-                .take_retired_task()
+            let scheduler = slot
+                .as_mut()
+                .expect("kernel scheduler is not initialized");
+            while let Some(mm) = scheduler.take_deferred_mm() {
+                mms.push(mm);
+            }
+        }
+
+        // Phase 2a: destroy them with the lock released. Timer IRQs and
+        // TLB/IPI completion paths are therefore free to make forward
+        // progress.
+        for mm in mms.drain(..) {
+            // P0-3D: final MM destruction runs in ordinary reaper task
+            // context with the scheduler lock released. UserMm::drop no
+            // longer acquires any runtime lock (P0-2), and the teardown
+            // of pages/page tables proceeds with IRQs serviced.
+            drop(mm);
+        }
+
+        // Phase 1b/2b: one retired task per pass — the slow debug-build
+        // path. The mm sweep above runs once per pass, before every
+        // task, so mm handoffs are never starved behind it.
+        let task = {
+            let mut slot = SCHEDULER.lock();
+            let scheduler = slot
+                .as_mut()
+                .expect("kernel scheduler is not initialized");
+            scheduler.take_retired_task()
         };
-        let Some(task) = retired else {
+        let Some(task) = task else {
+            if deferred_mm_backlog() != 0 {
+                // MMs arrived between the sweep and the task pop; sweep
+                // them before deciding to sleep.
+                continue;
+            }
             break;
         };
-
-        // Phase 2: release VM mappings, page-table pages and the guarded stack
-        // with no scheduler/cross-CPU spin lock held.  Timer IRQs and TLB/IPI
-        // completion paths are therefore free to make forward progress.
+        // Release VM mappings, page-table pages and the guarded stack of
+        // a retired task.
         task.destroy_resources();
         TASKS_RECLAIMED.fetch_add(1, Ordering::Relaxed);
         complete_retired_task_reclamation();
@@ -4103,15 +4350,81 @@ fn complete_retired_task_reclamation() {
 
 fn task_reaper_main() {
     loop {
-        TASK_REAPER_QUEUE.wait_until(|| retired_task_backlog() != 0);
+        // §14: the wait condition covers both reclamation backlogs. The
+        // counters are incremented under SCHEDULER when the ownership
+        // handoff happens; the wake itself must never run while SCHEDULER
+        // is still held (the wake re-takes it), so callers wake from
+        // finish_switch / reap_retired_tasks instead.
+        TASK_REAPER_QUEUE
+            .wait_until(|| retired_task_backlog() != 0 || deferred_mm_backlog() != 0);
         drain_retired_queue();
     }
 }
 
 fn reap_retired_tasks() {
-    if retired_task_backlog() != 0 {
+    if retired_task_backlog() != 0 || deferred_mm_backlog() != 0 {
         TASK_REAPER_QUEUE.wake_one();
     }
+}
+
+/// P0-3C: park MMs detached on the lockless yield/preempt switch paths.
+/// The SCHEDULER critical section performs ownership handoff only; the
+/// pushing task then sweeps the queue and reclaims the MMs inline in an
+/// IRQ-capable task context. The high-frequency preempt detach stream
+/// must not depend on reaper wake latency: twelve pushers produce the
+/// backlog while one reaper sleeps between wakes, and the queue grew to
+/// capacity inside those wake windows. Each pusher therefore drains up
+/// to RECLAIM_BATCH entries per detach event (a fixed-capacity stack
+/// buffer — no allocation while SCHEDULER is held), leaving the reaper
+/// as the backstop for block/exit handoffs and retired tasks. An empty
+/// sink returns without touching SCHEDULER, preserving the lockless
+/// fast path.
+const RECLAIM_BATCH: usize = 64;
+
+fn defer_detached_mms(mut detached: Vec<Arc<crate::user_mm::UserMm>>) {
+    if detached.is_empty() {
+        return;
+    }
+    let mut reclaimed: [Option<Arc<crate::user_mm::UserMm>>; RECLAIM_BATCH] =
+        [const { None }; RECLAIM_BATCH];
+    {
+        let mut slot = SCHEDULER.lock();
+        let scheduler = slot
+            .as_mut()
+            .expect("kernel scheduler is not initialized");
+        while let Some(mm) = detached.pop() {
+            scheduler.defer_mm_drop(mm);
+        }
+        for slot_ in &mut reclaimed {
+            match scheduler.take_deferred_mm() {
+                Some(mm) => *slot_ = Some(mm),
+                None => break,
+            }
+        }
+    }
+    // P0-4 reclaim window: final MM drops run in task context with local
+    // IRQs serviced so TLB/IPI completions make forward progress. The
+    // yield call sites arrive IRQ-enabled; the timer-exit preempt path
+    // runs with IE=0 and opens the named window around the drops.
+    let preempt_guard = PreemptGuard::new();
+    if crate::arch::interrupt::are_enabled() {
+        drop(reclaimed);
+    } else {
+        let state = crate::arch::interrupt::save_and_disable();
+        // SAFETY: trap/task context on the current task's kernel stack;
+        // the saved state is restored right after the drops below.
+        unsafe { crate::arch::interrupt::enable() };
+        note_irq_state(true);
+        drop(reclaimed);
+        crate::arch::interrupt::restore(state);
+        note_irq_state(state.was_enabled());
+    }
+    drop(preempt_guard);
+    // §14: the wake must never run while SCHEDULER is still held (the wake
+    // re-takes it). Both lockless callers (yield_from_user_trap and the
+    // timer-exit preempt path) end without their own reap call, so the
+    // reaper wake happens here, after the lock is released.
+    reap_retired_tasks();
 }
 
 #[cfg(debug_assertions)]
@@ -4208,6 +4521,10 @@ fn active_cpu_mask() -> usize {
 // diagnostic. Keep it available in release builds as well.
 fn retired_task_backlog() -> usize {
     RETIRED_BACKLOG.load(Ordering::Acquire)
+}
+
+fn deferred_mm_backlog() -> usize {
+    DEFERRED_MM_BACKLOG.load(Ordering::Acquire)
 }
 
 fn retired_task_outstanding() -> usize {

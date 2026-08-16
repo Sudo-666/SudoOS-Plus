@@ -10013,8 +10013,19 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     process.signals().reset_actions_for_exec();
     let old_mm = process.replace_mm(prepared.mm);
     let new_mm = process.mm_arc();
-    crate::task::replace_current_user_mm(Arc::clone(&old_mm), Arc::clone(&new_mm));
+    let detached =
+        crate::task::replace_current_user_mm(Arc::clone(&old_mm), Arc::clone(&new_mm));
     swap_mark(2);
+    // P0-4 (doc §15-B): final destruction of the old address space must not
+    // run in the LA syscall body's IE=0 context — a long IRQ-deaf teardown
+    // starves TLB ACKs and timer wakeups. The named reclaim window enables
+    // IRQs around the drops with the task pinned, and running it here (not
+    // at function end) keeps every later failure path free of a hidden
+    // IE=0 scope-exit drop. A multithreaded process can still have sibling
+    // tasks retiring from the old address space; they pin it with Arc
+    // references, and the final owner performs teardown after every CPU
+    // has switched away.
+    crate::task::reclaim_detached_mms(detached, Some(old_mm));
     if thread
         .exec_replace_context(prepared.entry, prepared.stack, prepared.stack_pointer)
         .is_err()
@@ -10038,12 +10049,8 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     };
     thread.set_tls_pointer(init_tls);
     set_frame_tls(frame, init_tls);
-    // A multithreaded process can still have sibling tasks retiring from the
-    // old address space.  They pin it with Arc references; the final owner
-    // performs teardown after every CPU has switched away.
     swap_mark(3);
     exec_mark(3);
-    drop(old_mm);
     set_frame_entry(frame, prepared.entry.get());
     set_frame_stack_pointer(frame, prepared.stack_pointer.get());
     process.complete_vfork();

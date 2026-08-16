@@ -286,7 +286,12 @@ impl UserMm {
             let tlb = core.tlb_context();
             LIVE_ROOTS.fetch_add(1, Ordering::AcqRel);
             Ok(Self {
-                cold: TrackedSpinLock::new_preemptible(
+                // P0-1: UserMm holders are pinned (migration + preemption)
+                // while IRQs stay enabled, so a waiter never depends on the
+                // SpinIrqWindow to reopen IRQs inside an unknown outer lock
+                // context. The window was the entry point of the SCHEDULER
+                // self-deadlock observed under BuildStorm.
+                cold: TrackedSpinLock::new_with_class(
                     UserMmColdState {
                         core,
                         file_mappings: BTreeMap::new(),
@@ -294,7 +299,7 @@ impl UserMm {
                     },
                     LockClass::new("user_mm", LockRank::CrossCpu, 10),
                 ),
-                hot: TrackedSpinLock::new_preemptible(
+                hot: TrackedSpinLock::new_with_class(
                     UserMmHotState {
                         page_table: Some(page_table),
                         pages: BTreeMap::new(),
@@ -2322,7 +2327,12 @@ impl UserMm {
         } else {
             None
         };
-        let (cold, mut hot) = self.lock_both();
+        // P0-2B: destroy(&mut self) already proves exclusive ownership, so
+        // teardown takes the payloads directly instead of acquiring the
+        // runtime cold/hot spin locks. Final destruction must never become
+        // a hidden cross-CPU lock acquisition.
+        let cold = self.cold.get_mut();
+        let hot = self.hot.get_mut();
         cold.core.assert_inactive_for_destroy()?;
         let table_capacity = hot
             .page_table
@@ -2443,8 +2453,8 @@ impl UserMm {
         hot.page_table = None;
         LIVE_ROOTS.fetch_sub(1, Ordering::AcqRel);
         let asid = cold.core.asid();
-        drop(hot);
-        drop(cold);
+        // No guards to drop: cold/hot are plain `get_mut` borrows that end
+        // here (NLL).
         release_mm_reservation(asid);
         if let Some(start) = diag_start {
             let elapsed = crate::arch::time::counter().wrapping_sub(start);
@@ -2495,16 +2505,19 @@ impl UserMm {
 
 impl Drop for UserMm {
     fn drop(&mut self) {
-        let needs_teardown = {
-            let hot = self.hot.lock();
-            hot.page_table.is_some()
-        };
+        // P0-2C: &mut self already proves no concurrent locker exists —
+        // the final Arc drop must not acquire the runtime cold/hot spin
+        // locks. That made MM final destruction a hidden CrossCpu lock
+        // acquisition inside SCHEDULER/IRQ-off switch contexts (the
+        // BuildStorm self-deadlock entry point).
+        let needs_teardown = self.hot.get_mut().page_table.is_some();
         if needs_teardown {
             if let Err(error) = self.destroy() {
                 panic!("M8-B3 UserMm teardown failed during drop: {error:?}");
             }
         }
-        let (cold, hot) = self.lock_both();
+        let cold = self.cold.get_mut();
+        let hot = self.hot.get_mut();
         assert!(
             hot.pages.is_empty(),
             "M8-B3 UserMm dropped with owned backing pages",
