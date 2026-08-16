@@ -21,6 +21,7 @@ core
 /kernel-visionfive2
 /kernel-visionfive2.elf
 /kernel-vf2.bin
+/starfive_visionfive2.dtb
 
 # LS2K1000 board build artifacts (generated binaries / uImages)
 /kernel-ls2k1000
@@ -38,6 +39,7 @@ core
 /uImage.fit
 /uImage-*
 /uImage-test/
+/*.manifest
 
 # Third-party test suite (nested git repo, not part of this kernel)
 /testsuits-for-oskernel/
