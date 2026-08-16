@@ -283,6 +283,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         explicit_oscomp_mode,
         userland_mode,
         contest_config,
+        boot_ramdisks,
     ) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
@@ -331,6 +332,18 @@ fn kernel_main(boot: BootInfo) -> ! {
                 );
             });
 
+        // 固件加载的竞赛镜像区域（LS2K1000 U-Boot → ram0）。这些区域由
+        // build_boot_memory_layout 通过 /reserved-memory 从 free memory
+        // 中排除；这里收集其细节供注册只读块设备。
+        let mut boot_ramdisks: alloc::vec::Vec<myos_fdt::BootRamdiskRegion> =
+            alloc::vec::Vec::new();
+        tree.for_each_boot_ramdisk(|region| {
+            boot_ramdisks.push(region);
+        })
+        .unwrap_or_else(|error| {
+            panic!("failed to parse boot ramdisk regions: {error}");
+        });
+
         (
             memory_layout,
             firmware_timer_frequency,
@@ -340,6 +353,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             explicit_oscomp_mode,
             userland_mode,
             contest_config,
+            boot_ramdisks,
         )
     };
 
@@ -456,6 +470,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     net::initialize();
     rtc::initialize();
     fault::initialize();
+    register_boot_ramdisks(&boot_ramdisks);
     fs::initialize();
     mount_proc();
     mount_sys();
@@ -749,6 +764,29 @@ fn mount_sdcard_if_present(config: &storage::ContestStorageConfig) {
     }
     contest_fixture_probe(&device);
     install_sdcard_contents(&device, &device_name);
+}
+
+/// C5: 把 FDT 声明的固件加载竞赛镜像注册为只读块设备（`ram0`）。
+///
+/// 必须在 `fs::initialize()` 之前调用，使 `/dev/ram0` 在 devfs 建立时
+/// 可见。区域已由 `memory::build_boot_memory_layout` 从 free memory 排除。
+fn register_boot_ramdisks(regions: &[myos_fdt::BootRamdiskRegion]) {
+    for region in regions {
+        crate::println!(
+            "ramdisk: region [{:#018x}, {:#018x}) block-size={} read-only={}",
+            region.base(),
+            region.end().unwrap_or(usize::MAX),
+            region.block_size(),
+            region.read_only(),
+        );
+        if let Err(error) = crate::boot_ramdisk::register_boot_ramdisk(
+            myos_mm::PhysAddr::new(region.base()),
+            region.size(),
+            region.block_size(),
+        ) {
+            crate::println!("ramdisk: register ram0 failed: {error:?}");
+        }
+    }
 }
 
 /// C3: 识别自动生成的竞赛 fixture（root 含 `/SUDOOS_CONTEST_FIXTURE`）并打印

@@ -27,6 +27,47 @@ impl MemoryRegion {
     }
 }
 
+/// 固件加载、通过 `/reserved-memory` 声明的竞赛镜像区域
+/// （`compatible = "sudoos,boot-ramdisk"`）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BootRamdiskRegion {
+    base: usize,
+    size: usize,
+    block_size: usize,
+    read_only: bool,
+}
+
+impl BootRamdiskRegion {
+    pub const fn new(base: usize, size: usize, block_size: usize, read_only: bool) -> Self {
+        Self {
+            base,
+            size,
+            block_size,
+            read_only,
+        }
+    }
+
+    pub const fn base(self) -> usize {
+        self.base
+    }
+
+    pub const fn size(self) -> usize {
+        self.size
+    }
+
+    pub const fn block_size(self) -> usize {
+        self.block_size
+    }
+
+    pub const fn read_only(self) -> bool {
+        self.read_only
+    }
+
+    pub const fn end(self) -> Option<usize> {
+        self.base.checked_add(self.size)
+    }
+}
+
 /// 一个通过 MMIO 暴露的 VirtIO transport。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VirtioMmioRegion<'a> {

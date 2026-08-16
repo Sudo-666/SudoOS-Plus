@@ -8,7 +8,7 @@ use fdt_parser::{
     properties::Compatible,
 };
 
-use crate::{FdtBlob, FdtError, MemoryRegion, PciHostBridge, VirtioMmioRegion};
+use crate::{BootRamdiskRegion, FdtBlob, FdtError, MemoryRegion, PciHostBridge, VirtioMmioRegion};
 
 /// MyOS 对设备树的只读视图。
 ///
@@ -311,6 +311,66 @@ impl<'a> DeviceTree<'a> {
             }
         }
 
+        Ok(())
+    }
+
+    /// 遍历 `/reserved-memory` 中 `compatible = "sudoos,boot-ramdisk"` 的节点。
+    ///
+    /// 这些节点声明固件（如 LS2K1000 U-Boot）加载竞赛镜像的只读物理区域。
+    /// 区域同时被 [`Self::for_each_reserved_memory_region`] 从 free memory
+    /// 中排除；这里提供 `block-size` 与 `read-only` 细节供存储层注册
+    /// `/dev/ram0`。
+    pub fn for_each_boot_ramdisk(
+        &self,
+        mut visitor: impl FnMut(BootRamdiskRegion),
+    ) -> Result<(), FdtError> {
+        let Some(root) = self.inner.find_node("/") else {
+            return Err(FdtError::InvalidReservedMemoryLayout);
+        };
+        let Some(reserved) = self.inner.find_node("/reserved-memory") else {
+            return Ok(());
+        };
+
+        let root_address_cells = read_cell_count(root, "#address-cells").unwrap_or(2);
+        let root_size_cells = read_cell_count(root, "#size-cells").unwrap_or(1);
+        let Some(address_cells) = read_cell_count(reserved, "#address-cells") else {
+            return Err(FdtError::InvalidReservedMemoryLayout);
+        };
+        let Some(size_cells) = read_cell_count(reserved, "#size-cells") else {
+            return Err(FdtError::InvalidReservedMemoryLayout);
+        };
+        if address_cells != root_address_cells
+            || size_cells != root_size_cells
+            || reserved.raw_property("ranges").is_none()
+        {
+            return Err(FdtError::InvalidReservedMemoryLayout);
+        }
+        validate_cell_counts(address_cells, size_cells)?;
+
+        for child in reserved.children() {
+            if !node_is_available(child) || !node_is_compatible(child, "sudoos,boot-ramdisk") {
+                continue;
+            }
+            let Some(reg) = child.raw_property("reg") else {
+                continue;
+            };
+            let region = parse_first_region(reg.value, address_cells, size_cells)?;
+            let block_size = child
+                .raw_property("block-size")
+                .and_then(|property| read_cells(property.value).ok())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(512);
+            if block_size == 0 {
+                continue;
+            }
+            let read_only = child.raw_property("read-only").is_some();
+            visitor(BootRamdiskRegion::new(
+                region.start(),
+                region.size(),
+                block_size,
+                read_only,
+            ));
+        }
         Ok(())
     }
 }
@@ -844,5 +904,79 @@ mod tests {
         );
 
         assert_eq!(collect_cpu_ids(&fdt, true), Vec::from([7]));
+    }
+
+    /// 组装一个带 `/reserved-memory/contest-disk@e0000000` 的最小 FDT。
+    fn build_fdt_with_boot_ramdisk() -> Vec<u8> {
+        let mut structure = Vec::new();
+        let mut strings = Vec::new();
+
+        push_node(&mut structure, "");
+        push_prop(&mut structure, &mut strings, "#address-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "#size-cells", &be32(2));
+
+        push_node(&mut structure, "reserved-memory");
+        push_prop(&mut structure, &mut strings, "#address-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "#size-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "ranges", &[]);
+
+        push_node(&mut structure, "contest-disk@e0000000");
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "compatible",
+            b"sudoos,boot-ramdisk\0",
+        );
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&u64_cells(0xe000_0000));
+        reg.extend_from_slice(&u64_cells(0x0200_0000));
+        push_prop(&mut structure, &mut strings, "reg", &reg);
+        push_prop(&mut structure, &mut strings, "block-size", &be32(512));
+        push_prop(&mut structure, &mut strings, "read-only", &[]);
+        push_end_node(&mut structure);
+
+        push_end_node(&mut structure); // reserved-memory
+        push_end_node(&mut structure); // root
+        structure.extend_from_slice(&be32(FDT_END));
+
+        let header_size = 40_usize;
+        let struct_offset = header_size + 16;
+        let strings_offset = struct_offset + structure.len();
+        let total_size = strings_offset + strings.len();
+        let mut fdt = Vec::with_capacity(total_size);
+        fdt.extend_from_slice(&be32(0xd00d_feed));
+        fdt.extend_from_slice(&be32(total_size as u32));
+        fdt.extend_from_slice(&be32(struct_offset as u32));
+        fdt.extend_from_slice(&be32(strings_offset as u32));
+        fdt.extend_from_slice(&be32(header_size as u32));
+        fdt.extend_from_slice(&be32(17));
+        fdt.extend_from_slice(&be32(16));
+        fdt.extend_from_slice(&be32(0));
+        fdt.extend_from_slice(&be32(strings.len() as u32));
+        fdt.extend_from_slice(&be32(structure.len() as u32));
+        fdt.extend_from_slice(&[0_u8; 16]);
+        fdt.extend_from_slice(&structure);
+        fdt.extend_from_slice(&strings);
+        assert_eq!(fdt.len(), total_size);
+        fdt
+    }
+
+    #[test]
+    fn for_each_boot_ramdisk_parses_contest_disk() {
+        let fdt = build_fdt_with_boot_ramdisk();
+        let blob = FdtBlob::from_bytes(&fdt).expect("valid FDT blob");
+        let tree = DeviceTree::from_blob(&blob).expect("parseable device tree");
+
+        let mut regions = Vec::new();
+        tree.for_each_boot_ramdisk(|region| regions.push(region))
+            .expect("boot ramdisk parse");
+
+        assert_eq!(regions.len(), 1);
+        let region = regions[0];
+        assert_eq!(region.base(), 0xe000_0000);
+        assert_eq!(region.size(), 0x0200_0000);
+        assert_eq!(region.block_size(), 512);
+        assert!(region.read_only());
+        assert_eq!(region.end(), Some(0xe200_0000));
     }
 }

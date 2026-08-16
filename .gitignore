@@ -35,6 +35,9 @@ core
 /ls2k1000-minimal.dtb
 /ls2k1000-stage4.dtb
 /ls2k1000-stage4-init.dtb
+/ls2k1000-contest-fixture.dtb
+/contest-la.ext4
+/ls2k1000-contest-fixture-boot.txt
 /busybox-loongarch64.cpio
 /uImage.fit
 /uImage-*

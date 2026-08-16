@@ -112,6 +112,33 @@ check-ls2k1000-stage4: kernel-ls2k1000.uImage ls2k1000-stage4.dtb
 
 ls2k1000-stage4-bundle: kernel-ls2k1000.uImage busybox-initramfs-loongarch64 ls2k1000-stage4.dtb check-ls2k1000-stage4
 
+# C5: contest fixture bundle for the LS2K1000 board. Builds the kernel uImage,
+# a DTB whose /reserved-memory carries contest-disk@e0000000
+# (compatible = "sudoos,boot-ramdisk"), the disposable ext4 fixture, and a
+# U-Boot boot script. The kernel registers /dev/ram0 over that region.
+.PHONY: ls2k1000-contest-fixture-bundle
+ls2k1000-contest-fixture-bundle: kernel-ls2k1000.uImage
+	@mkdir -p build/fixtures
+	@bash scripts/make-contest-fixture.sh --arch loongarch64 --output build/fixtures/contest-la.ext4
+	@CONTEST_DISK=0xe0000000 CONTEST_DISK_SIZE=0x02000000 \
+	    BOOTARGS="console=ttyS0,115200n8 sudoos.contest.dev=ram0" \
+	    DTB_NAME=ls2k1000-contest-fixture \
+	    scripts/build-ls2k1000-dtb.sh
+	@cp build/host-tools/ls2k1000/ls2k1000-contest-fixture.dtb ls2k1000-contest-fixture.dtb
+	@cp build/fixtures/contest-la.ext4 contest-la.ext4
+	@printf '%s\n' \
+	    "SudoOS LS2K1000 contest fixture boot (ram0, CodePlan C5)" \
+	    "1. make ls2k1000-contest-fixture-bundle" \
+	    "2. Copy kernel-ls2k1000.uImage, ls2k1000-contest-fixture.dtb, contest-la.ext4 to a FAT USB drive." \
+	    "3. U-Boot (cached-VA addressing):" \
+	    "     fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage" \
+	    "     fatload usb 0:1 0x900000000a000000 ls2k1000-contest-fixture.dtb" \
+	    "     fatload usb 0:1 0x90000000e0000000 contest-la.ext4" \
+	    "     bootm 0x9000000002000000 - 0x900000000a000000" \
+	    "4. Serial: expect 'registered=/dev/ram0', CONTEST_FIXTURE: arch=loongarch64, FIXTURE_OSCOMP_PASS" \
+	    > ls2k1000-contest-fixture-boot.txt
+	@ls -lh kernel-ls2k1000.uImage ls2k1000-contest-fixture.dtb contest-la.ext4 ls2k1000-contest-fixture-boot.txt
+
 # SUDOOS_LS2K_GATEB_V1: rdinit=/init variant of the stage-4 DTB. Same layout
 # and initrd placement as ls2k1000-stage4, but /chosen/bootargs carries
 # "rdinit=/init init.debug=1" so the kernel boots the real /init as PID 1

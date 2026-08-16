@@ -52,6 +52,42 @@ BOOTARGS="${BOOTARGS:-console=ttyS0,115200n8}"
 # emit a named variant such as ls2k1000-stage4-init.
 DTB_NAME="${DTB_NAME:-}"
 
+# Contest fixture ramdisk (CodePlan C5): when CONTEST_DISK is a physical
+# address, emit a /reserved-memory/contest-disk node
+# (compatible = "sudoos,boot-ramdisk") so the kernel registers /dev/ram0 over
+# the firmware-loaded image. The region is excluded from free memory by the
+# /reserved-memory reservation. Default 32 MiB.
+CONTEST_DISK="${CONTEST_DISK:-}"
+CONTEST_DISK_SIZE="${CONTEST_DISK_SIZE:-0x02000000}"
+
+RESERVED_MEMORY_LINES=""
+if [[ -n "${CONTEST_DISK}" ]]; then
+    CONTEST_DISK_ADDR=$(( CONTEST_DISK ))
+    CONTEST_DISK_LEN=$(( CONTEST_DISK_SIZE ))
+    if [[ ${CONTEST_DISK_ADDR} -eq 0 || ${CONTEST_DISK_LEN} -eq 0 ]]; then
+        echo "error: contest disk address/size must be non-zero" >&2
+        exit 1
+    fi
+    CONTEST_DISK_ADDR_HEX=$(printf '%08x' "${CONTEST_DISK_ADDR}")
+    CONTEST_DISK_SIZE_HEX=$(printf '%08x' "${CONTEST_DISK_LEN}")
+    RESERVED_MEMORY_LINES=$(cat <<EOT
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+
+        contest_disk: contest-disk@${CONTEST_DISK_ADDR_HEX} {
+            compatible = "sudoos,boot-ramdisk";
+            reg = <0x0 0x${CONTEST_DISK_ADDR_HEX} 0x0 0x${CONTEST_DISK_SIZE_HEX}>;
+            block-size = <512>;
+            read-only;
+        };
+    };
+EOT
+)
+fi
+
 # Fixed physical staging layout (U-Boot cached-VA = phys + 0x9000000000000000):
 #   kernel uImage   0x02000000
 #   DTB             0x0a000000
@@ -66,6 +102,8 @@ INITRD_PROPS=""
 MEMRESERVE_LINES=""
 if [[ -n "${DTB_NAME}" ]]; then
     OUT_BASENAME="${DTB_NAME}"
+elif [[ -n "${CONTEST_DISK}" ]]; then
+    OUT_BASENAME="ls2k1000-contest-fixture"
 elif [[ -n "${INITRD}" ]]; then
     OUT_BASENAME="ls2k1000-stage4"
 else
@@ -141,6 +179,8 @@ ${INITRD_PROPS}
         device_type = "memory";
         reg = <0x0 0x90000000 0x0 0x70000000>;
     };
+
+${RESERVED_MEMORY_LINES}
 
     /* LA264 双核；内核要求 /cpus 节点，cpu 子节点用 reg 给硬件 ID。 */
     cpus {
