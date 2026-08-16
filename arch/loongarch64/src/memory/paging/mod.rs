@@ -33,6 +33,17 @@ pub fn maximum_address_space_id() -> u16 {
     ((1u16 << bits) - 1).min(ASID_MASK as u16)
 }
 
+/// Whether the CPU implements usable hardware ASID bits.
+///
+/// LoongArch always exposes a hardware ASID width in CSR.ASID (1..=10 bits,
+/// validated by [`maximum_address_space_id`]), so every hart has usable ASIDs.
+/// Mirrors the RISC-V contract used by the shared `user_mm` ASID-less
+/// fallback (`assert_hardware_active`): a false return means "ASID is WARL to
+/// zero, treat all logical spaces as ASID 0".
+pub fn hardware_address_space_id_available() -> bool {
+    maximum_address_space_id() != 0
+}
+
 /// Changes only PGDL and ASID. PGDH permanently remains the kernel root.
 ///
 /// # Safety
