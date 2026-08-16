@@ -9,7 +9,11 @@ fail() {
     exit 1
 }
 
-tracked_build_artifacts="$(git ls-files | while IFS= read -r path; do [[ -e "$path" ]] && printf '%s\n' "$path"; done | grep -E '(^|/)(build|target)/' || true)"
+# The vendored third-party tree (vendor/cargo, vendor/u-boot-*) legitimately
+# contains source paths with /build/ or /target/ segments (e.g. the `object`
+# crate's src/build/, the `cc` crate's src/target/). Exclude it: only the
+# repo's own generated build/target artifacts should trip this gate.
+tracked_build_artifacts="$(git ls-files | while IFS= read -r path; do [[ -e "$path" ]] && printf '%s\n' "$path"; done | grep -E '(^|/)(build|target)/' | grep -v '^vendor/' || true)"
 if [[ -n "${tracked_build_artifacts}" ]]; then
     printf '%s\n' "${tracked_build_artifacts}" >&2
     fail "generated build artifacts are tracked by git"
