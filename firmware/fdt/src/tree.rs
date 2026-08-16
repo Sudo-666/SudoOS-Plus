@@ -8,7 +8,10 @@ use fdt_parser::{
     properties::Compatible,
 };
 
-use crate::{BootRamdiskRegion, FdtBlob, FdtError, MemoryRegion, PciHostBridge, VirtioMmioRegion};
+use crate::{
+    BootRamdiskRegion, FdtBlob, FdtError, MemoryRegion, MmcHostConfig, PciHostBridge,
+    VirtioMmioRegion,
+};
 
 /// MyOS 对设备树的只读视图。
 ///
@@ -373,6 +376,117 @@ impl<'a> DeviceTree<'a> {
         }
         Ok(())
     }
+
+    /// 遍历 `/aliases` 中 `mmcN` 指向的 DesignWare MMC 主机
+    /// （`compatible = "snps,dw-mshc"`）。VisionFive 2 上 `mmc0` 是板载
+    /// eMMC、`mmc1` 是 TF 卡槽；`alias_index` 让调用方按槽位选择。
+    pub fn for_each_mmc_host(
+        &self,
+        mut visitor: impl FnMut(MmcHostConfig),
+    ) -> Result<(), FdtError> {
+        let Some(aliases) = self.inner.root().aliases() else {
+            return Ok(());
+        };
+        for (name, path) in aliases.iter() {
+            let Some(index_text) = name.strip_prefix("mmc") else {
+                continue;
+            };
+            let Ok(alias_index) = index_text.parse::<u8>() else {
+                continue;
+            };
+            let Some(node) = self.inner.find_node(path) else {
+                continue;
+            };
+            let node = node.as_node();
+            if !node_is_available(node) || !node_is_compatible(node, "snps,dw-mshc") {
+                continue;
+            }
+            let Some(reg) = node.reg() else {
+                continue;
+            };
+            let mut regions = reg.iter::<u64, u64>();
+            let Some(Ok(entry)) = regions.next() else {
+                continue;
+            };
+            let base = match usize::try_from(entry.address) {
+                Ok(base) => base,
+                Err(_) => continue,
+            };
+            let size = match usize::try_from(entry.len) {
+                Ok(size) => size,
+                Err(_) => continue,
+            };
+
+            let irq = node
+                .raw_property("interrupts")
+                .filter(|property| property.value.len() >= 4)
+                .map(|property| {
+                    u32::from_be_bytes([
+                        property.value[0],
+                        property.value[1],
+                        property.value[2],
+                        property.value[3],
+                    ]) as usize
+                })
+                .unwrap_or(0);
+
+            let bus_width = node
+                .raw_property("bus-width")
+                .and_then(|property| read_u32_property(property.value))
+                .unwrap_or(1)
+                .clamp(1, 8) as u8;
+
+            let fifo_depth = node
+                .raw_property("fifo-depth")
+                .and_then(|property| read_u32_property(property.value));
+
+            let max_frequency_hz = node
+                .raw_property("max-frequency")
+                .and_then(|property| read_cells(property.value).ok());
+
+            let ciu_frequency_hz = node
+                .raw_property("clock-frequency")
+                .and_then(|property| read_cells(property.value).ok())
+                .or_else(|| {
+                    node.raw_property("assigned-clock-rates")
+                        .and_then(|property| last_cell(property.value))
+                });
+
+            let non_removable = node.raw_property("non-removable").is_some();
+
+            visitor(MmcHostConfig::new(
+                Some(alias_index),
+                base,
+                size,
+                irq,
+                bus_width,
+                fifo_depth,
+                max_frequency_hz,
+                ciu_frequency_hz,
+                non_removable,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn read_u32_property(bytes: &[u8]) -> Option<u32> {
+    (bytes.len() == 4).then(|| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// 读取大端 32-bit cell 列表的最后一个 cell（assigned-clock-rates 中
+/// 的 ciu 频率）。
+fn last_cell(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() % 4 != 0 || bytes.is_empty() {
+        return None;
+    }
+    let offset = bytes.len() - 4;
+    Some(u64::from(u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])))
 }
 
 fn node_is_memory(node: UnalignedInfallibleNode<'_>) -> bool {
@@ -978,5 +1092,112 @@ mod tests {
         assert_eq!(region.block_size(), 512);
         assert!(region.read_only());
         assert_eq!(region.end(), Some(0xe200_0000));
+    }
+
+    /// 组装一个带 `/aliases`(mmc0/mmc1) + 两个 `snps,dw-mshc` 主机的 FDT。
+    /// `sdio0` 显式 disabled，`sdio1` 正常。
+    fn build_fdt_with_mmc_hosts() -> Vec<u8> {
+        let mut structure = Vec::new();
+        let mut strings = Vec::new();
+
+        push_node(&mut structure, "");
+        push_prop(&mut structure, &mut strings, "#address-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "#size-cells", &be32(2));
+
+        push_node(&mut structure, "aliases");
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "mmc0",
+            b"/soc/sdio0@16010000\0",
+        );
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "mmc1",
+            b"/soc/sdio1@16020000\0",
+        );
+        push_end_node(&mut structure);
+
+        push_node(&mut structure, "soc");
+        push_prop(&mut structure, &mut strings, "#address-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "#size-cells", &be32(2));
+        push_prop(&mut structure, &mut strings, "ranges", &[]);
+
+        push_node(&mut structure, "sdio0@16010000");
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "compatible",
+            b"snps,dw-mshc\0",
+        );
+        let mut reg0 = Vec::new();
+        reg0.extend_from_slice(&u64_cells(0x1601_0000));
+        reg0.extend_from_slice(&u64_cells(0x1_0000));
+        push_prop(&mut structure, &mut strings, "reg", &reg0);
+        push_prop(&mut structure, &mut strings, "bus-width", &be32(8));
+        push_prop(&mut structure, &mut strings, "status", b"disabled\0");
+        push_end_node(&mut structure);
+
+        push_node(&mut structure, "sdio1@16020000");
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "compatible",
+            b"snps,dw-mshc\0",
+        );
+        let mut reg1 = Vec::new();
+        reg1.extend_from_slice(&u64_cells(0x1602_0000));
+        reg1.extend_from_slice(&u64_cells(0x1_0000));
+        push_prop(&mut structure, &mut strings, "reg", &reg1);
+        push_prop(&mut structure, &mut strings, "bus-width", &be32(4));
+        push_prop(&mut structure, &mut strings, "fifo-depth", &be32(32));
+        push_end_node(&mut structure);
+
+        push_end_node(&mut structure); // soc
+        push_end_node(&mut structure); // root
+        structure.extend_from_slice(&be32(FDT_END));
+
+        let header_size = 40_usize;
+        let struct_offset = header_size + 16;
+        let strings_offset = struct_offset + structure.len();
+        let total_size = strings_offset + strings.len();
+        let mut fdt = Vec::with_capacity(total_size);
+        fdt.extend_from_slice(&be32(0xd00d_feed));
+        fdt.extend_from_slice(&be32(total_size as u32));
+        fdt.extend_from_slice(&be32(struct_offset as u32));
+        fdt.extend_from_slice(&be32(strings_offset as u32));
+        fdt.extend_from_slice(&be32(header_size as u32));
+        fdt.extend_from_slice(&be32(17));
+        fdt.extend_from_slice(&be32(16));
+        fdt.extend_from_slice(&be32(0));
+        fdt.extend_from_slice(&be32(strings.len() as u32));
+        fdt.extend_from_slice(&be32(structure.len() as u32));
+        fdt.extend_from_slice(&[0_u8; 16]);
+        fdt.extend_from_slice(&structure);
+        fdt.extend_from_slice(&strings);
+        assert_eq!(fdt.len(), total_size);
+        fdt
+    }
+
+    #[test]
+    fn for_each_mmc_host_parses_dw_mshc() {
+        let fdt = build_fdt_with_mmc_hosts();
+        let blob = FdtBlob::from_bytes(&fdt).expect("valid FDT blob");
+        let tree = DeviceTree::from_blob(&blob).expect("parseable device tree");
+
+        let mut hosts = Vec::new();
+        tree.for_each_mmc_host(|host| hosts.push(host))
+            .expect("mmc host parse");
+
+        // sdio0 is disabled -> only sdio1 (mmc1) is discovered.
+        assert_eq!(hosts.len(), 1);
+        let host = hosts[0];
+        assert_eq!(host.alias_index(), Some(1));
+        assert_eq!(host.base(), 0x1602_0000);
+        assert_eq!(host.size(), 0x1_0000);
+        assert_eq!(host.bus_width(), 4);
+        assert_eq!(host.fifo_depth(), Some(32));
+        assert!(!host.non_removable());
     }
 }

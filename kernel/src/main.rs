@@ -25,6 +25,7 @@ mod irq_lock;
 mod linker;
 mod lockdep;
 mod memory;
+mod mmc;
 mod net;
 mod oscomp;
 mod page_alloc;
@@ -303,6 +304,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         inspect_device_tree(&boot, &blob, &tree);
         let virtio_regions = collect_virtio_mmio_regions(&tree);
         let pci_hosts = collect_pci_host_bridges(&tree);
+        mmc::discover_hosts(&tree);
         let max_cpus = match bootargs::max_cpus(tree.bootargs()) {
             Ok(Some(requested)) => {
                 println!("SMP: maxcpus requested={requested}");
