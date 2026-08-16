@@ -64,9 +64,9 @@ pub fn select_mode(explicit: Option<RunMode>) -> RunMode {
     }
 
     // CLOUD_FINAL_MODE_FALLBACK_V1
-    if crate::block::open_device("vda").is_some() {
+    if crate::storage::contest_storage_mounted() {
         crate::println!(
-            "sudoos-diag: oscomp mode selected: final-all (contest block fallback)"
+            "sudoos-diag: oscomp mode selected: final-all (contest storage fallback)"
         );
         return RunMode::FinalAll;
     }

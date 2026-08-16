@@ -610,7 +610,6 @@ pub fn initialize(regions: &MmioRegions, pci_hosts: &PciHostBridges) {
                 match block::register_device(&name, Arc::clone(&device)) {
                     Ok(()) => {
                         crate::println!("  block registry : /dev/{name}");
-                        register_compat_partition_alias(&name, &device);
                         usable += 1;
                     }
                     Err(error) => {
@@ -650,16 +649,6 @@ pub fn initialize(regions: &MmioRegions, pci_hosts: &PciHostBridges) {
         crate::println!("  mmio probe     : {} region(s) checked", probed);
     }
     crate::println!("  block devices  : {}", usable);
-}
-
-fn register_compat_partition_alias(name: &str, device: &Arc<dyn BlockDevice>) {
-    if name != "vda" || block::open_device("vda2").is_some() {
-        return;
-    }
-    match block::register_device("vda2", Arc::clone(device)) {
-        Ok(()) => crate::println!("  block registry : /dev/vda2 -> /dev/vda"),
-        Err(error) => crate::println!("  block registry : /dev/vda2 alias failed ({error:?})"),
-    }
 }
 
 fn virtio_block_name(index: usize) -> alloc::string::String {
@@ -826,7 +815,6 @@ fn probe_pci_host(host: PciHostBridge, first_index: usize) -> Result<usize, Virt
                         match block::register_device(&name, Arc::clone(&device)) {
                             Ok(()) => {
                                 crate::println!("  block registry : /dev/{name}");
-                                register_compat_partition_alias(&name, &device);
                                 found += 1;
                             }
                             Err(error) => {

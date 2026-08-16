@@ -36,6 +36,7 @@ mod rtc;
 mod runtime_page_table;
 mod signal;
 mod smp;
+mod storage;
 mod syscall;
 mod sysfs;
 mod task;
@@ -279,6 +280,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         initrd_range,
         explicit_oscomp_mode,
         userland_mode,
+        contest_config,
     ) = {
         // SAFETY: fdt_pointer 指向启动协议提供的只读 FDT blob。
         let blob = unsafe { FdtBlob::from_ptr(fdt_pointer) }.unwrap_or_else(|error| {
@@ -313,6 +315,9 @@ fn kernel_main(boot: BootInfo) -> ! {
             .or_else(|| direct_boot_oscomp_mode(&boot));
         let direct_command_line = direct_boot_command_line(&boot);
         let userland_mode = userland_boot_mode(tree.bootargs().or(direct_command_line.as_deref()));
+        let contest_config = storage::config_from_bootargs(
+            tree.bootargs().or(direct_command_line.as_deref()),
+        );
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
@@ -332,6 +337,7 @@ fn kernel_main(boot: BootInfo) -> ! {
             initrd_range,
             explicit_oscomp_mode,
             userland_mode,
+            contest_config,
         )
     };
 
@@ -452,7 +458,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     mount_proc();
     mount_sys();
     install_external_initramfs(initrd_range);
-    mount_sdcard_if_present();
+    mount_sdcard_if_present(&contest_config);
     println!("BOOT13 rootfs-ready");
     tty::initialize();
 
@@ -465,6 +471,8 @@ fn kernel_main(boot: BootInfo) -> ! {
     fs::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     block::verify();
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
+    storage::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     virtio::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
@@ -715,26 +723,35 @@ fn mount_sys() {
     }
 }
 
-fn mount_sdcard_if_present() {
-    if crate::block::open_device("vda").is_none() {
-        return;
-    }
-    let device = match crate::block::open_device("vda") {
-        Some(device) => device,
-        None => {
-            crate::println!("sdcard: /dev/vda open failed — skipping mount");
+fn mount_sdcard_if_present(config: &storage::ContestStorageConfig) {
+    let selected = match storage::select_device(config) {
+        Ok(Some(selected)) => selected,
+        Ok(None) => {
+            crate::println!("sdcard: no contest storage found — skipping mount");
+            return;
+        }
+        Err(error) => {
+            crate::println!("sdcard: contest storage selection failed: {error:?}");
             return;
         }
     };
-    let mut magic = [0_u8; 2];
-    if crate::block::read_at(&device, 1024 + 56, &mut magic).is_err()
-        || u16::from_le_bytes(magic) != 0xef53
-    {
-        crate::println!("sdcard: not an ext4 filesystem — skipping mount");
+    let device = selected.device();
+    let device_name = alloc::string::String::from(selected.name());
+    if let Err(error) = storage::mount_selected(&selected) {
+        crate::println!("sdcard: contest storage mount failed: {error:?}");
         return;
     }
+    install_sdcard_contents(&device, &device_name);
+}
 
-    let root_entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(&device), "/") {
+/// Install the ext4 contest image contents (busybox, libs, scripts, dirs)
+/// into the VFS /mnt/sdcard tree. Runs only after a device was selected and
+/// mounted by `storage`; the whole body is device-agnostic.
+fn install_sdcard_contents(
+    device: &alloc::sync::Arc<dyn crate::block::BlockDevice>,
+    device_name: &str,
+) {
+    let root_entries = match crate::ext4::list_directory(alloc::sync::Arc::clone(device), "/") {
         Ok(entries) => entries,
         Err(error) => {
             // CLOUD_EXT4_MOUNT_FAILURE_V1
@@ -824,7 +841,7 @@ fn mount_sdcard_if_present() {
         };
         for busybox_ext4 in busybox_sources {
             let _ = fs::unlink("/bin/busybox", false);
-            oscomp_sdcard_install_ext4_path(busybox_ext4, "/bin/busybox");
+            oscomp_sdcard_install_ext4_path(device_name, busybox_ext4, "/bin/busybox");
             if fs::stat("/bin/busybox").is_err() {
                 continue;
             }
@@ -908,8 +925,8 @@ fn mount_sdcard_if_present() {
     // P1-A: install ld-linux / ld-musl interpreters from their real ext4
     // source paths (/glibc/lib/... or /musl/lib/...) into the canonical
     // VFS paths that PT_INTERP encodes (/lib/..., /lib64/...).
-    oscomp_install_runtime_loader_aliases();
-    oscomp_install_runtime_lib_aliases();
+    oscomp_install_runtime_loader_aliases(device_name);
+    oscomp_install_runtime_lib_aliases(device_name);
 
     const EXT4_FT_DIR: u16 = 2;
     const MAX_SCAN_DIRS: usize = 96;
@@ -932,7 +949,7 @@ fn mount_sdcard_if_present() {
     while index < dirs.len() && index < MAX_SCAN_DIRS {
         let dir = dirs[index].clone();
         index += 1;
-        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), &dir)
+        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), &dir)
         else {
             continue;
         };
@@ -954,7 +971,7 @@ fn mount_sdcard_if_present() {
     // Install each test script individually.
     for ext4_path in &test_scripts {
         let vfs_path = alloc::format!("/mnt/sdcard{}", ext4_path);
-        oscomp_sdcard_install_ext4_path(ext4_path, &vfs_path);
+        oscomp_sdcard_install_ext4_path(device_name, ext4_path, &vfs_path);
         if fs::stat(&vfs_path).is_ok() {
             installed_scripts.push(vfs_path.trim_start_matches('/').into());
         }
@@ -964,21 +981,91 @@ fn mount_sdcard_if_present() {
     // find ./busybox, ./lua, ./lmbench_all, ./iperf3 etc.
     // Must happen *after* /mnt/sdcard skeleton exists but *before*
     // any script runs.
-    oscomp_materialize_ext4_dir_flat("/glibc", "/mnt/sdcard/glibc", 512, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/lib", "/mnt/sdcard/glibc/lib", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/basic", "/mnt/sdcard/glibc/basic", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/lua", "/mnt/sdcard/glibc/lua", 128, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/ltp", "/mnt/sdcard/glibc/ltp", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/glibc/lmbench", "/mnt/sdcard/glibc/lmbench", 128, 0);
-    oscomp_materialize_ext4_dir_flat("/musl", "/mnt/sdcard/musl", 512, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/lib", "/mnt/sdcard/musl/lib", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/basic", "/mnt/sdcard/musl/basic", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/lua", "/mnt/sdcard/musl/lua", 128, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/ltp", "/mnt/sdcard/musl/ltp", 256, 0);
-    oscomp_materialize_ext4_dir_flat("/musl/lmbench", "/mnt/sdcard/musl/lmbench", 128, 0);
+    oscomp_materialize_ext4_dir_flat(device, device_name, "/glibc", "/mnt/sdcard/glibc", 512, 0);
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/glibc/lib",
+        "/mnt/sdcard/glibc/lib",
+        256,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/glibc/basic",
+        "/mnt/sdcard/glibc/basic",
+        256,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/glibc/lua",
+        "/mnt/sdcard/glibc/lua",
+        128,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/glibc/ltp",
+        "/mnt/sdcard/glibc/ltp",
+        256,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/glibc/lmbench",
+        "/mnt/sdcard/glibc/lmbench",
+        128,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(device, device_name, "/musl", "/mnt/sdcard/musl", 512, 0);
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/musl/lib",
+        "/mnt/sdcard/musl/lib",
+        256,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/musl/basic",
+        "/mnt/sdcard/musl/basic",
+        256,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/musl/lua",
+        "/mnt/sdcard/musl/lua",
+        128,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/musl/ltp",
+        "/mnt/sdcard/musl/ltp",
+        256,
+        0,
+    );
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        "/musl/lmbench",
+        "/mnt/sdcard/musl/lmbench",
+        128,
+        0,
+    );
 
     println!("sdcard:");
-    println!("  mount         : /dev/vda (ext4)");
+    println!("  mount         : /dev/{} (ext4)", device_name);
     println!("  mounted tree  : /mnt/sdcard (lazy file install)");
     println!("  root entries  : {}", root_entries.len());
     println!("  scanned dirs   : {}", dirs.len().min(MAX_SCAN_DIRS));
@@ -1002,9 +1089,10 @@ fn oscomp_sdcard_is_test_script(path: &str) -> bool {
         || (lower.ends_with(".sh") && lower.contains("test"))
 }
 
-fn oscomp_sdcard_install_ext4_path(ext4_path: &str, vfs_path: &str) {
+fn oscomp_sdcard_install_ext4_path(device_name: &str, ext4_path: &str, vfs_path: &str) {
     oscomp_sdcard_ensure_parent_dirs(vfs_path);
-    let _ = fs::install_ext4_path("/dev/vda", vfs_path, ext4_path);
+    let source = alloc::format!("/dev/{}", device_name);
+    let _ = fs::install_ext4_path(&source, vfs_path, ext4_path);
 }
 
 /// Install raw bytes as a VFS regular file (for vendor/userland binaries).
@@ -1023,22 +1111,19 @@ fn oscomp_sdcard_install_bytes(vfs_path: &str, data: &[u8]) {
 /// P1-E fix: also count files that already exist as "available", and log both
 /// counts separately so "0 newly installed" doesn't look like a regression.
 fn oscomp_materialize_ext4_dir_flat(
+    device: &alloc::sync::Arc<dyn crate::block::BlockDevice>,
+    device_name: &str,
     ext4_dir: &str,
     vfs_dir: &str,
     max_files: usize,
     recurse_levels: usize,
 ) -> usize {
-    let Some(device) = crate::block::open_device("vda") else {
-        crate::println!("sdcard: expand {} — no device", ext4_dir);
-        return 0;
-    };
-
     const EXT4_FT_DIR: u16 = 2;
-    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(&device), ext4_dir)
+    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), ext4_dir)
     else {
         // ext4_dir may be a regular file (e.g. /glibc/lua), not a directory.
         // Install it as a regular file instead of creating a false directory.
-        oscomp_sdcard_install_ext4_path(ext4_dir, vfs_dir);
+        oscomp_sdcard_install_ext4_path(device_name, ext4_dir, vfs_dir);
         if fs::stat(vfs_dir).is_ok() {
             crate::println!(
                 "sdcard: installed {} -> {} (regular file)",
@@ -1071,7 +1156,14 @@ fn oscomp_materialize_ext4_dir_flat(
             // Expand one more level so that rustlib/riscv64gc-.../
             // has lib/ populated with .rlib files visible to rustc.
             if recurse_levels > 0 {
-    oscomp_materialize_ext4_dir_flat(&ext4_child, &vfs_child, max_files, recurse_levels - 1);
+    oscomp_materialize_ext4_dir_flat(
+        device,
+        device_name,
+        &ext4_child,
+        &vfs_child,
+        max_files,
+        recurse_levels - 1,
+    );
 }
             continue;
         }
@@ -1081,7 +1173,7 @@ fn oscomp_materialize_ext4_dir_flat(
             continue;
         }
 
-        oscomp_sdcard_install_ext4_path(&ext4_child, &vfs_child);
+        oscomp_sdcard_install_ext4_path(device_name, &ext4_child, &vfs_child);
         if fs::stat(&vfs_child).is_ok() {
             newly_installed += 1;
         }
@@ -1108,6 +1200,15 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         return false;
     }
 
+    // No local contest storage: skip ext4 materialisation so exec/open can
+    // safely report ENOENT without touching a block device.
+    let Some(device) = crate::storage::contest_storage_device() else {
+        return false;
+    };
+    let Some(device_name) = crate::storage::contest_storage_name() else {
+        return false;
+    };
+
     let rel = match vfs_path.strip_prefix("/mnt/sdcard/") {
         Some(r) if !r.is_empty() => r,
         _ => return false,
@@ -1123,7 +1224,7 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
     for component in parent.split('/').filter(|component| !component.is_empty()) {
         let next_vfs = alloc::format!("{}/{}", vfs_dir, component);
         if crate::fs::stat(&next_vfs).is_err() {
-            oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 2);
+            oscomp_materialize_ext4_dir_flat(&device, &device_name, &ext4_dir, &vfs_dir, 4096, 2);
         }
         if crate::fs::stat(&next_vfs).is_err() {
             return false;
@@ -1138,14 +1239,14 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         vfs_dir = next_vfs;
     }
 
-    let count = oscomp_materialize_ext4_dir_flat(&ext4_dir, &vfs_dir, 4096, 2);
+    let count = oscomp_materialize_ext4_dir_flat(&device, &device_name, &ext4_dir, &vfs_dir, 4096, 2);
     count > 0
 }
 
 /// P1-A: install ELF dynamic linker (ld-linux / ld-musl) from their real
 /// ext4 source paths into the canonical /lib and /lib64 VFS paths that
 /// PT_INTERP encodes.
-fn oscomp_install_runtime_loader_aliases() {
+fn oscomp_install_runtime_loader_aliases(device_name: &str) {
     const ALIASES: &[(&str, &[&str])] = &[
         ("/glibc/lib/ld-linux-riscv64-lp64d.so.1", &[
             "/lib/ld-linux-riscv64-lp64d.so.1",
@@ -1205,7 +1306,7 @@ fn oscomp_install_runtime_loader_aliases() {
 
     for (src, dsts) in ALIASES {
         for dst in *dsts {
-            oscomp_sdcard_install_ext4_path(src, dst);
+            oscomp_sdcard_install_ext4_path(device_name, src, dst);
         }
     }
     crate::println!("sdcard: installed runtime loader aliases");
@@ -1214,7 +1315,7 @@ fn oscomp_install_runtime_loader_aliases() {
 /// P1-A: install common glibc/musl shared libraries from ext4 /glibc/lib
 /// and /musl/lib into /lib, /lib64, and /usr/lib so ld-linux can find
 /// them via openat.
-fn oscomp_install_runtime_lib_aliases() {
+fn oscomp_install_runtime_lib_aliases(device_name: &str) {
     const LIBS: &[&str] = &[
         "libc.so.6",
         "libpthread.so.0",
@@ -1242,18 +1343,18 @@ fn oscomp_install_runtime_lib_aliases() {
         let usr_dst = alloc::format!("/usr/lib/{}", name);
 
         // Prefer glibc; fall back to musl only if glibc source is absent.
-        oscomp_sdcard_install_ext4_path(&glibc_src, &lib_dst);
-        oscomp_sdcard_install_ext4_path(&glibc_src, &lib64_dst);
-        oscomp_sdcard_install_ext4_path(&glibc_src, &usr_dst);
+        oscomp_sdcard_install_ext4_path(device_name, &glibc_src, &lib_dst);
+        oscomp_sdcard_install_ext4_path(device_name, &glibc_src, &lib64_dst);
+        oscomp_sdcard_install_ext4_path(device_name, &glibc_src, &usr_dst);
 
         if fs::stat(&lib_dst).is_err() {
-            oscomp_sdcard_install_ext4_path(&musl_src, &lib_dst);
+            oscomp_sdcard_install_ext4_path(device_name, &musl_src, &lib_dst);
         }
         if fs::stat(&lib64_dst).is_err() {
-            oscomp_sdcard_install_ext4_path(&musl_src, &lib64_dst);
+            oscomp_sdcard_install_ext4_path(device_name, &musl_src, &lib64_dst);
         }
         if fs::stat(&usr_dst).is_err() {
-            oscomp_sdcard_install_ext4_path(&musl_src, &usr_dst);
+            oscomp_sdcard_install_ext4_path(device_name, &musl_src, &usr_dst);
         }
 
         if fs::stat(&lib_dst).is_ok() || fs::stat(&lib64_dst).is_ok() {

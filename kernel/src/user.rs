@@ -1082,7 +1082,7 @@ fn pid1_exit_monitor() {
 }
 
 pub fn verify_sdcard_sample() {
-    if crate::block::open_device("vda").is_none() {
+    if !crate::storage::contest_storage_mounted() {
         return;
     }
 
@@ -1090,9 +1090,8 @@ pub fn verify_sdcard_sample() {
 }
 
 fn verify_sdcard_sample_thread() {
-    let device = match crate::block::open_device("vda") {
-        Some(d) => d,
-        None => return,
+    let Some(device) = crate::storage::contest_storage_device() else {
+        return;
     };
     let sample_path = "/musl/busybox";
     let snapshot = match crate::ext4::load_path_snapshot(device, sample_path) {
@@ -2302,11 +2301,14 @@ fn oscomp_probe_only_prepare_path(path: &str) {
     }
     // No local sdcard: skip ext4 materialisation so preflight can safely
     // report NotReady without touching a block device.
-    if crate::block::open_device("vda").is_none() {
+    if !crate::storage::contest_storage_mounted() {
         let budget = OSCOMP_PROBE_ONLY_LOG_BUDGET.load(Ordering::Relaxed);
         if budget > 0 {
             OSCOMP_PROBE_ONLY_LOG_BUDGET.store(budget - 1, Ordering::Relaxed);
-            crate::println!("oscomp-probe-only: prepare skipped no-vda path={}", path,);
+            crate::println!(
+                "oscomp-probe-only: prepare skipped no-storage path={}",
+                path,
+            );
         }
         return;
     }
@@ -2444,7 +2446,7 @@ fn oscomp_probe_only_no_sdcard_selftest() {
 }
 
 pub fn verify_sdcard_all_scripts() -> bool {
-    if crate::block::open_device("vda").is_none() {
+    if !crate::storage::contest_storage_mounted() {
         crate::println!("oscomp: no sdcard, skip contest runner");
         oscomp_probe_only_no_sdcard_selftest();
         return false;
@@ -2456,7 +2458,7 @@ pub fn verify_sdcard_all_scripts() -> bool {
 }
 
 pub fn verify_final_cagent() -> bool {
-    if crate::block::open_device("vda").is_none() {
+    if !crate::storage::contest_storage_mounted() {
         crate::println!("sudoos-diag: final-cagent: no sdcard");
         return false;
     }
@@ -2473,7 +2475,7 @@ pub fn verify_final_cagent() -> bool {
 }
 
 pub fn verify_final_buildstorm() -> bool {
-    if crate::block::open_device("vda").is_none() {
+    if !crate::storage::contest_storage_mounted() {
         crate::println!("sudoos-diag: final-buildstorm: no sdcard");
         return false;
     }
@@ -2485,7 +2487,7 @@ pub fn verify_final_buildstorm() -> bool {
 }
 
 pub fn verify_final_buildstorm_diag() -> bool {
-    if crate::block::open_device("vda").is_none() {
+    if !crate::storage::contest_storage_mounted() {
         crate::println!("sudoos-diag: final-buildstorm-diag: no sdcard");
         return false;
     }
@@ -5559,9 +5561,8 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
     const EXT4_FT_REG_FILE: u16 = 1;
     const EXT4_FT_DIR: u16 = 2;
     const EXT4_FT_SYMLINK: u16 = 7;
-    let device = match crate::block::open_device("vda") {
-        Some(d) => d,
-        None => return,
+    let Some(device) = crate::storage::contest_storage_device() else {
+        return;
     };
     let entries = match crate::ext4::list_directory(device, ext4_dir) {
         Ok(e) => e,
