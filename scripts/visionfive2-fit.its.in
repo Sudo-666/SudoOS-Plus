@@ -78,6 +78,30 @@
             };
         };
 
+        fdt-contest-single {
+            description = "VF2 DTB (conf-contest-fixture-single)";
+            data = /incbin/("DTB_CONTEST_SINGLE");
+            type = "flat_dt";
+            arch = "riscv";
+            compression = "none";
+            load = <0x0 0x46000000>;
+            hash {
+                algo = "sha256";
+            };
+        };
+
+        fdt-contest-smp {
+            description = "VF2 DTB (conf-contest-fixture-smp)";
+            data = /incbin/("DTB_CONTEST_SMP");
+            type = "flat_dt";
+            arch = "riscv";
+            compression = "none";
+            load = <0x0 0x46000000>;
+            hash {
+                algo = "sha256";
+            };
+        };
+
         ramdisk {
             description = "BusyBox ramdisk (riscv64)";
             data = /incbin/("INITRAMFS");
@@ -113,6 +137,20 @@
             description = "Gate C/D: 4x U74 final configuration";
             kernel = "kernel";
             fdt = "fdt-smp";
+            ramdisk = "ramdisk";
+        };
+
+        conf-contest-fixture-single {
+            description = "Contest fixture, single-core (TF card mmcblk1)";
+            kernel = "kernel";
+            fdt = "fdt-contest-single";
+            ramdisk = "ramdisk";
+        };
+
+        conf-contest-fixture-smp {
+            description = "Contest fixture, 4x U74 (TF card mmcblk1)";
+            kernel = "kernel";
+            fdt = "fdt-contest-smp";
             ramdisk = "ramdisk";
         };
     };

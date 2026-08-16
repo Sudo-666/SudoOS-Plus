@@ -139,6 +139,22 @@ ls2k1000-contest-fixture-bundle: kernel-ls2k1000.uImage
 	    > ls2k1000-contest-fixture-boot.txt
 	@ls -lh kernel-ls2k1000.uImage ls2k1000-contest-fixture.dtb contest-la.ext4 ls2k1000-contest-fixture-boot.txt
 
+# C9: LS2K1000 contest-fixture boot configs (single / smp). The DTB carries
+# the boot-ramdisk reserved-memory node and fixture bootargs (ram0).
+.PHONY: ls2k1000-contest-fixture-configs
+ls2k1000-contest-fixture-configs: kernel-ls2k1000.uImage
+	@CONTEST_DISK=0xe0000000 CONTEST_DISK_SIZE=0x02000000 \
+	    BOOTARGS="console=ttyS0,115200n8 sudoos.oscomp=preliminary sudoos.contest.dev=ram0 sudoos.contest.fixture=1 sudoos.maxcpus=1" \
+	    DTB_NAME=ls2k1000-contest-fixture-single \
+	    scripts/build-ls2k1000-dtb.sh
+	@CONTEST_DISK=0xe0000000 CONTEST_DISK_SIZE=0x02000000 \
+	    BOOTARGS="console=ttyS0,115200n8 sudoos.oscomp=preliminary sudoos.contest.dev=ram0 sudoos.contest.fixture=1 sudoos.maxcpus=2" \
+	    DTB_NAME=ls2k1000-contest-fixture-smp \
+	    scripts/build-ls2k1000-dtb.sh
+	@cp build/host-tools/ls2k1000/ls2k1000-contest-fixture-single.dtb ls2k1000-contest-fixture-single.dtb
+	@cp build/host-tools/ls2k1000/ls2k1000-contest-fixture-smp.dtb ls2k1000-contest-fixture-smp.dtb
+	@echo "LS2K1000 contest fixture configs ready (single/smp)"
+
 # SUDOOS_LS2K_GATEB_V1: rdinit=/init variant of the stage-4 DTB. Same layout
 # and initrd placement as ls2k1000-stage4, but /chosen/bootargs carries
 # "rdinit=/init init.debug=1" so the kernel boots the real /init as PID 1
