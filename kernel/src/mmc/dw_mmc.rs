@@ -111,6 +111,37 @@ impl MmcCommand {
         self.read = read;
         self
     }
+
+    pub const fn with_init(mut self) -> Self {
+        self.init = true;
+        self
+    }
+}
+
+/// SD 卡协议层依赖的主机接口（由 `DwMmcController` 实现）。
+pub trait MmcHost: Send + Sync + 'static {
+    fn send_command(&mut self, command: MmcCommand) -> Result<MmcResponse, MmcError>;
+    fn read_block_data(&mut self, output: &mut [u8]) -> Result<(), MmcError>;
+    fn set_clock(&mut self, frequency_hz: u64) -> Result<(), MmcError>;
+    fn set_bus_width(&mut self, bus_width: u8) -> Result<(), MmcError>;
+}
+
+impl<I: MmcRegisterIo> MmcHost for DwMmcController<I> {
+    fn send_command(&mut self, command: MmcCommand) -> Result<MmcResponse, MmcError> {
+        DwMmcController::send_command(self, command)
+    }
+
+    fn read_block_data(&mut self, output: &mut [u8]) -> Result<(), MmcError> {
+        DwMmcController::read_block_data(self, output)
+    }
+
+    fn set_clock(&mut self, frequency_hz: u64) -> Result<(), MmcError> {
+        DwMmcController::set_clock(self, frequency_hz)
+    }
+
+    fn set_bus_width(&mut self, bus_width: u8) -> Result<(), MmcError> {
+        DwMmcController::set_bus_width(self, bus_width)
+    }
 }
 
 /// 控制器响应（RESP0-3）。
@@ -326,6 +357,12 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
 
     fn fifo_empty(&mut self) -> bool {
         self.io.read32(REG_STATUS) & STATUS_FIFO_EMPTY != 0
+    }
+
+    /// 测试用：返回底层 I/O 引用（mock 的命令轨迹）。
+    #[cfg(debug_assertions)]
+    pub fn io_ref(&self) -> &I {
+        &self.io
     }
 
     fn clear_interrupts(&mut self, bits: u32) {

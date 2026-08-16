@@ -40,6 +40,8 @@ pub struct MockRegisterIo {
     responses: Vec<u32>,
     response_index: usize,
     failure: Option<MockFailure>,
+    /// 仅作用于指定命令索引的故障（用后即清）。
+    one_shot_failure: Option<(MockFailure, u8)>,
     fifo_words: Vec<u32>,
     fifo_index: usize,
     /// 当前 RXDR 窗口已读字数（驱动分批模拟）。
@@ -57,6 +59,7 @@ impl MockRegisterIo {
             responses: Vec::new(),
             response_index: 0,
             failure: None,
+            one_shot_failure: None,
             fifo_words: Vec::new(),
             fifo_index: 0,
             batch_served: 0,
@@ -75,6 +78,12 @@ impl MockRegisterIo {
     /// 设置故障注入。
     pub fn with_failure(mut self, failure: MockFailure) -> Self {
         self.failure = Some(failure);
+        self
+    }
+
+    /// 设置只对指定命令索引生效一次故障注入（用后即清）。
+    pub fn with_failure_once(mut self, failure: MockFailure, command_index: u8) -> Self {
+        self.one_shot_failure = Some((failure, command_index));
         self
     }
 
@@ -178,7 +187,15 @@ impl MmcRegisterIo for MockRegisterIo {
                 self.regs[index] = value;
 
                 let rintsts = &mut self.regs[Self::index(REG_RINTSTS)];
-                match self.failure {
+                let command_index = (value & CMD_INDEX_MASK) as u8;
+                let active_failure = match self.one_shot_failure {
+                    Some((failure, index)) if index == command_index => {
+                        self.one_shot_failure = None;
+                        Some(failure)
+                    }
+                    _ => self.failure,
+                };
+                match active_failure {
                     Some(MockFailure::ResponseTimeout) => {
                         *rintsts |= INT_RESP_TIMEOUT;
                     }

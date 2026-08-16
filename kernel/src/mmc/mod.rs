@@ -7,8 +7,10 @@
 //!
 //! VisionFive 2 上 `mmc0` 是板载 eMMC、`mmc1` 是 TF 卡槽。
 
+pub mod block;
 pub mod dw_mmc;
 pub mod registers;
+pub mod sd;
 
 #[cfg(debug_assertions)]
 mod mock;
@@ -67,7 +69,50 @@ pub fn removable_host() -> Option<myos_fdt::MmcHostConfig> {
         .copied()
 }
 
+/// 初始化可移除主机的 SD 卡并注册 `/dev/mmcblk1`（无卡/失败不 panic）。
+///
+/// 在 `fs::initialize()` 之前调用，使块设备在 devfs 建立时可见。仅当设备
+/// 树发现可移除主机（VisionFive 2 的 `mmc1` TF 槽）时执行。
+pub fn initialize_storage() {
+    let Some(host) = removable_host() else {
+        return;
+    };
+    crate::println!(
+        "mmc: probing removable host mmc{} base={:#018x}",
+        host.alias_index().unwrap_or(u8::MAX),
+        host.base(),
+    );
+    // SAFETY: host.base 来自设备树校验过的 MMIO 区域，内核生命周期内有效。
+    let io = unsafe { dw_mmc::MmioRegisterIo::new(host.base()) };
+    let ciu = host.ciu_frequency_hz().unwrap_or(25_000_000);
+    let mut controller = dw_mmc::DwMmcController::new(io, ciu);
+    match controller.reset() {
+        Ok(()) => {}
+        Err(error) => {
+            crate::println!("mmc: controller reset failed ({error:?}) — no card");
+            return;
+        }
+    }
+    controller.disable_interrupts();
+    if let Err(error) = controller.set_clock(400_000) {
+        crate::println!("mmc: init clock setup failed ({error:?}) — no card");
+        return;
+    }
+    let info = match sd::initialize_card(&mut controller) {
+        Ok(info) => info,
+        Err(error) => {
+            crate::println!("mmc: no SD card on removable host ({error:?})");
+            return;
+        }
+    };
+    match block::register_mmcblk1(controller, info) {
+        Ok(()) => crate::println!("mmc: registered=/dev/mmcblk1"),
+        Err(error) => crate::println!("mmc: register mmcblk1 failed ({error:?})"),
+    }
+}
+
 #[cfg(debug_assertions)]
 pub fn verify() {
     dw_mmc::verify();
+    sd::verify();
 }

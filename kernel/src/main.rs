@@ -473,6 +473,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     rtc::initialize();
     fault::initialize();
     register_boot_ramdisks(&boot_ramdisks);
+    mmc::initialize_storage();
     fs::initialize();
     mount_proc();
     mount_sys();
