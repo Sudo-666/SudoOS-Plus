@@ -63,6 +63,12 @@ pub trait BlockDevice: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Whether the device rejects writes (e.g. a firmware-loaded ramdisk or a
+    /// read-only partition). Writable devices return `false` (the default).
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     fn flush(&self) -> Result<(), BlockError> {
         Ok(())
     }
@@ -501,6 +507,10 @@ impl BlockDevice for MemoryBlockDevice {
         let range = self.byte_range(block)?;
         self.data.lock()[range].copy_from_slice(input);
         Ok(())
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.read_only
     }
 }
 

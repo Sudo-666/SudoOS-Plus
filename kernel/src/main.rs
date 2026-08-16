@@ -28,6 +28,7 @@ mod net;
 mod oscomp;
 mod page_alloc;
 mod panic;
+mod partition;
 mod pipe;
 mod process;
 mod procfs;
@@ -473,6 +474,8 @@ fn kernel_main(boot: BootInfo) -> ! {
     block::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     storage::verify();
+    #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
+    partition::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     virtio::verify();
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
