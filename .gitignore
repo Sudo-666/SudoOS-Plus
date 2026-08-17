@@ -43,6 +43,8 @@ core
 /ls2k1000-contest-final-all.dtb
 /ls2k1000-contest-final-all.img
 /ls2k1000-contest-final-all-boot.txt
+/ls2k1000-contest-final-all-single.dtb
+/ls2k1000-contest-final-all-smp.dtb
 /busybox-loongarch64.cpio
 /uImage.fit
 /uImage-*
