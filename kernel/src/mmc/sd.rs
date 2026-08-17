@@ -133,11 +133,8 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
     }
 
     // CMD9：CSD → 容量。
-    let csd_response = host.send_command(MmcCommand::new(
-        SD_CMD9,
-        rca << 16,
-        MmcResponseType::R2,
-    ))?;
+    let csd_response =
+        host.send_command(MmcCommand::new(SD_CMD9, rca << 16, MmcResponseType::R2))?;
     let csd = csd_response.card_data();
     let (block_count, block_size) = parse_csd(&csd, is_sdhc)?;
     if block_count == 0 {
@@ -145,29 +142,18 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
     }
 
     // CMD7：选中该卡（R1b，响应后等 busy 清才能发 CMD55/ACMD51）。
-    host.send_command(MmcCommand::new(
-        SD_CMD7,
-        rca << 16,
-        MmcResponseType::R1b,
-    ))?;
+    host.send_command(MmcCommand::new(SD_CMD7, rca << 16, MmcResponseType::R1b))?;
 
     // CMD16：仅 SDSC 需要设置块长。
     if !is_sdhc {
-        host.send_command(MmcCommand::new(
-            SD_CMD16,
-            SD_BLOCK_LEN,
-            MmcResponseType::R1,
-        ))?;
+        host.send_command(MmcCommand::new(SD_CMD16, SD_BLOCK_LEN, MmcResponseType::R1))?;
     }
 
     // ACMD51：SCR（8 字节）→ 总线宽度支持。
     host.send_command(MmcCommand::new(SD_CMD55, rca << 16, MmcResponseType::R1))?;
-    host.send_command(MmcCommand::new(
-        SD_ACMD51,
-        0,
-        MmcResponseType::R1,
-    )
-    .with_data_length(true, 8))?;
+    host.send_command(
+        MmcCommand::new(SD_ACMD51, 0, MmcResponseType::R1).with_data_length(true, 8),
+    )?;
     let mut scr = [0_u8; 8];
     host.read_block_data(&mut scr)?;
 
@@ -187,11 +173,7 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
     }
 
     // CMD13：状态确认。
-    host.send_command(MmcCommand::new(
-        SD_CMD13,
-        rca << 16,
-        MmcResponseType::R1,
-    ))?;
+    host.send_command(MmcCommand::new(SD_CMD13, rca << 16, MmcResponseType::R1))?;
 
     // 切工作时钟。
     host.set_clock(25_000_000)?;
@@ -233,7 +215,11 @@ pub fn parse_csd(csd: &[u8; 16], is_sdhc: bool) -> Result<(u64, u64), MmcError> 
             .checked_shl(read_bl_len as u32)
             .ok_or(MmcError::InvalidArgument)?;
         let multiplier = 1_u64
-            .checked_shl(c_size_mult.checked_add(2).ok_or(MmcError::InvalidArgument)? as u32)
+            .checked_shl(
+                c_size_mult
+                    .checked_add(2)
+                    .ok_or(MmcError::InvalidArgument)? as u32,
+            )
             .ok_or(MmcError::InvalidArgument)?;
         let byte_capacity = c_size
             .checked_add(1)
@@ -290,10 +276,30 @@ pub fn verify() {
         0x10,
     ];
     responses.extend([
-        u32::from_be_bytes([cid_payload[12], cid_payload[13], cid_payload[14], cid_payload[15]]),
-        u32::from_be_bytes([cid_payload[8], cid_payload[9], cid_payload[10], cid_payload[11]]),
-        u32::from_be_bytes([cid_payload[4], cid_payload[5], cid_payload[6], cid_payload[7]]),
-        u32::from_be_bytes([cid_payload[0], cid_payload[1], cid_payload[2], cid_payload[3]]),
+        u32::from_be_bytes([
+            cid_payload[12],
+            cid_payload[13],
+            cid_payload[14],
+            cid_payload[15],
+        ]),
+        u32::from_be_bytes([
+            cid_payload[8],
+            cid_payload[9],
+            cid_payload[10],
+            cid_payload[11],
+        ]),
+        u32::from_be_bytes([
+            cid_payload[4],
+            cid_payload[5],
+            cid_payload[6],
+            cid_payload[7],
+        ]),
+        u32::from_be_bytes([
+            cid_payload[0],
+            cid_payload[1],
+            cid_payload[2],
+            cid_payload[3],
+        ]),
     ]); // CMD2 CID
     responses.extend([0x1234_0000, 0, 0, 0]); // CMD3 RCA 0x1234
     responses.extend(csd_v2_words(0x12345)); // CMD9 CSD v2, C_SIZE=0x12345
@@ -359,7 +365,10 @@ pub fn verify() {
     responses.extend([0, 0, 0, 0]); // CMD3 RCA=0 → invalid
     let mock = MockRegisterIo::new().with_responses(responses);
     let mut controller = DwMmcController::new(mock, 25_000_000, 32);
-    assert_eq!(initialize_card(&mut controller), Err(MmcError::InvalidArgument));
+    assert_eq!(
+        initialize_card(&mut controller),
+        Err(MmcError::InvalidArgument)
+    );
 
     // 4) CSD 容量：全零（0 块）被拒；最大合法值不溢出且正确。
     assert_eq!(
@@ -399,8 +408,16 @@ pub fn verify() {
     controller
         .send_command(MmcCommand::new(SD_CMD17, 5, MmcResponseType::R1).with_data_length(true, 512))
         .expect("CMD17");
-    let cmd17 = controller.io_ref().commands.iter().find(|c| c.index == SD_CMD17);
-    assert_eq!(cmd17.expect("CMD17 sent").argument, 5, "SDHC CMD17 must use the block number");
+    let cmd17 = controller
+        .io_ref()
+        .commands
+        .iter()
+        .find(|c| c.index == SD_CMD17);
+    assert_eq!(
+        cmd17.expect("CMD17 sent").argument,
+        5,
+        "SDHC CMD17 must use the block number"
+    );
     assert_eq!(cmd17.expect("CMD17 trace").data_length, Some(512));
     assert!(cmd17.expect("CMD17 trace").cmd_start);
     assert!(info.is_sdhc);
@@ -430,7 +447,10 @@ pub fn verify() {
     // sd_block_address 负责，见 block.rs verify）。
     let byte_address = 7 * 512;
     controller
-        .send_command(MmcCommand::new(SD_CMD17, byte_address, MmcResponseType::R1).with_data_length(true, 512))
+        .send_command(
+            MmcCommand::new(SD_CMD17, byte_address, MmcResponseType::R1)
+                .with_data_length(true, 512),
+        )
         .expect("CMD17");
     let cmd17 = controller
         .io_ref()

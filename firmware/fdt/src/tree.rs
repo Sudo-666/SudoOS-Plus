@@ -978,31 +978,28 @@ mod tests {
 
     #[test]
     fn cpu_available_filters_disabled_and_fail() {
-        let fdt = build_fdt(
-            &[],
-            &[
-                CpuNode {
-                    name: "cpu@0",
-                    id: 0,
-                    status: Some("okay"),
-                },
-                CpuNode {
-                    name: "cpu@1",
-                    id: 1,
-                    status: Some("disabled"),
-                },
-                CpuNode {
-                    name: "cpu@2",
-                    id: 2,
-                    status: Some("fail"),
-                },
-                CpuNode {
-                    name: "cpu@3",
-                    id: 3,
-                    status: None,
-                },
-            ],
-        );
+        let fdt = build_fdt(&[], &[
+            CpuNode {
+                name: "cpu@0",
+                id: 0,
+                status: Some("okay"),
+            },
+            CpuNode {
+                name: "cpu@1",
+                id: 1,
+                status: Some("disabled"),
+            },
+            CpuNode {
+                name: "cpu@2",
+                id: 2,
+                status: Some("fail"),
+            },
+            CpuNode {
+                name: "cpu@3",
+                id: 3,
+                status: None,
+            },
+        ]);
 
         // all: 保留 disabled(1),排除 fail(2)。
         assert_eq!(collect_cpu_ids(&fdt, false), Vec::from([0, 1, 3]));
@@ -1012,14 +1009,11 @@ mod tests {
 
     #[test]
     fn cpu_available_treats_no_status_as_available() {
-        let fdt = build_fdt(
-            &[],
-            &[CpuNode {
-                name: "cpu@7",
-                id: 7,
-                status: None,
-            }],
-        );
+        let fdt = build_fdt(&[], &[CpuNode {
+            name: "cpu@7",
+            id: 7,
+            status: None,
+        }]);
 
         assert_eq!(collect_cpu_ids(&fdt, true), Vec::from([7]));
     }

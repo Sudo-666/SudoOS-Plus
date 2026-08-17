@@ -264,7 +264,11 @@ pub fn contest_source_path() -> Option<String> {
 /// 读取设备头部 ext4 超级块魔数（偏移 1024 + 56）。
 fn device_is_ext4(device: &Arc<dyn BlockDevice>) -> Result<bool, StorageError> {
     let mut magic = [0_u8; 2];
-    let read = block::read_at(device, EXT4_SUPER_OFFSET + EXT4_SUPER_MAGIC_OFFSET, &mut magic)?;
+    let read = block::read_at(
+        device,
+        EXT4_SUPER_OFFSET + EXT4_SUPER_MAGIC_OFFSET,
+        &mut magic,
+    )?;
     if read != magic.len() {
         return Ok(false);
     }
@@ -293,9 +297,10 @@ pub fn verify() {
 
     // 2) 指定存在设备（ext4）。
     let ext4 = make_ext4_device();
-    let candidates = vec![
-        (String::from("contest-ext4"), Arc::clone(&ext4) as Arc<dyn BlockDevice>),
-    ];
+    let candidates = vec![(
+        String::from("contest-ext4"),
+        Arc::clone(&ext4) as Arc<dyn BlockDevice>,
+    )];
     let selected = select_from_candidates(
         &ContestStorageConfig {
             device_name: Some(String::from("contest-ext4")),
@@ -319,8 +324,14 @@ pub fn verify() {
     // 4) 自动扫描：第一个 ext4 设备。
     let not_ext4 = Arc::new(MemoryBlockDevice::new(512, 16).expect("non-ext4 fixture"));
     let scanned_candidates = vec![
-        (String::from("disk-blank"), not_ext4.clone() as Arc<dyn BlockDevice>),
-        (String::from("contest-ext4"), Arc::clone(&ext4) as Arc<dyn BlockDevice>),
+        (
+            String::from("disk-blank"),
+            not_ext4.clone() as Arc<dyn BlockDevice>,
+        ),
+        (
+            String::from("contest-ext4"),
+            Arc::clone(&ext4) as Arc<dyn BlockDevice>,
+        ),
     ];
     let scanned = select_from_candidates(&ContestStorageConfig::default(), &scanned_candidates)
         .expect("auto-scan should succeed")
@@ -329,7 +340,10 @@ pub fn verify() {
 
     // 5) 注册表重复设备名必须被拒绝。
     let contest_reg = Arc::clone(&ext4) as Arc<dyn BlockDevice>;
-    assert_eq!(block::register_device("contest-reg", contest_reg.clone()), Ok(()));
+    assert_eq!(
+        block::register_device("contest-reg", contest_reg.clone()),
+        Ok(())
+    );
     assert_eq!(
         block::register_device("contest-reg", contest_reg),
         Err(BlockError::InvalidArgument),

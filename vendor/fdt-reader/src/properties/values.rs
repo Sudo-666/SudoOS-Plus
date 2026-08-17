@@ -97,7 +97,7 @@ impl<'a> U32List<'a> {
 
 impl<'a> PropertyValue<'a> for U32List<'a> {
     fn parse(value: &'a [u8]) -> Result<Self, InvalidPropertyValue> {
-        if (value.len() % 4 != 0) {
+        if value.len() % 4 != 0 {
             return Err(InvalidPropertyValue);
         }
 

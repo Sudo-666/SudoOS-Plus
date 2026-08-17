@@ -45,7 +45,11 @@ fn report_final_image_contract() {
         crate::println!(
             "  {} = {}",
             path,
-            if path_exists(path) { "present" } else { "missing" },
+            if path_exists(path) {
+                "present"
+            } else {
+                "missing"
+            },
         );
     }
 

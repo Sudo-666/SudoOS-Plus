@@ -10,8 +10,8 @@ mod qemu_virt;
 
 #[cfg(feature = "platform-qemu-virt")]
 pub(crate) use qemu_virt::{
-    boot_context, console_line_status, hardware_cpu_is_supported, reserve_early_memory,
-    try_read_console_byte, write_console_byte, HAS_CONSOLE_RX,
+    HAS_CONSOLE_RX, boot_context, console_line_status, hardware_cpu_is_supported,
+    reserve_early_memory, try_read_console_byte, write_console_byte,
 };
 
 #[cfg(feature = "platform-visionfive2")]
@@ -19,8 +19,8 @@ mod visionfive2;
 
 #[cfg(feature = "platform-visionfive2")]
 pub(crate) use visionfive2::{
-    boot_context, console_line_status, hardware_cpu_is_supported, reserve_early_memory,
-    try_read_console_byte, write_console_byte, HAS_CONSOLE_RX,
+    HAS_CONSOLE_RX, boot_context, console_line_status, hardware_cpu_is_supported,
+    reserve_early_memory, try_read_console_byte, write_console_byte,
 };
 
 // 防止漏选平台

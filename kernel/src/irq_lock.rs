@@ -36,7 +36,11 @@ impl<T> IrqSpinLock<T> {
     /// Caller must prove that this is the single-CPU boot publication window:
     /// interrupts are not delivering allocator users and no secondary CPU can
     /// observe the protected value. Runtime paths must use lock().
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_mut_unchecked(&self) -> &mut T {
+        // SAFETY: this method inherits SpinLock::get_mut_unchecked's contract;
+        // the caller guarantees the single-CPU boot-time exclusive-access
+        // window described above.
         unsafe { self.inner.get_mut_unchecked() }
     }
 

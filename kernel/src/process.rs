@@ -8,9 +8,7 @@
 //! IDs, so the ownership graph cannot form a strong-reference cycle.
 
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{
-    AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering,
-};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{VirtAddr, VirtRange};
 
@@ -42,8 +40,7 @@ const PROCESS_REGISTRY_LOCK: LockClass = LockClass::new("process.registry", Lock
 // Process metadata shown by /proc/<pid>/comm|cmdline.  Read/updated only from
 // exec (no Vfs lock held) and the procfs snapshot path (which also runs with no
 // Vfs lock held), so it sits at the tail of the Process rank.
-const PROCESS_METADATA_LOCK: LockClass =
-    LockClass::new("process.metadata", LockRank::Process, 6);
+const PROCESS_METADATA_LOCK: LockClass = LockClass::new("process.metadata", LockRank::Process, 6);
 
 /// Length of the `/proc/<pid>/comm` name, matching Linux `TASK_COMM_LEN`
 /// (15 displayable bytes + a terminating NUL).
@@ -734,7 +731,10 @@ impl Process {
         let mut cmdline = alloc::vec::Vec::new();
         cmdline
             .try_reserve(
-                argv.iter().map(|arg| arg.len() + 1).sum::<usize>().min(4096),
+                argv.iter()
+                    .map(|arg| arg.len() + 1)
+                    .sum::<usize>()
+                    .min(4096),
             )
             .ok();
         for arg in argv {

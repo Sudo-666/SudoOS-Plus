@@ -1,5 +1,9 @@
 // SUDOOS_NEWTEST_P0_ABI_HOTFIX_V2: uname release is Linux-compatible for contest libc startup.
-use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 
 use myos_mm::{FaultAccess, PAGE_SIZE, VirtAddr, VirtRange, VmArea, VmAreaFlags, VmAreaKind};
@@ -269,11 +273,7 @@ struct PosixRecordLock {
 static POSIX_RECORD_LOCKS: crate::irq_lock::IrqSpinLock<Vec<PosixRecordLock>> =
     crate::irq_lock::IrqSpinLock::new_with_class(
         Vec::new(),
-        crate::lockdep::LockClass::new(
-            "fcntl.record.locks",
-            crate::lockdep::LockRank::Vfs,
-            93,
-        ),
+        crate::lockdep::LockClass::new("fcntl.record.locks", crate::lockdep::LockRank::Vfs, 93),
     );
 static POSIX_RECORD_LOCK_WAIT: crate::task::WaitQueue = crate::task::WaitQueue::new();
 
@@ -345,10 +345,8 @@ static BUILDSTORM_LATE_SNAPSHOT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BUILDSTORM_SAFE_UNKNOWN_BUDGET: AtomicUsize = AtomicUsize::new(0);
 static BUILDSTORM_SAFE_UNKNOWN_COUNT: AtomicUsize = AtomicUsize::new(0);
 static BUILDSTORM_FCNTL_TRACE_BUDGET: AtomicUsize = AtomicUsize::new(0);
-static BUILDSTORM_SYSCALL_COUNTS: [AtomicU64; 512] =
-    [const { AtomicU64::new(0) }; 512];
-static BUILDSTORM_FUTEX_OP_COUNTS: [AtomicU64; 16] =
-    [const { AtomicU64::new(0) }; 16];
+static BUILDSTORM_SYSCALL_COUNTS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+static BUILDSTORM_FUTEX_OP_COUNTS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static BUILDSTORM_FUTEX_WAIT_MISMATCH: AtomicU64 = AtomicU64::new(0);
 static BUILDSTORM_FUTEX_WAIT_TIMED: AtomicU64 = AtomicU64::new(0);
 static BUILDSTORM_FUTEX_WAIT_BLOCKED: AtomicU64 = AtomicU64::new(0);
@@ -497,30 +495,22 @@ impl LoongArchSignalExtendedState {
     fn capture() -> Self {
         let mut state = Self::default();
         unsafe {
-            __sudoos_loongarch_save_signal_extended_state(
-                core::ptr::addr_of_mut!(state),
-            );
+            __sudoos_loongarch_save_signal_extended_state(core::ptr::addr_of_mut!(state));
         }
         state
     }
 
     fn restore(&self) {
         unsafe {
-            __sudoos_loongarch_restore_signal_extended_state(
-                core::ptr::addr_of!(*self),
-            );
+            __sudoos_loongarch_restore_signal_extended_state(core::ptr::addr_of!(*self));
         }
     }
 }
 
 #[cfg(target_arch = "loongarch64")]
 unsafe extern "C" {
-    fn __sudoos_loongarch_save_signal_extended_state(
-        output: *mut LoongArchSignalExtendedState,
-    );
-    fn __sudoos_loongarch_restore_signal_extended_state(
-        input: *const LoongArchSignalExtendedState,
-    );
+    fn __sudoos_loongarch_save_signal_extended_state(output: *mut LoongArchSignalExtendedState);
+    fn __sudoos_loongarch_restore_signal_extended_state(input: *const LoongArchSignalExtendedState);
 }
 
 #[cfg(target_arch = "loongarch64")]
@@ -1011,11 +1001,7 @@ fn verify_busybox_rootfs_thread() {
 static PID1_EXIT_MONITOR: crate::irq_lock::IrqSpinLock<Option<Arc<Thread>>> =
     crate::irq_lock::IrqSpinLock::new_with_class(
         None,
-        crate::lockdep::LockClass::new(
-            "init.pid1",
-            crate::lockdep::LockRank::Process,
-            4,
-        ),
+        crate::lockdep::LockClass::new("init.pid1", crate::lockdep::LockRank::Process, 4),
     );
 
 /// Boot the real `/init` from the unpacked rootfs as PID 1.
@@ -1042,17 +1028,18 @@ pub fn init_supervisor(init_path: &str) -> ! {
         VmAreaFlags::user_rw(),
         VmAreaKind::Anonymous,
     )];
-    let exec = crate::exec::kernel_execve_from_vfs(
-        init_path,
-        crate::exec::ExecConfig {
-            argv: &[init_path],
-            envp: &["PATH=/bin:/sbin:/usr/bin:/usr/sbin", "HOME=/root", "TERM=vt100"],
-            stack: VirtRange::from_bounds(RUNTIME_STACK, RUNTIME_STACK_TOP),
-            heap_start: VirtAddr::new(USER_HEAP_START),
-            heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
-            extra_areas: &extra_areas,
-        },
-    )
+    let exec = crate::exec::kernel_execve_from_vfs(init_path, crate::exec::ExecConfig {
+        argv: &[init_path],
+        envp: &[
+            "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+            "HOME=/root",
+            "TERM=vt100",
+        ],
+        stack: VirtRange::from_bounds(RUNTIME_STACK, RUNTIME_STACK_TOP),
+        heap_start: VirtAddr::new(USER_HEAP_START),
+        heap_limit: VirtAddr::new(USER_HEAP_LIMIT),
+        extra_areas: &extra_areas,
+    })
     .unwrap_or_else(|error| {
         panic!("INIT: exec failed path={init_path} reason={:?}", error);
     });
@@ -2537,17 +2524,16 @@ pub fn verify_task_lifecycle_stress() -> bool {
     LIFECYCLE_STRESS_PASSED.load(Ordering::Acquire)
 }
 
-fn lifecycle_stress_invariants(
-    label: &str,
-    baseline: crate::task::TaskLifecycleSnapshot,
-) -> bool {
+fn lifecycle_stress_invariants(label: &str, baseline: crate::task::TaskLifecycleSnapshot) -> bool {
     crate::task::synchronize_user_task_reclamation();
     let current = crate::task::task_lifecycle_snapshot();
     let spawned = current.tasks_spawned.saturating_sub(baseline.tasks_spawned);
     let visible = current
         .tasks_exit_visible
         .saturating_sub(baseline.tasks_exit_visible);
-    let joins_begin = current.join_wait_begin.saturating_sub(baseline.join_wait_begin);
+    let joins_begin = current
+        .join_wait_begin
+        .saturating_sub(baseline.join_wait_begin);
     let joins_end = current.join_wait_end.saturating_sub(baseline.join_wait_end);
     let clean = spawned == visible
         && joins_begin == joins_end
@@ -2655,96 +2641,68 @@ fn verify_task_lifecycle_stress_thread() {
     LIFECYCLE_STRESS_ACTIVE.store(true, Ordering::Release);
     crate::task::spawn_kernel_thread(lifecycle_stress_watchdog);
 
-    let t1 = lifecycle_stress_repeat(
-        "T1-sequential-10000",
-        10_000,
-        "/bin/true",
-        &["true"],
-    );
-    let t2 = t1
-        && lifecycle_stress_repeat(
-            "T2-shell-2000",
-            2_000,
-            "/bin/sh",
-            &["sh", "-c", "exit 0"],
-        );
+    let t1 = lifecycle_stress_repeat("T1-sequential-10000", 10_000, "/bin/true", &["true"]);
+    let t2 =
+        t1 && lifecycle_stress_repeat("T2-shell-2000", 2_000, "/bin/sh", &["sh", "-c", "exit 0"]);
     let t3 = t2
-        && lifecycle_stress_repeat(
-            "T3-pipe-2000",
-            2_000,
-            "/bin/sh",
-            &["sh", "-c", "echo x | cat >/dev/null"],
-        );
+        && lifecycle_stress_repeat("T3-pipe-2000", 2_000, "/bin/sh", &[
+            "sh",
+            "-c",
+            "echo x | cat >/dev/null",
+        ]);
     // Concurrency ladder: the last PASS identifies the first unsafe width.
     let t4a = t3
-        && lifecycle_stress_repeat(
-            "T4a-concurrent-8x8",
-            8,
-            "/bin/sh",
-            &["sh", "-c", "j=0; while test $j -lt 8; do /bin/true & j=$((j+1)); done; wait"],
-        );
+        && lifecycle_stress_repeat("T4a-concurrent-8x8", 8, "/bin/sh", &[
+            "sh",
+            "-c",
+            "j=0; while test $j -lt 8; do /bin/true & j=$((j+1)); done; wait",
+        ]);
     let t4b = t4a
-        && lifecycle_stress_repeat(
-            "T4b-concurrent-16x8",
-            8,
-            "/bin/sh",
-            &["sh", "-c", "j=0; while test $j -lt 16; do /bin/true & j=$((j+1)); done; wait"],
-        );
+        && lifecycle_stress_repeat("T4b-concurrent-16x8", 8, "/bin/sh", &[
+            "sh",
+            "-c",
+            "j=0; while test $j -lt 16; do /bin/true & j=$((j+1)); done; wait",
+        ]);
     let t4c = t4b
-        && lifecycle_stress_repeat(
-            "T4c-concurrent-32x8",
-            8,
-            "/bin/sh",
-            &["sh", "-c", "j=0; while test $j -lt 32; do /bin/true & j=$((j+1)); done; wait"],
-        );
+        && lifecycle_stress_repeat("T4c-concurrent-32x8", 8, "/bin/sh", &[
+            "sh",
+            "-c",
+            "j=0; while test $j -lt 32; do /bin/true & j=$((j+1)); done; wait",
+        ]);
     let t4d = t4c
-        && lifecycle_stress_repeat(
-            "T4d-concurrent-48x8",
-            8,
-            "/bin/sh",
-            &["sh", "-c", "j=0; while test $j -lt 48; do /bin/true & j=$((j+1)); done; wait"],
-        );
+        && lifecycle_stress_repeat("T4d-concurrent-48x8", 8, "/bin/sh", &[
+            "sh",
+            "-c",
+            "j=0; while test $j -lt 48; do /bin/true & j=$((j+1)); done; wait",
+        ]);
     let t4 = t4d
-        && lifecycle_stress_repeat(
-            "T4-concurrent-64x200",
-            200,
-            "/bin/sh",
-            &["sh", "-c", "j=0; while test $j -lt 64; do /bin/true & j=$((j+1)); done; wait"],
+        && lifecycle_stress_repeat("T4-concurrent-64x200", 200, "/bin/sh", &[
+            "sh",
+            "-c",
+            "j=0; while test $j -lt 64; do /bin/true & j=$((j+1)); done; wait",
+        ]);
+    let t5 = t4
+        && lifecycle_stress_shell(
+            "T5-signals",
+            "set +e; /bin/sleep 30 & p=$!; /bin/kill -TERM $p; wait $p; r=$?; test $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill -KILL $p; wait $p; r=$?; test $r -eq 137 || exit 1; /bin/timeout 1 /bin/sleep 30; r=$?; test $r -eq 124 -o $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill $p; wait $p; r=$?; test $r -eq 143",
         );
-let t5 = t4 && lifecycle_stress_shell(
-        "T5-signals",
-        "set +e; /bin/sleep 30 & p=$!; /bin/kill -TERM $p; wait $p; r=$?; test $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill -KILL $p; wait $p; r=$?; test $r -eq 137 || exit 1; /bin/timeout 1 /bin/sleep 30; r=$?; test $r -eq 124 -o $r -eq 143 || exit 1; /bin/sleep 30 & p=$!; /bin/kill $p; wait $p; r=$?; test $r -eq 143",
-    );
     // BusyBox's foreground/background wait path exercises clone, child-tid
     // publication, wait wakeups and group exit without depending on Cargo.
     let t6 = t5
-        && lifecycle_stress_repeat(
-            "T6-clone-futex-group-exit",
-            2_000,
-            "/bin/sh",
-            &["sh", "-c", "/bin/true & p=$!; wait $p"],
-        );
+        && lifecycle_stress_repeat("T6-clone-futex-group-exit", 2_000, "/bin/sh", &[
+            "sh",
+            "-c",
+            "/bin/true & p=$!; wait $p",
+        ]);
 
     // Repeat a same-boot steady-state workload. This distinguishes bounded
     // allocator/cache high-water retention from a per-process lifecycle leak.
     crate::task::synchronize_user_task_reclamation();
     let steady_before = crate::page_alloc::total_free_pages().unwrap_or(0);
-    let t7 = t6
-        && lifecycle_stress_repeat(
-            "T7-steady-warmup-1000",
-            1_000,
-            "/bin/true",
-            &["true"],
-        );
+    let t7 = t6 && lifecycle_stress_repeat("T7-steady-warmup-1000", 1_000, "/bin/true", &["true"]);
     crate::task::synchronize_user_task_reclamation();
     let steady_mid = crate::page_alloc::total_free_pages().unwrap_or(0);
-    let t8 = t7
-        && lifecycle_stress_repeat(
-            "T8-steady-check-1000",
-            1_000,
-            "/bin/true",
-            &["true"],
-        );
+    let t8 = t7 && lifecycle_stress_repeat("T8-steady-check-1000", 1_000, "/bin/true", &["true"]);
     crate::task::synchronize_user_task_reclamation();
     let steady_after = crate::page_alloc::total_free_pages().unwrap_or(0);
     let steady_loss = steady_mid.saturating_sub(steady_after);
@@ -2784,16 +2742,16 @@ fn final_buildstorm_lifecycle_watchdog() {
         if !OSCOMP_LIFECYCLE_TRACE.load(Ordering::Acquire) {
             return;
         }
-        crate::println!(
-            "sudoos-diag: lifecycle watchdog fired after {}s",
-            elapsed,
-        );
+        crate::println!("sudoos-diag: lifecycle watchdog fired after {}s", elapsed,);
         crate::task::print_task_debug_dump();
     }
 }
 
 fn final_buildstorm_safe_watchdog_dump(label: &str, reset: bool) {
-    crate::println!("buildstorm-watchdog: syscall-histogram begin label={}", label);
+    crate::println!(
+        "buildstorm-watchdog: syscall-histogram begin label={}",
+        label
+    );
     for (number, count) in BUILDSTORM_SYSCALL_COUNTS.iter().enumerate() {
         let value = if reset {
             count.swap(0, Ordering::AcqRel)
@@ -3234,12 +3192,7 @@ echo "SUDOOS_BUILDSTORM_BOOTSTRAP_V5 rc=0 xtask=$xtask bytes=$(wc -c < "$xtask")
 exit 0
 "###;
 
-    match run_rootfs_program_with_cwd(
-        "/bin/sh",
-        &["sh", "-c", bootstrap],
-        environment,
-        Some("/"),
-    ) {
+    match run_rootfs_program_with_cwd("/bin/sh", &["sh", "-c", bootstrap], environment, Some("/")) {
         Ok(code) => crate::println!(
             "sudoos-diag: final-buildstorm: xtask tmpfs bootstrap exit={}",
             code,
@@ -3295,12 +3248,7 @@ rm -rf /tmp/sudoos-buildstorm-bin /tmp/sudoos-xtask-target \
 exit 0
 "###
     };
-    let _ = run_rootfs_program_with_cwd(
-        "/bin/sh",
-        &["sh", "-c", command],
-        environment,
-        Some("/"),
-    );
+    let _ = run_rootfs_program_with_cwd("/bin/sh", &["sh", "-c", command], environment, Some("/"));
 }
 
 /// 已挂载竞赛存储的 `/dev/<name>` 源路径；回退 `/dev/vda` 以兼容现有 QEMU
@@ -3416,9 +3364,7 @@ fn verify_final_buildstorm_thread(run_diagnostic: bool) {
             }
         }
 
-        crate::println!(
-            "sudoos-diag: final-buildstorm: repeat/xtask diagnostic begin"
-        );
+        crate::println!("sudoos-diag: final-buildstorm: repeat/xtask diagnostic begin");
 
         // BUILDSTORM_MINIBUILD_CAPTURE_DIAG_V1
         // Reproduce the evaluator's three minibuild operations separately so
@@ -3548,10 +3494,7 @@ exit 0
 
         match diagnostic_result {
             Ok(code) => {
-                crate::println!(
-                    "sudoos-diag: final-buildstorm: diagnostic exit={}",
-                    code
-                )
+                crate::println!("sudoos-diag: final-buildstorm: diagnostic exit={}", code)
             }
             Err(error) => crate::println!(
                 "sudoos-diag: final-buildstorm: diagnostic exec failed: {:?}",
@@ -3623,12 +3566,7 @@ exit 0
     // SUDOOS_BUILDSTORM_XTASK_TMPFS_V3: prepare/reuse the real xtask in tmpfs.
     prepare_buildstorm_xtask_bootstrap(&environment);
     let buildstorm_result =
-        run_rootfs_program_with_cwd(
-            "/bin/sh",
-            &["sh", script],
-            &environment,
-            Some("/"),
-        );
+        run_rootfs_program_with_cwd("/bin/sh", &["sh", script], &environment, Some("/"));
     // 脚本返回即停 watchdog（防止其后续误触发）。
     OSCOMP_ACTIVE.store(false, Ordering::Release);
     BUILDSTORM_SAFE_ACTIVE.store(false, Ordering::Release);
@@ -3897,10 +3835,7 @@ fn verify_final_cagent_thread() {
                     signal,
                 );
             } else {
-                crate::println!(
-                    "sudoos-diag: final-cagent: official script exit={}",
-                    code,
-                );
+                crate::println!("sudoos-diag: final-cagent: official script exit={}", code,);
             }
             OSCOMP_FAIL.store(1, Ordering::Release);
             crate::oscomp::report_contest_result(
@@ -4397,8 +4332,7 @@ fn verify_sdcard_all_scripts_thread() {
         let skipped = OSCOMP_SKIPPED.load(Ordering::Acquire);
         let timed_out = OSCOMP_TIMEOUT.load(Ordering::Acquire);
         // K2.1: 只有全部脚本通过（无失败/超时/信号/跳过）才打印 pass。
-        let verdict = if failed == 0 && timed_out == 0 && sig11 == 0 && sig14 == 0 && skipped == 0
-        {
+        let verdict = if failed == 0 && timed_out == 0 && sig11 == 0 && sig14 == 0 && skipped == 0 {
             crate::oscomp::ContestVerdict::Passed
         } else {
             crate::oscomp::ContestVerdict::Failed
@@ -6117,9 +6051,7 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
     }
     let number = syscall_number(frame);
     let arguments = syscall_arguments(frame);
-    if BUILDSTORM_DIAGNOSTICS
-        && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed)
-    {
+    if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
         if let Some(count) = BUILDSTORM_SYSCALL_COUNTS.get(number) {
             count.fetch_add(1, Ordering::Relaxed);
         }
@@ -6381,28 +6313,17 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
                 arguments[4],
             ),
         ),
-        SYS_FCHOWN => set_syscall_result(
-            frame,
-            sys_fchown(arguments[0], arguments[1], arguments[2]),
-        ),
+        SYS_FCHOWN => {
+            set_syscall_result(frame, sys_fchown(arguments[0], arguments[1], arguments[2]))
+        }
         SYS_FTRUNCATE => set_syscall_result(frame, sys_ftruncate(arguments[0], arguments[1])),
         SYS_FALLOCATE => set_syscall_result(
             frame,
-            sys_fallocate(
-                arguments[0],
-                arguments[1],
-                arguments[2],
-                arguments[3],
-            ),
+            sys_fallocate(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
         SYS_FADVISE64 => set_syscall_result(
             frame,
-            sys_fadvise64(
-                arguments[0],
-                arguments[1],
-                arguments[2],
-                arguments[3],
-            ),
+            sys_fadvise64(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
         SYS_READAHEAD => set_syscall_result(
             frame,
@@ -6410,17 +6331,9 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         ),
         SYS_SYNC_FILE_RANGE => set_syscall_result(
             frame,
-            sys_sync_file_range(
-                arguments[0],
-                arguments[1],
-                arguments[2],
-                arguments[3],
-            ),
+            sys_sync_file_range(arguments[0], arguments[1], arguments[2], arguments[3]),
         ),
-        SYS_GETCPU => set_syscall_result(
-            frame,
-            sys_getcpu(arguments[0], arguments[1]),
-        ),
+        SYS_GETCPU => set_syscall_result(frame, sys_getcpu(arguments[0], arguments[1])),
         SYS_MEMBARRIER => set_syscall_result(
             frame,
             sys_membarrier(arguments[0], arguments[1], arguments[2]),
@@ -6787,19 +6700,17 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
         }
         _ => {
             static UNKNOWN_SYSCALL_PRINTS: AtomicUsize = AtomicUsize::new(0);
-            let buildstorm_safe_active = BUILDSTORM_DIAGNOSTICS
-                && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed);
+            let buildstorm_safe_active =
+                BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed);
             if buildstorm_safe_active {
                 BUILDSTORM_SAFE_UNKNOWN_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             let buildstorm_safe_trace = buildstorm_safe_active
                 && number != 258
                 && BUILDSTORM_SAFE_UNKNOWN_BUDGET
-                    .fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |value| value.checked_sub(1),
-                    )
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        value.checked_sub(1)
+                    })
                     .is_ok();
             if (oscomp_verbose_user_trace_active()
                 && UNKNOWN_SYSCALL_PRINTS.fetch_add(1, Ordering::Relaxed) < 128)
@@ -6825,8 +6736,8 @@ pub fn handle_syscall(frame: &mut crate::arch::trap::TrapFrame) {
 }
 
 pub(crate) fn handle_forced_exit(frame: &mut crate::arch::trap::TrapFrame) -> bool {
-    let Some(status) = crate::task::current_user_thread()
-        .and_then(|thread| thread.forced_exit_status())
+    let Some(status) =
+        crate::task::current_user_thread().and_then(|thread| thread.forced_exit_status())
     else {
         return false;
     };
@@ -6934,18 +6845,40 @@ pub fn handle_fault(
                     #[cfg(target_arch = "riscv64")]
                     crate::println!(
                         "sigsegv-rv-regs: ra={:#x} gp={:#x} tp={:#x} t0={:#x} t1={:#x} t2={:#x} s0={:#x} s1={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} a5={:#x} a6={:#x} a7={:#x}",
-                        frame.gpr[1], frame.gpr[3], frame.gpr[4], frame.gpr[5],
-                        frame.gpr[6], frame.gpr[7], frame.gpr[8], frame.gpr[9],
-                        frame.gpr[10], frame.gpr[11], frame.gpr[12], frame.gpr[13],
-                        frame.gpr[14], frame.gpr[15], frame.gpr[16], frame.gpr[17],
+                        frame.gpr[1],
+                        frame.gpr[3],
+                        frame.gpr[4],
+                        frame.gpr[5],
+                        frame.gpr[6],
+                        frame.gpr[7],
+                        frame.gpr[8],
+                        frame.gpr[9],
+                        frame.gpr[10],
+                        frame.gpr[11],
+                        frame.gpr[12],
+                        frame.gpr[13],
+                        frame.gpr[14],
+                        frame.gpr[15],
+                        frame.gpr[16],
+                        frame.gpr[17],
                     );
                     #[cfg(target_arch = "riscv64")]
                     crate::println!(
                         "sigsegv-rv-regs: s2={:#x} s3={:#x} s4={:#x} s5={:#x} s6={:#x} s7={:#x} s8={:#x} s9={:#x} s10={:#x} s11={:#x} t3={:#x} t4={:#x} t5={:#x} t6={:#x}",
-                        frame.gpr[18], frame.gpr[19], frame.gpr[20], frame.gpr[21],
-                        frame.gpr[22], frame.gpr[23], frame.gpr[24], frame.gpr[25],
-                        frame.gpr[26], frame.gpr[27], frame.gpr[28], frame.gpr[29],
-                        frame.gpr[30], frame.gpr[31],
+                        frame.gpr[18],
+                        frame.gpr[19],
+                        frame.gpr[20],
+                        frame.gpr[21],
+                        frame.gpr[22],
+                        frame.gpr[23],
+                        frame.gpr[24],
+                        frame.gpr[25],
+                        frame.gpr[26],
+                        frame.gpr[27],
+                        frame.gpr[28],
+                        frame.gpr[29],
+                        frame.gpr[30],
+                        frame.gpr[31],
                     );
                 } else if print_idx == 8 {
                     crate::println!("sigsegv: ... further faults suppressed");
@@ -7079,14 +7012,37 @@ pub fn handle_exception(frame: &mut crate::arch::trap::TrapFrame, _code: usize) 
             frame.badv,
             frame.badi,
             frame.prmd,
-            frame.gpr[1], frame.gpr[2], frame.gpr[3], frame.gpr[4],
-            frame.gpr[5], frame.gpr[6], frame.gpr[7], frame.gpr[8],
-            frame.gpr[9], frame.gpr[10], frame.gpr[11], frame.gpr[12],
-            frame.gpr[13], frame.gpr[14], frame.gpr[15], frame.gpr[16],
-            frame.gpr[17], frame.gpr[18], frame.gpr[19], frame.gpr[20],
-            frame.gpr[21], frame.gpr[22], frame.gpr[23], frame.gpr[24],
-            frame.gpr[25], frame.gpr[26], frame.gpr[27], frame.gpr[28],
-            frame.gpr[29], frame.gpr[30], frame.gpr[31],
+            frame.gpr[1],
+            frame.gpr[2],
+            frame.gpr[3],
+            frame.gpr[4],
+            frame.gpr[5],
+            frame.gpr[6],
+            frame.gpr[7],
+            frame.gpr[8],
+            frame.gpr[9],
+            frame.gpr[10],
+            frame.gpr[11],
+            frame.gpr[12],
+            frame.gpr[13],
+            frame.gpr[14],
+            frame.gpr[15],
+            frame.gpr[16],
+            frame.gpr[17],
+            frame.gpr[18],
+            frame.gpr[19],
+            frame.gpr[20],
+            frame.gpr[21],
+            frame.gpr[22],
+            frame.gpr[23],
+            frame.gpr[24],
+            frame.gpr[25],
+            frame.gpr[26],
+            frame.gpr[27],
+            frame.gpr[28],
+            frame.gpr[29],
+            frame.gpr[30],
+            frame.gpr[31],
         );
     }
     // SUDOOS_FINAL_DIRECT_FIX_V1: bounded telemetry from the real LoongArch trap frame.
@@ -7189,8 +7145,7 @@ fn fetch_faulting_insn(frame: &crate::arch::trap::TrapFrame) -> Result<u32, AleE
         return Ok(frame.badi as u32);
     }
     let mut insn_bytes = [0u8; 4];
-    copy_from_user(frame.era, &mut insn_bytes)
-        .map_err(|_| AleEmulationError::InstructionFetch)?;
+    copy_from_user(frame.era, &mut insn_bytes).map_err(|_| AleEmulationError::InstructionFetch)?;
     Ok(u32::from_le_bytes(insn_bytes))
 }
 
@@ -7642,24 +7597,21 @@ fn sys_mremap(
     let old_rounded = old_range.size();
 
     if !fixed && new_rounded == old_rounded {
-        mremap_success_trace("unchanged", old_address, old_rounded, new_rounded, old_address);
+        mremap_success_trace(
+            "unchanged",
+            old_address,
+            old_rounded,
+            new_rounded,
+            old_address,
+        );
         return old_address as isize;
     }
 
     if !fixed && new_rounded < old_rounded {
-        let tail = VirtRange::from_bounds(
-            old_address + new_rounded,
-            old_address + old_rounded,
-        );
+        let tail = VirtRange::from_bounds(old_address + new_rounded, old_address + old_rounded);
         return match mm.unmap_range(tail) {
             Ok(()) => {
-                mremap_success_trace(
-                    "shrink",
-                    old_address,
-                    old_rounded,
-                    new_rounded,
-                    old_address,
-                );
+                mremap_success_trace("shrink", old_address, old_rounded, new_rounded, old_address);
                 old_address as isize
             }
             Err(_) => -ENOMEM,
@@ -7675,7 +7627,13 @@ fn sys_mremap(
     };
     let growth = VirtRange::from_bounds(old_address + old_rounded, grown_end);
     if !fixed && mm.map_anonymous_exact(growth, area.flags()).is_ok() {
-        mremap_success_trace("grow-in-place", old_address, old_rounded, new_rounded, old_address);
+        mremap_success_trace(
+            "grow-in-place",
+            old_address,
+            old_rounded,
+            new_rounded,
+            old_address,
+        );
         return old_address as isize;
     }
 
@@ -7718,10 +7676,8 @@ fn sys_mremap(
         Ok(address) => address,
         Err(_) => return -ENOMEM,
     };
-    let destination_range = VirtRange::from_bounds(
-        destination.get(),
-        destination.get() + new_rounded,
-    );
+    let destination_range =
+        VirtRange::from_bounds(destination.get(), destination.get() + new_rounded);
 
     let copy_length = old_rounded.min(new_rounded);
     let buffer_size = copy_length.min(MAX_BULK_IO_COPY);
@@ -7786,8 +7742,7 @@ fn mremap_success_trace(
     new_size: usize,
     result: usize,
 ) {
-    if oscomp_verbose_user_trace_active()
-        && MREMAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
+    if oscomp_verbose_user_trace_active() && MREMAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 16
     {
         crate::println!(
             "mremap: ok mode={} old={:#x}+{:#x} new={:#x} result={:#x}",
@@ -7963,8 +7918,7 @@ fn sys_madvise(address: usize, length: usize, advice: usize) -> isize {
     }
     if address & (PAGE_SIZE - 1) != 0
         || address.checked_add(length).is_none()
-        || !crate::arch::memory::layout::USER_RANGE
-            .contains(VirtAddr::new(address))
+        || !crate::arch::memory::layout::USER_RANGE.contains(VirtAddr::new(address))
     {
         return -EINVAL;
     }
@@ -8594,7 +8548,9 @@ fn sys_clone_canonical(
             Ok(child) => child,
             Err(error) => {
                 if BUILDSTORM_DIAGNOSTICS && BUILDSTORM_SAFE_ACTIVE.load(Ordering::Relaxed) {
-                    crate::println!("buildstorm-clone-enomem: phase=shared-process error={error:?}");
+                    crate::println!(
+                        "buildstorm-clone-enomem: phase=shared-process error={error:?}"
+                    );
                 }
                 return -ENOMEM;
             }
@@ -8870,22 +8826,14 @@ fn sys_execve(frame: &mut crate::arch::trap::TrapFrame, arguments: [usize; 6]) -
     let argv = match copy_user_string_array(arguments[1], MAX_EXEC_ARGS, Some(&raw_path)) {
         Ok(values) => values,
         Err(errno) => {
-            crate::println!(
-                "execve-fail: phase=argv-copy path={} errno={}",
-                path,
-                errno,
-            );
+            crate::println!("execve-fail: phase=argv-copy path={} errno={}", path, errno,);
             return errno;
         }
     };
     let envp = match copy_user_string_array(arguments[2], MAX_EXEC_ENVS, None) {
         Ok(values) => values,
         Err(errno) => {
-            crate::println!(
-                "execve-fail: phase=envp-copy path={} errno={}",
-                path,
-                errno,
-            );
+            crate::println!("execve-fail: phase=envp-copy path={} errno={}", path, errno,);
             return errno;
         }
     };
@@ -9211,8 +9159,8 @@ fn read_exec_image_file(file: myos_vfs::ArcFile) -> Result<Vec<u8>, isize> {
     if stat.size < 0 {
         return Err(myos_vfs::Errno::Einval.to_isize());
     }
-    let file_size = usize::try_from(stat.size)
-        .map_err(|_| myos_vfs::Errno::Eoverflow.to_isize())?;
+    let file_size =
+        usize::try_from(stat.size).map_err(|_| myos_vfs::Errno::Eoverflow.to_isize())?;
 
     let read_length = if file_size <= MAX_EXEC_IMAGE {
         file_size
@@ -9224,7 +9172,10 @@ fn read_exec_image_file(file: myos_vfs::ArcFile) -> Result<Vec<u8>, isize> {
         // irrelevant to exec and must not force a multi-hundred-MiB read.
         let mut header = [0_u8; crate::elf::ELF_HEADER_LEN];
         let mut header_output = myos_vfs::MutableIoBuffer::new(&mut header);
-        if file.read_at(0, &mut header_output).map_err(|e| e.to_isize())? != header.len()
+        if file
+            .read_at(0, &mut header_output)
+            .map_err(|e| e.to_isize())?
+            != header.len()
             || header.get(..4) != Some(b"\x7fELF")
             || header[4] != 2
             || header[5] != 1
@@ -9236,7 +9187,9 @@ fn read_exec_image_file(file: myos_vfs::ArcFile) -> Result<Vec<u8>, isize> {
         };
         let read_u64 = |offset: usize| -> Result<usize, isize> {
             usize::try_from(u64::from_le_bytes(
-                header[offset..offset + 8].try_into().expect("ELF64 header field"),
+                header[offset..offset + 8]
+                    .try_into()
+                    .expect("ELF64 header field"),
             ))
             .map_err(|_| myos_vfs::Errno::Eoverflow.to_isize())
         };
@@ -9318,7 +9271,6 @@ fn read_exec_image_file(file: myos_vfs::ArcFile) -> Result<Vec<u8>, isize> {
 }
 
 fn load_exec_image(path: &str) -> Result<Vec<u8>, isize> {
-
     match crate::fs::open(path, myos_vfs::OpenFlags::O_RDONLY) {
         Ok(file) => return read_exec_image_file(file),
         Err(myos_vfs::Errno::Enoent) if path == "/init" || path == EXEC_PROBE_PATH => {}
@@ -9606,14 +9558,11 @@ fn sys_rt_sigaction(arguments: [usize; 6]) -> isize {
         #[cfg(target_arch = "riscv64")]
         let result = copy_plain_to_user(old_action, &action);
         #[cfg(target_arch = "loongarch64")]
-        let result = copy_plain_to_user(
-            old_action,
-            &LoongArchUserSigAction {
-                handler: action.handler,
-                flags: action.flags,
-                mask: action.mask,
-            },
-        );
+        let result = copy_plain_to_user(old_action, &LoongArchUserSigAction {
+            handler: action.handler,
+            flags: action.flags,
+            mask: action.mask,
+        });
         if result != 0 {
             return result;
         }
@@ -9783,10 +9732,9 @@ fn sys_rt_sigsuspend(mask_address: usize, sigsetsize: usize) -> isize {
     // Sleep atomically with the pending-state recheck.  Returning EINTR
     // without an actual signal turns timeout(1)'s wait4/sigsuspend loop into
     // a multi-million-syscall busy spin and starves the compiler.
-    let _ = crate::task::block_current_on_if_from_user_trap(
-        process.signals().wait_queue(),
-        || process.signals().pending() & !temp_mask == 0,
-    );
+    let _ = crate::task::block_current_on_if_from_user_trap(process.signals().wait_queue(), || {
+        process.signals().pending() & !temp_mask == 0
+    });
 
     // Restore old mask before returning.
     thread.set_blocked_signals(old_mask);
@@ -10091,9 +10039,11 @@ fn sys_wait4(pid: usize, status_address: usize, options: usize, rusage_address: 
                 // iteration before any EINTR, so a signal never steals a
                 // child's exit status. EINTR only fires while children are
                 // still running and none is reaped yet.
-                match process.child_wait_queue().wait_interruptible_from_user_trap(|| {
-                    process.has_zombie_child(requested) || !process.has_child(requested)
-                }) {
+                match process
+                    .child_wait_queue()
+                    .wait_interruptible_from_user_trap(|| {
+                        process.has_zombie_child(requested) || !process.has_child(requested)
+                    }) {
                     crate::task::InterruptibleWaitOutcome::Ready => {}
                     crate::task::InterruptibleWaitOutcome::Interrupted => {
                         return -(crate::syscall::errno::EINTR);
@@ -10497,8 +10447,8 @@ fn sys_epoll_pwait(
             if ready == max_events {
                 break;
             }
-            let requested_bits = registration.events
-                & (EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP);
+            let requested_bits =
+                registration.events & (EPOLLIN | EPOLLPRI | EPOLLOUT | EPOLLERR | EPOLLHUP);
             let requested = myos_vfs::PollEvents::from_bits(requested_bits as u16)
                 .union(myos_vfs::PollEvents::ERR)
                 .union(myos_vfs::PollEvents::HUP);
@@ -10545,16 +10495,15 @@ fn sys_epoll_pwait(
             return ready as isize;
         }
         if timeout.is_some_and(|duration| duration.is_zero())
-            || deadline.is_some_and(|deadline| {
-                crate::time::deadline_reached(crate::time::now(), deadline)
-            })
-            || compatibility_rescan.is_some_and(|deadline| {
-                crate::time::deadline_reached(crate::time::now(), deadline)
-            })
+            || deadline
+                .is_some_and(|deadline| crate::time::deadline_reached(crate::time::now(), deadline))
+            || compatibility_rescan
+                .is_some_and(|deadline| crate::time::deadline_reached(crate::time::now(), deadline))
         {
             return 0;
         }
-        let thread = crate::task::current_user_thread().expect("epoll_pwait without current Thread");
+        let thread =
+            crate::task::current_user_thread().expect("epoll_pwait without current Thread");
         if thread.process().signals().pending() & !thread.blocked_signals() != 0 {
             return -(crate::syscall::errno::EINTR);
         }
@@ -11153,14 +11102,10 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
     let Some(first) = read_usize(head) else {
         return;
     };
-    let Some(futex_offset) =
-        read_isize(head.saturating_add(core::mem::size_of::<usize>()))
-    else {
+    let Some(futex_offset) = read_isize(head.saturating_add(core::mem::size_of::<usize>())) else {
         return;
     };
-    let pending =
-        read_usize(head.saturating_add(2 * core::mem::size_of::<usize>()))
-            .unwrap_or(0);
+    let pending = read_usize(head.saturating_add(2 * core::mem::size_of::<usize>())).unwrap_or(0);
 
     let mut pending_wakes: usize = 0;
     let mut wake_addrs = [0_usize; MAX_ROBUST_NODES];
@@ -11185,10 +11130,7 @@ pub(crate) fn cleanup_robust_list_on_exit(thread: &crate::process::Thread) {
         }
 
         let dead = (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
-        if mm
-            .copy_to_user(futex_address, &dead.to_ne_bytes())
-            .is_ok()
-        {
+        if mm.copy_to_user(futex_address, &dead.to_ne_bytes()).is_ok() {
             if pending_wakes < MAX_ROBUST_NODES {
                 wake_addrs[pending_wakes] = futex_address;
                 pending_wakes += 1;
@@ -12165,9 +12107,8 @@ fn sys_ppoll(fds_address: usize, nfds: usize, timeout_address: usize) -> isize {
             break ready;
         }
         if timeout.is_some_and(|duration| duration.is_zero())
-            || deadline.is_some_and(|deadline| {
-                crate::time::deadline_reached(crate::time::now(), deadline)
-            })
+            || deadline
+                .is_some_and(|deadline| crate::time::deadline_reached(crate::time::now(), deadline))
         {
             break 0;
         }
@@ -12378,22 +12319,16 @@ fn fcntl_normalize_range(
         }
         _ => return Err(-EINVAL),
     };
-    let anchor = base
-        .checked_add(i128::from(lock.l_start))
-        .ok_or(-EINVAL)?;
+    let anchor = base.checked_add(i128::from(lock.l_start)).ok_or(-EINVAL)?;
 
     let (start, end) = if lock.l_len > 0 {
         (
             anchor,
-            anchor
-                .checked_add(i128::from(lock.l_len))
-                .ok_or(-EINVAL)?,
+            anchor.checked_add(i128::from(lock.l_len)).ok_or(-EINVAL)?,
         )
     } else if lock.l_len < 0 {
         (
-            anchor
-                .checked_add(i128::from(lock.l_len))
-                .ok_or(-EINVAL)?,
+            anchor.checked_add(i128::from(lock.l_len)).ok_or(-EINVAL)?,
             anchor,
         )
     } else {
@@ -12419,12 +12354,7 @@ fn fcntl_lock_conflicts(existing: &PosixRecordLock, requested: &PosixRecordLock)
     existing.dev == requested.dev
         && existing.ino == requested.ino
         && existing.owner_pid != requested.owner_pid
-        && fcntl_ranges_overlap(
-            existing.start,
-            existing.end,
-            requested.start,
-            requested.end,
-        )
+        && fcntl_ranges_overlap(existing.start, existing.end, requested.start, requested.end)
         && (existing.lock_type == F_WRLCK || requested.lock_type == F_WRLCK)
 }
 
@@ -12452,12 +12382,8 @@ fn fcntl_apply_lock(requested: PosixRecordLock) -> bool {
         let same_owner_file = existing.owner_pid == requested.owner_pid
             && existing.dev == requested.dev
             && existing.ino == requested.ino;
-        let overlaps = fcntl_ranges_overlap(
-            existing.start,
-            existing.end,
-            requested.start,
-            requested.end,
-        );
+        let overlaps =
+            fcntl_ranges_overlap(existing.start, existing.end, requested.start, requested.end);
         if !same_owner_file || !overlaps {
             locks.push(existing);
             continue;
@@ -12486,9 +12412,7 @@ fn fcntl_apply_lock(requested: PosixRecordLock) -> bool {
 fn fcntl_release_process_file_locks(owner_pid: usize, dev: u64, ino: u64) {
     let mut locks = POSIX_RECORD_LOCKS.lock();
     let before = locks.len();
-    locks.retain(|lock| {
-        !(lock.owner_pid == owner_pid && lock.dev == dev && lock.ino == ino)
-    });
+    locks.retain(|lock| !(lock.owner_pid == owner_pid && lock.dev == dev && lock.ino == ino));
     let changed = locks.len() != before;
     drop(locks);
     if changed {
@@ -12811,7 +12735,10 @@ fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
             Some(chunk_offset) => chunk_offset,
             None => return if total > 0 { total as isize } else { -EINVAL },
         };
-        match file.write_at(chunk_offset as u64, &myos_vfs::IoBuffer::new(&data[..chunk])) {
+        match file.write_at(
+            chunk_offset as u64,
+            &myos_vfs::IoBuffer::new(&data[..chunk]),
+        ) {
             Ok(0) => break,
             Ok(written) => {
                 total += written;
@@ -12830,15 +12757,9 @@ fn sys_pwrite64(fd: usize, buf: usize, count: usize, offset: usize) -> isize {
     total as isize
 }
 
-
 // BUILDSTORM_SAFE_ABI_V15
 
-fn sys_fallocate(
-    fd: usize,
-    mode: usize,
-    offset: usize,
-    length: usize,
-) -> isize {
+fn sys_fallocate(fd: usize, mode: usize, offset: usize, length: usize) -> isize {
     const FALLOC_FL_KEEP_SIZE: usize = 0x01;
 
     if mode & !FALLOC_FL_KEEP_SIZE != 0 {
@@ -12872,12 +12793,7 @@ fn sys_fallocate(
     }
 }
 
-fn sys_fadvise64(
-    fd: usize,
-    _offset: usize,
-    _length: usize,
-    advice: usize,
-) -> isize {
+fn sys_fadvise64(fd: usize, _offset: usize, _length: usize, advice: usize) -> isize {
     if advice > 5 {
         return -EINVAL;
     }
@@ -12894,12 +12810,7 @@ fn sys_readahead(fd: usize, _offset: usize, _count: usize) -> isize {
     }
 }
 
-fn sys_sync_file_range(
-    fd: usize,
-    _offset: usize,
-    _length: usize,
-    flags: usize,
-) -> isize {
+fn sys_sync_file_range(fd: usize, _offset: usize, _length: usize, flags: usize) -> isize {
     const ALLOWED: usize = 1 | 2 | 4;
 
     if flags & !ALLOWED != 0 {
@@ -13015,8 +12926,7 @@ fn sys_copy_file_range(
             None => return if total == 0 { -EINVAL } else { total as isize },
         };
 
-        let mut read_buffer =
-            myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
+        let mut read_buffer = myos_vfs::MutableIoBuffer::new(&mut buffer[..chunk]);
         let read = match input.read_at(input_offset, &mut read_buffer) {
             Ok(0) => break,
             Ok(read) => read,
@@ -13025,7 +12935,7 @@ fn sys_copy_file_range(
                     errno.to_isize()
                 } else {
                     total as isize
-                }
+                };
             }
         };
 
@@ -13033,9 +12943,7 @@ fn sys_copy_file_range(
         while written < read {
             let count = match output.write_at(
                 output_offset + written as u64,
-                &myos_vfs::IoBuffer::new(
-                    &read_buffer.filled_bytes()[written..read],
-                ),
+                &myos_vfs::IoBuffer::new(&read_buffer.filled_bytes()[written..read]),
             ) {
                 Ok(0) => break,
                 Ok(count) => count,
@@ -13044,7 +12952,7 @@ fn sys_copy_file_range(
                         errno.to_isize()
                     } else {
                         (total + written) as isize
-                    }
+                    };
                 }
             };
             written += count;

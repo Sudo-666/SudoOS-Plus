@@ -1662,9 +1662,7 @@ impl Scheduler {
             self.retired_tasks
                 .iter()
                 .filter(|task| matches!(task.kind, TaskKind::UserThread))
-                .all(|task| {
-                    task.state == TaskState::Exited && task.exit_visible.is_none()
-                }),
+                .all(|task| { task.state == TaskState::Exited && task.exit_visible.is_none() }),
             "M9-B retained a non-retired user task in the reaper queue",
         );
         for (index, cpu) in self.cpus.iter().take(self.discovered_cpus).enumerate() {
@@ -1726,9 +1724,7 @@ pub(crate) struct TaskLifecycleSnapshot {
 pub(crate) fn task_lifecycle_snapshot() -> TaskLifecycleSnapshot {
     let (live_user_threads, live_kernel_threads) = {
         let slot = SCHEDULER.lock();
-        let scheduler = slot
-            .as_ref()
-            .expect("kernel scheduler is not initialized");
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
         (scheduler.live_user_threads, scheduler.live_kernel_threads)
     };
     TaskLifecycleSnapshot {
@@ -1793,9 +1789,7 @@ pub(crate) fn print_lifecycle_stress_progress(label: &str, iteration: usize) {
 pub(crate) fn print_task_debug_dump() {
     let (tasks, cpus) = {
         let slot = SCHEDULER.lock();
-        let scheduler = slot
-            .as_ref()
-            .expect("kernel scheduler is not initialized");
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
         let tasks = scheduler
             .tasks
             .iter()
@@ -1807,9 +1801,9 @@ pub(crate) fn print_task_debug_dump() {
                     task.state,
                     task.wait_channel,
                     task.queued_on,
-                    task.user_thread.as_ref().map(|thread| {
-                        (thread.process().id().get(), thread.id().get())
-                    }),
+                    task.user_thread
+                        .as_ref()
+                        .map(|thread| (thread.process().id().get(), thread.id().get())),
                 )
             })
             .collect::<Vec<_>>();
@@ -2372,10 +2366,7 @@ pub(crate) fn spawn_user_thread_on(
     if target != crate::smp::current_cpu_id() {
         crate::smp::send_ipi(target);
     }
-    UserTaskHandle {
-        id,
-        exit_visible,
-    }
+    UserTaskHandle { id, exit_visible }
 }
 
 pub(crate) fn spawn_user_thread_from_user_trap(
@@ -2390,22 +2381,12 @@ pub(crate) fn spawn_user_thread_from_user_trap(
         let mut slot = SCHEDULER.lock();
         slot.as_mut()
             .expect("kernel scheduler is not initialized")
-            .spawn_user(
-                thread,
-                Arc::clone(&exit_visible),
-                None,
-                stack,
-                None,
-                None,
-            )
+            .spawn_user(thread, Arc::clone(&exit_visible), None, stack, None, None)
     };
     if target != current {
         crate::smp::send_ipi(target);
     }
-    UserTaskHandle {
-        id,
-        exit_visible,
-    }
+    UserTaskHandle { id, exit_visible }
 }
 
 pub(crate) fn current_user_thread() -> Option<Arc<crate::process::Thread>> {
@@ -2833,9 +2814,7 @@ fn exit_current() -> ! {
             }
         }
         owner.unwrap_or_else(|| {
-            panic!(
-                "exiting task stack has no scheduler owner: sp={running_sp:#x}",
-            )
+            panic!("exiting task stack has no scheduler owner: sp={running_sp:#x}",)
         })
     };
     // Always repair tp — it may have been corrupted by a stale anchor.
@@ -3393,8 +3372,8 @@ fn worker_15() {
 const WORKER_TABLE_SIZE: usize = 16;
 #[cfg(debug_assertions)]
 const WORKER_ENTRIES: [KernelThreadEntry; WORKER_TABLE_SIZE] = [
-    worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7,
-    worker_8, worker_9, worker_10, worker_11, worker_12, worker_13, worker_14, worker_15,
+    worker_0, worker_1, worker_2, worker_3, worker_4, worker_5, worker_6, worker_7, worker_8,
+    worker_9, worker_10, worker_11, worker_12, worker_13, worker_14, worker_15,
 ];
 
 #[cfg(debug_assertions)]

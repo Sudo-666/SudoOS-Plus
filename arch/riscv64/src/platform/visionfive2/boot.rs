@@ -74,9 +74,8 @@ fn valid_fdt_address(address: usize) -> Option<usize> {
     }
 
     // totalsize (FDT 大端 u32,header 偏移 4) 必须在合理范围内。
-    let totalsize_bytes = unsafe {
-        core::ptr::read_volatile((virtual_address.get() + 4) as *const u32)
-    };
+    let totalsize_bytes =
+        unsafe { core::ptr::read_volatile((virtual_address.get() + 4) as *const u32) };
     let totalsize = u32::from_be(totalsize_bytes) as usize;
 
     if !(FDT_HEADER_SIZE..=FDT_MAX_SIZE).contains(&totalsize) {

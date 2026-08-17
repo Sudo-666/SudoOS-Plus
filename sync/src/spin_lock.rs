@@ -37,7 +37,11 @@ impl<T: ?Sized> SpinLock<T> {
     /// Caller must prove there is no concurrent locker or accessor.
     /// This is intended only for single-CPU boot-time publication before
     /// runtime locking is required.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn get_mut_unchecked(&self) -> &mut T {
+        // SAFETY: the caller guarantees exclusive access to the protected
+        // value for the lifetime of the returned reference. UnsafeCell is the
+        // lock's designated interior-mutability boundary.
         unsafe { &mut *self.value.get() }
     }
 }

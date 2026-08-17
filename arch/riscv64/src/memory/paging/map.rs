@@ -276,7 +276,7 @@ fn read_entry(frame: PhysFrame, index: usize) -> Result<u64, PageTableAccessErro
 
     // SAFETY:
     // 页表页面由 BootPageTable 独占，并在当前地址模式下可访问。
-    unsafe { (&*pointer).entry(index) }
+    unsafe { (*pointer).entry(index) }
 }
 
 fn write_entry(frame: PhysFrame, index: usize, value: u64) -> Result<(), PageTableAccessError> {
@@ -285,5 +285,5 @@ fn write_entry(frame: PhysFrame, index: usize, value: u64) -> Result<(), PageTab
 
     // SAFETY:
     // 页表尚未发布给硬件 walker，不存在并发访问。
-    unsafe { (&mut *pointer).set_entry(index, value) }
+    unsafe { (*pointer).set_entry(index, value) }
 }

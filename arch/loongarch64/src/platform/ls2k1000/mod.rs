@@ -10,7 +10,7 @@ mod memory;
 
 pub(crate) use boot::boot_context;
 pub(crate) use console::{
-    console_line_status, try_read_console_byte, write_console_byte, HAS_CONSOLE_RX,
+    HAS_CONSOLE_RX, console_line_status, try_read_console_byte, write_console_byte,
 };
 pub(crate) use memory::reserve_early_memory;
 

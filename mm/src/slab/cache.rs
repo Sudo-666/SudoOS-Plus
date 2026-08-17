@@ -110,7 +110,7 @@ impl SlabCache {
         let slab_pointer = unsafe { SlabHeader::from_object::<P::Error>(object)? };
 
         // SAFETY: slab_pointer 已由 magic 校验为有效 slab header。
-        let actual_class = unsafe { (&*slab_pointer.as_ptr()).class::<P::Error>()? };
+        let actual_class = unsafe { (*slab_pointer.as_ptr()).class::<P::Error>()? };
 
         if actual_class != self.class {
             return Err(SlabError::WrongSizeClass {
@@ -120,7 +120,7 @@ impl SlabCache {
         }
 
         // SAFETY: object 已确认属于该 size class 的有效 slab。
-        let outcome = unsafe { (&mut *slab_pointer.as_ptr()).free_object::<P::Error>(object)? };
+        let outcome = unsafe { (*slab_pointer.as_ptr()).free_object::<P::Error>(object)? };
 
         if outcome.was_full {
             // SAFETY: full slab 此前不在 partial 链表，释放对象后可重新加入。
@@ -152,7 +152,7 @@ impl SlabCache {
                 }
 
                 // SAFETY: slab 已从链表移除，且即将归还承载页。
-                let allocation = unsafe { (&mut *slab_pointer.as_ptr()).take_allocation() };
+                let allocation = unsafe { (*slab_pointer.as_ptr()).take_allocation() };
 
                 self.slab_count = self
                     .slab_count
@@ -178,10 +178,10 @@ impl SlabCache {
             let slab_pointer = link_to_pointer::<P::Error>(current)?;
 
             // SAFETY: current 是 partial 链表中的有效 slab 链接。
-            let next = unsafe { (&*slab_pointer.as_ptr()).partial_next };
+            let next = unsafe { (*slab_pointer.as_ptr()).partial_next };
 
             // SAFETY: current 是 partial 链表中的有效 slab 链接。
-            let empty = unsafe { (&*slab_pointer.as_ptr()).is_empty() };
+            let empty = unsafe { (*slab_pointer.as_ptr()).is_empty() };
 
             if empty {
                 // SAFETY: empty slab 当前位于 partial 链表中。
@@ -190,7 +190,7 @@ impl SlabCache {
                 }
 
                 // SAFETY: slab 已从链表移除，且即将归还承载页。
-                let allocation = unsafe { (&mut *slab_pointer.as_ptr()).take_allocation() };
+                let allocation = unsafe { (*slab_pointer.as_ptr()).take_allocation() };
 
                 self.slab_count = self
                     .slab_count

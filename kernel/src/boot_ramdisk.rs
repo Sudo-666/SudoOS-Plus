@@ -8,9 +8,7 @@ use alloc::sync::Arc;
 
 use myos_mm::PhysAddr;
 
-use crate::{
-    block::{self, BlockDevice, BlockError},
-};
+use crate::block::{self, BlockDevice, BlockError};
 
 /// 注册时固定的扇区大小（与 ext4 块设备一致）。
 pub const RAMDISK_BLOCK_SIZE: usize = 512;
@@ -178,16 +176,32 @@ pub fn verify() {
 
     // 5) 非 512 对齐长度 / 零长度拒绝。
     assert_eq!(
-        BootRamBlockDevice::new(MockSource { data: alloc::vec![0; 1000] }, 1000, 512).err(),
+        BootRamBlockDevice::new(
+            MockSource {
+                data: alloc::vec![0; 1000]
+            },
+            1000,
+            512
+        )
+        .err(),
         Some(BlockError::BadBlockSize),
     );
     assert_eq!(
-        BootRamBlockDevice::new(MockSource { data: alloc::vec![0; 0] }, 0, 512).err(),
+        BootRamBlockDevice::new(
+            MockSource {
+                data: alloc::vec![0; 0]
+            },
+            0,
+            512
+        )
+        .err(),
         Some(BlockError::BadBlockSize),
     );
 
     // 6) 源内地址溢出传播。
-    let src = MockSource { data: alloc::vec![0_u8; 512] };
+    let src = MockSource {
+        data: alloc::vec![0_u8; 512],
+    };
     let mut out = [0_u8; 512];
     assert_eq!(
         src.copy_from_physical(usize::MAX - 10, &mut out),

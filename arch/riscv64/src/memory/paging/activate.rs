@@ -76,6 +76,8 @@ pub unsafe fn switch_sv39_root(root: PhysFrame) -> Result<(), ActivateError> {
      * into silent hangs.
      */
     let old_stvec: usize;
+    // SAFETY: 纯 CSR 读（csrr stvec），options 声明无内存/栈副作用，结果只写入
+    // 本地变量；不修改任何机器状态，任意时刻执行都安全。
     unsafe {
         asm!(
             "csrr {old}, stvec",
@@ -124,6 +126,8 @@ pub unsafe fn switch_sv39_root(root: PhysFrame) -> Result<(), ActivateError> {
         );
     }
 
+    // SAFETY: 恢复调用者原始 stvec（值来自上方 csrr 捕获的本地变量）。跳转已越过
+    // satp 切换点，新旧页表对内核高半地址的映射一致；options 保证无内存副作用。
     unsafe {
         asm!(
             "csrw stvec, {old}",

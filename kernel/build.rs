@@ -36,7 +36,9 @@ fn main() {
             } else if env::var("CARGO_FEATURE_PLATFORM_QEMU_VIRT").is_ok() {
                 project_root.join("arch/loongarch64/src/platform/qemu_virt/linker.ld")
             } else {
-                panic!("For loongarch64, a platform feature must be enabled (e.g., 'platform-ls2k1000').");
+                panic!(
+                    "For loongarch64, a platform feature must be enabled (e.g., 'platform-ls2k1000')."
+                );
             }
         }
 

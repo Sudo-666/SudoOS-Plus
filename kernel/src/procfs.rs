@@ -205,8 +205,14 @@ impl ProcFileGenerator for PidStatusFile {
             meta.pid,
             meta.pid,
             ppid,
-            meta.uid, meta.uid, meta.uid, meta.uid,
-            meta.gid, meta.gid, meta.gid, meta.gid,
+            meta.uid,
+            meta.uid,
+            meta.uid,
+            meta.uid,
+            meta.gid,
+            meta.gid,
+            meta.gid,
+            meta.gid,
             meta.thread_count,
         );
         Ok(output.into_bytes())
@@ -228,57 +234,57 @@ impl ProcFileGenerator for PidStatFile {
         let ppid = meta.ppid.unwrap_or(0);
         let fields = [
             meta.pid.to_string(),          // 1  pid
-            format!("({comm})"),            // 2  comm(带括号)
-            state.to_string(),              // 3  state
-            ppid.to_string(),               // 4  ppid
-            meta.pgrp.to_string(),          // 5  pgrp
-            meta.session.to_string(),       // 6  session
-            "0".to_string(),                // 7  tty_nr
-            "0".to_string(),                // 8  tpgid
-            "0".to_string(),                // 9  flags
-            "0".to_string(),                // 10 minflt
-            "0".to_string(),                // 11 cminflt
-            "0".to_string(),                // 12 majflt
-            "0".to_string(),                // 13 cmajflt
-            "0".to_string(),                // 14 utime
-            "0".to_string(),                // 15 stime
-            "0".to_string(),                // 16 cutime
-            "0".to_string(),                // 17 cstime
-            "0".to_string(),                // 18 priority
-            "0".to_string(),                // 19 nice
-            meta.thread_count.to_string(),  // 20 num_threads
-            "0".to_string(),                // 21 itrealvalue
-            "0".to_string(),                // 22 starttime
-            "0".to_string(),                // 23 vsize
-            "0".to_string(),                // 24 rss
-            "0".to_string(),                // 25 rsslim
-            "0".to_string(),                // 26 startcode
-            "0".to_string(),                // 27 endcode
-            "0".to_string(),                // 28 startstack
-            "0".to_string(),                // 29 kstkesp
-            "0".to_string(),                // 30 kstkeip
-            "0".to_string(),                // 31 signal
-            "0".to_string(),                // 32 blocked
-            "0".to_string(),                // 33 sigignore
-            "0".to_string(),                // 34 sigcatch
-            "0".to_string(),                // 35 wchan
-            "0".to_string(),                // 36 nswap
-            "0".to_string(),                // 37 cnswap
-            "0".to_string(),                // 38 exit_signal
-            "0".to_string(),                // 39 processor
-            "0".to_string(),                // 40 rt_priority
-            "0".to_string(),                // 41 policy
-            "0".to_string(),                // 42 delayacct_blkio_ticks
-            "0".to_string(),                // 43 guest_time
-            "0".to_string(),                // 44 cguest_time
-            "0".to_string(),                // 45 start_data
-            "0".to_string(),                // 46 end_data
-            "0".to_string(),                // 47 start_brk
-            "0".to_string(),                // 48 arg_start
-            "0".to_string(),                // 49 arg_end
-            "0".to_string(),                // 50 env_start
-            "0".to_string(),                // 51 env_end
-            "0".to_string(),                // 52 exit_code
+            format!("({comm})"),           // 2  comm(带括号)
+            state.to_string(),             // 3  state
+            ppid.to_string(),              // 4  ppid
+            meta.pgrp.to_string(),         // 5  pgrp
+            meta.session.to_string(),      // 6  session
+            "0".to_string(),               // 7  tty_nr
+            "0".to_string(),               // 8  tpgid
+            "0".to_string(),               // 9  flags
+            "0".to_string(),               // 10 minflt
+            "0".to_string(),               // 11 cminflt
+            "0".to_string(),               // 12 majflt
+            "0".to_string(),               // 13 cmajflt
+            "0".to_string(),               // 14 utime
+            "0".to_string(),               // 15 stime
+            "0".to_string(),               // 16 cutime
+            "0".to_string(),               // 17 cstime
+            "0".to_string(),               // 18 priority
+            "0".to_string(),               // 19 nice
+            meta.thread_count.to_string(), // 20 num_threads
+            "0".to_string(),               // 21 itrealvalue
+            "0".to_string(),               // 22 starttime
+            "0".to_string(),               // 23 vsize
+            "0".to_string(),               // 24 rss
+            "0".to_string(),               // 25 rsslim
+            "0".to_string(),               // 26 startcode
+            "0".to_string(),               // 27 endcode
+            "0".to_string(),               // 28 startstack
+            "0".to_string(),               // 29 kstkesp
+            "0".to_string(),               // 30 kstkeip
+            "0".to_string(),               // 31 signal
+            "0".to_string(),               // 32 blocked
+            "0".to_string(),               // 33 sigignore
+            "0".to_string(),               // 34 sigcatch
+            "0".to_string(),               // 35 wchan
+            "0".to_string(),               // 36 nswap
+            "0".to_string(),               // 37 cnswap
+            "0".to_string(),               // 38 exit_signal
+            "0".to_string(),               // 39 processor
+            "0".to_string(),               // 40 rt_priority
+            "0".to_string(),               // 41 policy
+            "0".to_string(),               // 42 delayacct_blkio_ticks
+            "0".to_string(),               // 43 guest_time
+            "0".to_string(),               // 44 cguest_time
+            "0".to_string(),               // 45 start_data
+            "0".to_string(),               // 46 end_data
+            "0".to_string(),               // 47 start_brk
+            "0".to_string(),               // 48 arg_start
+            "0".to_string(),               // 49 arg_end
+            "0".to_string(),               // 50 env_start
+            "0".to_string(),               // 51 env_end
+            "0".to_string(),               // 52 exit_code
         ];
         let mut output = fields.join(" ");
         output.push('\n');

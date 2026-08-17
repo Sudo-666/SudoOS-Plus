@@ -54,17 +54,15 @@ const EXT4_READONLY_IGNORABLE_INCOMPAT: u32 = EXT4_FEATURE_INCOMPAT_RECOVER
     | EXT4_FEATURE_INCOMPAT_ENCRYPT
     | EXT4_FEATURE_INCOMPAT_CASEFOLD;
 
-const EXT4_LAYOUT_SUPPORTED_INCOMPAT: u32 =
-    EXT4_SUPPORTED_INCOMPAT | EXT4_FEATURE_INCOMPAT_META_BG;
+const EXT4_LAYOUT_SUPPORTED_INCOMPAT: u32 = EXT4_SUPPORTED_INCOMPAT | EXT4_FEATURE_INCOMPAT_META_BG;
 
 const EXT4_KNOWN_HARD_INCOMPAT: u32 = EXT4_FEATURE_INCOMPAT_COMPRESSION
     | EXT4_FEATURE_INCOMPAT_JOURNAL_DEV
     | EXT4_FEATURE_INCOMPAT_DIRDATA
     | EXT4_FEATURE_INCOMPAT_INLINE_DATA;
 
-const EXT4_KNOWN_INCOMPAT: u32 = EXT4_LAYOUT_SUPPORTED_INCOMPAT
-    | EXT4_READONLY_IGNORABLE_INCOMPAT
-    | EXT4_KNOWN_HARD_INCOMPAT;
+const EXT4_KNOWN_INCOMPAT: u32 =
+    EXT4_LAYOUT_SUPPORTED_INCOMPAT | EXT4_READONLY_IGNORABLE_INCOMPAT | EXT4_KNOWN_HARD_INCOMPAT;
 
 const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
 const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
@@ -326,12 +324,10 @@ impl Ext4FileSystem {
 
         let hard_incompat = feature_incompat & EXT4_KNOWN_HARD_INCOMPAT;
         let unknown_incompat = feature_incompat & !EXT4_KNOWN_INCOMPAT;
-        let readonly_ignored =
-            feature_incompat & EXT4_READONLY_IGNORABLE_INCOMPAT;
+        let readonly_ignored = feature_incompat & EXT4_READONLY_IGNORABLE_INCOMPAT;
         let dangerous_ro = feature_ro_compat & EXT4_FEATURE_RO_COMPAT_BIGALLOC;
 
-        let first_diagnostic =
-            !EXT4_SUPER_DIAG_PRINTED.swap(true, Ordering::AcqRel);
+        let first_diagnostic = !EXT4_SUPER_DIAG_PRINTED.swap(true, Ordering::AcqRel);
         if first_diagnostic {
             let uuid0 = le_u32(&superblock, 104).unwrap_or(0);
             let uuid1 = le_u32(&superblock, 108).unwrap_or(0);
@@ -385,9 +381,7 @@ impl Ext4FileSystem {
                 );
             }
             if feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG != 0 {
-                crate::println!(
-                    "ext4-super: META_BG descriptor addressing enabled"
-                );
+                crate::println!("ext4-super: META_BG descriptor addressing enabled");
             }
         }
 
@@ -490,29 +484,20 @@ impl Ext4FileSystem {
             let chunk_start = chunk_index
                 .checked_mul(EXT4_DATA_CACHE_CHUNK_SIZE as u64)
                 .ok_or(Ext4Error::AddressOverflow)?;
-            let in_chunk = usize::try_from(current - chunk_start)
-                .map_err(|_| Ext4Error::AddressOverflow)?;
-            let chunk_len = usize::try_from(
-                (inode.size - chunk_start).min(EXT4_DATA_CACHE_CHUNK_SIZE as u64),
-            )
-            .map_err(|_| Ext4Error::AddressOverflow)?;
+            let in_chunk =
+                usize::try_from(current - chunk_start).map_err(|_| Ext4Error::AddressOverflow)?;
+            let chunk_len =
+                usize::try_from((inode.size - chunk_start).min(EXT4_DATA_CACHE_CHUNK_SIZE as u64))
+                    .map_err(|_| Ext4Error::AddressOverflow)?;
             let copy_len = (count - copied).min(chunk_len - in_chunk);
 
-            let Some(chunk) = self.read_data_chunk_cached(
-                &inode,
-                chunk_index,
-                chunk_start,
-                chunk_len,
-            )? else {
+            let Some(chunk) =
+                self.read_data_chunk_cached(&inode, chunk_index, chunk_start, chunk_len)?
+            else {
                 // A full cache or memory pressure must not turn a valid read
                 // into ENOMEM.  Preserve the original direct, bulk-I/O path
                 // for this request and all remaining bytes.
-                self.read_extent_range(
-                    &inode.block,
-                    current,
-                    &mut output[copied..count],
-                    0,
-                )?;
+                self.read_extent_range(&inode.block, current, &mut output[copied..count], 0)?;
                 return Ok(count);
             };
             output[copied..copied + copy_len]
@@ -1073,8 +1058,7 @@ impl Ext4FileSystem {
         };
         let size = size_lo | (size_hi << 32);
         let flags = le_u32(&raw, 32)?;
-        let unsupported_inode_flags =
-            flags & (EXT4_ENCRYPT_FL | EXT4_INLINE_DATA_FL);
+        let unsupported_inode_flags = flags & (EXT4_ENCRYPT_FL | EXT4_INLINE_DATA_FL);
         if unsupported_inode_flags != 0 {
             crate::println!(
                 "ext4-inode: unsupported ino={} flags={:#010x} mask={:#010x}",
@@ -1103,9 +1087,7 @@ impl Ext4FileSystem {
 
     fn group_has_superblock(&self, group: u32) -> bool {
         if self.feature_compat & EXT4_FEATURE_COMPAT_SPARSE_SUPER2 != 0 {
-            return group == 0
-                || group == self.backup_bgs[0]
-                || group == self.backup_bgs[1];
+            return group == 0 || group == self.backup_bgs[0] || group == self.backup_bgs[1];
         }
 
         if self.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER == 0 {
@@ -1132,44 +1114,37 @@ impl Ext4FileSystem {
             .checked_div(u64::from(self.group_desc_size))
             .filter(|count| *count != 0)
             .ok_or(Ext4Error::BadGroupDescriptor)?;
-        let descriptor_block_index =
-            u64::from(group) / descriptors_per_block;
-        let descriptor_index =
-            u64::from(group) % descriptors_per_block;
+        let descriptor_block_index = u64::from(group) / descriptors_per_block;
+        let descriptor_index = u64::from(group) % descriptors_per_block;
 
-        let descriptor_table_block =
-            if self.feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG == 0
-                || descriptor_block_index < u64::from(self.first_meta_bg)
-            {
-                u64::from(self.first_data_block)
-                    .checked_add(1)
-                    .and_then(|base| base.checked_add(descriptor_block_index))
-                    .ok_or(Ext4Error::AddressOverflow)?
-            } else {
-                let meta_group = descriptor_block_index
-                    .checked_mul(descriptors_per_block)
-                    .ok_or(Ext4Error::AddressOverflow)?;
-                let meta_group_u32 =
-                    u32::try_from(meta_group).map_err(|_| Ext4Error::AddressOverflow)?;
-                let group_first = u64::from(self.first_data_block)
-                    .checked_add(
-                        meta_group
-                            .checked_mul(u64::from(self.blocks_per_group))
-                            .ok_or(Ext4Error::AddressOverflow)?,
-                    )
-                    .ok_or(Ext4Error::AddressOverflow)?;
-                group_first
-                    .checked_add(u64::from(self.group_has_superblock(meta_group_u32)))
-                    .ok_or(Ext4Error::AddressOverflow)?
-            };
+        let descriptor_table_block = if self.feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG == 0
+            || descriptor_block_index < u64::from(self.first_meta_bg)
+        {
+            u64::from(self.first_data_block)
+                .checked_add(1)
+                .and_then(|base| base.checked_add(descriptor_block_index))
+                .ok_or(Ext4Error::AddressOverflow)?
+        } else {
+            let meta_group = descriptor_block_index
+                .checked_mul(descriptors_per_block)
+                .ok_or(Ext4Error::AddressOverflow)?;
+            let meta_group_u32 =
+                u32::try_from(meta_group).map_err(|_| Ext4Error::AddressOverflow)?;
+            let group_first = u64::from(self.first_data_block)
+                .checked_add(
+                    meta_group
+                        .checked_mul(u64::from(self.blocks_per_group))
+                        .ok_or(Ext4Error::AddressOverflow)?,
+                )
+                .ok_or(Ext4Error::AddressOverflow)?;
+            group_first
+                .checked_add(u64::from(self.group_has_superblock(meta_group_u32)))
+                .ok_or(Ext4Error::AddressOverflow)?
+        };
 
         let descriptor_offset = descriptor_table_block
             .checked_mul(self.block_size)
-            .and_then(|base| {
-                base.checked_add(
-                    descriptor_index * u64::from(self.group_desc_size),
-                )
-            })
+            .and_then(|base| base.checked_add(descriptor_index * u64::from(self.group_desc_size)))
             .ok_or(Ext4Error::AddressOverflow)?;
 
         let mut descriptor = Vec::new();
@@ -1205,7 +1180,6 @@ impl Ext4FileSystem {
             .or_insert(block);
         Ok(block)
     }
-
 
     fn read_block(&self, block: u64) -> Result<Vec<u8>, Ext4Error> {
         let size = usize::try_from(self.block_size).map_err(|_| Ext4Error::AddressOverflow)?;

@@ -67,9 +67,7 @@ pub fn send_signal_to_thread(thread: &Thread, signal: u32) -> Result<(), myos_vf
 pub fn send_signal_to_process_group(pgrp: isize, signal: u32) -> usize {
     let mut delivered = 0;
     crate::process::for_each_process(|process| {
-        if process.process_group() == pgrp
-            && send_signal(process.id(), signal).is_ok()
-        {
+        if process.process_group() == pgrp && send_signal(process.id(), signal).is_ok() {
             delivered += 1;
         }
     });

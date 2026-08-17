@@ -440,9 +440,8 @@ pub fn read_console(buf: &mut MutableIoBuffer<'_>) -> Result<usize, Errno> {
             return Err(Errno::Eagain);
         }
         drop(tty);
-        let outcome = TTY_READ_WAIT.wait_interruptible_from_user_trap(|| {
-            CONSOLE_TTY.lock().read_ready()
-        });
+        let outcome =
+            TTY_READ_WAIT.wait_interruptible_from_user_trap(|| CONSOLE_TTY.lock().read_ready());
         if matches!(outcome, crate::task::InterruptibleWaitOutcome::Interrupted) {
             // No readable data and an unblocked signal arrived: interrupt the
             // read so the signal is delivered on syscall return.

@@ -115,7 +115,7 @@ where
         .checked_sub(size_of::<LargeAllocationHeader>())
         .ok_or(HeapError::AddressOverflow)?;
 
-    if (header_address % align_of::<LargeAllocationHeader>() != 0) {
+    if header_address % align_of::<LargeAllocationHeader>() != 0 {
         return release_with_error(provider, allocation, HeapError::CorruptLargeAllocation);
     }
 
@@ -175,7 +175,7 @@ where
         .checked_sub(size_of::<LargeAllocationHeader>())
         .ok_or(HeapError::CorruptLargeAllocation)?;
 
-    if (header_address % align_of::<LargeAllocationHeader>() != 0) {
+    if header_address % align_of::<LargeAllocationHeader>() != 0 {
         return Err(HeapError::CorruptLargeAllocation);
     }
 
@@ -192,7 +192,7 @@ where
         return Err(HeapError::LayoutMismatch);
     }
 
-    if (user_address % layout.align() != 0) {
+    if user_address % layout.align() != 0 {
         return Err(HeapError::CorruptLargeAllocation);
     }
 

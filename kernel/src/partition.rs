@@ -402,7 +402,8 @@ fn scan_mbr(
         if partition_type == 0 || partition_type == MBR_GPT_PROTECTIVE {
             continue;
         }
-        let first_lba = u32::from_le_bytes(lba0[offset + 8..offset + 12].try_into().unwrap()) as u64;
+        let first_lba =
+            u32::from_le_bytes(lba0[offset + 8..offset + 12].try_into().unwrap()) as u64;
         let sector_count =
             u32::from_le_bytes(lba0[offset + 12..offset + 16].try_into().unwrap()) as u64;
         if sector_count == 0 {
@@ -453,15 +454,12 @@ pub fn verify() {
     super_sector[56..58].copy_from_slice(&0xef53_u16.to_le_bytes());
     raw.write_block(2, &super_sector).expect("write ext4 magic");
     let raw_specs = scan_partitions(&Arc::clone(&raw)).expect("raw ext4 scan");
-    assert_eq!(
-        raw_specs,
-        vec![PartitionSpec {
-            number: 1,
-            first_lba: 0,
-            block_count: 64,
-            read_only: false,
-        }],
-    );
+    assert_eq!(raw_specs, vec![PartitionSpec {
+        number: 1,
+        first_lba: 0,
+        block_count: 64,
+        read_only: false,
+    }],);
 
     // 3) 正常 GPT：两个分区。
     let gpt = make_disk(64);
@@ -490,7 +488,9 @@ pub fn verify() {
     let corrupt = make_disk(64);
     install_gpt(&corrupt, &[(34, 40, false)], GPT_HEADER_SIZE);
     let mut bad_header = [0_u8; 512];
-    corrupt.read_block(1, &mut bad_header).expect("read gpt header");
+    corrupt
+        .read_block(1, &mut bad_header)
+        .expect("read gpt header");
     bad_header[16] ^= 0xff;
     corrupt
         .write_block(1, &bad_header)
@@ -513,31 +513,30 @@ pub fn verify() {
     // 6) 空分区表：无分区项的 GPT → 空结果。
     let empty = make_disk(64);
     install_gpt(&empty, &[], GPT_HEADER_SIZE);
-    assert!(scan_partitions(&Arc::clone(&empty))
-        .expect("empty gpt scan")
-        .is_empty());
+    assert!(
+        scan_partitions(&Arc::clone(&empty))
+            .expect("empty gpt scan")
+            .is_empty()
+    );
 
     // 7) 普通 MBR：两个主分区（0xEE 保护项被跳过）。
     let mbr = make_disk(64);
     install_mbr(&mbr, &[(1, 20, 0x0c), (30, 15, 0x83)]);
     let mbr_specs = scan_partitions(&Arc::clone(&mbr)).expect("mbr scan");
-    assert_eq!(
-        mbr_specs,
-        vec![
-            PartitionSpec {
-                number: 1,
-                first_lba: 1,
-                block_count: 20,
-                read_only: false,
-            },
-            PartitionSpec {
-                number: 2,
-                first_lba: 30,
-                block_count: 15,
-                read_only: false,
-            },
-        ],
-    );
+    assert_eq!(mbr_specs, vec![
+        PartitionSpec {
+            number: 1,
+            first_lba: 1,
+            block_count: 20,
+            read_only: false,
+        },
+        PartitionSpec {
+            number: 2,
+            first_lba: 30,
+            block_count: 15,
+            read_only: false,
+        },
+    ],);
 
     // 7b) 稀疏 MBR：中间槽位为空 → 分区保留真实序号（1 与 3，不是 1、2），
     //     注册名也必须是 vda1/vda3 而非按列表下标压缩成 vda1/vda2。
@@ -593,18 +592,15 @@ pub fn verify() {
         .expect("read-only partition construction");
     assert!(part.is_read_only());
     let mut block = [0_u8; 512];
-    assert_eq!(
-        part.write_block(0, &block),
-        Err(BlockError::DeviceReadOnly),
-    );
+    assert_eq!(part.write_block(0, &block), Err(BlockError::DeviceReadOnly),);
 
     // 11) 分区读写：读映射到父设备偏移；越界拒绝。
     let base = make_disk(64);
     let mut first = [0_u8; 512];
     first[0..8].copy_from_slice(b"partdata");
     base.write_block(2, &first).expect("write parent block 2");
-    let part = PartitionBlockDevice::new(Arc::clone(&base), 2, 10, false)
-        .expect("partition construction");
+    let part =
+        PartitionBlockDevice::new(Arc::clone(&base), 2, 10, false).expect("partition construction");
     let mut readback = [0_u8; 512];
     part.read_block(0, &mut readback).expect("partition read");
     assert_eq!(&readback[0..8], b"partdata");
@@ -680,10 +676,7 @@ fn make_disk(blocks: u64) -> Arc<dyn BlockDevice> {
 
 /// 供其他模块测试复用：写入一张标准 92 字节头部的 GPT 表。
 #[cfg(debug_assertions)]
-pub(crate) fn install_gpt_fixture(
-    device: &Arc<dyn BlockDevice>,
-    partitions: &[(u64, u64, bool)],
-) {
+pub(crate) fn install_gpt_fixture(device: &Arc<dyn BlockDevice>, partitions: &[(u64, u64, bool)]) {
     install_gpt(device, partitions, GPT_HEADER_SIZE);
 }
 

@@ -303,7 +303,6 @@ impl UserMm {
                 }
             }
 
-
             state.pages.push(MappedPage {
                 page: source.page,
                 backing,
@@ -449,11 +448,7 @@ impl UserMm {
             // SAFETY: the newly populated translation names RAM owned by this
             // inactive MM, and the copy is bounded to its current page.
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    input.as_ptr().add(copied),
-                    destination,
-                    chunk,
-                );
+                core::ptr::copy_nonoverlapping(input.as_ptr().add(copied), destination, chunk);
             }
             copied += chunk;
         }
@@ -720,9 +715,10 @@ impl UserMm {
                     .ok_or(UserMmRuntimeError::InvalidRange)?;
                 let old_area = old_layout.find_area(page_address);
                 let frame = match page_table.translate(page_address)? {
-                    Some(physical) => Some(PhysFrame::from_start_address(physical).ok_or(
-                        UserMmRuntimeError::AddressOverflow,
-                    )?),
+                    Some(physical) => Some(
+                        PhysFrame::from_start_address(physical)
+                            .ok_or(UserMmRuntimeError::AddressOverflow)?,
+                    ),
                     None => state
                         .pages
                         .iter()
@@ -1091,7 +1087,10 @@ impl UserMm {
         // marker. A CLONE_VM/pthread process may legally execute this same mm
         // on multiple CPUs at once. Hardware root/ASID checks above and the
         // current-CPU membership check below are the required local invariant.
-        assert!(active.count() >= 1, "M8-B3 published an unexpected CPU mask");
+        assert!(
+            active.count() >= 1,
+            "M8-B3 published an unexpected CPU mask"
+        );
         let current_is_active = active.contains(cpu).map_err(UserMmError::from)?;
         assert!(
             current_is_active,

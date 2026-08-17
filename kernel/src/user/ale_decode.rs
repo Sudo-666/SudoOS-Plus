@@ -95,9 +95,7 @@ pub fn load_value_from_bytes(size: usize, sign_extend: bool, bytes: &[u8]) -> u6
         (1, false) => bytes[0] as u64,
         (2, true) => u16::from_le_bytes([bytes[0], bytes[1]]) as i16 as u64,
         (2, false) => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
-        (4, true) => {
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i32 as u64
-        }
+        (4, true) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i32 as u64,
         (4, false) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
         (8, false) => u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],

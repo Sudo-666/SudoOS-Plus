@@ -6,7 +6,7 @@ pub struct BootContext {
 
     device_tree: Option<usize>,
     command_line: Option<usize>,
-    system_table: Option<usize>, 
+    system_table: Option<usize>,
 }
 
 impl BootContext {

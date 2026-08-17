@@ -224,8 +224,7 @@ impl WaitQueue {
         // predicate used there must not re-enter the scheduler lock — hence
         // `thread_has_unblocked_signal(&thread)` (atomics only) instead of a
         // fresh `current_user_thread()` lookup.
-        let thread = super::current_user_thread()
-            .expect("interruptible wait outside a user task");
+        let thread = super::current_user_thread().expect("interruptible wait outside a user task");
         loop {
             if ready() {
                 return InterruptibleWaitOutcome::Ready;
@@ -256,8 +255,7 @@ impl WaitQueue {
         // As in `wait_interruptible_from_user_trap`, capture the current
         // thread once so the `should_block` closure (run under `SCHEDULER`)
         // can consult pending signals without re-entering the scheduler lock.
-        let thread = super::current_user_thread()
-            .expect("interruptible wait outside a user task");
+        let thread = super::current_user_thread().expect("interruptible wait outside a user task");
         if ready() {
             return InterruptibleWaitOutcome::Ready;
         }

@@ -1,4 +1,8 @@
-use alloc::{string::{String, ToString}, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use myos_vfs::{
@@ -639,7 +643,10 @@ fn populate_proc_root(parent: &Arc<Node>) -> Result<(), Errno> {
 /// Whether `node` is the mounted `/proc` root (used by readdir to decide
 /// whether the live-PID children need refreshing).
 fn is_proc_root(node: &Arc<Node>) -> bool {
-    PROC_ROOT.lock().as_ref().is_some_and(|root| Arc::ptr_eq(root, node))
+    PROC_ROOT
+        .lock()
+        .as_ref()
+        .is_some_and(|root| Arc::ptr_eq(root, node))
 }
 
 /// Rebuild the `/proc` root's children from the live process registry.
@@ -1141,11 +1148,7 @@ fn truncate_node(node: &Arc<Node>, length: u64) -> Result<(), Errno> {
     let length = usize::try_from(length).map_err(|_| Errno::Eoverflow)?;
     let mut state = node.state.lock();
     match &mut *state {
-        NodeState::Ext4Regular {
-            overlay,
-            size,
-            ..
-        } if overlay.is_none() && length == 0 => {
+        NodeState::Ext4Regular { overlay, size, .. } if overlay.is_none() && length == 0 => {
             // O_TRUNC is pervasive in compiler output directories.  The new
             // file has no dependency on the immutable ext4 bytes, so avoid
             // reading the entire old artifact only to discard it.
@@ -1526,10 +1529,7 @@ fn lookup_child(parent: &Arc<Node>, name: &str) -> Result<Option<Arc<Node>>, Err
     if whiteouts.iter().any(|hidden| hidden == name) {
         return Ok(None);
     }
-    if let Some((_, existing)) = children
-        .iter()
-        .find(|(child_name, _)| child_name == name)
-    {
+    if let Some((_, existing)) = children.iter().find(|(child_name, _)| child_name == name) {
         return Ok(Some(Arc::clone(existing)));
     }
     children.try_reserve(1).map_err(|_| Errno::Enomem)?;

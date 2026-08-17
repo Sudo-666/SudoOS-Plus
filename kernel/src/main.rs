@@ -316,13 +316,12 @@ fn kernel_main(boot: BootInfo) -> ! {
         smp::initialize(&tree, boot_hardware_cpu_id(&boot), max_cpus);
 
         let firmware_timer_frequency = tree.timebase_frequency_hz();
-        let explicit_oscomp_mode = oscomp::mode_from_bootargs(tree.bootargs())
-            .or_else(|| direct_boot_oscomp_mode(&boot));
+        let explicit_oscomp_mode =
+            oscomp::mode_from_bootargs(tree.bootargs()).or_else(|| direct_boot_oscomp_mode(&boot));
         let direct_command_line = direct_boot_command_line(&boot);
         let userland_mode = userland_boot_mode(tree.bootargs().or(direct_command_line.as_deref()));
-        let contest_config = storage::config_from_bootargs(
-            tree.bootargs().or(direct_command_line.as_deref()),
-        );
+        let contest_config =
+            storage::config_from_bootargs(tree.bootargs().or(direct_command_line.as_deref()));
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
@@ -565,8 +564,7 @@ fn kernel_main(boot: BootInfo) -> ! {
 
         // 2) 副核中断路径：向每个副核发送真实 IPI 并等待接收确认。
         for logical in 1..discovered {
-            let cpu =
-                crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+            let cpu = crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
             let mut round = 0u32;
             while crate::ipi::interrupt_count(cpu) == 0 && round < 50 {
                 crate::smp::send_ipi(cpu);
@@ -576,8 +574,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         }
 
         for logical in 0..discovered {
-            let cpu = crate::smp::CpuId::new(logical)
-                .expect("discovered CPU exceeds MAX_CPUS");
+            let cpu = crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
             crate::console::raw::puts("CPU-CNTR cpu=");
             crate::console::raw::putdec(logical);
             crate::console::raw::puts(" timer=");
@@ -594,8 +591,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         );
         assert!(
             (1..discovered).all(|logical| {
-                let cpu = crate::smp::CpuId::new(logical)
-                    .expect("discovered CPU exceeds MAX_CPUS");
+                let cpu = crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
                 crate::ipi::interrupt_count(cpu) > 0
             }),
             "secondary CPU IPI round-trip did not reach every online CPU",
@@ -630,8 +626,7 @@ fn kernel_main(boot: BootInfo) -> ! {
 
         // 2) 副核中断路径：向逻辑 CPU 1..N 各发送真实 IPI 并等待接收确认。
         for logical in 1..discovered {
-            let cpu =
-                crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
+            let cpu = crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
             let mut round = 0u32;
             while crate::ipi::interrupt_count(cpu) == 0 && round < 50 {
                 crate::smp::send_ipi(cpu);
@@ -641,8 +636,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         }
 
         for logical in 0..discovered {
-            let cpu = crate::smp::CpuId::new(logical)
-                .expect("discovered CPU exceeds MAX_CPUS");
+            let cpu = crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
             crate::println!(
                 "CPU-CNTR cpu={} timer={} ipi_recv={}",
                 logical,
@@ -656,8 +650,7 @@ fn kernel_main(boot: BootInfo) -> ! {
         );
         assert!(
             (1..discovered).all(|logical| {
-                let cpu = crate::smp::CpuId::new(logical)
-                    .expect("discovered CPU exceeds MAX_CPUS");
+                let cpu = crate::smp::CpuId::new(logical).expect("discovered CPU exceeds MAX_CPUS");
                 crate::ipi::interrupt_count(cpu) > 0
             }),
             "secondary CPU IPI round-trip did not reach every online CPU",
@@ -813,7 +806,10 @@ fn contest_fixture_probe(device: &alloc::sync::Arc<dyn crate::block::BlockDevice
     let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), "/") else {
         return;
     };
-    if !entries.iter().any(|entry| entry.name == "SUDOOS_CONTEST_FIXTURE") {
+    if !entries
+        .iter()
+        .any(|entry| entry.name == "SUDOOS_CONTEST_FIXTURE")
+    {
         return;
     }
     crate::println!("CONTEST_FIXTURE: arch={}", arch::ARCH_NAME);
@@ -826,8 +822,7 @@ fn contest_fixture_probe(device: &alloc::sync::Arc<dyn crate::block::BlockDevice
     ];
     let mut missing = 0_usize;
     for path in required {
-        let ok =
-            crate::ext4::load_path_snapshot(alloc::sync::Arc::clone(device), path).is_ok();
+        let ok = crate::ext4::load_path_snapshot(alloc::sync::Arc::clone(device), path).is_ok();
         crate::println!(
             "CONTEST_FIXTURE: path={} {}",
             path,
@@ -1050,8 +1045,7 @@ fn install_sdcard_contents(
     while index < dirs.len() && index < MAX_SCAN_DIRS {
         let dir = dirs[index].clone();
         index += 1;
-        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), &dir)
-        else {
+        let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), &dir) else {
             continue;
         };
         for entry in entries {
@@ -1220,8 +1214,7 @@ fn oscomp_materialize_ext4_dir_flat(
     recurse_levels: usize,
 ) -> usize {
     const EXT4_FT_DIR: u16 = 2;
-    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), ext4_dir)
-    else {
+    let Ok(entries) = crate::ext4::list_directory(alloc::sync::Arc::clone(device), ext4_dir) else {
         // ext4_dir may be a regular file (e.g. /glibc/lua), not a directory.
         // Install it as a regular file instead of creating a false directory.
         oscomp_sdcard_install_ext4_path(device_name, ext4_dir, vfs_dir);
@@ -1257,15 +1250,15 @@ fn oscomp_materialize_ext4_dir_flat(
             // Expand one more level so that rustlib/riscv64gc-.../
             // has lib/ populated with .rlib files visible to rustc.
             if recurse_levels > 0 {
-    oscomp_materialize_ext4_dir_flat(
-        device,
-        device_name,
-        &ext4_child,
-        &vfs_child,
-        max_files,
-        recurse_levels - 1,
-    );
-}
+                oscomp_materialize_ext4_dir_flat(
+                    device,
+                    device_name,
+                    &ext4_child,
+                    &vfs_child,
+                    max_files,
+                    recurse_levels - 1,
+                );
+            }
             continue;
         }
 
@@ -1340,7 +1333,8 @@ pub fn ensure_sdcard_dir_materialized(vfs_path: &str) -> bool {
         vfs_dir = next_vfs;
     }
 
-    let count = oscomp_materialize_ext4_dir_flat(&device, &device_name, &ext4_dir, &vfs_dir, 4096, 2);
+    let count =
+        oscomp_materialize_ext4_dir_flat(&device, &device_name, &ext4_dir, &vfs_dir, 4096, 2);
     count > 0
 }
 

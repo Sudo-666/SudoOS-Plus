@@ -35,10 +35,11 @@ mod uart_input {
     static POLL_COUNT: AtomicU64 = AtomicU64::new(0);
 
     fn queue_next_poll() {
-        crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0)
-            .unwrap_or_else(|error| {
+        crate::workqueue::queue_delayed(POLL_INTERVAL, poll_uart_console, 0).unwrap_or_else(
+            |error| {
                 panic!("UART-RX: unable to queue poller: {error:?}");
-            });
+            },
+        );
     }
 
     fn poll_uart_console(_argument: usize) {

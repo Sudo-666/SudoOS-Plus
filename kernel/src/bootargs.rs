@@ -21,7 +21,9 @@ pub fn max_cpus(bootargs: Option<&str>) -> Result<Option<usize>, MaxCpusError> {
                 return Err(MaxCpusError::Malformed);
             }
 
-            let parsed = value.parse::<usize>().map_err(|_| MaxCpusError::Malformed)?;
+            let parsed = value
+                .parse::<usize>()
+                .map_err(|_| MaxCpusError::Malformed)?;
             if parsed == 0 {
                 return Err(MaxCpusError::Zero);
             }

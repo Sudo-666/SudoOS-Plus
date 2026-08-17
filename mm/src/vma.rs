@@ -204,22 +204,18 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
         // separate entry exhausts bounded kernel metadata even though the
         // resulting address-space topology is simple.
         let coalescible = matches!(area.kind(), VmAreaKind::Anonymous);
-        let merge_previous = coalescible
-            && index > 0
-            && {
-                let previous = self.areas[index - 1];
-                previous.range().end() == area.range().start()
-                    && previous.flags() == area.flags()
-                    && previous.kind() == area.kind()
-            };
-        let merge_next = coalescible
-            && index < self.len()
-            && {
-                let next = self.areas[index];
-                area.range().end() == next.range().start()
-                    && next.flags() == area.flags()
-                    && next.kind() == area.kind()
-            };
+        let merge_previous = coalescible && index > 0 && {
+            let previous = self.areas[index - 1];
+            previous.range().end() == area.range().start()
+                && previous.flags() == area.flags()
+                && previous.kind() == area.kind()
+        };
+        let merge_next = coalescible && index < self.len() && {
+            let next = self.areas[index];
+            area.range().end() == next.range().start()
+                && next.flags() == area.flags()
+                && next.kind() == area.kind()
+        };
 
         if merge_previous && merge_next {
             let previous = self.areas[index - 1];
@@ -444,7 +440,6 @@ impl<const CAPACITY: usize> VmAreaSet<CAPACITY> {
             .ok_or(VmAreaError::AddressOverflow)?;
 
         for area in self.areas.iter().copied() {
-
             if area.range().end() <= candidate {
                 continue;
             }
@@ -508,11 +503,7 @@ impl<const CAPACITY: usize> Default for VmAreaSet<CAPACITY> {
     }
 }
 
-fn append_area(
-    areas: &mut Vec<VmArea>,
-    area: VmArea,
-    capacity: usize,
-) -> Result<(), VmAreaError> {
+fn append_area(areas: &mut Vec<VmArea>, area: VmArea, capacity: usize) -> Result<(), VmAreaError> {
     validate_area(area)?;
     if let Some(previous) = areas.last().copied() {
         if previous.range().overlaps(area.range())
@@ -654,7 +645,10 @@ mod tests {
         assert_eq!(set.len(), ENTRIES);
         assert_eq!(
             set.insert(VmArea::new(
-                range(0x1000 + ENTRIES * PAGE_SIZE * 2, 0x2000 + ENTRIES * PAGE_SIZE * 2),
+                range(
+                    0x1000 + ENTRIES * PAGE_SIZE * 2,
+                    0x2000 + ENTRIES * PAGE_SIZE * 2
+                ),
                 VmAreaFlags::user_rw(),
                 VmAreaKind::Anonymous,
             )),

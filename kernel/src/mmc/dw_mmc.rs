@@ -229,7 +229,10 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
     /// 控制器 + FIFO 复位。复位位写 1 后硬件自清；轮询至位清 0。
     pub fn reset(&mut self) -> Result<(), MmcError> {
         self.io.write32(REG_CTRL, CTRL_RESET | CTRL_FIFO_RESET);
-        self.poll_for(|value| value & (CTRL_RESET | CTRL_FIFO_RESET) == 0, REG_CTRL)?;
+        self.poll_for(
+            |value| value & (CTRL_RESET | CTRL_FIFO_RESET) == 0,
+            REG_CTRL,
+        )?;
         Ok(())
     }
 
@@ -339,8 +342,11 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 response.r2 = self.io.read32(REG_RESP1);
                 response.r3 = self.io.read32(REG_RESP0);
             }
-            MmcResponseType::R1 | MmcResponseType::R1b | MmcResponseType::R3
-            | MmcResponseType::R6 | MmcResponseType::R7 => {
+            MmcResponseType::R1
+            | MmcResponseType::R1b
+            | MmcResponseType::R3
+            | MmcResponseType::R6
+            | MmcResponseType::R7 => {
                 response.r0 = self.io.read32(REG_RESP0);
             }
         }
@@ -372,8 +378,13 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         while total < words {
             let interrupts = self.poll_for(
                 |value| {
-                    value & (INT_RX_DATA_REQ | INT_DATA_OVER | INT_DATA_CRC | INT_DATA_TIMEOUT
-                        | INT_FIFO_RUN_ERROR | INT_HLE)
+                    value
+                        & (INT_RX_DATA_REQ
+                            | INT_DATA_OVER
+                            | INT_DATA_CRC
+                            | INT_DATA_TIMEOUT
+                            | INT_FIFO_RUN_ERROR
+                            | INT_HLE)
                         != 0
                 },
                 REG_RINTSTS,
@@ -409,7 +420,8 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 break;
             }
         }
-        self.io.write32(REG_RINTSTS, INT_DATA_OVER | INT_RX_DATA_REQ);
+        self.io
+            .write32(REG_RINTSTS, INT_DATA_OVER | INT_RX_DATA_REQ);
         if received < words {
             return Err(MmcError::Timeout);
         }
@@ -424,7 +436,9 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 // R2 也带 CRC 校验（136-bit，命令后 7-bit CRC）。
                 value |= CMD_RESP_EXP | CMD_RESP_LONG | CMD_RESP_CRC;
             }
-            MmcResponseType::R1 | MmcResponseType::R1b | MmcResponseType::R6
+            MmcResponseType::R1
+            | MmcResponseType::R1b
+            | MmcResponseType::R6
             | MmcResponseType::R7 => {
                 value |= CMD_RESP_EXP | CMD_RESP_CRC;
             }
@@ -491,8 +505,12 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
     /// `CMD_START` 自清（命令已发出）**不等于**响应已就绪，不能在 START
     /// 清零时就读 RESP（K3.4 起按 CMD_DONE 判定）。
     fn poll_normal_command_done(&mut self) -> Result<(), MmcError> {
-        let error_mask = INT_RESP_CRC | INT_RESP_TIMEOUT | INT_RESP_ERR | INT_HLE
-            | INT_START_BIT_ERROR | INT_END_BIT_ERROR;
+        let error_mask = INT_RESP_CRC
+            | INT_RESP_TIMEOUT
+            | INT_RESP_ERR
+            | INT_HLE
+            | INT_START_BIT_ERROR
+            | INT_END_BIT_ERROR;
         let cycles_per_ms = crate::time::clock_frequency_hz() / 1000;
         let deadline = crate::time::now()
             .cycles()
@@ -509,7 +527,8 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 return Err(MmcError::CrcError);
             }
             if interrupts & INT_RESP_TIMEOUT != 0 {
-                self.io.write32(REG_RINTSTS, INT_RESP_TIMEOUT | INT_CMD_DONE);
+                self.io
+                    .write32(REG_RINTSTS, INT_RESP_TIMEOUT | INT_CMD_DONE);
                 return Err(MmcError::Timeout);
             }
             if interrupts & INT_HLE != 0 {
@@ -625,7 +644,10 @@ pub fn verify() {
         .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data_length(true, 512))
         .expect("data command accepted");
     let mut block = [0_u8; 512];
-    assert_eq!(controller.read_block_data(&mut block), Err(MmcError::Timeout));
+    assert_eq!(
+        controller.read_block_data(&mut block),
+        Err(MmcError::Timeout)
+    );
 
     // 5) FIFO 上溢。
     let mock = MockRegisterIo::new().with_failure(MockFailure::FifoOverrun);
@@ -657,12 +679,18 @@ pub fn verify() {
     controller
         .read_block_data(&mut block)
         .expect("batched fifo read");
-    assert_eq!(block, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    assert_eq!(block, [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    ]);
 
     // 8) VERID ≥ 2.40a → FIFO 在 0x200（JH7110）。
     let mock = MockRegisterIo::new().with_verid(0x291a);
     let mut controller = DwMmcController::new(mock, 25_000_000, 32);
-    assert_eq!(controller.fifo_offset(), DATA_240A_OFFSET, "2.91a -> new FIFO");
+    assert_eq!(
+        controller.fifo_offset(),
+        DATA_240A_OFFSET,
+        "2.91a -> new FIFO"
+    );
 
     // 9) 错误后恢复：清掉故障再发命令成功。
     let mut mock = MockRegisterIo::new().with_failure(MockFailure::ResponseTimeout);
@@ -715,7 +743,9 @@ pub fn verify() {
         .expect("update-clock completes via CMD_START self-clear");
     let trace = &controller.io_ref().commands;
     assert!(
-        trace.iter().any(|command| command.update_clock && command.cmd_start),
+        trace
+            .iter()
+            .any(|command| command.update_clock && command.cmd_start),
         "update-clock must be issued with CMD_START"
     );
 

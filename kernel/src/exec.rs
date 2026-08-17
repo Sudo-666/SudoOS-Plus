@@ -177,10 +177,7 @@ pub fn kernel_execve_from_initramfs(
 /// an unpacked initramfs or `/bin/busybox`). Reads the image through
 /// `load_exec_image_from_vfs` and builds a fresh Process + leader thread with
 /// `/dev/console` wired to fds 0/1/2 via `exec_elf`.
-pub fn kernel_execve_from_vfs(
-    path: &str,
-    config: ExecConfig<'_>,
-) -> Result<ExecImage, ExecError> {
+pub fn kernel_execve_from_vfs(path: &str, config: ExecConfig<'_>) -> Result<ExecImage, ExecError> {
     let image = load_exec_image_from_vfs(path)?;
     exec_elf(&image, config)
 }
@@ -592,7 +589,6 @@ fn apply_static_pie_relocations(
     Ok(())
 }
 
-
 #[cfg(target_arch = "loongarch64")]
 fn apply_static_pie_relocations(
     mm: &UserMm,
@@ -620,8 +616,7 @@ fn apply_static_pie_relocations(
 
     for entry in entries.chunks_exact(16) {
         let tag = read_u64(entry, 0)?;
-        let value = usize::try_from(read_u64(entry, 8)?)
-            .map_err(|_| ExecError::AddressOverflow)?;
+        let value = usize::try_from(read_u64(entry, 8)?).map_err(|_| ExecError::AddressOverflow)?;
         match tag {
             DT_NULL => break,
             DT_SYMTAB => symtab_vaddr = value,
@@ -649,14 +644,7 @@ fn apply_static_pie_relocations(
         return Err(ExecError::Elf(crate::elf::ElfError::InvalidProgramHeader));
     }
 
-    let relr_applied = apply_loongarch_relr(
-        mm,
-        image,
-        elf,
-        relr_vaddr,
-        relr_size,
-        relr_ent,
-    )?;
+    let relr_applied = apply_loongarch_relr(mm, image, elf, relr_vaddr, relr_size, relr_ent)?;
 
     let mut rela_applied = 0_usize;
     let mut rela_skipped = 0_usize;
@@ -689,13 +677,7 @@ fn apply_static_pie_relocations(
                 let symbol_value = if symbol == 0 {
                     Some(0_u64)
                 } else {
-                    read_loongarch_dynamic_symbol(
-                        image,
-                        elf,
-                        symtab_vaddr,
-                        sym_ent,
-                        symbol,
-                    )?
+                    read_loongarch_dynamic_symbol(image, elf, symtab_vaddr, sym_ent, symbol)?
                 };
                 match symbol_value {
                     Some(symbol_value) => Some(add_signed_u64(symbol_value, addend)?),
@@ -706,11 +688,7 @@ fn apply_static_pie_relocations(
             };
 
             if let Some(value) = value {
-                loader_copy_to_user_physical(
-                    mm,
-                    VirtAddr::new(destination),
-                    &value.to_le_bytes(),
-                )?;
+                loader_copy_to_user_physical(mm, VirtAddr::new(destination), &value.to_le_bytes())?;
                 rela_applied += 1;
             } else {
                 // Undefined dynamic symbols and PLT relocations are resolved
@@ -763,8 +741,8 @@ fn apply_loongarch_relr(
     let mut have_cursor = false;
     let mut applied = 0_usize;
     for encoded in bytes.chunks_exact(8) {
-        let entry = usize::try_from(read_u64(encoded, 0)?)
-            .map_err(|_| ExecError::AddressOverflow)?;
+        let entry =
+            usize::try_from(read_u64(encoded, 0)?).map_err(|_| ExecError::AddressOverflow)?;
         if entry & 1 == 0 {
             cursor = entry
                 .checked_add(elf.load_bias)

@@ -105,9 +105,7 @@ pub fn select_mode(explicit: Option<RunMode>) -> RunMode {
 
     // CLOUD_FINAL_MODE_FALLBACK_V1
     if crate::storage::contest_storage_mounted() {
-        crate::println!(
-            "sudoos-diag: oscomp mode selected: final-all (contest storage fallback)"
-        );
+        crate::println!("sudoos-diag: oscomp mode selected: final-all (contest storage fallback)");
         return RunMode::FinalAll;
     }
     crate::println!("sudoos-diag: oscomp mode selected: preliminary (no contest disk)");

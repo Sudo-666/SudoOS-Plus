@@ -93,8 +93,6 @@ impl PageAllocation {
     }
 }
 
-
-
 /// 长期物理页分配器。
 ///
 /// 当前限制：
@@ -145,7 +143,7 @@ impl BuddyAllocator {
             return Err(BuddyError::MetadataPointerIsNull);
         }
 
-        if ((metadata_pointer as usize) % align_of::<Page>() != 0) {
+        if (metadata_pointer as usize) % align_of::<Page>() != 0 {
             return Err(BuddyError::MetadataMisaligned {
                 required_alignment: align_of::<Page>(),
             });
