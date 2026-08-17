@@ -69,6 +69,12 @@ pub trait BlockDevice: Send + Sync + 'static {
         false
     }
 
+    /// Whether the device is a partition view of a parent disk. Partition
+    /// devices must not be scanned again for nested partition tables.
+    fn is_partition(&self) -> bool {
+        false
+    }
+
     fn flush(&self) -> Result<(), BlockError> {
         Ok(())
     }

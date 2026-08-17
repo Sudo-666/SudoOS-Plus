@@ -114,6 +114,9 @@ pub fn select_device(
                             name: String::from(name),
                             device,
                         }))
+                    } else if let Some(partition) = select_ext4_partition(name)? {
+                        crate::println!("CONTEST01 selected-device={}", partition.name);
+                        Ok(Some(partition))
                     } else {
                         Err(StorageError::NotExt4)
                     }
@@ -191,12 +194,35 @@ fn select_from_candidates(
     }
 }
 
+/// 显式指定设备整盘非 ext4 时，自动降级到它的第一个 ext4 分区
+/// （如 `mmcblk1` → `mmcblk1p1`、`vda` → `vda1`）。分区设备由
+/// `partition::register_all_partitions` 在启动期注册并索引。
+fn select_ext4_partition(base_name: &str) -> Result<Option<SelectedStorage>, StorageError> {
+    for partition_name in crate::partition::partitions_of(base_name) {
+        let Some(device) = block::open_device(&partition_name) else {
+            continue;
+        };
+        if device_is_ext4(&device)? {
+            return Ok(Some(SelectedStorage {
+                name: partition_name,
+                device,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// 把选中的设备挂到 `/mnt/sdcard`（创建目录骨架），并记录全局已挂载状态。
 ///
 /// 打印验收日志 `CONTEST02` / `CONTEST03`。真正的目录安装由调用方在
 /// 返回后完成（见 `main::install_sdcard_contents`）。
 pub fn mount_selected(selected: &SelectedStorage) -> Result<(), StorageError> {
     if !device_is_ext4(&selected.device)? {
+        return Err(StorageError::NotExt4);
+    }
+    // 结构校验：能真正打开 ext4（超级块/块组/特性合法）才置位
+    // `contest_storage_mounted`。只有魔数、结构损坏的镜像不得挂载。
+    if crate::ext4::Ext4FileSystem::open(Arc::clone(&selected.device)).is_err() {
         return Err(StorageError::NotExt4);
     }
     crate::println!("CONTEST02 filesystem=ext4");
@@ -225,6 +251,13 @@ pub fn contest_storage_name() -> Option<String> {
         .lock()
         .as_ref()
         .map(|selected| selected.name.clone())
+}
+
+/// 已挂载竞赛存储的 `/dev/<name>` 源路径，供 `fs::mount_ext4_overlay` /
+/// `fs::install_ext4_path` 直接作 `source` 参数（fs 层按注册表名解析，
+/// 不经 VFS `/dev` 树）。未挂载时返回 `None`。
+pub fn contest_source_path() -> Option<String> {
+    contest_storage_name().map(|name| alloc::format!("/dev/{}", name))
 }
 
 /// 读取设备头部 ext4 超级块魔数（偏移 1024 + 56）。
@@ -316,6 +349,44 @@ pub fn verify() {
     let empty = select_from_candidates(&ContestStorageConfig::default(), &[]);
     assert!(empty.expect("empty scan should not error").is_none());
 
+    // 8) 显式指定整盘非 ext4 的 GPT 盘 → 自动降级到其 ext4 分区
+    //    （`select_device` 经注册表 + 分区索引的完整路径）。
+    let gpt_disk: Arc<dyn BlockDevice> =
+        Arc::new(MemoryBlockDevice::new(512, 64).expect("gpt fixture disk"));
+    crate::partition::install_gpt_fixture(&gpt_disk, &[(34, 63, false)]);
+    // 分区 1 起始 LBA 34 → 分区内 ext4 超级块偏移 1024+56 落在父盘块 36。
+    let mut super_sector = [0_u8; 512];
+    super_sector[56..58].copy_from_slice(&0xef53_u16.to_le_bytes());
+    gpt_disk
+        .write_block(36, &super_sector)
+        .expect("write partition ext4 magic");
+    block::register_device("gptdisk", Arc::clone(&gpt_disk)).expect("register gpt disk");
+    crate::partition::register_all_partitions();
+    let descended = select_device(&ContestStorageConfig {
+        device_name: Some(String::from("gptdisk")),
+    })
+    .expect("partition descend selection")
+    .expect("gptdisk1 should be selected");
+    assert_eq!(descended.name(), "gptdisk1");
+    block::unregister_device("gptdisk1").expect("unregister gpt partition");
+    block::unregister_device("gptdisk").expect("unregister gpt disk");
+
+    // 9) mount_selected 仅在能真正打开 ext4 后置位，contest_source_path
+    //    反映所选设备的 `/dev/<name>` 路径；复位不泄漏到后续。
+    let openable = make_openable_ext4_device();
+    let selected = SelectedStorage {
+        name: String::from("testdisk"),
+        device: Arc::clone(&openable) as Arc<dyn BlockDevice>,
+    };
+    let prior = SELECTED.lock().clone();
+    mount_selected(&selected).expect("mount valid ext4");
+    assert_eq!(
+        contest_source_path().as_deref(),
+        Some("/dev/testdisk"),
+        "contest_source_path must reflect the mounted device",
+    );
+    *SELECTED.lock() = prior;
+
     crate::println!("C1 contest storage gate:");
     crate::println!("  bootargs parsing      : verified");
     crate::println!("  explicit device       : verified");
@@ -324,6 +395,9 @@ pub fn verify() {
     crate::println!("  duplicate name        : verified");
     crate::println!("  non-ext4 rejected     : verified");
     crate::println!("  no-device safe skip   : verified");
+    crate::println!("  GPT partition descend : verified");
+    crate::println!("  mount-validates-ext4  : verified");
+    crate::println!("  contest_source_path   : verified");
 }
 
 #[cfg(debug_assertions)]
@@ -334,5 +408,23 @@ fn make_ext4_device() -> Arc<MemoryBlockDevice> {
     device
         .write_block(2, &super_sector)
         .expect("write ext4 super magic");
+    device
+}
+
+/// 结构合法的 ext4 fixture：除魔数外还填上 `Ext4FileSystem::open` 校验的
+/// 字段（块大小/每组块/每组 inode/inode 大小），使 `mount_selected` 的
+/// "成功打开 ext4" 门能通过。
+#[cfg(debug_assertions)]
+fn make_openable_ext4_device() -> Arc<MemoryBlockDevice> {
+    let device = Arc::new(MemoryBlockDevice::new(512, 32).expect("ext4 fixture block device"));
+    let mut super_sector = [0_u8; 512];
+    super_sector[24..28].copy_from_slice(&0_u32.to_le_bytes()); // log_block_size = 0 → 1024
+    super_sector[32..36].copy_from_slice(&32768_u32.to_le_bytes()); // blocks_per_group
+    super_sector[40..44].copy_from_slice(&8192_u32.to_le_bytes()); // inodes_per_group
+    super_sector[56..58].copy_from_slice(&0xef53_u16.to_le_bytes()); // magic
+    super_sector[88..90].copy_from_slice(&256_u16.to_le_bytes()); // inode_size
+    device
+        .write_block(2, &super_sector)
+        .expect("write ext4 superblock");
     device
 }

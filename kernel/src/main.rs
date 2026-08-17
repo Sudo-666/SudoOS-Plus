@@ -474,6 +474,10 @@ fn kernel_main(boot: BootInfo) -> ! {
     fault::initialize();
     register_boot_ramdisks(&boot_ramdisks);
     mmc::initialize_storage();
+    // 在所有基础块设备注册完成后、devfs 建立前，统一扫描并注册 GPT/MBR
+    // 分区（vdaN/ram0pN/mmcblk1pN），使分区设备出现在 /dev 树且存储选择
+    // 能自动降级到 ext4 分区（K1.1）。
+    partition::register_all_partitions();
     fs::initialize();
     mount_proc();
     mount_sys();

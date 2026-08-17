@@ -152,6 +152,10 @@ impl BlockDevice for PartitionBlockDevice {
     fn is_read_only(&self) -> bool {
         self.read_only
     }
+
+    fn is_partition(&self) -> bool {
+        true
+    }
 }
 
 /// 扫描父设备的分区布局。
@@ -219,6 +223,51 @@ pub fn register_partitions(
         }
     }
     Ok(registered)
+}
+
+/// 已注册分区名索引：基础磁盘名 → 该盘的分区设备名列表。
+static PARTITIONS_BY_DISK: IrqSpinLock<Vec<(String, Vec<String>)>> =
+    IrqSpinLock::new_with_class(Vec::new(), PARTITION_LOCK);
+
+/// 扫描注册表中所有基础磁盘（非分区设备，如 `vda`/`ram0`/`mmcblk1`）并注册
+/// 各自的分区。必须在 `fs::initialize()` 之前调用，使分区设备在 `/dev` 树
+/// 可见；同时记录 `基础盘 → 分区名` 索引供存储选择降级用。
+///
+/// 单个磁盘扫描失败（无分区布局是常态）静默跳过；返回成功注册的分区设备数。
+pub fn register_all_partitions() -> usize {
+    let base = match block::registered_devices() {
+        Ok(snapshot) => snapshot,
+        Err(_) => return 0,
+    };
+    let mut by_disk: Vec<(String, Vec<String>)> = Vec::new();
+    let mut total = 0;
+    for entry in base {
+        let device = entry.device();
+        if device.is_partition() {
+            continue;
+        }
+        match register_partitions(entry.name(), &device) {
+            Ok(names) if !names.is_empty() => {
+                total += names.len();
+                by_disk.push((String::from(entry.name()), names));
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    *PARTITIONS_BY_DISK.lock() = by_disk;
+    total
+}
+
+/// 返回某基础磁盘已注册的分区设备名列表（如 `["mmcblk1p1", "mmcblk1p2"]`）。
+/// 基础盘本身是 raw ext4 时也会有一条 `{base}1`（与整盘并存，选择逻辑优先
+/// 整盘）。无分区或未注册时返回空列表。
+pub fn partitions_of(base_name: &str) -> Vec<String> {
+    PARTITIONS_BY_DISK
+        .lock()
+        .iter()
+        .find(|(name, _)| name == base_name)
+        .map(|(_, names)| names.clone())
+        .unwrap_or_default()
 }
 
 /// Linux 风格的分区命名：`mmcblk*` 使用 `pN` 后缀，其余直接拼接数字。
@@ -627,6 +676,15 @@ pub fn verify() {
 #[cfg(debug_assertions)]
 fn make_disk(blocks: u64) -> Arc<dyn BlockDevice> {
     Arc::new(MemoryBlockDevice::new(512, blocks).expect("fixture disk"))
+}
+
+/// 供其他模块测试复用：写入一张标准 92 字节头部的 GPT 表。
+#[cfg(debug_assertions)]
+pub(crate) fn install_gpt_fixture(
+    device: &Arc<dyn BlockDevice>,
+    partitions: &[(u64, u64, bool)],
+) {
+    install_gpt(device, partitions, GPT_HEADER_SIZE);
 }
 
 /// 写入合法 GPT 表（保护 MBR + LBA1 头部 + LBA2 分区项）。
