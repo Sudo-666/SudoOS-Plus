@@ -59,14 +59,22 @@ pub fn discovered_hosts() -> Vec<myos_fdt::MmcHostConfig> {
     DISCOVERED_HOSTS.lock().clone()
 }
 
-/// 返回首个可移除主机（`non_removable == false`）。VisionFive 2 上即
-/// `mmc1` TF 卡槽；无匹配时返回 `None`。
-pub fn removable_host() -> Option<myos_fdt::MmcHostConfig> {
-    DISCOVERED_HOSTS
-        .lock()
+/// 选择 TF 卡主机。显式优先别名 `mmc1`（VisionFive 2 的 SD/TF 槽，与
+/// `sudoos.contest.dev=mmcblk1` / `register_mmcblk1` 的契约一致），而不是
+/// "遍历序第一个可移除主机"——后者在 DT 未标 `non-removable` 或别名遍历
+/// 顺序变化时会误选 `mmc0`（板载 eMMC）。无 `mmc1` 别名时回退到第一个
+/// 可移除主机。纯函数便于单测。
+pub fn select_tf_host(hosts: &[myos_fdt::MmcHostConfig]) -> Option<myos_fdt::MmcHostConfig> {
+    hosts
         .iter()
-        .find(|host| !host.non_removable())
+        .find(|host| host.alias_index() == Some(1))
+        .or_else(|| hosts.iter().find(|host| !host.non_removable()))
         .copied()
+}
+
+/// 返回 TF 卡主机（VisionFive 2 的 `mmc1` 槽）；无匹配时返回 `None`。
+pub fn removable_host() -> Option<myos_fdt::MmcHostConfig> {
+    select_tf_host(&DISCOVERED_HOSTS.lock())
 }
 
 /// 初始化可移除主机的 SD 卡并注册 `/dev/mmcblk1`（无卡/失败不 panic）。
@@ -151,4 +159,63 @@ pub fn initialize_storage() {
 pub fn verify() {
     dw_mmc::verify();
     sd::verify();
+
+    // TF 主机选择：别名 mmc1 必须优先于"第一个可移除主机"。
+    let emmc = myos_fdt::MmcHostConfig::new(
+        Some(0),
+        0x1601_0000,
+        0x1_0000,
+        74,
+        8,
+        Some(32),
+        None,
+        None,
+        false, // 即使 DT 漏标 non-removable，也必须选 mmc1 而非 mmc0
+    );
+    let tf = myos_fdt::MmcHostConfig::new(
+        Some(1),
+        0x1602_0000,
+        0x1_0000,
+        75,
+        4,
+        Some(32),
+        None,
+        None,
+        false,
+    );
+    assert_eq!(
+        select_tf_host(&[emmc, tf]),
+        Some(tf),
+        "alias mmc1 must win over first-removable (mmc0)"
+    );
+    // 无别名：回退第一个可移除主机。
+    let anonymous = myos_fdt::MmcHostConfig::new(
+        None,
+        0x1602_0000,
+        0x1_0000,
+        75,
+        4,
+        Some(32),
+        None,
+        None,
+        false,
+    );
+    assert_eq!(select_tf_host(&[anonymous]), Some(anonymous));
+    // 只有 mmc0：无 mmc1 别名时不得误配。
+    assert_eq!(select_tf_host(&[emmc]), None);
+    // 全部不可移除且无别名 → None。
+    let fixed = myos_fdt::MmcHostConfig::new(
+        None,
+        0x1602_0000,
+        0x1_0000,
+        75,
+        4,
+        Some(32),
+        None,
+        None,
+        true,
+    );
+    assert_eq!(select_tf_host(&[fixed]), None);
+
+    crate::println!("C6.1 host selection    : verified");
 }
