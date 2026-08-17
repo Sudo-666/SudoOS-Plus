@@ -138,8 +138,9 @@ pub fn select_device(
                 candidates.push((String::from(entry.name()), entry.device()));
             }
             let selected = select_from_candidates(config, &candidates)?;
-            if selected.is_some() {
-                return Ok(selected);
+            if let Some(storage) = selected {
+                crate::println!("CONTEST01 selected-device={}", storage.name);
+                return Ok(Some(storage));
             }
             // 兼容现有 vda：自动扫描理论上已覆盖，这里仅作最终兜底。
             if let Some(device) = block::open_device("vda") {
