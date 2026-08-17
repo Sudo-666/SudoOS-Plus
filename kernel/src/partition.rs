@@ -262,8 +262,11 @@ fn scan_gpt(
         return Err(PartitionError::BadPartitionTable);
     }
     let stored_crc = u32::from_le_bytes(header[16..20].try_into().unwrap());
-    let mut crc_buf = [0_u8; GPT_HEADER_SIZE];
-    crc_buf[..GPT_HEADER_SIZE].copy_from_slice(&header[..GPT_HEADER_SIZE]);
+    // UEFI 规范：header CRC32 覆盖整个头部（全部 header_size 字节，含 size
+    // 字段），计算时 CRC 字段清零。header_size 允许大于最小 92 字节
+    // （保留字段/未来扩展），因此缓冲区按 LBA_SIZE 分配，避免越界 panic。
+    let mut crc_buf = [0_u8; LBA_SIZE];
+    crc_buf[..header_size].copy_from_slice(&header[..header_size]);
     crc_buf[16..20].copy_from_slice(&0_u32.to_le_bytes());
     if crc32(&crc_buf[..header_size]) != stored_crc {
         return Err(PartitionError::BadPartitionTable);
@@ -404,7 +407,7 @@ pub fn verify() {
 
     // 3) 正常 GPT：两个分区。
     let gpt = make_disk(64);
-    install_gpt(&gpt, &[(34, 40, false), (50, 60, true)]);
+    install_gpt(&gpt, &[(34, 40, false), (50, 60, true)], GPT_HEADER_SIZE);
     let gpt_specs = scan_partitions(&Arc::clone(&gpt)).expect("gpt scan");
     assert_eq!(
         gpt_specs,
@@ -425,7 +428,7 @@ pub fn verify() {
 
     // 4) GPT CRC 损坏 → BadPartitionTable。
     let corrupt = make_disk(64);
-    install_gpt(&corrupt, &[(34, 40, false)]);
+    install_gpt(&corrupt, &[(34, 40, false)], GPT_HEADER_SIZE);
     let mut bad_header = [0_u8; 512];
     corrupt.read_block(1, &mut bad_header).expect("read gpt header");
     bad_header[16] ^= 0xff;
@@ -440,7 +443,7 @@ pub fn verify() {
 
     // 5) 分区越界：GPT 项超出父设备 → BadPartitionTable。
     let oob = make_disk(64);
-    install_gpt(&oob, &[(50, 100, false)]);
+    install_gpt(&oob, &[(50, 100, false)], GPT_HEADER_SIZE);
     assert_eq!(
         scan_partitions(&Arc::clone(&oob)),
         Err(PartitionError::BadPartitionTable),
@@ -449,7 +452,7 @@ pub fn verify() {
 
     // 6) 空分区表：无分区项的 GPT → 空结果。
     let empty = make_disk(64);
-    install_gpt(&empty, &[]);
+    install_gpt(&empty, &[], GPT_HEADER_SIZE);
     assert!(scan_partitions(&Arc::clone(&empty))
         .expect("empty gpt scan")
         .is_empty());
@@ -515,15 +518,15 @@ pub fn verify() {
         Err(BlockError::OutOfRange),
     );
     let mut write = [0_u8; 512];
-    write[0..8].copy_from_slice(b"written");
+    write[0..7].copy_from_slice(b"written");
     part.write_block(0, &write).expect("partition write");
     let mut check = [0_u8; 512];
     base.read_block(2, &mut check).expect("parent block read");
-    assert_eq!(&check[0..8], b"written");
+    assert_eq!(&check[0..7], b"written");
 
     // 12) register_partitions 按命名规则注册。
     let reg_disk = make_disk(64);
-    install_gpt(&reg_disk, &[(34, 40, false)]);
+    install_gpt(&reg_disk, &[(34, 40, false)], GPT_HEADER_SIZE);
     let names = register_partitions("vda", &Arc::clone(&reg_disk)).expect("register partitions");
     assert_eq!(names, vec![String::from("vda1")]);
     assert!(crate::block::open_device("vda1").is_some());
@@ -532,6 +535,31 @@ pub fn verify() {
         register_partitions("mmcblk1", &Arc::clone(&reg_disk)).expect("register mmc partitions");
     assert_eq!(mmc_names, vec![String::from("mmcblk1p1")]);
     crate::block::unregister_device("mmcblk1p1").expect("unregister mmc partition");
+
+    // 13) header_size > 92（扩展头部）：CRC 覆盖全部 header_size 字节，
+    //     不得因固定 92 字节缓冲越界 panic。
+    let wide = make_disk(64);
+    install_gpt(&wide, &[(34, 40, false)], 128);
+    let wide_specs = scan_partitions(&Arc::clone(&wide)).expect("wide-header gpt scan");
+    assert_eq!(
+        wide_specs,
+        vec![PartitionSpec {
+            first_lba: 34,
+            block_count: 7,
+            read_only: false,
+        }],
+        "GPT with header_size=128 must parse without panic",
+    );
+
+    // 14) header_size > LBA_SIZE：扫描器必须在触碰 CRC 前按 size 拒绝，
+    //     返回 BadPartitionTable 而不是越界。
+    let oversized = make_disk(64);
+    install_gpt(&oversized, &[(34, 40, false)], LBA_SIZE + 16);
+    assert_eq!(
+        scan_partitions(&Arc::clone(&oversized)),
+        Err(PartitionError::BadPartitionTable),
+        "header_size above LBA_SIZE must be rejected",
+    );
 
     crate::println!("C2 partition gate:");
     crate::println!("  raw ext4 whole disk : verified");
@@ -544,6 +572,8 @@ pub fn verify() {
     crate::println!("  parent error prop   : verified");
     crate::println!("  read-only inherit   : verified");
     crate::println!("  partition naming    : verified");
+    crate::println!("  GPT wide header     : verified");
+    crate::println!("  GPT oversized header: verified");
 }
 
 #[cfg(debug_assertions)]
@@ -552,8 +582,13 @@ fn make_disk(blocks: u64) -> Arc<dyn BlockDevice> {
 }
 
 /// 写入合法 GPT 表（保护 MBR + LBA1 头部 + LBA2 分区项）。
+/// `header_size` 控制头部 size 字段（允许 > 92 以覆盖超大头部场景）。
 #[cfg(debug_assertions)]
-fn install_gpt(device: &Arc<dyn BlockDevice>, partitions: &[(u64, u64, bool)]) {
+fn install_gpt(device: &Arc<dyn BlockDevice>, partitions: &[(u64, u64, bool)], header_size: usize) {
+    assert!(
+        header_size >= GPT_HEADER_SIZE,
+        "fixture header_size must be at least GPT_HEADER_SIZE",
+    );
     let blocks = device.block_count();
 
     let mut mbr = [0_u8; 512];
@@ -588,7 +623,7 @@ fn install_gpt(device: &Arc<dyn BlockDevice>, partitions: &[(u64, u64, bool)]) {
     let mut header = [0_u8; LBA_SIZE];
     header[..8].copy_from_slice(GPT_SIGNATURE);
     header[8..12].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
-    header[12..16].copy_from_slice(&(GPT_HEADER_SIZE as u32).to_le_bytes());
+    header[12..16].copy_from_slice(&(header_size as u32).to_le_bytes());
     header[24..32].copy_from_slice(&1_u64.to_le_bytes());
     header[32..40].copy_from_slice(&(blocks - 1).to_le_bytes());
     header[40..48].copy_from_slice(&34_u64.to_le_bytes());
@@ -598,7 +633,14 @@ fn install_gpt(device: &Arc<dyn BlockDevice>, partitions: &[(u64, u64, bool)]) {
     header[80..84].copy_from_slice(&(num_entries as u32).to_le_bytes());
     header[84..88].copy_from_slice(&(GPT_ENTRY_SIZE as u32).to_le_bytes());
     header[88..92].copy_from_slice(&entries_crc.to_le_bytes());
-    let header_crc = crc32(&header[..GPT_HEADER_SIZE]);
+    // header_size > 92 时填充扩展区，保证 CRC 覆盖到真实数据（不是全零）。
+    for byte in header[GPT_HEADER_SIZE..header_size.min(LBA_SIZE)].iter_mut() {
+        *byte = 0x5a;
+    }
+    // CRC 覆盖 min(header_size, LBA_SIZE) 字节；超 LBA_SIZE 的场景由扫描器在
+    // 检查 size 时提前拒绝，CRC 值无关紧要，这里避免在 fixture 内越界。
+    let crc_len = header_size.min(LBA_SIZE);
+    let header_crc = crc32(&header[..crc_len]);
     header[16..20].copy_from_slice(&header_crc.to_le_bytes());
     device.write_block(1, &header).expect("write gpt header");
 }
