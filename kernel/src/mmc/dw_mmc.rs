@@ -289,7 +289,10 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
             return Err(MmcError::InvalidArgument);
         }
         let words = data_length.div_ceil(4) as u32;
-        let watermark = words.min(self.fifo_depth).max(1);
+        // RX/TX 水印有效范围是 [1, fifo_depth-1]，习惯取半深。等于
+        // fifo_depth 时 RXDR 比较器永不满足 → 读扇区超时（K3.4）。
+        let max_watermark = self.fifo_depth.saturating_sub(1).max(1);
+        let watermark = words.min(self.fifo_depth / 2).clamp(1, max_watermark);
         self.io.write32(REG_BLKSIZ, data_length as u32);
         self.io.write32(REG_BYTCNT, data_length as u32);
         self.io.write32(REG_FIFOTH, fifoth_for(watermark));
@@ -648,6 +651,44 @@ pub fn verify() {
         Err(MmcError::Timeout),
     );
 
+    // 15) CMD17（512B，128 字）在 32 深 FIFO 上：RX 水印必须取半深 16，
+    //     而不是 FIFO 深度 32（等于深度时 RXDR 永不触发，读超时）。
+    let mock = MockRegisterIo::new().with_responses(vec![0, 0, 0, 0]);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    controller
+        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data_length(true, 512))
+        .expect("CMD17 accepted");
+    let cmd17 = controller
+        .io_ref()
+        .commands
+        .iter()
+        .find(|command| command.index == 17)
+        .expect("CMD17 trace");
+    let rx_wm = (cmd17.fifo_threshold.unwrap() >> 16) & 0x0fff;
+    assert!(
+        rx_wm < 32,
+        "RX watermark {rx_wm} must be below FIFO depth 32"
+    );
+    assert_eq!(rx_wm, 16, "512B on 32-word FIFO → half-depth watermark");
+
+    // 16) 小传输（ACMD51=8B，2 字）：水印取 min(words, half) = 2。
+    let mock = MockRegisterIo::new().with_responses(vec![0, 0, 0, 0]);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    controller
+        .send_command(MmcCommand::new(51, 0, MmcResponseType::R1).with_data_length(true, 8))
+        .expect("ACMD51 accepted");
+    let cmd51 = controller
+        .io_ref()
+        .commands
+        .iter()
+        .find(|command| command.index == 51)
+        .expect("ACMD51 trace");
+    assert_eq!(
+        (cmd51.fifo_threshold.unwrap() >> 16) & 0x0fff,
+        2,
+        "8B → 2-word watermark"
+    );
+
     crate::println!("C7 DW-MMC controller gate:");
     crate::println!("  command complete    : verified");
     crate::println!("  response timeout    : verified");
@@ -662,4 +703,5 @@ pub fn verify() {
     crate::println!("  clock/bus-width     : verified");
     crate::println!("  update-clock        : verified");
     crate::println!("  command hang        : verified");
+    crate::println!("  FIFO watermark      : verified");
 }
