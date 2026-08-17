@@ -260,18 +260,19 @@ pub fn verify() {
     responses.extend([0x00ff_8000, 0, 0, 0]); // ACMD41 busy
     responses.extend([0, 0, 0, 0]); // CMD55
     responses.extend([0xc0ff_8000, 0, 0, 0]); // ACMD41 ready + CCS
-    // CMD2 CID：非回文字节序列（区分 BE/LE 字节序）。DW-MMC RESP 字内
-    // 4 字节按小端存放，mock 用 from_le_bytes 编码，card_data() 用
-    // to_le_bytes 还原，往返应得到原始 16 字节。
+    // CMD2 CID：非回文字节序列（区分 BE/LE 字节序）。DW-MMC 逆序存储——
+    // RESP3 = 协议最高 word（payload[0..4]）、RESP0 = 最低 word
+    // （payload[12..16]），字内大端。mock 按 [RESP0, RESP1, RESP2, RESP3]
+    // 编码，card_data() 逆序读 + to_be_bytes() 还原，往返应得到原始 16 字节。
     let cid_payload = [
         0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
         0x10,
     ];
     responses.extend([
-        u32::from_le_bytes([cid_payload[0], cid_payload[1], cid_payload[2], cid_payload[3]]),
-        u32::from_le_bytes([cid_payload[4], cid_payload[5], cid_payload[6], cid_payload[7]]),
-        u32::from_le_bytes([cid_payload[8], cid_payload[9], cid_payload[10], cid_payload[11]]),
-        u32::from_le_bytes([cid_payload[12], cid_payload[13], cid_payload[14], cid_payload[15]]),
+        u32::from_be_bytes([cid_payload[12], cid_payload[13], cid_payload[14], cid_payload[15]]),
+        u32::from_be_bytes([cid_payload[8], cid_payload[9], cid_payload[10], cid_payload[11]]),
+        u32::from_be_bytes([cid_payload[4], cid_payload[5], cid_payload[6], cid_payload[7]]),
+        u32::from_be_bytes([cid_payload[0], cid_payload[1], cid_payload[2], cid_payload[3]]),
     ]); // CMD2 CID
     responses.extend([0x1234_0000, 0, 0, 0]); // CMD3 RCA 0x1234
     responses.extend(csd_v2_words(0x12345)); // CMD9 CSD v2, C_SIZE=0x12345
@@ -296,10 +297,10 @@ pub fn verify() {
     assert_eq!(info.rca, 0x1234);
     // CSD v2: blocks = (0x12345 + 1) * 1024
     assert_eq!(info.block_count, (0x12345 + 1) * 1024);
-    // CID 字节序：RESP 字内小端编码必须被 card_data() 正确还原。
+    // CID 字节序：RESP3..RESP0 大端编码必须被 card_data() 正确还原。
     assert_eq!(
         info.cid, cid_payload,
-        "R2 response must decode as little-endian within each RESP word"
+        "R2 must decode RESP3..RESP0 as big-endian protocol payload"
     );
 
     // 2) SDSC v1 初始化（CMD8 超时，无 4-bit）。
@@ -383,6 +384,45 @@ pub fn verify() {
     assert!(cmd17.expect("CMD17 trace").cmd_start);
     assert!(info.is_sdhc);
 
+    // 6) SDSC CMD17 地址计算：SDSC 用字节地址（块号 × 512）。
+    let mut responses: Vec<u32> = Vec::new();
+    responses.extend([0, 0, 0, 0]); // CMD0
+    responses.extend([0, 0, 0, 0]); // CMD8（超时 → SDSC）
+    responses.extend([0, 0, 0, 0]); // CMD55
+    responses.extend([0x80ff_8000, 0, 0, 0]); // ACMD41 ready（无 CCS）
+    responses.extend([0, 0, 0, 0]); // CMD2
+    responses.extend([0x4321_0000, 0, 0, 0]); // CMD3 RCA
+    responses.extend(csd_v1_words()); // CMD9 CSD v1
+    responses.extend([0, 0, 0, 0]); // CMD7
+    responses.extend([0, 0, 0, 0]); // CMD16
+    responses.extend([0, 0, 0, 0]); // CMD55
+    responses.extend([0, 0, 0, 0]); // ACMD51
+    responses.extend([0, 0, 0, 0]); // CMD13
+    let mock = MockRegisterIo::new()
+        .with_failure_once(MockFailure::ResponseTimeout, 8)
+        .with_responses(responses)
+        .with_fifo_data(vec![0, 0]); // SCR：无 4-bit
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    let info = initialize_card(&mut controller).expect("SDSC init for block read");
+    assert!(!info.is_sdhc);
+    // 读块 7：SDSC 用字节地址 = 7 × 512（换算由 block.rs 的
+    // sd_block_address 负责，见 block.rs verify）。
+    let byte_address = 7 * 512;
+    controller
+        .send_command(MmcCommand::new(SD_CMD17, byte_address, MmcResponseType::R1).with_data_length(true, 512))
+        .expect("CMD17");
+    let cmd17 = controller
+        .io_ref()
+        .commands
+        .iter()
+        .find(|c| c.index == SD_CMD17);
+    assert_eq!(
+        cmd17.expect("CMD17 sent").argument,
+        byte_address,
+        "SDSC CMD17 argument must carry the byte address"
+    );
+    assert!(cmd17.expect("CMD17 trace").cmd_start);
+
     crate::println!("C8 SD card gate:");
     crate::println!("  SDHC init           : verified");
     crate::println!("  SDSC init (no CMD8) : verified");
@@ -393,8 +433,9 @@ pub fn verify() {
 
 /// CSD v2 响应字：构造 C_SIZE 的 16 字节 CSD。
 ///
-/// DW-MMC RESP0..3 内 4 个字节按小端存放，故 mock 用 `from_le_bytes`
-/// 编码（与 `MmcResponse::card_data()` 的 `to_le_bytes()` 互为逆运算）。
+/// DW-MMC 逆序存储：RESP3 = 最高 word（payload[0..4]）、RESP0 = 最低
+/// word（payload[12..16]），字内大端。mock 按 [RESP0..RESP3] 编码，与
+/// `MmcResponse::card_data()` 的逆序读 + `to_be_bytes()` 互为逆运算。
 #[cfg(debug_assertions)]
 fn csd_v2_words(c_size: u64) -> Vec<u32> {
     // CSD v2：bits 48-69 = C_SIZE。构造 16 字节大端。
@@ -408,10 +449,10 @@ fn csd_v2_words(c_size: u64) -> Vec<u32> {
         }
     }
     vec![
-        u32::from_le_bytes([csd[0], csd[1], csd[2], csd[3]]),
-        u32::from_le_bytes([csd[4], csd[5], csd[6], csd[7]]),
-        u32::from_le_bytes([csd[8], csd[9], csd[10], csd[11]]),
-        u32::from_le_bytes([csd[12], csd[13], csd[14], csd[15]]),
+        u32::from_be_bytes([csd[12], csd[13], csd[14], csd[15]]),
+        u32::from_be_bytes([csd[8], csd[9], csd[10], csd[11]]),
+        u32::from_be_bytes([csd[4], csd[5], csd[6], csd[7]]),
+        u32::from_be_bytes([csd[0], csd[1], csd[2], csd[3]]),
     ]
 }
 
@@ -446,9 +487,9 @@ fn csd_v1_words() -> Vec<u32> {
         }
     }
     vec![
-        u32::from_le_bytes([csd[0], csd[1], csd[2], csd[3]]),
-        u32::from_le_bytes([csd[4], csd[5], csd[6], csd[7]]),
-        u32::from_le_bytes([csd[8], csd[9], csd[10], csd[11]]),
-        u32::from_le_bytes([csd[12], csd[13], csd[14], csd[15]]),
+        u32::from_be_bytes([csd[12], csd[13], csd[14], csd[15]]),
+        u32::from_be_bytes([csd[8], csd[9], csd[10], csd[11]]),
+        u32::from_be_bytes([csd[4], csd[5], csd[6], csd[7]]),
+        u32::from_be_bytes([csd[0], csd[1], csd[2], csd[3]]),
     ]
 }

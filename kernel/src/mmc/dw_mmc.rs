@@ -163,23 +163,25 @@ pub struct MmcResponse {
 }
 
 impl MmcResponse {
-    /// 48-bit 响应（R1/R3/R6/R7）：高 32 位在 RESP0。
+    /// 48-bit 响应（R1/R3/R6/R7）：卡状态在 RESP0。
     pub fn status(&self) -> u32 {
         self.r0
     }
 
-    /// 136-bit 响应（R2）：RESP0..3 从高位到低位。DW-MMC 每个 32-bit
-    /// 寄存器内的 4 个载荷字节按**小端**存放（RESP0 = payload[127:96]，
-    /// RESP0 的 bit[7:0] = payload 的 bit[127:120]），故用 `to_le_bytes()`
-    /// 还原出 16 字节大端载荷（bit 127 = bytes[0] 的 MSB）。此前用
-    /// `to_be_bytes()` 会把每个字内字节反转，C_SIZE 取错位导致容量解析
-    /// 错误（K3.4）。
+    /// 136-bit 响应（R2）：`r0..r3` 是协议响应**从高到低**的四个 word
+    /// （`r0` = payload[127:96]），与物理 RESP 寄存器编号无关——读取时
+    /// `r0 = REG_RESP3`、`r1 = REG_RESP2`、`r2 = REG_RESP1`、
+    /// `r3 = REG_RESP0`（Linux `dw_mmc.c` 逆序读，`resp[0] = RESP3`；
+    /// `mmc_decode_cid` 取 `resp[0] >> 24` = CID[127:120] = 厂商 ID）。
+    /// 每个 word 内 4 个载荷字节按**大端**存放，故用 `to_be_bytes()`
+    /// 还原出 16 字节协议顺序载荷（上一轮误用 `to_le_bytes()`，C_SIZE
+    /// 取错位导致容量解析错误，且 mock 与实现共享同一错误假设）。
     pub fn card_data(&self) -> [u8; 16] {
         let mut bytes = [0_u8; 16];
-        bytes[0..4].copy_from_slice(&self.r0.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.r1.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.r2.to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.r3.to_le_bytes());
+        bytes[0..4].copy_from_slice(&self.r0.to_be_bytes());
+        bytes[4..8].copy_from_slice(&self.r1.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.r2.to_be_bytes());
+        bytes[12..16].copy_from_slice(&self.r3.to_be_bytes());
         bytes
     }
 }
@@ -322,10 +324,12 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         match command.response_type {
             MmcResponseType::None => {}
             MmcResponseType::R2 => {
-                response.r0 = self.io.read32(REG_RESP0);
-                response.r1 = self.io.read32(REG_RESP1);
-                response.r2 = self.io.read32(REG_RESP2);
-                response.r3 = self.io.read32(REG_RESP3);
+                // r0 = 协议最高 word = RESP3；r3 = 协议最低 word = RESP0
+                // （DW-MMC 逆序存储，Linux/U-Boot 均按此读取）。
+                response.r0 = self.io.read32(REG_RESP3);
+                response.r1 = self.io.read32(REG_RESP2);
+                response.r2 = self.io.read32(REG_RESP1);
+                response.r3 = self.io.read32(REG_RESP0);
             }
             MmcResponseType::R1 | MmcResponseType::R3 | MmcResponseType::R6
             | MmcResponseType::R7 => {
@@ -400,7 +404,8 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         match command.response_type {
             MmcResponseType::None => {}
             MmcResponseType::R2 => {
-                value |= CMD_RESP_EXP | CMD_RESP_LONG;
+                // R2 也带 CRC 校验（136-bit，命令后 7-bit CRC）。
+                value |= CMD_RESP_EXP | CMD_RESP_LONG | CMD_RESP_CRC;
             }
             MmcResponseType::R1 | MmcResponseType::R6 | MmcResponseType::R7 => {
                 value |= CMD_RESP_EXP | CMD_RESP_CRC;
@@ -730,6 +735,27 @@ pub fn verify() {
         (cmd51.fifo_threshold.unwrap() >> 16) & 0x0fff,
         2,
         "8B → 2-word watermark"
+    );
+
+    // 17) R2 字节序：RESP3 = 协议最高 word，字内大端。mock 的 RESP 组按
+    //     [RESP0, RESP1, RESP2, RESP3] 给出（Linux dw_mmc.c 逆序读）。
+    let mock = MockRegisterIo::new().with_responses(vec![
+        0x7654_3210, // RESP0 = payload[12..16]
+        0xfedc_ba98, // RESP1 = payload[8..12]
+        0x89ab_cdef, // RESP2 = payload[4..8]
+        0x0123_4567, // RESP3 = payload[0..4]（最高 word）
+    ]);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    let response = controller
+        .send_command(MmcCommand::new(2, 0, MmcResponseType::R2))
+        .expect("CMD2 R2 response");
+    assert_eq!(
+        response.card_data(),
+        [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ],
+        "R2 must decode RESP3..RESP0 as big-endian protocol payload"
     );
 
     crate::println!("C7 DW-MMC controller gate:");

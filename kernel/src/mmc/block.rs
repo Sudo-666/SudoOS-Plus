@@ -41,13 +41,7 @@ impl<I: MmcRegisterIo> SdBlockDevice<I> {
         if output.len() != SD_BLOCK_SIZE {
             return Err(BlockError::BufferTooSmall);
         }
-        let address = if self.info.is_sdhc {
-            block
-        } else {
-            block
-                .checked_mul(SD_BLOCK_SIZE as u64)
-                .ok_or(BlockError::AddressOverflow)?
-        };
+        let address = sd_block_address(self.info.is_sdhc, block, SD_BLOCK_SIZE)?;
         let argument = u32::try_from(address).map_err(|_| BlockError::AddressOverflow)?;
 
         let mut controller = self.controller.lock();
@@ -105,4 +99,35 @@ fn mmc_to_block(error: MmcError) -> BlockError {
         MmcError::ResetFailed | MmcError::NotReady | MmcError::Io => BlockError::InvalidArgument,
         MmcError::InvalidArgument => BlockError::InvalidArgument,
     }
+}
+
+/// CMD17 寻址：SDHC/SDXC 用块号，SDSC 用字节地址（块号 × 块大小）。
+fn sd_block_address(is_sdhc: bool, block: u64, block_size: usize) -> Result<u64, BlockError> {
+    if is_sdhc {
+        Ok(block)
+    } else {
+        block
+            .checked_mul(block_size as u64)
+            .ok_or(BlockError::AddressOverflow)
+    }
+}
+
+#[cfg(debug_assertions)]
+pub fn verify() {
+    assert_eq!(
+        sd_block_address(true, 5, SD_BLOCK_SIZE),
+        Ok(5),
+        "SDHC CMD17 uses the block number"
+    );
+    assert_eq!(
+        sd_block_address(false, 7, SD_BLOCK_SIZE),
+        Ok(7 * SD_BLOCK_SIZE as u64),
+        "SDSC CMD17 uses the byte address (block × 512)"
+    );
+    assert_eq!(
+        sd_block_address(false, u64::MAX, SD_BLOCK_SIZE),
+        Err(BlockError::AddressOverflow),
+        "SDSC byte-address overflow must be caught"
+    );
+    crate::println!("C8 block addressing    : verified");
 }

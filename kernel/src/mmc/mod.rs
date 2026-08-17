@@ -159,6 +159,7 @@ pub fn initialize_storage() {
 pub fn verify() {
     dw_mmc::verify();
     sd::verify();
+    block::verify();
 
     // TF 主机选择：别名 mmc1 必须优先于"第一个可移除主机"。
     let emmc = myos_fdt::MmcHostConfig::new(
