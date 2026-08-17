@@ -378,8 +378,9 @@ impl<'a> DeviceTree<'a> {
     }
 
     /// 遍历 `/aliases` 中 `mmcN` 指向的 DesignWare MMC 主机
-    /// （`compatible = "snps,dw-mshc"`）。VisionFive 2 上 `mmc0` 是板载
-    /// eMMC、`mmc1` 是 TF 卡槽；`alias_index` 让调用方按槽位选择。
+    /// （`compatible` 匹配 `"snps,dw-mshc"` 或 `"starfive,jh7110-mmc"`——
+    /// 后者是 JH7110 上游 DT 的正式兼容串，K3.1）。VisionFive 2 上 `mmc0`
+    /// 是板载 eMMC、`mmc1` 是 TF 卡槽；`alias_index` 让调用方按槽位选择。
     pub fn for_each_mmc_host(
         &self,
         mut visitor: impl FnMut(MmcHostConfig),
@@ -398,7 +399,10 @@ impl<'a> DeviceTree<'a> {
                 continue;
             };
             let node = node.as_node();
-            if !node_is_available(node) || !node_is_compatible(node, "snps,dw-mshc") {
+            if !node_is_available(node)
+                || !(node_is_compatible(node, "snps,dw-mshc")
+                    || node_is_compatible(node, "starfive,jh7110-mmc"))
+            {
                 continue;
             }
             let Some(reg) = node.reg() else {
@@ -1094,8 +1098,9 @@ mod tests {
         assert_eq!(region.end(), Some(0xe200_0000));
     }
 
-    /// 组装一个带 `/aliases`(mmc0/mmc1) + 两个 `snps,dw-mshc` 主机的 FDT。
-    /// `sdio0` 显式 disabled，`sdio1` 正常。
+    /// 组装一个带 `/aliases`(mmc0/mmc1/mmc2) + 三个主机的 FDT。
+    /// `sdio0` 显式 disabled；`sdio1` 用 `snps,dw-mshc`；
+    /// `sdio2` 用 JH7110 上游正式串 `starfive,jh7110-mmc`（K3.1）。
     fn build_fdt_with_mmc_hosts() -> Vec<u8> {
         let mut structure = Vec::new();
         let mut strings = Vec::new();
@@ -1116,6 +1121,12 @@ mod tests {
             &mut strings,
             "mmc1",
             b"/soc/sdio1@16020000\0",
+        );
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "mmc2",
+            b"/soc/sdio2@16030000\0",
         );
         push_end_node(&mut structure);
 
@@ -1154,6 +1165,20 @@ mod tests {
         push_prop(&mut structure, &mut strings, "fifo-depth", &be32(32));
         push_end_node(&mut structure);
 
+        push_node(&mut structure, "sdio2@16030000");
+        push_prop(
+            &mut structure,
+            &mut strings,
+            "compatible",
+            b"starfive,jh7110-mmc\0",
+        );
+        let mut reg2 = Vec::new();
+        reg2.extend_from_slice(&u64_cells(0x1603_0000));
+        reg2.extend_from_slice(&u64_cells(0x1_0000));
+        push_prop(&mut structure, &mut strings, "reg", &reg2);
+        push_prop(&mut structure, &mut strings, "bus-width", &be32(4));
+        push_end_node(&mut structure);
+
         push_end_node(&mut structure); // soc
         push_end_node(&mut structure); // root
         structure.extend_from_slice(&be32(FDT_END));
@@ -1181,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn for_each_mmc_host_parses_dw_mshc() {
+    fn for_each_mmc_host_parses_dw_mshc_and_jh7110() {
         let fdt = build_fdt_with_mmc_hosts();
         let blob = FdtBlob::from_bytes(&fdt).expect("valid FDT blob");
         let tree = DeviceTree::from_blob(&blob).expect("parseable device tree");
@@ -1190,14 +1215,21 @@ mod tests {
         tree.for_each_mmc_host(|host| hosts.push(host))
             .expect("mmc host parse");
 
-        // sdio0 is disabled -> only sdio1 (mmc1) is discovered.
-        assert_eq!(hosts.len(), 1);
-        let host = hosts[0];
-        assert_eq!(host.alias_index(), Some(1));
-        assert_eq!(host.base(), 0x1602_0000);
-        assert_eq!(host.size(), 0x1_0000);
-        assert_eq!(host.bus_width(), 4);
-        assert_eq!(host.fifo_depth(), Some(32));
-        assert!(!host.non_removable());
+        // sdio0 is disabled -> sdio1 (snps,dw-mshc) and sdio2
+        // (starfive,jh7110-mmc) are discovered; both compatibles accepted.
+        assert_eq!(hosts.len(), 2);
+        let sdio1 = hosts[0];
+        assert_eq!(sdio1.alias_index(), Some(1));
+        assert_eq!(sdio1.base(), 0x1602_0000);
+        assert_eq!(sdio1.size(), 0x1_0000);
+        assert_eq!(sdio1.bus_width(), 4);
+        assert_eq!(sdio1.fifo_depth(), Some(32));
+        assert!(!sdio1.non_removable());
+
+        let sdio2 = hosts[1];
+        assert_eq!(sdio2.alias_index(), Some(2));
+        assert_eq!(sdio2.base(), 0x1603_0000);
+        assert_eq!(sdio2.bus_width(), 4);
+        assert!(!sdio2.non_removable());
     }
 }

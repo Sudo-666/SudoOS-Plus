@@ -68,7 +68,8 @@ impl BootRamdiskRegion {
     }
 }
 
-/// 一个 DesignWare MMC 主机（`compatible = "snps,dw-mshc"`，JH7110）。
+/// 一个 DesignWare MMC 主机（`compatible` 匹配 `"snps,dw-mshc"` 或
+/// `"starfive,jh7110-mmc"`，K3.1）。
 ///
 /// 由 `/aliases` 的 `mmcN` 指向。VisionFive 2 上 `mmc0` 是板载 eMMC（8-bit，
 /// 不可移除），`mmc1` 是 TF 卡槽（4-bit，可移除）。
