@@ -838,7 +838,11 @@ fn contest_fixture_probe(device: &alloc::sync::Arc<dyn crate::block::BlockDevice
         }
     }
     crate::println!("CONTEST_FIXTURE: paths-missing={}", missing);
-    crate::println!("FIXTURE_OSCOMP_PASS");
+    if missing == 0 {
+        crate::println!("FIXTURE_OSCOMP_PASS");
+    } else {
+        crate::println!("FIXTURE_OSCOMP_FAIL missing={}", missing);
+    }
 }
 
 /// Install the ext4 contest image contents (busybox, libs, scripts, dirs)

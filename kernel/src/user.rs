@@ -3307,6 +3307,7 @@ fn contest_storage_source() -> String {
 }
 
 fn verify_final_buildstorm_thread(run_diagnostic: bool) {
+    crate::oscomp::set_active_mode("final-buildstorm");
     let source = contest_storage_source();
     let _ = crate::fs::mkdir("/mnt", 0o755);
     let _ = crate::fs::mkdir("/mnt/sdcard", 0o755);
@@ -3616,17 +3617,30 @@ exit 0
     let buildstorm_failed = !matches!(&buildstorm_result, Ok(0));
     finish_buildstorm_xtask_bootstrap(&environment, buildstorm_failed);
     match buildstorm_result {
-        Ok(0) => crate::println!(
-            "sudoos-diag: final-buildstorm: script exit=0"
-        ),
-        Ok(code) => crate::println!(
-            "sudoos-diag: final-buildstorm: script exit={}",
-            code
-        ),
-        Err(error) => crate::println!(
-            "sudoos-diag: final-buildstorm: script exec failed: {:?}",
-            error,
-        ),
+        Ok(0) => {
+            crate::println!("sudoos-diag: final-buildstorm: script exit=0");
+            crate::oscomp::report_contest_result(
+                "final-buildstorm",
+                crate::oscomp::ContestVerdict::Passed,
+            );
+        }
+        Ok(code) => {
+            crate::println!("sudoos-diag: final-buildstorm: script exit={}", code);
+            crate::oscomp::report_contest_result(
+                "final-buildstorm",
+                crate::oscomp::ContestVerdict::Failed,
+            );
+        }
+        Err(error) => {
+            crate::println!(
+                "sudoos-diag: final-buildstorm: script exec failed: {:?}",
+                error,
+            );
+            crate::oscomp::report_contest_result(
+                "final-buildstorm",
+                crate::oscomp::ContestVerdict::Failed,
+            );
+        }
     }
     crate::println!(
         "buildstorm-safe-summary: unknown_syscalls={}",
@@ -3635,6 +3649,7 @@ exit 0
 }
 
 fn verify_final_cagent_thread() {
+    crate::oscomp::set_active_mode("final-cagent");
     let source = contest_storage_source();
     let _ = crate::fs::mkdir("/var", 0o755);
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
@@ -3844,6 +3859,10 @@ fn verify_final_cagent_thread() {
         Ok(0) => {
             crate::println!("sudoos-diag: final-cagent: official script exit=0");
             OSCOMP_PASS.store(1, Ordering::Release);
+            crate::oscomp::report_contest_result(
+                "final-cagent",
+                crate::oscomp::ContestVerdict::Passed,
+            );
         }
         Ok(code) => {
             if code < 0 {
@@ -3865,6 +3884,10 @@ fn verify_final_cagent_thread() {
                 );
             }
             OSCOMP_FAIL.store(1, Ordering::Release);
+            crate::oscomp::report_contest_result(
+                "final-cagent",
+                crate::oscomp::ContestVerdict::Failed,
+            );
         }
         Err(error) => {
             crate::println!(
@@ -3872,6 +3895,10 @@ fn verify_final_cagent_thread() {
                 error,
             );
             OSCOMP_FAIL.store(1, Ordering::Release);
+            crate::oscomp::report_contest_result(
+                "final-cagent",
+                crate::oscomp::ContestVerdict::Failed,
+            );
         }
     }
 
@@ -3905,6 +3932,7 @@ fn oscomp_print_summary(
 }
 
 fn verify_sdcard_all_scripts_thread() {
+    crate::oscomp::set_active_mode("preliminary");
     let _ = crate::fs::mkdir("/var", 0o755);
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
     let _ = crate::fs::mkdir("/tmp", 0o755);
@@ -4349,6 +4377,14 @@ fn verify_sdcard_all_scripts_thread() {
     {
         let skipped = OSCOMP_SKIPPED.load(Ordering::Acquire);
         let timed_out = OSCOMP_TIMEOUT.load(Ordering::Acquire);
+        // K2.1: 只有全部脚本通过（无失败/超时/信号/跳过）才打印 pass。
+        let verdict = if failed == 0 && timed_out == 0 && sig11 == 0 && sig14 == 0 && skipped == 0
+        {
+            crate::oscomp::ContestVerdict::Passed
+        } else {
+            crate::oscomp::ContestVerdict::Failed
+        };
+        crate::oscomp::report_contest_result("preliminary", verdict);
         crate::println!("#### OS COMP SUMMARY ####");
         crate::println!("arch={}", crate::arch::ARCH_NAME);
         crate::println!("total={}", scripts.len());
@@ -5539,6 +5575,11 @@ fn contest_watchdog_main() {
                 crate::println!("score={}", passed);
                 crate::println!("score: {}", passed);
                 crate::println!("#### OS COMP SUMMARY END ####");
+                // K2.1: 看门狗超时 → 结果协议里的 timeout 裁决。
+                crate::oscomp::report_contest_result(
+                    crate::oscomp::active_mode(),
+                    crate::oscomp::ContestVerdict::TimedOut,
+                );
                 crate::println!("oscomp: shutdown");
                 contest_platform_shutdown();
             }

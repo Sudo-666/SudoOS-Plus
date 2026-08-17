@@ -1,6 +1,46 @@
 pub mod final_2026;
 pub mod preliminary;
 
+use crate::irq_lock::IrqSpinLock;
+use crate::lockdep::{LockClass, LockRank};
+
+const MODE_LOCK: LockClass = LockClass::new("oscomp.mode", LockRank::Vfs, 93);
+
+/// 当前运行的用例模式（`final-cagent`/`final-buildstorm`/`preliminary`），
+/// 看门狗超时用它打印 `CONTEST_RESULT ... timeout`。
+static ACTIVE_MODE: IrqSpinLock<Option<&'static str>> =
+    IrqSpinLock::new_with_class(None, MODE_LOCK);
+
+/// 用例结果裁决。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContestVerdict {
+    Passed,
+    Failed,
+    TimedOut,
+}
+
+/// 记录当前运行的用例模式。
+pub fn set_active_mode(mode: &'static str) {
+    *ACTIVE_MODE.lock() = Some(mode);
+}
+
+/// 返回当前运行的用例模式（未记录时为 `unknown`）。
+pub fn active_mode() -> &'static str {
+    ACTIVE_MODE.lock().unwrap_or("unknown")
+}
+
+/// 打印 `CONTEST_RESULT mode=<mode> <pass|fail|timeout>`。这是最终结果协议：
+/// 只有镜像脚本退出码为 0 才打印 `pass`；日志检查器按模式匹配这些行判定
+/// 用例成败（K2.1）。
+pub fn report_contest_result(mode: &str, verdict: ContestVerdict) {
+    let word = match verdict {
+        ContestVerdict::Passed => "pass",
+        ContestVerdict::Failed => "fail",
+        ContestVerdict::TimedOut => "timeout",
+    };
+    crate::println!("CONTEST_RESULT mode={mode} {word}");
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunMode {
     Preliminary,
