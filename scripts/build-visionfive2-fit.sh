@@ -42,7 +42,9 @@ for f in "${KERNEL_RAW}" "${KERNEL_ELF}" "${INITRAMFS}" \
          "${DTB_DIR}/vf2-selftest.dtb" "${DTB_DIR}/vf2-single.dtb" \
          "${DTB_DIR}/vf2-smp.dtb" \
          "${DTB_DIR}/vf2-contest-fixture-single.dtb" \
-         "${DTB_DIR}/vf2-contest-fixture-smp.dtb"; do
+         "${DTB_DIR}/vf2-contest-fixture-smp.dtb" \
+         "${DTB_DIR}/vf2-finalall-single.dtb" \
+         "${DTB_DIR}/vf2-finalall-smp.dtb"; do
     [[ -f "${f}" ]] || {
         echo "error: required input missing: ${f}" >&2
         exit 2
@@ -61,6 +63,8 @@ sed \
     -e "s|DTB_SMP|$(realpath "${DTB_DIR}/vf2-smp.dtb")|g" \
     -e "s|DTB_CONTEST_SINGLE|$(realpath "${DTB_DIR}/vf2-contest-fixture-single.dtb")|g" \
     -e "s|DTB_CONTEST_SMP|$(realpath "${DTB_DIR}/vf2-contest-fixture-smp.dtb")|g" \
+    -e "s|DTB_FINALALL_SINGLE|$(realpath "${DTB_DIR}/vf2-finalall-single.dtb")|g" \
+    -e "s|DTB_FINALALL_SMP|$(realpath "${DTB_DIR}/vf2-finalall-smp.dtb")|g" \
     -e "s|INITRAMFS|$(realpath "${INITRAMFS}")|g" \
     "${ITS_TEMPLATE}" > "${ITS_GEN}"
 
@@ -108,7 +112,7 @@ bool() { if git rev-parse --git-dir >/dev/null 2>&1; then
     echo "fit_sha256      = $(sha256 "${ITB}")"
     echo "fit_size        = $(size "${ITB}")"
     echo
-    echo "fit_configs     = conf-selftest conf-single conf-smp conf-contest-fixture-single conf-contest-fixture-smp (default conf-smp)"
+    echo "fit_configs     = conf-selftest conf-single conf-smp conf-contest-fixture-single conf-contest-fixture-smp conf-final-all-single conf-final-all-smp (default conf-smp)"
     echo "dtb_addr        = 0x46000000"
     echo "initrd_addr     = 0x46200000"
     echo "fit_staging     = 0x60000000"
@@ -118,6 +122,8 @@ bool() { if git rev-parse --git-dir >/dev/null 2>&1; then
     echo "bootargs_smp      = console=ttyS0,115200n8 rdinit=/init init.debug=1 sudoos.maxcpus=4"
     echo "bootargs_contest_single = console=ttyS0,115200n8 sudoos.oscomp=preliminary sudoos.contest.dev=mmcblk1 sudoos.contest.fixture=1 sudoos.maxcpus=1"
     echo "bootargs_contest_smp    = console=ttyS0,115200n8 sudoos.oscomp=preliminary sudoos.contest.dev=mmcblk1 sudoos.contest.fixture=1 sudoos.maxcpus=4"
+    echo "bootargs_finalall_single = console=ttyS0,115200n8 sudoos.oscomp=final-all sudoos.contest.dev=mmcblk1 sudoos.maxcpus=1"
+    echo "bootargs_finalall_smp    = console=ttyS0,115200n8 sudoos.oscomp=final-all sudoos.contest.dev=mmcblk1 sudoos.maxcpus=4"
     echo
     echo "rustc           = $(rustc -Vv 2>/dev/null | tr '\n' ' ')"
     echo "cargo           = $(cargo -V 2>/dev/null)"

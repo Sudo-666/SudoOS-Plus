@@ -111,6 +111,9 @@ BOOTARGS_SMP="console=ttyS0,115200n8 rdinit=/init init.debug=1 sudoos.maxcpus=4"
 # C9: contest fixture configs (TF card = mmcblk1). No rdinit=/init.
 BOOTARGS_CONTEST_SINGLE="console=ttyS0,115200n8 sudoos.oscomp=preliminary sudoos.contest.dev=mmcblk1 sudoos.contest.fixture=1 sudoos.maxcpus=1"
 BOOTARGS_CONTEST_SMP="console=ttyS0,115200n8 sudoos.oscomp=preliminary sudoos.contest.dev=mmcblk1 sudoos.contest.fixture=1 sudoos.maxcpus=4"
+# K5.1: official final-all configs (TF card mmcblk1, auto partition descend).
+BOOTARGS_FINALALL_SINGLE="console=ttyS0,115200n8 sudoos.oscomp=final-all sudoos.contest.dev=mmcblk1 sudoos.maxcpus=1"
+BOOTARGS_FINALALL_SMP="console=ttyS0,115200n8 sudoos.oscomp=final-all sudoos.contest.dev=mmcblk1 sudoos.maxcpus=4"
 
 declare -A VARIANTS=(
     [selftest]="${BOOTARGS_SELFTEST}"
@@ -118,9 +121,11 @@ declare -A VARIANTS=(
     [smp]="${BOOTARGS_SMP}"
     [contest-fixture-single]="${BOOTARGS_CONTEST_SINGLE}"
     [contest-fixture-smp]="${BOOTARGS_CONTEST_SMP}"
+    [finalall-single]="${BOOTARGS_FINALALL_SINGLE}"
+    [finalall-smp]="${BOOTARGS_FINALALL_SMP}"
 )
 
-for variant in selftest single smp contest-fixture-single contest-fixture-smp; do
+for variant in selftest single smp contest-fixture-single contest-fixture-smp finalall-single finalall-smp; do
     out="${OUT_DIR}/vf2-${variant}.dtb"
     cp "${DTB}" "${out}"
     fdtput -t s "${out}" /chosen bootargs "${VARIANTS[${variant}]}"
