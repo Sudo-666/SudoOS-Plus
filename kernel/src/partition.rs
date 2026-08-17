@@ -60,8 +60,13 @@ impl From<BlockError> for PartitionError {
 }
 
 /// 探测出的分区描述（尚无最终注册名）。
+///
+/// `number` 是分区表里的真实序号（MBR 槽位 / GPT 项号，均 1 起始）。
+/// 扫描器跳过空项后仍需保留真实序号，注册时不能按返回列表的下标重排
+/// （否则稀疏分区表会把第 3 分区压缩命名为 p1/p2）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartitionSpec {
+    pub number: u32,
     pub first_lba: u64,
     pub block_count: u64,
     pub read_only: bool,
@@ -168,6 +173,7 @@ pub fn scan_partitions(
     // raw ext4 整盘：超级块魔数直接出现在设备头部。
     if device_is_ext4(parent)? {
         return Ok(vec![PartitionSpec {
+            number: 1,
             first_lba: 0,
             block_count: parent_blocks,
             read_only: parent.is_read_only(),
@@ -196,8 +202,8 @@ pub fn register_partitions(
 ) -> Result<Vec<String>, PartitionError> {
     let specs = scan_partitions(device)?;
     let mut registered = Vec::new();
-    for (index, spec) in specs.iter().enumerate() {
-        let name = partition_name(base_name, (index + 1) as u32);
+    for spec in specs.iter() {
+        let name = partition_name(base_name, spec.number);
         let partition = Arc::new(PartitionBlockDevice::new(
             Arc::clone(device),
             spec.first_lba,
@@ -325,6 +331,7 @@ fn scan_gpt(
         }
         let attributes = u64::from_le_bytes(entry[48..56].try_into().unwrap());
         specs.push(PartitionSpec {
+            number: (index + 1) as u32,
             first_lba,
             block_count,
             read_only: attributes & GPT_READONLY_ATTR != 0,
@@ -360,6 +367,7 @@ fn scan_mbr(
             continue;
         }
         specs.push(PartitionSpec {
+            number: (index + 1) as u32,
             first_lba,
             block_count: sector_count,
             read_only: parent.is_read_only(),
@@ -399,6 +407,7 @@ pub fn verify() {
     assert_eq!(
         raw_specs,
         vec![PartitionSpec {
+            number: 1,
             first_lba: 0,
             block_count: 64,
             read_only: false,
@@ -413,11 +422,13 @@ pub fn verify() {
         gpt_specs,
         vec![
             PartitionSpec {
+                number: 1,
                 first_lba: 34,
                 block_count: 7,
                 read_only: false,
             },
             PartitionSpec {
+                number: 2,
                 first_lba: 50,
                 block_count: 11,
                 read_only: true,
@@ -465,17 +476,52 @@ pub fn verify() {
         mbr_specs,
         vec![
             PartitionSpec {
+                number: 1,
                 first_lba: 1,
                 block_count: 20,
                 read_only: false,
             },
             PartitionSpec {
+                number: 2,
                 first_lba: 30,
                 block_count: 15,
                 read_only: false,
             },
         ],
     );
+
+    // 7b) 稀疏 MBR：中间槽位为空 → 分区保留真实序号（1 与 3，不是 1、2），
+    //     注册名也必须是 vda1/vda3 而非按列表下标压缩成 vda1/vda2。
+    let sparse_mbr = make_disk(64);
+    install_mbr(&sparse_mbr, &[(1, 20, 0x0c), (0, 0, 0), (30, 15, 0x83)]);
+    let sparse_specs = scan_partitions(&Arc::clone(&sparse_mbr)).expect("sparse mbr scan");
+    assert_eq!(
+        sparse_specs,
+        vec![
+            PartitionSpec {
+                number: 1,
+                first_lba: 1,
+                block_count: 20,
+                read_only: false,
+            },
+            PartitionSpec {
+                number: 3,
+                first_lba: 30,
+                block_count: 15,
+                read_only: false,
+            },
+        ],
+        "empty MBR slot must not renumber later partitions",
+    );
+    let sparse_names =
+        register_partitions("vda", &Arc::clone(&sparse_mbr)).expect("register sparse mbr");
+    assert_eq!(
+        sparse_names,
+        vec![String::from("vda1"), String::from("vda3")],
+        "registered names must keep real MBR slot numbers",
+    );
+    crate::block::unregister_device("vda1").expect("unregister sparse p1");
+    crate::block::unregister_device("vda3").expect("unregister sparse p3");
 
     // 8) 超大 LBA：分区构造时溢出 → AddressOverflow。
     assert_eq!(
@@ -544,6 +590,7 @@ pub fn verify() {
     assert_eq!(
         wide_specs,
         vec![PartitionSpec {
+            number: 1,
             first_lba: 34,
             block_count: 7,
             read_only: false,
@@ -572,6 +619,7 @@ pub fn verify() {
     crate::println!("  parent error prop   : verified");
     crate::println!("  read-only inherit   : verified");
     crate::println!("  partition naming    : verified");
+    crate::println!("  sparse MBR (real #) : verified");
     crate::println!("  GPT wide header     : verified");
     crate::println!("  GPT oversized header: verified");
 }
