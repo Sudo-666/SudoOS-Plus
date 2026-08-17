@@ -201,8 +201,8 @@ pub fn verify() {
         false,
     );
     assert_eq!(select_tf_host(&[anonymous]), Some(anonymous));
-    // 只有 mmc0：无 mmc1 别名时不得误配。
-    assert_eq!(select_tf_host(&[emmc]), None);
+    // 只有可移除的 mmc0：无 mmc1 别名时回退选中它（尽力而为）。
+    assert_eq!(select_tf_host(&[emmc]), Some(emmc));
     // 全部不可移除且无别名 → None。
     let fixed = myos_fdt::MmcHostConfig::new(
         None,
@@ -216,6 +216,19 @@ pub fn verify() {
         true,
     );
     assert_eq!(select_tf_host(&[fixed]), None);
+    // 不可移除的 mmc0 + 可移除的 mmc1 → 别名 mmc1 胜出。
+    let emmc_fixed = myos_fdt::MmcHostConfig::new(
+        Some(0),
+        0x1601_0000,
+        0x1_0000,
+        74,
+        8,
+        Some(32),
+        None,
+        None,
+        true,
+    );
+    assert_eq!(select_tf_host(&[emmc_fixed, tf]), Some(tf));
 
     crate::println!("C6.1 host selection    : verified");
 }
