@@ -38,34 +38,41 @@ loongarch64 的 QEMU 直启还差 FDT 回退（parked 分支），fixture 目标
 ## VisionFive 2（TF 卡）
 
 ```bash
-# 构建 FIT（含 conf-contest-fixture-single / conf-contest-fixture-smp）
+# 构建 FIT（含 conf-contest-fixture-* 与 conf-final-all-*）
 VISIONFIVE2_DTB=/path/to/jh7110-...dtb make visionfive2-tftp-bundle
 
 # TFTP 到板上（U-Boot）：
 #   setenv bootargs; setenv fdt_high
 #   tftpboot 0x60000000 sudoos/vf2/sudoos-visionfive2.itb
-#   bootm 0x60000000#conf-contest-fixture-single   (或 #conf-contest-fixture-smp)
+#   bootm 0x60000000#conf-contest-fixture-single   (fixture，或 #conf-contest-fixture-smp)
+#   bootm 0x60000000#conf-final-all-single         (正式镜像，或 #conf-final-all-smp)
 ```
 
-TF 卡放 `contest-rv.ext4`（32 MiB raw ext4）。bootargs 由 FIT DTB 携带：
-`sudoos.oscomp=preliminary sudoos.contest.dev=mmcblk1 sudoos.contest.fixture=1
-sudoos.maxcpus=1|4`（无 `rdinit=/init`）。
+TF 卡放 `contest-rv.ext4`（32 MiB raw ext4）或正式 `.img`。bootargs 由 FIT
+DTB 携带：fixture 用 `sudoos.oscomp=preliminary sudoos.contest.dev=mmcblk1
+sudoos.contest.fixture=1`；正式用 `sudoos.oscomp=final-all
+sudoos.contest.dev=mmcblk1`（分区自动降级到 ext4 分区）。均无 `rdinit=/init`。
 
 ## LS2K1000（U-Boot 内存盘）
 
 ```bash
 make ls2k1000-contest-fixture-bundle      # kernel uImage + DTB + contest-la.ext4 + boot.txt
-make ls2k1000-contest-fixture-configs     # single/smp DTB 变体
+make ls2k1000-contest-fixture-configs     # fixture single/smp DTB 变体
+make ls2k1000-contest-final-all-configs   # 正式 final-all single/smp DTB
+CONTEST_IMAGE=/path/to/official.img make ls2k1000-contest-final-all-bundle  # 动态大小正式包
 
 # U-Boot（cached-VA）：
 #   fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage
-#   fatload usb 0:1 0x900000000a000000 ls2k1000-contest-fixture-single.dtb
-#   fatload usb 0:1 0x90000000e0000000 contest-la.ext4
+#   fatload usb 0:1 0x900000000a000000 ls2k1000-contest-final-all-single.dtb
+#   fatload usb 0:1 0x90000000e0000000 ls2k1000-contest-final-all.img
 #   bootm 0x9000000002000000 - 0x900000000a000000
 ```
 
 DTB 在 `/reserved-memory` 声明 `contest-disk@e0000000`
-（`compatible = "sudoos,boot-ramdisk"`），内核据此注册 `/dev/ram0`。
+（`compatible = "sudoos,boot-ramdisk"`），内核据此注册 `/dev/ram0`。正式镜像
+（`sudoos.oscomp=final-all sudoos.contest.dev=ram0`）的 reserved 大小由
+`CONTEST_IMAGE` 实际文件大小按 512 对齐，脚本校验落在 RAM 内且不与
+kernel/DTB/U-Boot 暂存重叠。
 
 ## 日志验收
 
