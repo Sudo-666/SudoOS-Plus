@@ -2255,6 +2255,10 @@ const OSCOMP_ENABLE_NETPERF_MINI: bool = false;
 const OSCOMP_ENABLE_LTP_ALLOWLIST: bool = false;
 const OSCOMP_RV_TOTAL_BUDGET_MS: u64 = 420_000;
 const OSCOMP_LA_TOTAL_BUDGET_MS: u64 = 240_000;
+/// BuildStorm 独立全局 watchdog 预算（毫秒）。评测脚本内部自带 timeout
+/// （最长达 4h = 14400s），内核侧兜底取 5h，保证正常构建绝不误触发，
+/// 只拦截"脚本挂死、wait_for_exit 永不返回"的情况。
+const BUILDSTORM_GLOBAL_BUDGET_MS: u64 = 5 * 60 * 60 * 1000;
 
 // ── P10-F8: no-sdcard selftest flags (all false) ──
 const OSCOMP_PROBE_SELFTEST_NO_SDCARD: bool = false;
@@ -3603,6 +3607,19 @@ exit 0
             crate::smp::CpuId::BOOT,
         );
     }
+    // BUILDSTORM_INDEPENDENT_WATCHDOG_V1
+    // BuildStorm 必须有独立全局 deadline，不能依赖 CAgent 已关闭的 watchdog
+    // （cagent 结束后 OSCOMP_FINALIZED 已置位，复用 contest_watchdog_main
+    // 的 CAS 会失败）。脚本挂死时内核不再永久等待。
+    let freq_hz = crate::time::clock_frequency_hz();
+    let budget_deadline = crate::time::now()
+        .cycles()
+        .saturating_add(freq_hz / 1000 * BUILDSTORM_GLOBAL_BUDGET_MS);
+    OSCOMP_ACTIVE.store(true, Ordering::Release);
+    OSCOMP_FINALIZED.store(false, Ordering::Release);
+    OSCOMP_DEADLINE_CYCLES.store(budget_deadline, Ordering::Release);
+    crate::task::spawn_kernel_thread(buildstorm_watchdog_main);
+
     // SUDOOS_BUILDSTORM_XTASK_TMPFS_V3: prepare/reuse the real xtask in tmpfs.
     prepare_buildstorm_xtask_bootstrap(&environment);
     let buildstorm_result =
@@ -3612,6 +3629,8 @@ exit 0
             &environment,
             Some("/"),
         );
+    // 脚本返回即停 watchdog（防止其后续误触发）。
+    OSCOMP_ACTIVE.store(false, Ordering::Release);
     BUILDSTORM_SAFE_ACTIVE.store(false, Ordering::Release);
     BUILDSTORM_LATE_SNAPSHOT_ACTIVE.store(false, Ordering::Release);
     let buildstorm_failed = !matches!(&buildstorm_result, Ok(0));
@@ -5534,6 +5553,36 @@ fn oscomp_la_run_musl_lua_direct() -> isize {
     crate::println!("#### OS COMP TEST GROUP END lua-musl ####");
 
     if failures == 0 { 0 } else { 1 }
+}
+
+/// BuildStorm 独立全局 watchdog。不能复用 `contest_watchdog_main`：其
+/// `OS_COMP_SUMMARY` 与 `OSCOMP_FINALIZED` CAS 语义属于 CAgent 脚本循环，
+/// CAgent 结束后 `OSCOMP_FINALIZED` 已置位，CAS 会失败。这里只打印
+/// `CONTEST_RESULT mode=final-buildstorm timeout` 并关机，保证脚本挂死时
+/// 内核不永久等待。
+fn buildstorm_watchdog_main() {
+    loop {
+        if !OSCOMP_ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        let deadline = OSCOMP_DEADLINE_CYCLES.load(Ordering::Acquire);
+        if deadline != 0 && crate::time::now().cycles() >= deadline {
+            if OSCOMP_FINALIZED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                crate::println!("oscomp: buildstorm global deadline reached");
+                crate::oscomp::report_contest_result(
+                    "final-buildstorm",
+                    crate::oscomp::ContestVerdict::TimedOut,
+                );
+                crate::println!("oscomp: shutdown");
+                contest_platform_shutdown();
+            }
+            return;
+        }
+        crate::task::yield_now();
+    }
 }
 
 /// External watchdog kernel thread.  If the contest runner blocks
