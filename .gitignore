@@ -40,6 +40,9 @@ core
 /ls2k1000-contest-fixture-smp.dtb
 /contest-la.ext4
 /ls2k1000-contest-fixture-boot.txt
+/ls2k1000-contest-final-all.dtb
+/ls2k1000-contest-final-all.img
+/ls2k1000-contest-final-all-boot.txt
 /busybox-loongarch64.cpio
 /uImage.fit
 /uImage-*

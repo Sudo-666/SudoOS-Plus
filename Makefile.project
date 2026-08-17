@@ -155,6 +155,28 @@ ls2k1000-contest-fixture-configs: kernel-ls2k1000.uImage
 	@cp build/host-tools/ls2k1000/ls2k1000-contest-fixture-smp.dtb ls2k1000-contest-fixture-smp.dtb
 	@echo "LS2K1000 contest fixture configs ready (single/smp)"
 
+# K4.1: 正式镜像动态打包。CONTEST_IMAGE 指定实际 .img —— 大小按 512 对齐并
+# 校验落在 RAM 内、不与 kernel/DTB/U-Boot 暂存重叠；DTB reserved-memory 用
+# 计算后大小；bootargs 用 final-all（不用 preliminary/fixture=1）。
+.PHONY: ls2k1000-contest-final-all-bundle
+ls2k1000-contest-final-all-bundle: kernel-ls2k1000.uImage
+	@test -n "$(CONTEST_IMAGE)" || { echo "error: CONTEST_IMAGE=/path/to/official.img required"; exit 1; }
+	@mkdir -p build/fixtures
+	@CONTEST_DISK=0xe0000000 CONTEST_IMAGE=$(CONTEST_IMAGE) \
+	    BOOTARGS="console=ttyS0,115200n8 sudoos.oscomp=final-all sudoos.contest.dev=ram0" \
+	    DTB_NAME=ls2k1000-contest-final-all \
+	    scripts/build-ls2k1000-dtb.sh
+	@cp build/host-tools/ls2k1000/ls2k1000-contest-final-all.dtb ls2k1000-contest-final-all.dtb
+	@cp $(CONTEST_IMAGE) ls2k1000-contest-final-all.img
+	@printf '%s\n' \
+	    "U-Boot (cached-VA):" \
+	    "  fatload usb 0:1 0x9000000002000000 kernel-ls2k1000.uImage" \
+	    "  fatload usb 0:1 0x900000000a000000 ls2k1000-contest-final-all.dtb" \
+	    "  fatload usb 0:1 0x90000000e0000000 ls2k1000-contest-final-all.img" \
+	    "  bootm 0x9000000002000000 - 0x900000000a000000" \
+	    "bootargs: sudoos.oscomp=final-all sudoos.contest.dev=ram0" > ls2k1000-contest-final-all-boot.txt
+	@ls -lh kernel-ls2k1000.uImage ls2k1000-contest-final-all.dtb ls2k1000-contest-final-all.img ls2k1000-contest-final-all-boot.txt
+
 # SUDOOS_LS2K_GATEB_V1: rdinit=/init variant of the stage-4 DTB. Same layout
 # and initrd placement as ls2k1000-stage4, but /chosen/bootargs carries
 # "rdinit=/init init.debug=1" so the kernel boots the real /init as PID 1

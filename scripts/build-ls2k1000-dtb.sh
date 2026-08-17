@@ -52,22 +52,70 @@ BOOTARGS="${BOOTARGS:-console=ttyS0,115200n8}"
 # emit a named variant such as ls2k1000-stage4-init.
 DTB_NAME="${DTB_NAME:-}"
 
-# Contest fixture ramdisk (CodePlan C5): when CONTEST_DISK is a physical
-# address, emit a /reserved-memory/contest-disk node
-# (compatible = "sudoos,boot-ramdisk") so the kernel registers /dev/ram0 over
-# the firmware-loaded image. The region is excluded from free memory by the
-# /reserved-memory reservation. Default 32 MiB.
+# Contest disk (CodePlan C5, K4.1): when CONTEST_DISK is a physical address,
+# emit a /reserved-memory/contest-disk node (compatible = "sudoos,boot-ramdisk")
+# so the kernel registers /dev/ram0 over the firmware-loaded image. The region
+# is excluded from free memory by the /reserved-memory reservation.
+#
+# Size resolution:
+#   1. CONTEST_IMAGE=<file>  -> actual file size, 512-byte aligned up
+#   2. CONTEST_DISK_SIZE=... -> explicit override
+#   3. otherwise             -> default 32 MiB (fixture)
+# The region must lie within RAM and not overlap the low-bank staging
+# (kernel/DTB/U-Boot) when addressed there.
 CONTEST_DISK="${CONTEST_DISK:-}"
-CONTEST_DISK_SIZE="${CONTEST_DISK_SIZE:-0x02000000}"
+CONTEST_DISK_SIZE="${CONTEST_DISK_SIZE:-}"
+CONTEST_IMAGE="${CONTEST_IMAGE:-}"
+
+# Fixed physical staging layout (U-Boot cached-VA = phys + 0x9000000000000000):
+#   kernel uImage   0x02000000
+#   DTB             0x0a000000
+#   raw initramfs   0x0b000000
+#   U-Boot          0x0ec00000
+KERNEL_BASE=0x02000000
+DTB_BASE=0x0a000000
+UBOOT_BASE=0x0ec00000
+LOW_BANK_END=0x10000000
+# 主 RAM bank 上限（memory@90000000 reg 0x70000000 的末端）。
+RAM_END=0x100000000
 
 RESERVED_MEMORY_LINES=""
 if [[ -n "${CONTEST_DISK}" ]]; then
     CONTEST_DISK_ADDR=$(( CONTEST_DISK ))
-    CONTEST_DISK_LEN=$(( CONTEST_DISK_SIZE ))
+    if [[ -n "${CONTEST_IMAGE}" ]]; then
+        if [[ ! -f "${CONTEST_IMAGE}" ]]; then
+            echo "error: CONTEST_IMAGE is not a file: ${CONTEST_IMAGE}" >&2
+            exit 1
+        fi
+        RAW_SIZE=$(stat -c %s "${CONTEST_IMAGE}")
+        CONTEST_DISK_LEN=$(( (RAW_SIZE + 511) / 512 * 512 ))
+    elif [[ -n "${CONTEST_DISK_SIZE}" ]]; then
+        CONTEST_DISK_LEN=$(( CONTEST_DISK_SIZE ))
+    else
+        CONTEST_DISK_LEN=$(( 0x02000000 ))
+    fi
     if [[ ${CONTEST_DISK_ADDR} -eq 0 || ${CONTEST_DISK_LEN} -eq 0 ]]; then
         echo "error: contest disk address/size must be non-zero" >&2
         exit 1
     fi
+
+    # ---- bounds / overlap checks ----
+    CONTEST_DISK_END=$(( CONTEST_DISK_ADDR + CONTEST_DISK_LEN ))
+    if [[ ${CONTEST_DISK_END} -gt ${RAM_END} ]]; then
+        echo "error: contest disk [0x$(printf %x ${CONTEST_DISK_ADDR}), 0x$(printf %x ${CONTEST_DISK_END})) exceeds RAM end 0x$(printf %x ${RAM_END})" >&2
+        exit 1
+    fi
+    if [[ ${CONTEST_DISK_ADDR} -lt ${LOW_BANK_END} ]]; then
+        if [[ ${CONTEST_DISK_ADDR} -lt ${DTB_BASE} && ${KERNEL_BASE} -lt ${CONTEST_DISK_END} ]]; then
+            echo "error: contest disk overlaps kernel/DTB staging [0x${KERNEL_BASE}, 0x${DTB_BASE})" >&2
+            exit 1
+        fi
+        if [[ ${UBOOT_BASE} -lt ${CONTEST_DISK_END} ]]; then
+            echo "error: contest disk overlaps U-Boot region [0x${UBOOT_BASE}, 0x${LOW_BANK_END})" >&2
+            exit 1
+        fi
+    fi
+
     CONTEST_DISK_ADDR_HEX=$(printf '%08x' "${CONTEST_DISK_ADDR}")
     CONTEST_DISK_SIZE_HEX=$(printf '%08x' "${CONTEST_DISK_LEN}")
     RESERVED_MEMORY_LINES=$(cat <<EOT
@@ -87,16 +135,6 @@ if [[ -n "${CONTEST_DISK}" ]]; then
 EOT
 )
 fi
-
-# Fixed physical staging layout (U-Boot cached-VA = phys + 0x9000000000000000):
-#   kernel uImage   0x02000000
-#   DTB             0x0a000000
-#   raw initramfs   0x0b000000
-#   U-Boot          0x0ec00000
-KERNEL_BASE=0x02000000
-DTB_BASE=0x0a000000
-UBOOT_BASE=0x0ec00000
-LOW_BANK_END=0x10000000
 
 INITRD_PROPS=""
 MEMRESERVE_LINES=""
@@ -228,4 +266,7 @@ echo "  bootargs      : ${BOOTARGS}"
 if [[ -n "${INITRD}" ]]; then
     echo "  linux,initrd  : [0x${INITRD_START_HEX}, 0x${INITRD_END_HEX}) ${INITRD_SIZE} bytes"
     echo "  /memreserve/  : 0x${INITRD_START_HEX} 0x${INITRD_SIZE_HEX}"
+fi
+if [[ -n "${CONTEST_DISK}" ]]; then
+    echo "  contest-disk  : [0x${CONTEST_DISK_ADDR_HEX}, 0x$(printf %x ${CONTEST_DISK_END})) ${CONTEST_DISK_LEN} bytes${CONTEST_IMAGE:+ (from ${CONTEST_IMAGE})}"
 fi
