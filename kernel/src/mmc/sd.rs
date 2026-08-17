@@ -31,7 +31,11 @@ const SD_OCR_CCS: u32 = 1 << 30;
 const SD_OCR_POWER_UP: u32 = 1 << 31;
 const SD_ACMD6_ARG_4BIT: u32 = 2;
 const SD_BLOCK_LEN: u32 = 512;
-const MAX_ACMD41_RETRIES: usize = 100;
+/// ACMD41 OCR 轮询：总 deadline ~1s、每轮间隔 5ms（卡上电需数百 ms），
+/// 叠加次数上限兜底计时器异常（避免死循环）。
+const ACMD41_POLL_DEADLINE_MS: u64 = 1_000;
+const ACMD41_POLL_INTERVAL_MS: u64 = 5;
+const MAX_ACMD41_RETRIES: usize = 512;
 
 /// 初始化后的 SD 卡信息。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,9 +84,15 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
     let is_v2 = interface_condition.r0 & 0x0fff == SD_IF_COND_PATTERN;
 
     // CMD55 + ACMD41：OCR 轮询，power-up busy 位（bit31）就绪后读取 CCS。
+    // 总 deadline ~1s，每轮间隔 5ms（上电需数百 ms），叠加次数上限兜底。
     let mut is_sdhc = false;
     let mut powered_up = false;
-    for _ in 0..MAX_ACMD41_RETRIES {
+    let freq_hz = crate::time::clock_frequency_hz();
+    let deadline = crate::time::now()
+        .cycles()
+        .saturating_add(freq_hz / 1000 * ACMD41_POLL_DEADLINE_MS);
+    let mut retries = 0;
+    while !powered_up {
         host.send_command(MmcCommand::new(SD_CMD55, 0, MmcResponseType::R1))?;
         let ocr = host.send_command(MmcCommand::new(
             SD_ACMD41,
@@ -93,6 +103,17 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
             is_sdhc = is_v2 && ocr.r0 & SD_OCR_CCS != 0;
             powered_up = true;
             break;
+        }
+        retries += 1;
+        if retries >= MAX_ACMD41_RETRIES || crate::time::now().cycles() >= deadline {
+            break;
+        }
+        // 1-10ms 间隔忙等，避免急转供电/总线。
+        let interval = crate::time::now()
+            .cycles()
+            .saturating_add(freq_hz / 1000 * ACMD41_POLL_INTERVAL_MS);
+        while crate::time::now().cycles() < interval {
+            core::hint::spin_loop();
         }
     }
     if !powered_up {
@@ -123,11 +144,11 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
         return Err(MmcError::InvalidArgument);
     }
 
-    // CMD7：选中该卡。
+    // CMD7：选中该卡（R1b，响应后等 busy 清才能发 CMD55/ACMD51）。
     host.send_command(MmcCommand::new(
         SD_CMD7,
         rca << 16,
-        MmcResponseType::R1,
+        MmcResponseType::R1b,
     ))?;
 
     // CMD16：仅 SDSC 需要设置块长。

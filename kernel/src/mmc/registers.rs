@@ -61,6 +61,11 @@ pub const CMD_DATA_EXPECTED: u32 = 1 << 9;
 pub const CMD_DATA_WRITE: u32 = 1 << 10;
 pub const CMD_SEND_INIT: u32 = 1 << 15;
 pub const CMD_UPDATE_CLOCK: u32 = 1 << 21;
+/// 等待上一条数据命令完成后再启动本命令（数据命令与 UPDATE_CLOCK 使用）。
+pub const CMD_PRV_DAT_WAIT: u32 = 1 << 13;
+/// 保持命令/数据寄存器（hold register）。JH7110 无 USE_HOLD_REG quirk，
+/// 普通命令统一置位以稳定 AHB 总线。
+pub const CMD_USE_HOLD_REG: u32 = 1 << 29;
 pub const CMD_START: u32 = 1 << 31;
 
 /// `RINTSTS` / `MINTSTS` 中断位（dw_mmc.h：HTO=10、FRUN=11、HLE=12、

@@ -71,6 +71,8 @@ pub enum MmcResponseType {
     None,
     /// R1：48-bit，CRC + 索引检查。
     R1,
+    /// R1b：R1 + 忙信号（CMD7 select 等）。响应后还需等数据总线 busy 清。
+    R1b,
     /// R2：136-bit（CID/CSD）。
     R2,
     /// R3：48-bit，无 CRC（OCR）。
@@ -250,12 +252,18 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         self.send_update_clock()?;
 
         let target = frequency_hz.max(100_000);
-        let divider = self
-            .ciu_frequency_hz
-            .checked_div(target.saturating_mul(2))
-            .unwrap_or(0)
-            .max(1)
-            .min(0xffff) as u32;
+        // 分频向上取整，保证实际输出 ≤ 目标频率（向下取整会略超目标）。
+        // ciu ≤ target 时 divider = 0（CLKDIV 直通，输出 = CIU）。CLKSRC
+        // 固定时钟源 0。CIU=50MHz→400kHz：divider = ceil(50M/800k) = 63，
+        // 实际 396.8kHz ≤ 400kHz。
+        let divider = if self.ciu_frequency_hz <= target {
+            0
+        } else {
+            self.ciu_frequency_hz
+                .div_ceil(target.saturating_mul(2))
+                .min(0xffff) as u32
+        };
+        self.io.write32(REG_CLKSRC, 0);
         self.io.write32(REG_CLKDIV, divider);
         self.io.write32(REG_CLKENA, CLKENA_ENABLE);
         self.send_update_clock()?;
@@ -331,14 +339,23 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 response.r2 = self.io.read32(REG_RESP1);
                 response.r3 = self.io.read32(REG_RESP0);
             }
-            MmcResponseType::R1 | MmcResponseType::R3 | MmcResponseType::R6
-            | MmcResponseType::R7 => {
+            MmcResponseType::R1 | MmcResponseType::R1b | MmcResponseType::R3
+            | MmcResponseType::R6 | MmcResponseType::R7 => {
                 response.r0 = self.io.read32(REG_RESP0);
             }
         }
-        // R1 卡状态校验：致命错误位 → CardError（K3.2）。
-        if command.response_type == MmcResponseType::R1 && r1_has_error(response.r0) {
+        // R1/R1b 卡状态校验：致命错误位 → CardError（K3.2）。
+        if matches!(
+            command.response_type,
+            MmcResponseType::R1 | MmcResponseType::R1b
+        ) && r1_has_error(response.r0)
+        {
             return Err(MmcError::CardError);
+        }
+        // R1b：读响应后继续等数据总线忙碌清，然后才能发下一条命令
+        // （如 CMD55/ACMD51）。
+        if command.response_type == MmcResponseType::R1b {
+            self.wait_data_busy_clear()?;
         }
         Ok(response)
     }
@@ -407,7 +424,8 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 // R2 也带 CRC 校验（136-bit，命令后 7-bit CRC）。
                 value |= CMD_RESP_EXP | CMD_RESP_LONG | CMD_RESP_CRC;
             }
-            MmcResponseType::R1 | MmcResponseType::R6 | MmcResponseType::R7 => {
+            MmcResponseType::R1 | MmcResponseType::R1b | MmcResponseType::R6
+            | MmcResponseType::R7 => {
                 value |= CMD_RESP_EXP | CMD_RESP_CRC;
             }
             MmcResponseType::R3 => {
@@ -426,6 +444,14 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         }
         if command.update_clock {
             value |= CMD_UPDATE_CLOCK;
+        }
+        // 数据命令 / UPDATE_CLOCK 置 PRV_DAT_WAIT（等上一条数据命令完成）；
+        // JH7110 无 USE_HOLD_REG quirk，普通命令统一置 USE_HOLD_REG。
+        if command.data_present || command.update_clock {
+            value |= CMD_PRV_DAT_WAIT;
+        }
+        if !command.update_clock {
+            value |= CMD_USE_HOLD_REG;
         }
         value
     }
@@ -757,6 +783,36 @@ pub fn verify() {
         ],
         "R2 must decode RESP3..RESP0 as big-endian protocol payload"
     );
+
+    // 18) 分频向上取整：CIU=50MHz → 400kHz 需 divider=63（实际 396.8kHz），
+    //     且 CLKSRC 固定时钟源 0。
+    let mock = MockRegisterIo::new();
+    let mut controller = DwMmcController::new(mock, 50_000_000, 32);
+    controller.set_clock(400_000).expect("400 kHz init clock");
+    assert_eq!(
+        controller.io_ref().read_reg(REG_CLKDIV),
+        63,
+        "50 MHz → 400 kHz needs divider = ceil(50M/800k) = 63"
+    );
+    assert_eq!(
+        controller.io_ref().read_reg(REG_CLKSRC),
+        0,
+        "CLKSRC must be fixed to clock source 0"
+    );
+
+    // 19) R1b：busy 永不清 → Timeout；普通 R1 不等待 busy。
+    let mock = MockRegisterIo::new().with_failure(MockFailure::BusyHang);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    assert_eq!(
+        controller.send_command(MmcCommand::new(7, 0x1234_0000, MmcResponseType::R1b)),
+        Err(MmcError::Timeout),
+        "R1b must wait for DAT busy to clear"
+    );
+    let mock = MockRegisterIo::new().with_failure(MockFailure::BusyHang);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    controller
+        .send_command(MmcCommand::new(7, 0x1234_0000, MmcResponseType::R1))
+        .expect("plain R1 must not wait for busy");
 
     crate::println!("C7 DW-MMC controller gate:");
     crate::println!("  command complete    : verified");

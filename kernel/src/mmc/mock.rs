@@ -24,6 +24,8 @@ pub enum MockFailure {
     FifoOverrun,
     /// 控制器复位卡死（CTRL 复位位永不自清）。
     ResetHang,
+    /// 数据总线忙碌永不清（R1b busy 等待超时）。命令本身照常完成。
+    BusyHang,
     /// 命令永不完成（CMD_START 不自清，无完成信号）。
     CommandHang,
 }
@@ -119,6 +121,11 @@ impl MockRegisterIo {
         self.failure = failure;
     }
 
+    /// 测试用：读指定偏移的寄存器值（分频/时钟源等断言）。
+    pub fn read_reg(&self, offset: usize) -> u32 {
+        self.regs[Self::index(offset)]
+    }
+
     fn index(offset: usize) -> usize {
         offset / 4
     }
@@ -169,6 +176,11 @@ impl MmcRegisterIo for MockRegisterIo {
                 }
             }
             REG_STATUS => {
+                // BusyHang：数据总线忙碌位（bit 9）保持置位，模拟 R1b
+                // busy 永不清 → wait_data_busy_clear 超时。
+                if self.failure == Some(MockFailure::BusyHang) {
+                    return STATUS_BUSY;
+                }
                 // FCNT 域：空 → 0（fifo_empty），非空 → 1。
                 if self.fifo_empty_now() {
                     0
