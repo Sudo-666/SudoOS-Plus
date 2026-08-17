@@ -698,7 +698,7 @@ FIXTURE_LOG_DIR := build/fixtures/logs
 .PHONY: smoke-contest-fixture-riscv64 smoke-contest-fixture-loongarch64 smoke-contest-fixture-all
 smoke-contest-fixture-riscv64: kernel-rv
 	@mkdir -p $(FIXTURE_DIR) $(FIXTURE_LOG_DIR)
-	@scripts/make-contest-fixture.sh --arch riscv64 --output $(FIXTURE_DIR)/contest-rv.ext4
+	@bash scripts/make-contest-fixture.sh --arch riscv64 --output $(FIXTURE_DIR)/contest-rv.ext4
 	@python3 scripts/check-contest-fixture.py --arch riscv64 --image $(FIXTURE_DIR)/contest-rv.ext4
 	@python3 scripts/qemu_log_wait.py --log $(FIXTURE_LOG_DIR)/contest-rv.log \
 		--success-pattern "CONTEST_FIXTURE: arch=riscv64" \
@@ -712,7 +712,7 @@ smoke-contest-fixture-riscv64: kernel-rv
 
 smoke-contest-fixture-loongarch64: kernel-la
 	@mkdir -p $(FIXTURE_DIR) $(FIXTURE_LOG_DIR)
-	@scripts/make-contest-fixture.sh --arch loongarch64 --output $(FIXTURE_DIR)/contest-la.ext4
+	@bash scripts/make-contest-fixture.sh --arch loongarch64 --output $(FIXTURE_DIR)/contest-la.ext4
 	@python3 scripts/check-contest-fixture.py --arch loongarch64 --image $(FIXTURE_DIR)/contest-la.ext4
 	@python3 scripts/qemu_log_wait.py --log $(FIXTURE_LOG_DIR)/contest-la.log \
 		--success-pattern "CONTEST_FIXTURE: arch=loongarch64" \
