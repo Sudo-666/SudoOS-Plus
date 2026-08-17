@@ -1,13 +1,15 @@
-//! DesignWare MMC 主控（轮询模式，CodePlan C7）。
+//! DesignWare MMC 主控（轮询模式，CodePlan C7，K3.2 按 dw_mmc.h 重写）。
 //!
-//! 寄存器访问经 [`MmcRegisterIo`] 抽象：真机为 volatile MMIO，单元测试用
-//! mock。所有轮询都有截止次数（`DEADLINE_POLLS`），绝不无限循环。
+//! 寄存器访问经 [`MmcRegisterIo`] 抽象：真机为 ioremap 后的 volatile MMIO，
+//! 单元测试用 mock。命令/数据/复位轮询都有真实时间 deadline（外加轮询次数
+//! 上限，防止时钟未走的 mock 挂死）。
 
 use super::registers::*;
 
-/// 轮询截止次数（真机每轮为一次 MMIO 读，远超硬件命令完成时间；
-/// 取值在未优化 debug 构建下也要能在 QEMU 里秒级跑完）。
-const DEADLINE_POLLS: usize = 100_000;
+/// 轮询截止（毫秒）：命令完成通常 < 1ms，给 500ms 余量覆盖卡忙场景。
+const POLL_DEADLINE_MS: u64 = 500;
+/// 轮询次数上限：兜底防止时间未走时无限循环（mock 测试）。
+const POLL_COUNT_CAP: usize = 2_000_000;
 
 /// 寄存器访问抽象（MMIO / mock）。`&mut self` 允许 mock 在读取时推进
 /// 内部状态（如 FIFO 数据指针）。
@@ -16,13 +18,13 @@ pub trait MmcRegisterIo: Send + Sync + 'static {
     fn write32(&mut self, offset: usize, value: u32);
 }
 
-/// 真机 volatile MMIO。
+/// 真机 volatile MMIO（虚拟地址，来自 `vm::ioremap`）。
 pub struct MmioRegisterIo {
     base: usize,
 }
 
 impl MmioRegisterIo {
-    /// SAFETY: `base` 必须是有效的 MMIO 寄存器基址，且在内核生命周期内
+    /// SAFETY: `base` 必须是有效的 MMIO 寄存器虚拟基址，且在内核生命周期内
     /// 保持映射。
     pub unsafe fn new(base: usize) -> Self {
         Self { base }
@@ -56,6 +58,8 @@ pub enum MmcError {
     InvalidArgument,
     /// 控制器未就绪。
     NotReady,
+    /// R1 卡状态致命错误位。
+    CardError,
     /// 底层 I/O 失败。
     Io,
 }
@@ -91,6 +95,8 @@ pub struct MmcCommand {
     pub init: bool,
     /// 仅更新时钟寄存器。
     pub update_clock: bool,
+    /// 数据长度（字节）。带数据命令必须给出，控制器据此编程 BLKSIZ/BYTCNT。
+    pub data_length: Option<usize>,
 }
 
 impl MmcCommand {
@@ -103,12 +109,15 @@ impl MmcCommand {
             read: false,
             init: false,
             update_clock: false,
+            data_length: None,
         }
     }
 
-    pub const fn with_data(mut self, read: bool) -> Self {
+    /// 带数据命令：`data_length` 为传输字节数（如 ACMD51=8、CMD17=512）。
+    pub const fn with_data_length(mut self, read: bool, data_length: usize) -> Self {
         self.data_present = true;
         self.read = read;
+        self.data_length = Some(data_length);
         self
     }
 
@@ -170,24 +179,48 @@ impl MmcResponse {
     }
 }
 
+/// R1 卡状态致命错误位（SD 规范 R1：bits 31:19 + bit 15）。
+const R1_ERROR_MASK: u32 = 0xfff8_0000 | 0x0000_8000;
+
+fn r1_has_error(status: u32) -> bool {
+    status & R1_ERROR_MASK != 0
+}
+
 /// DW-MMC 轮询主控。
 pub struct DwMmcController<I: MmcRegisterIo> {
     io: I,
     ciu_frequency_hz: u64,
+    fifo_depth: u32,
+    /// 数据寄存器（FIFO）偏移，构造时按 VERID 判定（0x100 / 0x200）。
+    fifo_offset: usize,
 }
 
 impl<I: MmcRegisterIo> DwMmcController<I> {
-    pub fn new(io: I, ciu_frequency_hz: u64) -> Self {
+    pub fn new(mut io: I, ciu_frequency_hz: u64, fifo_depth: u32) -> Self {
+        let verid = io.read32(REG_VERID) & 0xffff;
+        let fifo_offset = if verid >= DW_MMC_240A {
+            DATA_240A_OFFSET
+        } else {
+            DATA_OFFSET
+        };
         Self {
             io,
             ciu_frequency_hz,
+            fifo_depth: fifo_depth.max(1),
+            fifo_offset,
         }
+    }
+
+    /// 上电（PWREN = 1）。
+    pub fn power_on(&mut self) -> Result<(), MmcError> {
+        self.io.write32(REG_PWREN, 1);
+        Ok(())
     }
 
     /// 控制器 + FIFO 复位。复位位写 1 后硬件自清；轮询至位清 0。
     pub fn reset(&mut self) -> Result<(), MmcError> {
-        self.io.write32(REG_RST_N, RST_CTRL | RST_FIFO);
-        self.poll_until(|value| value & (RST_CTRL | RST_FIFO) == 0, REG_RST_N)?;
+        self.io.write32(REG_CTRL, CTRL_RESET | CTRL_FIFO_RESET);
+        self.poll_for(|value| value & (CTRL_RESET | CTRL_FIFO_RESET) == 0, REG_CTRL)?;
         Ok(())
     }
 
@@ -202,18 +235,27 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         self.io.read32(REG_RINTSTS)
     }
 
-    /// 配置时钟。先等待数据忙清除，再写分频 + 使能，最后用 UPDATE_CLOCK
-    /// 命令让硬件应用。
+    /// 配置时钟。先禁用时钟并应用（UPD_CLK），再写分频 + 使能并再次应用。
     pub fn set_clock(&mut self, frequency_hz: u64) -> Result<(), MmcError> {
         self.wait_data_busy_clear()?;
 
+        self.io.write32(REG_CLKENA, 0);
+        self.send_update_clock()?;
+
         let target = frequency_hz.max(100_000);
-        let divider = (self.ciu_frequency_hz / target.saturating_mul(2))
+        let divider = self
+            .ciu_frequency_hz
+            .checked_div(target.saturating_mul(2))
+            .unwrap_or(0)
             .max(1)
-            .min(u32::MAX as u64) as u32;
+            .min(0xffff) as u32;
         self.io.write32(REG_CLKDIV, divider);
         self.io.write32(REG_CLKENA, CLKENA_ENABLE);
+        self.send_update_clock()?;
+        Ok(())
+    }
 
+    fn send_update_clock(&mut self) -> Result<(), MmcError> {
         let command = MmcCommand {
             index: 0,
             argument: 0,
@@ -222,9 +264,9 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
             read: false,
             init: false,
             update_clock: true,
+            data_length: None,
         };
-        self.send_command(command)?;
-        Ok(())
+        self.send_command(command).map(|_| ())
     }
 
     /// 设置总线宽度（1/4/8-bit）。
@@ -236,9 +278,27 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         Ok(())
     }
 
-    /// 发送命令并等待响应。带数据时由调用方另行读/写 FIFO。
+    /// 带数据命令先编程块长/字节数/FIFO 水印。
+    fn configure_data_transfer(&mut self, data_length: usize) -> Result<(), MmcError> {
+        if data_length == 0 || data_length % 4 != 0 {
+            return Err(MmcError::InvalidArgument);
+        }
+        let words = data_length.div_ceil(4) as u32;
+        let watermark = words.min(self.fifo_depth).max(1);
+        self.io.write32(REG_BLKSIZ, data_length as u32);
+        self.io.write32(REG_BYTCNT, data_length as u32);
+        self.io.write32(REG_FIFOTH, fifoth_for(watermark));
+        Ok(())
+    }
+
+    /// 发送命令并等待响应。写 CMD 前先写 CMDARG；带数据时先编程
+    /// BLKSIZ/BYTCNT/FIFOTH；`CMD_START`（bit 31）置位启动命令。
     pub fn send_command(&mut self, command: MmcCommand) -> Result<MmcResponse, MmcError> {
-        let cmd_value = self.build_command_value(&command);
+        if command.data_present {
+            let data_length = command.data_length.ok_or(MmcError::InvalidArgument)?;
+            self.configure_data_transfer(data_length)?;
+        }
+        let cmd_value = self.build_command_value(&command) | CMD_START;
         self.io.write32(REG_CMDARG, command.argument);
         self.io.write32(REG_CMD, cmd_value);
 
@@ -258,10 +318,15 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 response.r0 = self.io.read32(REG_RESP0);
             }
         }
+        // R1 卡状态校验：致命错误位 → CardError（K3.2）。
+        if command.response_type == MmcResponseType::R1 && r1_has_error(response.r0) {
+            return Err(MmcError::CardError);
+        }
         Ok(response)
     }
 
-    /// PIO 单块读取：从 FIFO 拉取一个块（`output.len()` 字节）。
+    /// PIO 单块读取：从 FIFO 拉取一个块（`output.len()` 字节），按 RXDR /
+    /// DATA_OVER 中断驱动，FIFO 分批到达。
     pub fn read_block_data(&mut self, output: &mut [u8]) -> Result<(), MmcError> {
         if output.is_empty() || output.len() % 4 != 0 {
             return Err(MmcError::InvalidArgument);
@@ -270,7 +335,14 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         let mut received = 0_usize;
         let mut total = 0_usize;
         while total < words {
-            let interrupts = self.poll_for(|value| value & (INT_RX_DATA_REQ | INT_DATA_OVER | INT_DATA_CRC | INT_DATA_TIMEOUT | INT_FIFO_OVERRUN) != 0, REG_RINTSTS)?;
+            let interrupts = self.poll_for(
+                |value| {
+                    value & (INT_RX_DATA_REQ | INT_DATA_OVER | INT_DATA_CRC | INT_DATA_TIMEOUT
+                        | INT_FIFO_UNDERRUN | INT_FIFO_OVERRUN)
+                        != 0
+                },
+                REG_RINTSTS,
+            )?;
             if interrupts & INT_DATA_CRC != 0 {
                 self.clear_interrupts(INT_DATA_CRC | INT_DATA_OVER);
                 return Err(MmcError::CrcError);
@@ -279,13 +351,17 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 self.clear_interrupts(INT_DATA_TIMEOUT | INT_DATA_OVER);
                 return Err(MmcError::Timeout);
             }
+            if interrupts & INT_FIFO_UNDERRUN != 0 {
+                self.clear_interrupts(INT_FIFO_UNDERRUN | INT_DATA_OVER);
+                return Err(MmcError::FifoUnderrun);
+            }
             if interrupts & INT_FIFO_OVERRUN != 0 {
-                self.clear_interrupts(INT_FIFO_OVERRUN);
+                self.clear_interrupts(INT_FIFO_OVERRUN | INT_DATA_OVER);
                 return Err(MmcError::FifoOverrun);
             }
             // 读 FIFO 直到空（分批到达）。
             while !self.fifo_empty() && received < words {
-                let word = self.io.read32(REG_FIFO);
+                let word = self.io.read32(self.fifo_offset);
                 let offset = received * 4;
                 output[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
                 received += 1;
@@ -306,23 +382,22 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
     fn build_command_value(&self, command: &MmcCommand) -> u32 {
         let mut value = u32::from(command.index) & CMD_INDEX_MASK;
         match command.response_type {
-            MmcResponseType::None => {
-                value |= CMD_RESP_NONE;
-            }
+            MmcResponseType::None => {}
             MmcResponseType::R2 => {
-                value |= CMD_RESP_EXPECT | CMD_RESP_136;
+                value |= CMD_RESP_EXP | CMD_RESP_LONG;
             }
             MmcResponseType::R1 | MmcResponseType::R6 | MmcResponseType::R7 => {
-                value |= CMD_RESP_EXPECT | CMD_RESP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK;
+                value |= CMD_RESP_EXP | CMD_RESP_CRC;
             }
             MmcResponseType::R3 => {
-                value |= CMD_RESP_EXPECT | CMD_RESP_48;
+                value |= CMD_RESP_EXP;
             }
         }
         if command.data_present {
-            value |= CMD_DATA_PRESENT;
-            if command.read {
-                value |= CMD_READ;
+            value |= CMD_DATA_EXPECTED;
+            if !command.read {
+                // DAT_WR = 主机写数据到卡；读（卡 → 主机）不置位。
+                value |= CMD_DATA_WRITE;
             }
         }
         if command.init {
@@ -351,12 +426,13 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
     }
 
     fn wait_data_busy_clear(&mut self) -> Result<(), MmcError> {
-        self.poll_for(|value| value & STATUS_DATA_BUSY == 0, REG_STATUS)?;
+        self.poll_for(|value| value & STATUS_BUSY == 0, REG_STATUS)?;
         Ok(())
     }
 
     fn fifo_empty(&mut self) -> bool {
-        self.io.read32(REG_STATUS) & STATUS_FIFO_EMPTY != 0
+        let status = self.io.read32(REG_STATUS);
+        (status >> STATUS_FIFO_COUNT_SHIFT) & STATUS_FIFO_COUNT_MASK == 0
     }
 
     /// 测试用：返回底层 I/O 引用（mock 的命令轨迹）。
@@ -365,30 +441,41 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         &self.io
     }
 
+    /// 测试用：当前 FIFO 偏移。
+    #[cfg(debug_assertions)]
+    pub fn fifo_offset(&self) -> usize {
+        self.fifo_offset
+    }
+
     fn clear_interrupts(&mut self, bits: u32) {
         self.io.write32(REG_RINTSTS, bits);
     }
 
+    /// 轮询寄存器直到谓词成立，带真实时间 deadline + 次数上限。
     fn poll_for(
         &mut self,
         predicate: impl Fn(u32) -> bool,
         register: usize,
     ) -> Result<u32, MmcError> {
-        for _ in 0..DEADLINE_POLLS {
+        let cycles_per_ms = crate::time::clock_frequency_hz() / 1000;
+        let deadline = crate::time::now()
+            .cycles()
+            .saturating_add(cycles_per_ms.saturating_mul(POLL_DEADLINE_MS));
+        let mut count = 0_usize;
+        loop {
             let value = self.io.read32(register);
             if predicate(value) {
                 return Ok(value);
             }
+            count += 1;
+            if count >= POLL_COUNT_CAP {
+                return Err(MmcError::Timeout);
+            }
+            if count & 0x1f == 0 && crate::time::now().cycles() >= deadline {
+                return Err(MmcError::Timeout);
+            }
+            core::hint::spin_loop();
         }
-        Err(MmcError::Timeout)
-    }
-
-    fn poll_until(
-        &mut self,
-        predicate: impl Fn(u32) -> bool,
-        register: usize,
-    ) -> Result<(), MmcError> {
-        self.poll_for(predicate, register).map(|_| ())
     }
 }
 
@@ -397,17 +484,21 @@ pub fn verify() {
     use super::mock::{MockFailure, MockRegisterIo};
     use alloc::vec;
 
-    // 1) 正常命令完成。
+    // 1) 正常命令完成（R7：CMD8/0x1aa）。
     let mock = MockRegisterIo::new().with_responses(vec![0x1a2b_3c4d, 0, 0, 0]);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     let response = controller
         .send_command(MmcCommand::new(8, 0x1aa, MmcResponseType::R7))
         .expect("command 8 completed");
     assert_eq!(response.r0, 0x1a2b_3c4d);
+    // 控制器必须置位 CMD_START，且带数据命令先编程 BLKSIZ/BYTCNT。
+    let trace = &controller.io_ref().commands;
+    assert_eq!(trace[0].index, 8);
+    assert!(trace[0].cmd_start, "CMD_START must be set");
 
     // 2) 响应超时。
     let mock = MockRegisterIo::new().with_failure(MockFailure::ResponseTimeout);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     assert_eq!(
         controller.send_command(MmcCommand::new(8, 0x1aa, MmcResponseType::R7)),
         Err(MmcError::Timeout),
@@ -415,7 +506,7 @@ pub fn verify() {
 
     // 3) 响应 CRC 错误。
     let mock = MockRegisterIo::new().with_failure(MockFailure::ResponseCrc);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     assert_eq!(
         controller.send_command(MmcCommand::new(55, 0, MmcResponseType::R1)),
         Err(MmcError::CrcError),
@@ -423,18 +514,18 @@ pub fn verify() {
 
     // 4) 数据超时。
     let mock = MockRegisterIo::new().with_failure(MockFailure::DataTimeout);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     controller
-        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data(true))
+        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data_length(true, 512))
         .expect("data command accepted");
     let mut block = [0_u8; 512];
     assert_eq!(controller.read_block_data(&mut block), Err(MmcError::Timeout));
 
     // 5) FIFO 上溢。
     let mock = MockRegisterIo::new().with_failure(MockFailure::FifoOverrun);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     controller
-        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data(true))
+        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data_length(true, 512))
         .expect("data command accepted");
     let mut block = [0_u8; 512];
     assert_eq!(
@@ -444,16 +535,17 @@ pub fn verify() {
 
     // 6) 控制器复位卡死 → Timeout（不挂死）。
     let mock = MockRegisterIo::new().with_failure(MockFailure::ResetHang);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     assert_eq!(controller.reset(), Err(MmcError::Timeout));
 
-    // 7) FIFO 数据分批到达。
+    // 7) FIFO 数据分批到达（旧版 0x100 偏移）。
     let mock = MockRegisterIo::new()
         .with_fifo_data(vec![0x0302_0100, 0x0706_0504, 0x0b0a_0908, 0x0f0e_0d0c])
         .with_fifo_batch(2);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    assert_eq!(controller.fifo_offset(), DATA_OFFSET, "VERID=0 -> old FIFO");
     controller
-        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data(true))
+        .send_command(MmcCommand::new(17, 0, MmcResponseType::R1).with_data_length(true, 16))
         .expect("data command accepted");
     let mut block = [0_u8; 16];
     controller
@@ -461,26 +553,40 @@ pub fn verify() {
         .expect("batched fifo read");
     assert_eq!(block, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
 
-    // 8) 错误后恢复：清掉故障再发命令成功。
+    // 8) VERID ≥ 2.40a → FIFO 在 0x200（JH7110）。
+    let mock = MockRegisterIo::new().with_verid(0x291a);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    assert_eq!(controller.fifo_offset(), DATA_240A_OFFSET, "2.91a -> new FIFO");
+
+    // 9) 错误后恢复：清掉故障再发命令成功。
     let mut mock = MockRegisterIo::new().with_failure(MockFailure::ResponseTimeout);
     mock.set_failure(None);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     let response = controller
         .send_command(MmcCommand::new(13, 0x1234, MmcResponseType::R1))
         .expect("command after error recovery");
     assert_eq!(response.r0, 0);
 
-    // 9) 时钟与总线宽度配置。
+    // 10) R1 卡状态致命错误 → CardError。
+    let mock = MockRegisterIo::new().with_responses(vec![1 << 19, 0, 0, 0]); // R1: ERROR
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    assert_eq!(
+        controller.send_command(MmcCommand::new(13, 0, MmcResponseType::R1)),
+        Err(MmcError::CardError),
+    );
+
+    // 11) 时钟与总线宽度配置。
     let mock = MockRegisterIo::new();
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     controller.set_clock(400_000).expect("400 kHz clock");
     controller.set_clock(25_000_000).expect("25 MHz clock");
     controller.set_bus_width(4).expect("4-bit bus width");
     assert_eq!(controller.set_bus_width(3), Err(MmcError::InvalidArgument));
 
-    // 10) 复位 + 禁用中断不报错。
+    // 12) 复位 + 上电 + 禁用中断不报错。
     let mock = MockRegisterIo::new();
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    controller.power_on().expect("power on");
     controller.reset().expect("reset");
     controller.disable_interrupts();
 
@@ -492,6 +598,8 @@ pub fn verify() {
     crate::println!("  FIFO overrun        : verified");
     crate::println!("  reset hang          : verified");
     crate::println!("  FIFO batching       : verified");
+    crate::println!("  VERID FIFO offset   : verified");
     crate::println!("  error recovery      : verified");
+    crate::println!("  R1 card status      : verified");
     crate::println!("  clock/bus-width     : verified");
 }

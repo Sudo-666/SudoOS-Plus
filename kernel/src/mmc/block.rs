@@ -52,7 +52,10 @@ impl<I: MmcRegisterIo> SdBlockDevice<I> {
 
         let mut controller = self.controller.lock();
         controller
-            .send_command(MmcCommand::new(SD_CMD17, argument, MmcResponseType::R1).with_data(true))
+            .send_command(
+                MmcCommand::new(SD_CMD17, argument, MmcResponseType::R1)
+                    .with_data_length(true, SD_BLOCK_SIZE),
+            )
             .map_err(mmc_to_block)?;
         controller.read_block_data(output).map_err(mmc_to_block)
     }
@@ -98,6 +101,7 @@ fn mmc_to_block(error: MmcError) -> BlockError {
     match error {
         MmcError::Timeout | MmcError::CrcError => BlockError::InvalidArgument,
         MmcError::FifoUnderrun | MmcError::FifoOverrun => BlockError::InvalidArgument,
+        MmcError::CardError => BlockError::InvalidArgument,
         MmcError::ResetFailed | MmcError::NotReady | MmcError::Io => BlockError::InvalidArgument,
         MmcError::InvalidArgument => BlockError::InvalidArgument,
     }

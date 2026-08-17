@@ -83,10 +83,30 @@ pub fn initialize_storage() {
         host.base(),
         host.bus_width(),
     );
-    // SAFETY: host.base 来自设备树校验过的 MMIO 区域，内核生命周期内有效。
-    let io = unsafe { dw_mmc::MmioRegisterIo::new(host.base()) };
+    // K3.2：Sv39 最终页表启用后 0x16010000 不再恒等映射，MMIO 必须经
+    // `vm::ioremap` 建立内核映射（virtio 同款路径）。
+    let mapping = match crate::vm::ioremap(myos_mm::PhysAddr::new(host.base()), host.size()) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            crate::println!("VF2-TF00 ioremap-failed={error:?} no-card");
+            return;
+        }
+    };
+    let io_base = mapping.virtual_address().get();
+    // 映射生命周期须与内核一致：显式泄漏 guard，不回收。
+    core::mem::forget(mapping);
+    // SAFETY: io_base 来自 vm::ioremap，内核生命周期内保持映射。
+    let io = unsafe { dw_mmc::MmioRegisterIo::new(io_base) };
     let ciu = host.ciu_frequency_hz().unwrap_or(25_000_000);
-    let mut controller = dw_mmc::DwMmcController::new(io, ciu);
+    let fifo_depth = host.fifo_depth().unwrap_or(32);
+    let mut controller = dw_mmc::DwMmcController::new(io, ciu, fifo_depth);
+    match controller.power_on() {
+        Ok(()) => {}
+        Err(error) => {
+            crate::println!("VF2-TF01 power-failed={error:?} no-card");
+            return;
+        }
+    }
     match controller.reset() {
         Ok(()) => {}
         Err(error) => {

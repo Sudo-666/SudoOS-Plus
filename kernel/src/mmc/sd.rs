@@ -61,6 +61,7 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
         read: false,
         init: true,
         update_clock: false,
+        data_length: None,
     })?;
 
     // CMD8：SD v2 接口条件。旧卡（v1）不响应 → Timeout → 视为 SDSC。
@@ -145,7 +146,7 @@ pub fn initialize_card<H: MmcHost>(host: &mut H) -> Result<SdCardInfo, MmcError>
         0,
         MmcResponseType::R1,
     )
-    .with_data(true))?;
+    .with_data_length(true, 8))?;
     let mut scr = [0_u8; 8];
     host.read_block_data(&mut scr)?;
 
@@ -275,7 +276,7 @@ pub fn verify() {
     let mock = MockRegisterIo::new()
         .with_responses(responses)
         .with_fifo_data(scr_words);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
 
     let info = initialize_card(&mut controller).expect("SDHC init");
     assert!(info.is_sdhc);
@@ -304,7 +305,7 @@ pub fn verify() {
         .with_failure_once(MockFailure::ResponseTimeout, 8) // 仅 CMD8 超时
         .with_responses(responses)
         .with_fifo_data(scr_words);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     let info = initialize_card(&mut controller).expect("SDSC init");
     assert!(!info.is_sdhc);
     assert_eq!(info.bus_width, 1);
@@ -318,7 +319,7 @@ pub fn verify() {
     responses.extend([0, 0, 0, 0]); // CMD2
     responses.extend([0, 0, 0, 0]); // CMD3 RCA=0 → invalid
     let mock = MockRegisterIo::new().with_responses(responses);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     assert_eq!(initialize_card(&mut controller), Err(MmcError::InvalidArgument));
 
     // 4) CSD 容量：全零（0 块）被拒；最大合法值不溢出且正确。
@@ -352,15 +353,17 @@ pub fn verify() {
     let mock = MockRegisterIo::new()
         .with_responses(responses)
         .with_fifo_data(vec![0x0000_0400, 0]);
-    let mut controller = DwMmcController::new(mock, 25_000_000);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
     let info = initialize_card(&mut controller).expect("SDHC init for block read");
 
     // 读块 5：SDHC 用块号 5。
     controller
-        .send_command(MmcCommand::new(SD_CMD17, 5, MmcResponseType::R1).with_data(true))
+        .send_command(MmcCommand::new(SD_CMD17, 5, MmcResponseType::R1).with_data_length(true, 512))
         .expect("CMD17");
     let cmd17 = controller.io_ref().commands.iter().find(|c| c.index == SD_CMD17);
     assert_eq!(cmd17.expect("CMD17 sent").argument, 5, "SDHC CMD17 must use the block number");
+    assert_eq!(cmd17.expect("CMD17 trace").data_length, Some(512));
+    assert!(cmd17.expect("CMD17 trace").cmd_start);
     assert!(info.is_sdhc);
 
     crate::println!("C8 SD card gate:");

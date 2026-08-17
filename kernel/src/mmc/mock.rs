@@ -1,8 +1,10 @@
 //! DW-MMC 控制器 mock（单元测试用，`#[cfg(debug_assertions)]`）。
 //!
-//! 写入 `CMD` 时按配置模拟完成/错误；为数据读命令提供 FIFO 数据，支持
-//! 分批到达（`fifo_batch` 决定每次可见的字数，模拟数据分多个 RXDR 窗口
-//! 抵达）。寄存器数组按 4 字节偏移索引。
+//! K3.3：与修正后的寄存器语义一致——`CMD_START` 必须置位，带数据命令先写
+//! `BLKSIZ/BYTCNT`，复位走 `CTRL` 位，FIFO 偏移按 `VERID` 判定
+//! （`0x100` / `0x200`）。写入 `CMD` 时按配置模拟完成/错误；为数据读命令
+//! 提供 FIFO 数据，支持分批到达（`fifo_batch`）。寄存器数组按 4 字节偏移
+//! 索引，仅覆盖常规寄存器区（0x000..0x0fc）；FIFO 读走独立路径。
 
 use alloc::vec::Vec;
 
@@ -20,7 +22,7 @@ pub enum MockFailure {
     DataTimeout,
     /// FIFO 上溢。
     FifoOverrun,
-    /// 控制器复位卡死（RST_N 永不自清）。
+    /// 控制器复位卡死（CTRL 复位位永不自清）。
     ResetHang,
 }
 
@@ -31,6 +33,9 @@ pub struct MockCommandTrace {
     pub data_present: bool,
     pub read: bool,
     pub update_clock: bool,
+    pub cmd_start: bool,
+    /// 带数据命令的字节数（来自 BLKSIZ/BYTCNT 编程）。
+    pub data_length: Option<usize>,
 }
 
 /// 模拟寄存器。寄存器数组按 `offset / 4` 索引。
@@ -99,6 +104,12 @@ impl MockRegisterIo {
         self
     }
 
+    /// 设置 VERID（决定 mock 的 FIFO 偏移与控制器一致）。
+    pub fn with_verid(mut self, verid: u32) -> Self {
+        self.regs[Self::index(REG_VERID)] = verid;
+        self
+    }
+
     /// 改变故障注入（错误恢复后再发命令的测试）。
     pub fn set_failure(&mut self, failure: Option<MockFailure>) {
         self.failure = failure;
@@ -106,6 +117,16 @@ impl MockRegisterIo {
 
     fn index(offset: usize) -> usize {
         offset / 4
+    }
+
+    /// FIFO 偏移：与控制器同规则（VERID ≥ 2.40a → 0x200）。
+    fn fifo_offset(&self) -> usize {
+        let verid = self.regs[Self::index(REG_VERID)] & 0xffff;
+        if verid >= DW_MMC_240A {
+            DATA_240A_OFFSET
+        } else {
+            DATA_OFFSET
+        }
     }
 
     /// STATUS 的 FIFO 空位：数据耗尽，或分批模式下当前批次已读完
@@ -132,7 +153,8 @@ impl MmcRegisterIo for MockRegisterIo {
                     .copied()
                     .unwrap_or(0)
             }
-            REG_FIFO => {
+            // FIFO 偏移按 VERID 判定（0x100 / 0x200），独立于 regs 数组。
+            _ if offset == self.fifo_offset() => {
                 if self.fifo_index < self.fifo_words.len() {
                     let word = self.fifo_words[self.fifo_index];
                     self.fifo_index += 1;
@@ -143,15 +165,16 @@ impl MmcRegisterIo for MockRegisterIo {
                 }
             }
             REG_STATUS => {
+                // FCNT 域：空 → 0（fifo_empty），非空 → 1。
                 if self.fifo_empty_now() {
-                    STATUS_FIFO_EMPTY
-                } else {
                     0
+                } else {
+                    1 << STATUS_FIFO_COUNT_SHIFT
                 }
             }
-            REG_RST_N => {
+            REG_CTRL => {
                 if self.failure == Some(MockFailure::ResetHang) {
-                    RST_CTRL | RST_FIFO
+                    CTRL_RESET | CTRL_FIFO_RESET
                 } else {
                     self.regs[index]
                 }
@@ -163,24 +186,32 @@ impl MmcRegisterIo for MockRegisterIo {
     fn write32(&mut self, offset: usize, value: u32) {
         let index = Self::index(offset);
         match offset {
-            REG_RST_N => {
+            REG_CTRL => {
                 // 复位位写 1 后硬件自清；卡死故障下保持置位。
                 if self.failure == Some(MockFailure::ResetHang) {
-                    self.regs[index] = value & (RST_CTRL | RST_FIFO);
+                    self.regs[index] = value & (CTRL_RESET | CTRL_FIFO_RESET);
                 } else {
-                    self.regs[index] = value & !(RST_CTRL | RST_FIFO);
+                    self.regs[index] = value & !(CTRL_RESET | CTRL_FIFO_RESET);
                 }
             }
             REG_CMDARG => {
                 self.regs[index] = value;
             }
             REG_CMD => {
+                let data_present = value & CMD_DATA_EXPECTED != 0;
                 let command = MockCommandTrace {
                     index: (value & CMD_INDEX_MASK) as u8,
                     argument: self.regs[Self::index(REG_CMDARG)],
-                    data_present: value & CMD_DATA_PRESENT != 0,
-                    read: value & CMD_READ != 0,
+                    data_present,
+                    // DAT_WR 未置位 = 主机读（卡 → 主机）。
+                    read: data_present && value & CMD_DATA_WRITE == 0,
                     update_clock: value & CMD_UPDATE_CLOCK != 0,
+                    cmd_start: value & CMD_START != 0,
+                    data_length: if data_present {
+                        Some(self.regs[Self::index(REG_BYTCNT)] as usize)
+                    } else {
+                        None
+                    },
                 };
                 self.commands.push(command);
                 self.response_index += 1;
@@ -202,16 +233,16 @@ impl MmcRegisterIo for MockRegisterIo {
                     Some(MockFailure::ResponseCrc) => {
                         *rintsts |= INT_RESP_CRC;
                     }
-                    Some(MockFailure::DataTimeout) if command.data_present => {
+                    Some(MockFailure::DataTimeout) if data_present => {
                         // 命令本身完成，仅数据阶段超时。
                         *rintsts |= INT_CMD_DONE | INT_DATA_TIMEOUT;
                     }
-                    Some(MockFailure::FifoOverrun) if command.data_present => {
+                    Some(MockFailure::FifoOverrun) if data_present => {
                         *rintsts |= INT_CMD_DONE | INT_FIFO_OVERRUN;
                     }
                     _ => {
                         *rintsts |= INT_CMD_DONE;
-                        if command.data_present && command.read {
+                        if data_present && command.read {
                             self.data_active = true;
                             self.fifo_index = 0;
                             self.batch_served = 0;
