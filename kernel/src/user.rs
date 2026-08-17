@@ -3299,10 +3299,18 @@ exit 0
     );
 }
 
+/// 已挂载竞赛存储的 `/dev/<name>` 源路径；回退 `/dev/vda` 以兼容现有 QEMU
+/// 路径。这些 verify 线程入口都先检查 `contest_storage_mounted()`，实际总
+/// 有值；回退仅作防御（K1.1 后 runner 不再依赖硬编码 `/dev/vda`）。
+fn contest_storage_source() -> String {
+    crate::storage::contest_source_path().unwrap_or_else(|| String::from("/dev/vda"))
+}
+
 fn verify_final_buildstorm_thread(run_diagnostic: bool) {
+    let source = contest_storage_source();
     let _ = crate::fs::mkdir("/mnt", 0o755);
     let _ = crate::fs::mkdir("/mnt/sdcard", 0o755);
-    if let Err(error) = crate::fs::mount_ext4_overlay("/dev/vda", "/mnt/sdcard") {
+    if let Err(error) = crate::fs::mount_ext4_overlay(&source, "/mnt/sdcard") {
         crate::println!(
             "sudoos-diag: final-buildstorm: lazy ext4 mount failed: {:?}",
             error,
@@ -3627,6 +3635,7 @@ exit 0
 }
 
 fn verify_final_cagent_thread() {
+    let source = contest_storage_source();
     let _ = crate::fs::mkdir("/var", 0o755);
     let _ = crate::fs::mkdir("/var/tmp", 0o755);
     let _ = crate::fs::mkdir("/tmp", 0o1777);
@@ -3672,7 +3681,7 @@ fn verify_final_cagent_thread() {
     // glibc. The system libc remains backward compatible with the older agent
     // binaries bundled in /glibc, so keep the whole group on one loader/libc.
     let _ = crate::fs::mkdir("/mnt/sdcard/system-glibc", 0o755);
-    match crate::fs::install_ext4_path("/dev/vda", LOADER_DESTINATION, SYSTEM_LOADER_SOURCE) {
+    match crate::fs::install_ext4_path(&source, LOADER_DESTINATION, SYSTEM_LOADER_SOURCE) {
         Ok(()) => crate::println!("sudoos-diag: final-cagent: installed system loader"),
         Err(error) => crate::println!(
             "sudoos-diag: final-cagent: failed to install system loader: {:?}",
@@ -3680,7 +3689,7 @@ fn verify_final_cagent_thread() {
         ),
     }
     let libc_destination = "/mnt/sdcard/system-glibc/libc.so.6";
-    match crate::fs::install_ext4_path("/dev/vda", libc_destination, SYSTEM_LIBC_SOURCE) {
+    match crate::fs::install_ext4_path(&source, libc_destination, SYSTEM_LIBC_SOURCE) {
         Ok(()) => crate::println!("sudoos-diag: final-cagent: installed system libc"),
         Err(error) => crate::println!(
             "sudoos-diag: final-cagent: failed to install system libc: {:?}",
@@ -3692,7 +3701,7 @@ fn verify_final_cagent_thread() {
     // PIDs. Running it through ash turns the final targeted wait into a wait
     // for every child, including the deliberately long-lived LLM server.
     if crate::fs::stat("/mnt/sdcard/glibc/bash").is_err() {
-        match crate::fs::install_ext4_path("/dev/vda", "/mnt/sdcard/glibc/bash", "/usr/bin/bash") {
+        match crate::fs::install_ext4_path(&source, "/mnt/sdcard/glibc/bash", "/usr/bin/bash") {
             Ok(()) => crate::println!("sudoos-diag: final-cagent: installed official bash"),
             Err(error) => crate::println!(
                 "sudoos-diag: final-cagent: failed to install official bash: {:?}",
@@ -3706,7 +3715,7 @@ fn verify_final_cagent_thread() {
     const TINFO_SOURCE: &str = "/usr/lib/loongarch64-linux-gnu/libtinfo.so.6.5";
     if crate::fs::stat("/mnt/sdcard/glibc/lib/libtinfo.so.6.5").is_err() {
         match crate::fs::install_ext4_path(
-            "/dev/vda",
+            &source,
             "/mnt/sdcard/glibc/lib/libtinfo.so.6.5",
             TINFO_SOURCE,
         ) {
@@ -3728,7 +3737,7 @@ fn verify_final_cagent_thread() {
     // bundled BusyBox applet does not implement that grammar, while the
     // official image provides the matching coreutils binary and glibc.
     if crate::fs::stat("/mnt/sdcard/glibc/date").is_err() {
-        match crate::fs::install_ext4_path("/dev/vda", "/mnt/sdcard/glibc/date", "/usr/bin/date") {
+        match crate::fs::install_ext4_path(&source, "/mnt/sdcard/glibc/date", "/usr/bin/date") {
             Ok(()) => crate::println!("sudoos-diag: final-cagent: installed official date"),
             Err(error) => crate::println!(
                 "sudoos-diag: final-cagent: failed to install official date: {:?}",
@@ -5561,6 +5570,7 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
     const EXT4_FT_REG_FILE: u16 = 1;
     const EXT4_FT_DIR: u16 = 2;
     const EXT4_FT_SYMLINK: u16 = 7;
+    let source = contest_storage_source();
     let Some(device) = crate::storage::contest_storage_device() else {
         return;
     };
@@ -5584,7 +5594,7 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
             let vfs_path = alloc::format!("{}/{}", vfs_dir, entry.name);
             // Skip if already present (e.g. scripts already installed by mount phase)
             if crate::fs::stat(&vfs_path).is_err() {
-                if crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
+                if crate::fs::install_ext4_path(&source, &vfs_path, &ext4_path).is_ok() {
                     installed += 1;
                 }
             }
@@ -5596,7 +5606,7 @@ fn sdcard_install_ext4_dir_files(ext4_dir: &str) {
             };
             let vfs_path = alloc::format!("{}/{}", vfs_dir, entry.name);
             if crate::fs::stat(&vfs_path).is_err() {
-                if crate::fs::install_ext4_path("/dev/vda", &vfs_path, &ext4_path).is_ok() {
+                if crate::fs::install_ext4_path(&source, &vfs_path, &ext4_path).is_ok() {
                     installed += 1;
                 }
             }
