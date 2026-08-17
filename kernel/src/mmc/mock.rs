@@ -2,9 +2,17 @@
 //!
 //! K3.3：与修正后的寄存器语义一致——`CMD_START` 必须置位，带数据命令先写
 //! `BLKSIZ/BYTCNT`，复位走 `CTRL` 位，FIFO 偏移按 `VERID` 判定
-//! （`0x100` / `0x200`）。写入 `CMD` 时按配置模拟完成/错误；为数据读命令
-//! 提供 FIFO 数据，支持分批到达（`fifo_batch`）。寄存器数组按 4 字节偏移
-//! 索引，仅覆盖常规寄存器区（0x000..0x0fc）；FIFO 读走独立路径。
+//! （`0x100` / `0x200`）。为数据读命令提供 FIFO 数据，支持分批到达
+//! （`fifo_batch`）。寄存器数组按 4 字节偏移索引，仅覆盖常规寄存器区
+//! （0x000..0x0fc）；FIFO 读走独立路径。
+//!
+//! K3.5：**分阶段完成模型**——写 `CMD` 后 `CMD_START` 立即自清（命令已
+//! 发出），但普通命令的 `CMD_DONE` 延迟一拍（下一次 `RINTSTS` 读）才置起，
+//! 响应寄存器在 `CMD_DONE` 置起前返回 0。这模拟"START 清零 ≠ 响应就绪"，
+//! 能抓住"在 START 清零时就读 RESP"的驱动 bug（旧 mock 在写 CMD 时立即置
+//! CMD_DONE，掩盖了该错误）。UPDATE_CLOCK 永不产生 `CMD_DONE`，仅靠
+//! `CMD_START` 自清完成；错误故障（RTO/RCRC/数据错误）在写 CMD 时把错误位
+//! 与 `CMD_DONE` 同时置起，驱动必须先判错误。
 
 use alloc::vec::Vec;
 
@@ -49,7 +57,17 @@ pub struct MockRegisterIo {
     regs: [u32; 64],
     /// 每条命令的 RESP0..3（命令 N 用 `responses[4N..4N+4]`）。
     responses: Vec<u32>,
-    response_index: usize,
+    /// 已写入 CMD 的命令数（位置索引，含失败命令）。
+    command_count: usize,
+    /// 已到达 CMD_DONE 的命令数（响应仅在此时填充/可读）。
+    completed: usize,
+    /// 最近完成命令的位置（供 RESP 读取）。
+    last_completed_index: usize,
+    /// 待延迟完成的命令（START 已清但 CMD_DONE 未置）。
+    completion_pending: bool,
+    completion_pending_index: usize,
+    /// 延迟完成第一拍已过（下一拍真正置 CMD_DONE）。
+    done_armed: bool,
     failure: Option<MockFailure>,
     /// 仅作用于指定命令索引的故障（用后即清）。
     one_shot_failure: Option<(MockFailure, u8)>,
@@ -68,7 +86,12 @@ impl MockRegisterIo {
         Self {
             regs: [0; 64],
             responses: Vec::new(),
-            response_index: 0,
+            command_count: 0,
+            completed: 0,
+            last_completed_index: 0,
+            completion_pending: false,
+            completion_pending_index: 0,
+            done_armed: false,
             failure: None,
             one_shot_failure: None,
             fifo_words: Vec::new(),
@@ -126,6 +149,31 @@ impl MockRegisterIo {
         self.regs[Self::index(offset)]
     }
 
+    /// 测试用：已到达 CMD_DONE 的命令数。普通命令在 START 清零后还需两拍
+    /// RINTSTS 读才置 CMD_DONE；若驱动在 START 清零时就返回，此值不变。
+    pub fn completed_count(&self) -> usize {
+        self.completed
+    }
+
+    /// 延迟完成模型：普通命令在 CMD 写入后 START 立即自清，但 CMD_DONE
+    /// 要等一拍（下一次 RINTSTS 读）才置起，响应寄存器同时填充——模拟
+    /// "START 清零 ≠ 响应就绪"。旧 mock 在写 CMD 时立即置 CMD_DONE，
+    /// 掩盖了"在 START 清零时就读 RESP"的驱动 bug（K3.4）。
+    fn maybe_raise_cmd_done(&mut self) {
+        if !self.completion_pending {
+            return;
+        }
+        if !self.done_armed {
+            self.done_armed = true;
+            return;
+        }
+        self.regs[Self::index(REG_RINTSTS)] |= INT_CMD_DONE;
+        self.completed += 1;
+        self.last_completed_index = self.completion_pending_index;
+        self.completion_pending = false;
+        self.done_armed = false;
+    }
+
     fn index(offset: usize) -> usize {
         offset / 4
     }
@@ -158,11 +206,21 @@ impl MmcRegisterIo for MockRegisterIo {
         let index = Self::index(offset);
         match offset {
             REG_RESP0 | REG_RESP1 | REG_RESP2 | REG_RESP3 => {
+                // 响应仅在命令到达 CMD_DONE 后可读；否则返回 0（陈旧/未就绪），
+                // 保证"提前读 RESP"的驱动拿到 0 而非上一命令的残留。
+                if self.completed == 0 {
+                    return 0;
+                }
                 let resp_index = (offset - REG_RESP0) / 4;
                 self.responses
-                    .get(self.response_index.saturating_sub(1) * 4 + resp_index)
+                    .get(self.last_completed_index * 4 + resp_index)
                     .copied()
                     .unwrap_or(0)
+            }
+            REG_RINTSTS => {
+                // 读 RINTSTS 驱动延迟完成的 CMD_DONE。
+                self.maybe_raise_cmd_done();
+                self.regs[index]
             }
             // FIFO 偏移按 VERID 判定（0x100 / 0x200），独立于 regs 数组。
             _ if offset == self.fifo_offset() => {
@@ -235,7 +293,8 @@ impl MmcRegisterIo for MockRegisterIo {
                     },
                 };
                 self.commands.push(command);
-                self.response_index += 1;
+                let command_position = self.command_count;
+                self.command_count += 1;
 
                 let command_index = (value & CMD_INDEX_MASK) as u8;
                 let active_failure = match self.one_shot_failure {
@@ -255,10 +314,12 @@ impl MmcRegisterIo for MockRegisterIo {
                 let rintsts = &mut self.regs[Self::index(REG_RINTSTS)];
                 match active_failure {
                     Some(MockFailure::ResponseTimeout) => {
-                        *rintsts |= INT_RESP_TIMEOUT;
+                        // 响应超时终止命令：错误位与 CMD_DONE 同时出现，驱动
+                        // 必须先判错误再判完成（Test C）。
+                        *rintsts |= INT_RESP_TIMEOUT | INT_CMD_DONE;
                     }
                     Some(MockFailure::ResponseCrc) => {
-                        *rintsts |= INT_RESP_CRC;
+                        *rintsts |= INT_RESP_CRC | INT_CMD_DONE;
                     }
                     Some(MockFailure::DataTimeout) if data_present => {
                         // 命令本身完成，仅数据阶段超时。
@@ -272,11 +333,14 @@ impl MmcRegisterIo for MockRegisterIo {
                         // 无完成信号。
                     }
                     _ => {
-                        // 常规命令置 CMD_DONE；UPDATE_CLOCK 不置——真实硬件
-                        // 仅靠 CMD_START 自清表示完成（K3.4），驱动必须能
-                        // 在这种信号下返回。
+                        // 普通命令：START 自清 = 命令已发出，但 CMD_DONE 延迟
+                        // 一拍（下一次 RINTSTS 读）才置起——真实硬件 START
+                        // 清零与响应就绪不是同一事件。UPDATE_CLOCK 永不产生
+                        // CMD_DONE，仅靠 START 自清完成（K3.4）。
                         if value & CMD_UPDATE_CLOCK == 0 {
-                            *rintsts |= INT_CMD_DONE;
+                            self.completion_pending = true;
+                            self.completion_pending_index = command_position;
+                            self.done_armed = false;
                         }
                         if data_present && command.read {
                             self.data_active = true;

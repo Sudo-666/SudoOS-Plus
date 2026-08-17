@@ -503,15 +503,17 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
             if interrupts & (INT_RESP_CRC | INT_RESP_ERR | INT_START_BIT_ERROR | INT_END_BIT_ERROR)
                 != 0
             {
-                self.clear_interrupts(interrupts & error_mask);
+                // 错误返回也一并清 CMD_DONE：残留的 CMD_DONE 会让下一条命令
+                // 在响应就绪前误判完成。
+                self.clear_interrupts(interrupts & (error_mask | INT_CMD_DONE));
                 return Err(MmcError::CrcError);
             }
             if interrupts & INT_RESP_TIMEOUT != 0 {
-                self.io.write32(REG_RINTSTS, INT_RESP_TIMEOUT);
+                self.io.write32(REG_RINTSTS, INT_RESP_TIMEOUT | INT_CMD_DONE);
                 return Err(MmcError::Timeout);
             }
             if interrupts & INT_HLE != 0 {
-                self.clear_interrupts(INT_HLE);
+                self.clear_interrupts(INT_HLE | INT_CMD_DONE);
                 return Err(MmcError::Io);
             }
             if interrupts & INT_CMD_DONE != 0 {
@@ -813,6 +815,33 @@ pub fn verify() {
     controller
         .send_command(MmcCommand::new(7, 0x1234_0000, MmcResponseType::R1))
         .expect("plain R1 must not wait for busy");
+
+    // 20) 分阶段完成模型：START 清零 ≠ 响应就绪。mock 延迟一拍置 CMD_DONE，
+    //     驱动若在 START 清零时就返回，会读到未就绪的 RESP（0）；正确实现
+    //     必须等 CMD_DONE 且 completed_count == 1。
+    let mock = MockRegisterIo::new().with_responses(vec![0x1a2b_3c4d, 0, 0, 0]);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    let response = controller
+        .send_command(MmcCommand::new(8, 0x1aa, MmcResponseType::R7))
+        .expect("normal command must wait for CMD_DONE");
+    assert_eq!(
+        response.r0, 0x1a2b_3c4d,
+        "response must be available only after the mock raised CMD_DONE"
+    );
+    assert_eq!(
+        controller.io_ref().completed_count(),
+        1,
+        "driver must return only after CMD_DONE, not on START auto-clear"
+    );
+
+    // 21) CMD_DONE 与错误同时出现（RTO/RCRC 终止命令）：错误优先。
+    let mock = MockRegisterIo::new().with_failure(MockFailure::ResponseCrc);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    assert_eq!(
+        controller.send_command(MmcCommand::new(55, 0, MmcResponseType::R1)),
+        Err(MmcError::CrcError),
+        "error must win even when CMD_DONE is also set"
+    );
 
     crate::println!("C7 DW-MMC controller gate:");
     crate::println!("  command complete    : verified");
