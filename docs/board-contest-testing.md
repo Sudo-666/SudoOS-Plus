@@ -69,15 +69,28 @@ DTB 在 `/reserved-memory` 声明 `contest-disk@e0000000`
 
 ## 日志验收
 
+结果协议（K2.1）：fixture 模式要求 `CONTEST_FIXTURE: paths-missing=0` +
+`FIXTURE_OSCOMP_PASS`；正式镜像模式要求每个 runner 都打印
+`CONTEST_RESULT mode=<mode> pass`（仅脚本退出码 0 才打印 pass）。
+
 ```bash
-python3 scripts/check-board-contest-log.py --board visionfive2 --fixture vf2-contest.log
-python3 scripts/check-board-contest-log.py --board ls2k1000  --fixture ls2k-contest.log
+# fixture（自动生成的 ext4 探测镜像）
+python3 scripts/check-board-contest-log.py --board visionfive2 --image-type fixture --fixture vf2-contest.log
+python3 scripts/check-board-contest-log.py --board ls2k1000  --image-type fixture --fixture ls2k-contest.log
+
+# final（正式评测镜像）
+python3 scripts/check-board-contest-log.py --board visionfive2 --image-type final --fixture vf2-final.log
+python3 scripts/check-board-contest-log.py --board ls2k1000  --image-type final --fixture ls2k-final.log
 ```
 
-公共要求：`CONTEST00..03`、`FIXTURE_OSCOMP_PASS`、`SMOKE_TEST: PASS`。
+公共要求：`CONTEST00..03`（按序）、`SMOKE_TEST: PASS`；fixture 额外要求
+`paths-missing=0` + `FIXTURE_OSCOMP_PASS`；final 额外要求
+`CONTEST_RESULT mode=final-cagent pass`、`CONTEST_RESULT mode=final-buildstorm pass`
+与 `final-image-contract` 全路径 present。
 
 VF2 额外：`VF2-TF00..03`；LS2K 额外：`LS2K-RAMDISK00/01` +
 `registered=/dev/ram0`。
 
-拒绝：`panic`、`timeout`、`CRC error`、`out of range`、`filesystem corrupt`、
-`unhandled trap`、`OOM`。
+拒绝：`FIXTURE_OSCOMP_FAIL`、任何 `CONTEST_RESULT ... fail|timeout`、`panic`、
+`timeout`、`CRC error`、`out of range`、`filesystem corrupt`、`unhandled trap`、
+`OOM`。
