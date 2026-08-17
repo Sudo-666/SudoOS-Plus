@@ -24,6 +24,8 @@ pub enum MockFailure {
     FifoOverrun,
     /// 控制器复位卡死（CTRL 复位位永不自清）。
     ResetHang,
+    /// 命令永不完成（CMD_START 不自清，无完成信号）。
+    CommandHang,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +38,8 @@ pub struct MockCommandTrace {
     pub cmd_start: bool,
     /// 带数据命令的字节数（来自 BLKSIZ/BYTCNT 编程）。
     pub data_length: Option<usize>,
+    /// 带数据命令的 FIFOTH 值（水印须低于 FIFO 深度，K3.4）。
+    pub fifo_threshold: Option<u32>,
 }
 
 /// 模拟寄存器。寄存器数组按 `offset / 4` 索引。
@@ -212,12 +216,15 @@ impl MmcRegisterIo for MockRegisterIo {
                     } else {
                         None
                     },
+                    fifo_threshold: if data_present {
+                        Some(self.regs[Self::index(REG_FIFOTH)])
+                    } else {
+                        None
+                    },
                 };
                 self.commands.push(command);
                 self.response_index += 1;
-                self.regs[index] = value;
 
-                let rintsts = &mut self.regs[Self::index(REG_RINTSTS)];
                 let command_index = (value & CMD_INDEX_MASK) as u8;
                 let active_failure = match self.one_shot_failure {
                     Some((failure, index)) if index == command_index => {
@@ -226,6 +233,14 @@ impl MmcRegisterIo for MockRegisterIo {
                     }
                     _ => self.failure,
                 };
+                // 命令执行完成 → 硬件自清 CMD_START（K3.4）。CommandHang
+                // 故障下保持置位，模拟命令永不完成。
+                self.regs[index] = match active_failure {
+                    Some(MockFailure::CommandHang) => value,
+                    _ => value & !CMD_START,
+                };
+
+                let rintsts = &mut self.regs[Self::index(REG_RINTSTS)];
                 match active_failure {
                     Some(MockFailure::ResponseTimeout) => {
                         *rintsts |= INT_RESP_TIMEOUT;
@@ -240,8 +255,16 @@ impl MmcRegisterIo for MockRegisterIo {
                     Some(MockFailure::FifoOverrun) if data_present => {
                         *rintsts |= INT_CMD_DONE | INT_FIFO_OVERRUN;
                     }
+                    Some(MockFailure::CommandHang) => {
+                        // 无完成信号。
+                    }
                     _ => {
-                        *rintsts |= INT_CMD_DONE;
+                        // 常规命令置 CMD_DONE；UPDATE_CLOCK 不置——真实硬件
+                        // 仅靠 CMD_START 自清表示完成（K3.4），驱动必须能
+                        // 在这种信号下返回。
+                        if value & CMD_UPDATE_CLOCK == 0 {
+                            *rintsts |= INT_CMD_DONE;
+                        }
                         if data_present && command.read {
                             self.data_active = true;
                             self.fifo_index = 0;

@@ -302,7 +302,7 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         self.io.write32(REG_CMDARG, command.argument);
         self.io.write32(REG_CMD, cmd_value);
 
-        self.poll_command_done()?;
+        self.poll_command_complete()?;
 
         let mut response = MmcResponse::default();
         match command.response_type {
@@ -409,20 +409,42 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         value
     }
 
-    /// 等待 CMD_DONE 或命令错误，返回并清理中断。
-    fn poll_command_done(&mut self) -> Result<(), MmcError> {
-        let mask = INT_CMD_DONE | INT_RESP_CRC | INT_RESP_TIMEOUT | INT_START_BIT | INT_END_BIT;
-        let interrupts = self.poll_for(|value| value & mask != 0, REG_RINTSTS)?;
-        if interrupts & INT_CMD_DONE != 0 {
-            self.io.write32(REG_RINTSTS, INT_CMD_DONE);
-            return Ok(());
+    /// 等待命令完成。DW-MMC 命令完成的通用信号是 `CMD_START`（bit 31）被
+    /// 硬件自动清零（databook：START 位写 1 启动命令，命令结束自清）。
+    /// UPDATE_CLOCK 这类无响应命令**不会**置位 `CMD_DONE`，按 CMD_DONE 等
+    /// 会永久挂死（K3.4）。这里轮询 `REG_CMD` 的 START 位自清，同时监视
+    /// 响应/数据错误中断（错误位在自清前也可能置起）。
+    fn poll_command_complete(&mut self) -> Result<(), MmcError> {
+        let error_mask = INT_RESP_CRC | INT_RESP_TIMEOUT | INT_START_BIT | INT_END_BIT;
+        let cycles_per_ms = crate::time::clock_frequency_hz() / 1000;
+        let deadline = crate::time::now()
+            .cycles()
+            .saturating_add(cycles_per_ms.saturating_mul(POLL_DEADLINE_MS));
+        let mut count = 0_usize;
+        loop {
+            let interrupts = self.io.read32(REG_RINTSTS);
+            if interrupts & (INT_RESP_CRC | INT_START_BIT | INT_END_BIT) != 0 {
+                self.clear_interrupts(interrupts & error_mask);
+                return Err(MmcError::CrcError);
+            }
+            if interrupts & INT_RESP_TIMEOUT != 0 {
+                self.io.write32(REG_RINTSTS, INT_RESP_TIMEOUT);
+                return Err(MmcError::Timeout);
+            }
+            if self.io.read32(REG_CMD) & CMD_START == 0 {
+                // 命令完成。清掉常规命令可能置位的 CMD_DONE，避免残留。
+                self.io.write32(REG_RINTSTS, INT_CMD_DONE);
+                return Ok(());
+            }
+            count += 1;
+            if count >= POLL_COUNT_CAP {
+                return Err(MmcError::Timeout);
+            }
+            if count & 0x1f == 0 && crate::time::now().cycles() >= deadline {
+                return Err(MmcError::Timeout);
+            }
+            core::hint::spin_loop();
         }
-        if interrupts & (INT_RESP_CRC | INT_START_BIT | INT_END_BIT) != 0 {
-            self.clear_interrupts(interrupts & mask);
-            return Err(MmcError::CrcError);
-        }
-        self.io.write32(REG_RINTSTS, INT_RESP_TIMEOUT);
-        Err(MmcError::Timeout)
     }
 
     fn wait_data_busy_clear(&mut self) -> Result<(), MmcError> {
@@ -590,6 +612,37 @@ pub fn verify() {
     controller.reset().expect("reset");
     controller.disable_interrupts();
 
+    // 13) UPDATE_CLOCK 命令：mock 不置 CMD_DONE，仅靠 CMD_START 自清完成。
+    //     控制器必须通过轮询 START 位返回，不能等 CMD_DONE（K3.4）。
+    let mock = MockRegisterIo::new();
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    let update_clock = MmcCommand {
+        index: 0,
+        argument: 0,
+        response_type: MmcResponseType::None,
+        data_present: false,
+        read: false,
+        init: false,
+        update_clock: true,
+        data_length: None,
+    };
+    controller
+        .send_command(update_clock)
+        .expect("update-clock completes via CMD_START self-clear");
+    let trace = &controller.io_ref().commands;
+    assert!(
+        trace.iter().any(|command| command.update_clock && command.cmd_start),
+        "update-clock must be issued with CMD_START"
+    );
+
+    // 14) 命令永不完成（CMD_START 不自清）→ 轮询超时，不挂死。
+    let mock = MockRegisterIo::new().with_failure(MockFailure::CommandHang);
+    let mut controller = DwMmcController::new(mock, 25_000_000, 32);
+    assert_eq!(
+        controller.send_command(MmcCommand::new(55, 0, MmcResponseType::R1)),
+        Err(MmcError::Timeout),
+    );
+
     crate::println!("C7 DW-MMC controller gate:");
     crate::println!("  command complete    : verified");
     crate::println!("  response timeout    : verified");
@@ -602,4 +655,6 @@ pub fn verify() {
     crate::println!("  error recovery      : verified");
     crate::println!("  R1 card status      : verified");
     crate::println!("  clock/bus-width     : verified");
+    crate::println!("  update-clock        : verified");
+    crate::println!("  command hang        : verified");
 }
