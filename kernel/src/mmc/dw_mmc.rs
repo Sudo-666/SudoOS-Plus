@@ -310,7 +310,13 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         self.io.write32(REG_CMDARG, command.argument);
         self.io.write32(REG_CMD, cmd_value);
 
-        self.poll_command_complete()?;
+        // UPDATE_CLOCK 无响应、无 CMD_DONE，等 START 自清；普通命令等
+        // CMD_DONE（响应就绪）而非 START 清零。
+        if command.update_clock {
+            self.poll_update_clock_complete()?;
+        } else {
+            self.poll_normal_command_done()?;
+        }
 
         let mut response = MmcResponse::default();
         match command.response_type {
@@ -346,7 +352,7 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
             let interrupts = self.poll_for(
                 |value| {
                     value & (INT_RX_DATA_REQ | INT_DATA_OVER | INT_DATA_CRC | INT_DATA_TIMEOUT
-                        | INT_FIFO_UNDERRUN | INT_FIFO_OVERRUN)
+                        | INT_FIFO_RUN_ERROR | INT_HLE)
                         != 0
                 },
                 REG_RINTSTS,
@@ -359,13 +365,15 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 self.clear_interrupts(INT_DATA_TIMEOUT | INT_DATA_OVER);
                 return Err(MmcError::Timeout);
             }
-            if interrupts & INT_FIFO_UNDERRUN != 0 {
-                self.clear_interrupts(INT_FIFO_UNDERRUN | INT_DATA_OVER);
-                return Err(MmcError::FifoUnderrun);
-            }
-            if interrupts & INT_FIFO_OVERRUN != 0 {
-                self.clear_interrupts(INT_FIFO_OVERRUN | INT_DATA_OVER);
+            // FRUN（bit 11）同时覆盖 FIFO 下溢/上溢；读路径上溢 = 数据丢失。
+            if interrupts & INT_FIFO_RUN_ERROR != 0 {
+                self.clear_interrupts(INT_FIFO_RUN_ERROR | INT_DATA_OVER);
                 return Err(MmcError::FifoOverrun);
+            }
+            // HLE（bit 12）是主机锁定错误，不是 FIFO overrun。
+            if interrupts & INT_HLE != 0 {
+                self.clear_interrupts(INT_HLE | INT_DATA_OVER);
+                return Err(MmcError::Io);
             }
             // 读 FIFO 直到空（分批到达）。
             while !self.fifo_empty() && received < words {
@@ -417,13 +425,10 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         value
     }
 
-    /// 等待命令完成。DW-MMC 命令完成的通用信号是 `CMD_START`（bit 31）被
-    /// 硬件自动清零（databook：START 位写 1 启动命令，命令结束自清）。
-    /// UPDATE_CLOCK 这类无响应命令**不会**置位 `CMD_DONE`，按 CMD_DONE 等
-    /// 会永久挂死（K3.4）。这里轮询 `REG_CMD` 的 START 位自清，同时监视
-    /// 响应/数据错误中断（错误位在自清前也可能置起）。
-    fn poll_command_complete(&mut self) -> Result<(), MmcError> {
-        let error_mask = INT_RESP_CRC | INT_RESP_TIMEOUT | INT_START_BIT | INT_END_BIT;
+    /// 等待 UPDATE_CLOCK 完成。无响应命令**不**置位 `CMD_DONE`，完成信号是
+    /// `CMD_START`（bit 31）被硬件自动清零；只检查 `HLE`（主机锁定错误）。
+    /// 保留真实时间 deadline + 轮询次数上限双重超时。
+    fn poll_update_clock_complete(&mut self) -> Result<(), MmcError> {
         let cycles_per_ms = crate::time::clock_frequency_hz() / 1000;
         let deadline = crate::time::now()
             .cycles()
@@ -431,7 +436,42 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
         let mut count = 0_usize;
         loop {
             let interrupts = self.io.read32(REG_RINTSTS);
-            if interrupts & (INT_RESP_CRC | INT_START_BIT | INT_END_BIT) != 0 {
+            if interrupts & INT_HLE != 0 {
+                self.clear_interrupts(INT_HLE);
+                return Err(MmcError::Io);
+            }
+            if self.io.read32(REG_CMD) & CMD_START == 0 {
+                return Ok(());
+            }
+            count += 1;
+            if count >= POLL_COUNT_CAP {
+                return Err(MmcError::Timeout);
+            }
+            if count & 0x1f == 0 && crate::time::now().cycles() >= deadline {
+                return Err(MmcError::Timeout);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// 等待普通命令完成。轮询 `RINTSTS`：先判响应/主机错误位（RESP_TIMEOUT、
+    /// RESP_CRC、RESP_ERR、HLE、START_BIT_ERROR、END_BIT_ERROR），再等
+    /// `CMD_DONE`，成功后清理。响应寄存器只在 `CMD_DONE` 置起后有效——
+    /// `CMD_START` 自清（命令已发出）**不等于**响应已就绪，不能在 START
+    /// 清零时就读 RESP（K3.4 起按 CMD_DONE 判定）。
+    fn poll_normal_command_done(&mut self) -> Result<(), MmcError> {
+        let error_mask = INT_RESP_CRC | INT_RESP_TIMEOUT | INT_RESP_ERR | INT_HLE
+            | INT_START_BIT_ERROR | INT_END_BIT_ERROR;
+        let cycles_per_ms = crate::time::clock_frequency_hz() / 1000;
+        let deadline = crate::time::now()
+            .cycles()
+            .saturating_add(cycles_per_ms.saturating_mul(POLL_DEADLINE_MS));
+        let mut count = 0_usize;
+        loop {
+            let interrupts = self.io.read32(REG_RINTSTS);
+            if interrupts & (INT_RESP_CRC | INT_RESP_ERR | INT_START_BIT_ERROR | INT_END_BIT_ERROR)
+                != 0
+            {
                 self.clear_interrupts(interrupts & error_mask);
                 return Err(MmcError::CrcError);
             }
@@ -439,8 +479,11 @@ impl<I: MmcRegisterIo> DwMmcController<I> {
                 self.io.write32(REG_RINTSTS, INT_RESP_TIMEOUT);
                 return Err(MmcError::Timeout);
             }
-            if self.io.read32(REG_CMD) & CMD_START == 0 {
-                // 命令完成。清掉常规命令可能置位的 CMD_DONE，避免残留。
+            if interrupts & INT_HLE != 0 {
+                self.clear_interrupts(INT_HLE);
+                return Err(MmcError::Io);
+            }
+            if interrupts & INT_CMD_DONE != 0 {
                 self.io.write32(REG_RINTSTS, INT_CMD_DONE);
                 return Ok(());
             }

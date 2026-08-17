@@ -63,7 +63,10 @@ pub const CMD_SEND_INIT: u32 = 1 << 15;
 pub const CMD_UPDATE_CLOCK: u32 = 1 << 21;
 pub const CMD_START: u32 = 1 << 31;
 
-/// `RINTSTS` / `MINTSTS` 中断位。
+/// `RINTSTS` / `MINTSTS` 中断位（dw_mmc.h：HTO=10、FRUN=11、HLE=12、
+/// SBE=13、EBE=15）。bit 11 的 FRUN 同时覆盖 FIFO 下溢/上溢，没有单独的
+/// overrun 位；bit 12 是主机锁定错误 HLE，**不是** FIFO 错误（旧实现把它
+/// 误当 overrun，mock 与实现共享错误定义）。
 pub const INT_CARD_DETECT: u32 = 1 << 0;
 pub const INT_RESP_ERR: u32 = 1 << 1;
 pub const INT_CMD_DONE: u32 = 1 << 2;
@@ -75,11 +78,10 @@ pub const INT_DATA_CRC: u32 = 1 << 7;
 pub const INT_RESP_TIMEOUT: u32 = 1 << 8;
 pub const INT_DATA_TIMEOUT: u32 = 1 << 9;
 pub const INT_HOST_TIMEOUT: u32 = 1 << 10;
-pub const INT_FIFO_UNDERRUN: u32 = 1 << 11;
-/// 读路径把 HLE（bit 12，主机锁定错误）作为 FIFO/数据错误上溢上报。
-pub const INT_FIFO_OVERRUN: u32 = 1 << 12;
-pub const INT_START_BIT: u32 = 1 << 13;
-pub const INT_END_BIT: u32 = 1 << 15;
+pub const INT_FIFO_RUN_ERROR: u32 = 1 << 11;
+pub const INT_HLE: u32 = 1 << 12;
+pub const INT_START_BIT_ERROR: u32 = 1 << 13;
+pub const INT_END_BIT_ERROR: u32 = 1 << 15;
 
 /// 所有与命令/数据完成或错误相关的位（复位后应清空）。
 pub const INT_CMD_AND_DATA: u32 = INT_CMD_DONE
@@ -88,10 +90,10 @@ pub const INT_CMD_AND_DATA: u32 = INT_CMD_DONE
     | INT_DATA_CRC
     | INT_RESP_TIMEOUT
     | INT_DATA_TIMEOUT
-    | INT_FIFO_UNDERRUN
-    | INT_FIFO_OVERRUN
-    | INT_START_BIT
-    | INT_END_BIT;
+    | INT_FIFO_RUN_ERROR
+    | INT_HLE
+    | INT_START_BIT_ERROR
+    | INT_END_BIT_ERROR;
 
 /// `STATUS` 位：`DATA_BUSY` = bit 9；FIFO 计数在 bits [29:17]。
 pub const STATUS_BUSY: u32 = 1 << 9;

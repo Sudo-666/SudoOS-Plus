@@ -253,7 +253,8 @@ impl MmcRegisterIo for MockRegisterIo {
                         *rintsts |= INT_CMD_DONE | INT_DATA_TIMEOUT;
                     }
                     Some(MockFailure::FifoOverrun) if data_present => {
-                        *rintsts |= INT_CMD_DONE | INT_FIFO_OVERRUN;
+                        // bit 11（FRUN）同时覆盖 FIFO 下溢/上溢；读路径上溢。
+                        *rintsts |= INT_CMD_DONE | INT_FIFO_RUN_ERROR;
                     }
                     Some(MockFailure::CommandHang) => {
                         // 无完成信号。
