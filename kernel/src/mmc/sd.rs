@@ -260,7 +260,19 @@ pub fn verify() {
     responses.extend([0x00ff_8000, 0, 0, 0]); // ACMD41 busy
     responses.extend([0, 0, 0, 0]); // CMD55
     responses.extend([0xc0ff_8000, 0, 0, 0]); // ACMD41 ready + CCS
-    responses.extend([0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444]); // CMD2 CID
+    // CMD2 CID：非回文字节序列（区分 BE/LE 字节序）。DW-MMC RESP 字内
+    // 4 字节按小端存放，mock 用 from_le_bytes 编码，card_data() 用
+    // to_le_bytes 还原，往返应得到原始 16 字节。
+    let cid_payload = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+    responses.extend([
+        u32::from_le_bytes([cid_payload[0], cid_payload[1], cid_payload[2], cid_payload[3]]),
+        u32::from_le_bytes([cid_payload[4], cid_payload[5], cid_payload[6], cid_payload[7]]),
+        u32::from_le_bytes([cid_payload[8], cid_payload[9], cid_payload[10], cid_payload[11]]),
+        u32::from_le_bytes([cid_payload[12], cid_payload[13], cid_payload[14], cid_payload[15]]),
+    ]); // CMD2 CID
     responses.extend([0x1234_0000, 0, 0, 0]); // CMD3 RCA 0x1234
     responses.extend(csd_v2_words(0x12345)); // CMD9 CSD v2, C_SIZE=0x12345
     responses.extend([0, 0, 0, 0]); // CMD7
@@ -284,6 +296,11 @@ pub fn verify() {
     assert_eq!(info.rca, 0x1234);
     // CSD v2: blocks = (0x12345 + 1) * 1024
     assert_eq!(info.block_count, (0x12345 + 1) * 1024);
+    // CID 字节序：RESP 字内小端编码必须被 card_data() 正确还原。
+    assert_eq!(
+        info.cid, cid_payload,
+        "R2 response must decode as little-endian within each RESP word"
+    );
 
     // 2) SDSC v1 初始化（CMD8 超时，无 4-bit）。
     let mut responses: Vec<u32> = Vec::new();
@@ -375,6 +392,9 @@ pub fn verify() {
 }
 
 /// CSD v2 响应字：构造 C_SIZE 的 16 字节 CSD。
+///
+/// DW-MMC RESP0..3 内 4 个字节按小端存放，故 mock 用 `from_le_bytes`
+/// 编码（与 `MmcResponse::card_data()` 的 `to_le_bytes()` 互为逆运算）。
 #[cfg(debug_assertions)]
 fn csd_v2_words(c_size: u64) -> Vec<u32> {
     // CSD v2：bits 48-69 = C_SIZE。构造 16 字节大端。
@@ -388,10 +408,10 @@ fn csd_v2_words(c_size: u64) -> Vec<u32> {
         }
     }
     vec![
-        u32::from_be_bytes([csd[0], csd[1], csd[2], csd[3]]),
-        u32::from_be_bytes([csd[4], csd[5], csd[6], csd[7]]),
-        u32::from_be_bytes([csd[8], csd[9], csd[10], csd[11]]),
-        u32::from_be_bytes([csd[12], csd[13], csd[14], csd[15]]),
+        u32::from_le_bytes([csd[0], csd[1], csd[2], csd[3]]),
+        u32::from_le_bytes([csd[4], csd[5], csd[6], csd[7]]),
+        u32::from_le_bytes([csd[8], csd[9], csd[10], csd[11]]),
+        u32::from_le_bytes([csd[12], csd[13], csd[14], csd[15]]),
     ]
 }
 
@@ -426,9 +446,9 @@ fn csd_v1_words() -> Vec<u32> {
         }
     }
     vec![
-        u32::from_be_bytes([csd[0], csd[1], csd[2], csd[3]]),
-        u32::from_be_bytes([csd[4], csd[5], csd[6], csd[7]]),
-        u32::from_be_bytes([csd[8], csd[9], csd[10], csd[11]]),
-        u32::from_be_bytes([csd[12], csd[13], csd[14], csd[15]]),
+        u32::from_le_bytes([csd[0], csd[1], csd[2], csd[3]]),
+        u32::from_le_bytes([csd[4], csd[5], csd[6], csd[7]]),
+        u32::from_le_bytes([csd[8], csd[9], csd[10], csd[11]]),
+        u32::from_le_bytes([csd[12], csd[13], csd[14], csd[15]]),
     ]
 }

@@ -168,13 +168,18 @@ impl MmcResponse {
         self.r0
     }
 
-    /// 136-bit 响应（R2）：RESP0..3 从高位到低位。
+    /// 136-bit 响应（R2）：RESP0..3 从高位到低位。DW-MMC 每个 32-bit
+    /// 寄存器内的 4 个载荷字节按**小端**存放（RESP0 = payload[127:96]，
+    /// RESP0 的 bit[7:0] = payload 的 bit[127:120]），故用 `to_le_bytes()`
+    /// 还原出 16 字节大端载荷（bit 127 = bytes[0] 的 MSB）。此前用
+    /// `to_be_bytes()` 会把每个字内字节反转，C_SIZE 取错位导致容量解析
+    /// 错误（K3.4）。
     pub fn card_data(&self) -> [u8; 16] {
         let mut bytes = [0_u8; 16];
-        bytes[0..4].copy_from_slice(&self.r0.to_be_bytes());
-        bytes[4..8].copy_from_slice(&self.r1.to_be_bytes());
-        bytes[8..12].copy_from_slice(&self.r2.to_be_bytes());
-        bytes[12..16].copy_from_slice(&self.r3.to_be_bytes());
+        bytes[0..4].copy_from_slice(&self.r0.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.r1.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.r2.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.r3.to_le_bytes());
         bytes
     }
 }
