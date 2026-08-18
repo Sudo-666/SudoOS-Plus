@@ -79,21 +79,33 @@
 #define LS2K1000_PHYS_MASK          UINT64_C(0x0fffffffffffffff)
 #define LS2K1000_UNCACHED_DMW_BASE  UINT64_C(0x8000000000000000)
 
-#define usb_ehci_physramaddr(a) \
-    ((uintptr_t)(a) & (uintptr_t)LS2K1000_PHYS_MASK)
-
-static inline uintptr_t usb_ehci_virtramaddr(uintptr_t physaddr)
+static inline uintptr_t usb_ehci_physramaddr_ls2k(uintptr_t addr)
 {
+    return addr & (uintptr_t)LS2K1000_PHYS_MASK;
+}
+
+static inline uintptr_t usb_ehci_virtramaddr_ls2k(uintptr_t phys)
+{
+    /* M2.15：先掩码剥掉所有高位别名再 OR uncached base。链接指针一旦带的是
+     * cached 窗口 (0x9000...) 或其它高位，直接 `| 0x8000...` 会把残留高位 OR
+     * 回去，得到错误（仍是 cached）别名，CPU 经它读 QH 软件字段会读到陈旧值
+     * （真机 epinfo=0x0/fqp=0，硬件 overlay 却已由 EHCI 完成）。先
+     * & PHYS_MASK 保证结果一定落在 uncached DMW 窗口。 */
+    phys &= (uintptr_t)LS2K1000_PHYS_MASK;
+
     /* EHCI 链表结束（terminate link）地址是 0：必须原样返回 NULL，不能把它
      * `| 0x8000...` 变成非空地址，否则遍历会解引用垃圾指针继续崩溃。 */
-    if (physaddr == 0) {
+    if (phys == 0) {
         return 0;
     }
-    return physaddr | (uintptr_t)LS2K1000_UNCACHED_DMW_BASE;
+    return phys | (uintptr_t)LS2K1000_UNCACHED_DMW_BASE;
 }
+
+#define usb_ehci_physramaddr(a) usb_ehci_physramaddr_ls2k((uintptr_t)(a))
+#define usb_ehci_virtramaddr(a) usb_ehci_virtramaddr_ls2k((uintptr_t)(a))
 #else
-#define usb_ehci_physramaddr(a) (a)
-#define usb_ehci_virtramaddr(a) (a)
+#define usb_ehci_physramaddr(a) ((uintptr_t)(a))
+#define usb_ehci_virtramaddr(a) ((uintptr_t)(a))
 #endif
 
 /****************************************************************************
@@ -1060,6 +1072,16 @@ static void usb_ehci_qh_enqueue(struct usb_ehci_qh_s *qhead, struct usb_ehci_qh_
     physaddr = (uintptr_t)usb_ehci_physramaddr((uintptr_t)qh);
     qhead->hw.hlp = usb_ehci_swap32(physaddr | QH_HLP_TYP_QH);
     usb_ehci_dcache_clean((uintptr_t)&qhead->hw, sizeof(struct usb_ehci_qh_s));
+
+    /* M2.15 诊断：入队快照。pa 标识 QH 物理地址，epinfo/fqp 是软件字段。
+     * 与 USB-QH-IOC 的 va 对比：两者都是 0x8000... uncached 别名但值不同
+     * → QH 槽在 bottom-half 赶到前被 memset/复用（alloc/free 竞态）；
+     * va 不同 → 遍历经错误别名访问，修 virtramaddr。 */
+    printf("USB-QH-ENQ va=%p pa=%08x epinfo=%p fqp=%08x\r\n",
+           (void *)qh,
+           (unsigned)usb_ehci_physramaddr((uintptr_t)qh),
+           (void *)qh->epinfo,
+           (unsigned)usb_ehci_swap32(qh->fqp));
 }
 
 static int usb_ehci_control_setup(struct usb_ehci_epinfo_s *epinfo, struct usb_setup_packet *setup, uint8_t *buffer, uint32_t buflen)
@@ -1647,6 +1669,17 @@ static int usb_ehci_qh_ioccheck(struct usb_ehci_qh_s *qh, uint32_t **bp, void *a
     epinfo = qh->epinfo;
 
     token = usb_ehci_swap32(qh->hw.overlay.token);
+
+    /* M2.15 诊断：IOC 遍历到该 QH 时的完整快照（va/pa/epinfo/fqp/token）。
+     * va 与 USB-QH-ENQ 对比：相同 uncached 别名但值不同 → 槽被清零/复用；
+     * va 不同 → 访问别名不一致。token 低 8 位无 ACTIVE/HALTED 且 NBYTES=0
+     * → 硬件已由 EHCI 完成，故障在 CPU completion 路径。 */
+    printf("USB-QH-IOC va=%p pa=%08x epinfo=%p fqp=%08x token=%08x\r\n",
+           (void *)qh,
+           (unsigned)usb_ehci_physramaddr((uintptr_t)qh),
+           (void *)epinfo,
+           (unsigned)usb_ehci_swap32(qh->fqp),
+           (unsigned)token);
 
     /* M2.14 诊断：解引用 epinfo 之前打印该 QH 快照。上一轮真机
      * address=0x4 access=Read（= epinfo->iocwait，epinfo==NULL）在 USB-IOC00
