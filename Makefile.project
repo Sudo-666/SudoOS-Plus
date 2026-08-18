@@ -296,6 +296,10 @@ check-visionfive2-fit: visionfive2-fit
 	    --dtb-selftest $(VF2_TFTP_DIR)/dtbs/vf2-selftest.dtb \
 	    --dtb-single $(VF2_TFTP_DIR)/dtbs/vf2-single.dtb \
 	    --dtb-smp $(VF2_TFTP_DIR)/dtbs/vf2-smp.dtb \
+	    --dtb-contest-single $(VF2_TFTP_DIR)/dtbs/vf2-contest-fixture-single.dtb \
+	    --dtb-contest-smp $(VF2_TFTP_DIR)/dtbs/vf2-contest-fixture-smp.dtb \
+	    --dtb-finalall-single $(VF2_TFTP_DIR)/dtbs/vf2-finalall-single.dtb \
+	    --dtb-finalall-smp $(VF2_TFTP_DIR)/dtbs/vf2-finalall-smp.dtb \
 	    --initramfs build/initramfs/busybox-riscv64.cpio
 
 .PHONY: visionfive2-tftp-bundle
