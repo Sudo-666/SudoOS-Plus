@@ -40,6 +40,11 @@ REJECT_MARKERS = [
     "OOM",
     "ale-fail",
     "unknown-syscall",
+    # Heap is not installed before BOOT06 heap-ready: any allocation request
+    # there trips the alloc-error handler and must fail the gate.  riscv64 uses
+    # the default __rdl_oom message; ls2k1000 prints HEAP_FATAL-*.
+    "memory allocation of",
+    "HEAP_FATAL",
     # User-mode faults: a real SIGSEGV in a child process is a stability
     # failure, not a pass.  The kernel prints `sigsegv: pid=...` on the serial
     # and BusyBox ash echoes `Segmentation fault`.

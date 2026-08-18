@@ -15,7 +15,7 @@ pub mod sd;
 #[cfg(debug_assertions)]
 mod mock;
 
-use alloc::vec::Vec;
+use heapless::Vec;
 
 use crate::{
     irq_lock::IrqSpinLock,
@@ -24,20 +24,40 @@ use crate::{
 
 const MMC_DISCOVERY_LOCK: LockClass = LockClass::new("mmc.discovery", LockRank::Vfs, 5);
 
-static DISCOVERED_HOSTS: IrqSpinLock<Vec<myos_fdt::MmcHostConfig>> =
+/// FDT 描述的 DW-MMC 主机上限。`discover_hosts` 在 BOOT06 堆就绪前运行，
+/// 主机表必须用定容量的 `heapless::Vec`（零动态分配）；超限视为启动配置
+/// 错误直接 panic。
+const MAX_MMC_HOSTS: usize = 4;
+
+/// 定容量主机表。FDT 启动信息收集必须满足"堆初始化前零分配"约束——
+/// 之前用 `alloc::Vec` 在 VF2 上第一次 `push` 就触发
+/// `memory allocation of 288 bytes failed`（详见 heap.rs / BOOT06）。
+type DiscoveredHosts = Vec<myos_fdt::MmcHostConfig, MAX_MMC_HOSTS>;
+
+static DISCOVERED_HOSTS: IrqSpinLock<DiscoveredHosts> =
     IrqSpinLock::new_with_class(Vec::new(), MMC_DISCOVERY_LOCK);
 
-/// 从设备树收集 DW-MMC 主机并记录，打印发现日志。
+/// 从设备树收集 DW-MMC 主机并记录，打印发现日志。堆初始化前调用，不得分配。
 pub fn discover_hosts(tree: &myos_fdt::DeviceTree) {
-    let mut hosts = Vec::new();
-    tree.for_each_mmc_host(|host| hosts.push(host))
-        .unwrap_or_else(|error| {
-            crate::println!("mmc: host discovery failed: {error}");
-        });
+    let mut hosts = DiscoveredHosts::new();
+    let mut overflow = false;
+
+    tree.for_each_mmc_host(|host| {
+        if hosts.push(host).is_err() {
+            overflow = true;
+        }
+    })
+    .unwrap_or_else(|error| {
+        panic!("mmc: host discovery failed: {error}");
+    });
+
+    if overflow {
+        panic!("mmc: more than {MAX_MMC_HOSTS} hosts described by FDT");
+    }
 
     crate::println!("mmc:");
     crate::println!("  hosts discovered : {}", hosts.len());
-    for host in &hosts {
+    for host in hosts.iter() {
         crate::println!(
             "  mmc{}             : base={:#018x} size={:#x} bus-width={} irq={} fifo={:?} max={:?} ciu={:?} removable={}",
             host.alias_index().unwrap_or(u8::MAX),
@@ -51,11 +71,12 @@ pub fn discover_hosts(tree: &myos_fdt::DeviceTree) {
             !host.non_removable(),
         );
     }
+
     *DISCOVERED_HOSTS.lock() = hosts;
 }
 
 /// 返回已发现的主机配置快照。
-pub fn discovered_hosts() -> Vec<myos_fdt::MmcHostConfig> {
+pub fn discovered_hosts() -> DiscoveredHosts {
     DISCOVERED_HOSTS.lock().clone()
 }
 
@@ -74,7 +95,8 @@ pub fn select_tf_host(hosts: &[myos_fdt::MmcHostConfig]) -> Option<myos_fdt::Mmc
 
 /// 返回 TF 卡主机（VisionFive 2 的 `mmc1` 槽）；无匹配时返回 `None`。
 pub fn removable_host() -> Option<myos_fdt::MmcHostConfig> {
-    select_tf_host(&DISCOVERED_HOSTS.lock())
+    let hosts = DISCOVERED_HOSTS.lock();
+    select_tf_host(hosts.as_slice())
 }
 
 /// 初始化可移除主机的 SD 卡并注册 `/dev/mmcblk1`（无卡/失败不 panic）。

@@ -338,10 +338,14 @@ fn kernel_main(boot: BootInfo) -> ! {
         // 固件加载的竞赛镜像区域（LS2K1000 U-Boot → ram0）。这些区域由
         // build_boot_memory_layout 通过 /reserved-memory 从 free memory
         // 中排除；这里收集其细节供注册只读块设备。
-        let mut boot_ramdisks: alloc::vec::Vec<myos_fdt::BootRamdiskRegion> =
-            alloc::vec::Vec::new();
+        // 堆初始化前执行，定容量收集（heapless::Vec），超限即配置错误。
+        const MAX_BOOT_RAMDISKS: usize = 4;
+        let mut boot_ramdisks =
+            heapless::Vec::<myos_fdt::BootRamdiskRegion, MAX_BOOT_RAMDISKS>::new();
         tree.for_each_boot_ramdisk(|region| {
-            boot_ramdisks.push(region);
+            boot_ramdisks
+                .push(region)
+                .expect("too many boot ramdisk regions");
         })
         .unwrap_or_else(|error| {
             panic!("failed to parse boot ramdisk regions: {error}");
@@ -473,7 +477,7 @@ fn kernel_main(boot: BootInfo) -> ! {
     net::initialize();
     rtc::initialize();
     fault::initialize();
-    register_boot_ramdisks(&boot_ramdisks);
+    register_boot_ramdisks(boot_ramdisks.as_slice());
     mmc::initialize_storage();
     // LS2K1000 USB 早期轮询探针（M0–M9）。scheduler 尚未初始化，只做有界
     // 轮询 MMIO 探测，绝不 spawn 线程（CherryUSB 的 psc/hpworkq/lpworkq

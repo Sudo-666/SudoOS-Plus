@@ -50,6 +50,11 @@ REJECT_MARKERS = (
     "unhandled trap",
     "OOM",
     "FIXTURE_OSCOMP_FAIL",
+    # Early-boot heap use (allocation before BOOT06 heap-ready).  riscv64 trips
+    # the default __rdl_oom "memory allocation of N bytes failed"; ls2k1000
+    # spins in the HEAP_FATAL-* handler instead.
+    "memory allocation of",
+    "HEAP_FATAL",
 )
 
 
