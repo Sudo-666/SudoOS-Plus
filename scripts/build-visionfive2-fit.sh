@@ -76,7 +76,10 @@ echo "FIT built      : ${ITB} ($(du -h "${ITB}" | cut -f1))"
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
 size() { stat -c %s "$1"; }
 bool() { if git rev-parse --git-dir >/dev/null 2>&1; then
-        if git status --porcelain --untracked-files=no -- "${1}" 2>/dev/null | grep -q .; then
+        # git rejects an empty pathspec ("please use . instead") — that made a
+        # dirty tree always report "clean". Default to "." to match the whole
+        # tree of tracked files.
+        if git status --porcelain --untracked-files=no -- "${1:-.}" 2>/dev/null | grep -q .; then
             echo dirty
         else
             echo clean
