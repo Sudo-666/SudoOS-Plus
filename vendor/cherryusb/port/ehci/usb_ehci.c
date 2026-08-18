@@ -1542,7 +1542,16 @@ static int usb_ehci_transfer_wait(struct usb_ehci_epinfo_s *epinfo)
 
     /* Wait for the IOC completion event */
     if (epinfo->iocwait) {
+        /* M2.13 诊断：sem_take 前后。若 IOC02/03 出现而 WAIT01 永不出现，
+         * 说明 sem 计数没到达枚举线程（Rust UsbSem/WaitQueue 唤醒路径）；
+         * WAIT01 出现则 EHCI 完成路径已通，继续追下一请求。 */
+        printf("USB-WAIT00 wait=%u sem=%p\r\n",
+               epinfo->iocwait, (void *)epinfo->iocsem);
+
         ret = usb_osal_sem_take(epinfo->iocsem);
+
+        printf("USB-WAIT01 take-return rc=%d result=%d xfrd=%u\r\n",
+               ret, epinfo->result, epinfo->xfrd);
         if (ret == 0) {
             ret = epinfo->result;
         }
@@ -1653,6 +1662,15 @@ static int usb_ehci_qh_ioccheck(struct usb_ehci_qh_s *qh, uint32_t **bp, void *a
 
     token = usb_ehci_swap32(qh->hw.overlay.token);
 
+    /* M2.13 诊断：IOC 遍历到 QH 时的快照。ACTIVE bit7 清零 = 硬件已完成该
+     * QH；若超时的 QH 在此仍 ACTIVE=1，说明异步队列扫到它时太晚或未扫到。
+     * wait=是否有线程在等待 IOC（此路径的 sem_give 前提）。 */
+    printf("USB-IOC00 qh=%08x token=%08x fqp=%08x wait=%u\r\n",
+           (unsigned)usb_ehci_physramaddr((uintptr_t)qh),
+           token,
+           usb_ehci_swap32(qh->fqp),
+           epinfo->iocwait);
+
     if ((token & QH_TOKEN_ACTIVE) != 0) {
         /* Yes... we cannot process the QH while it is still active.  Return
        * zero to visit the next QH in the list.
@@ -1665,6 +1683,11 @@ static int usb_ehci_qh_ioccheck(struct usb_ehci_qh_s *qh, uint32_t **bp, void *a
     ret = usb_ehci_qtd_foreach(qh, usb_ehci_qtd_ioccheck, (void *)qh->epinfo);
     if (ret < 0) {
     }
+
+    /* M2.13 诊断：qTD 遍历后。fqp 的 QTD_NQP_T bit0 置位 = qTD 已全部摘除
+     * （下一步才会摘 QH 并 sem_give）；xfrd=累计已传字节。 */
+    printf("USB-IOC01 ret=%d fqp=%08x xfrd=%u\r\n",
+           ret, usb_ehci_swap32(qh->fqp), epinfo->xfrd);
     /* If there is no longer anything attached to the QH, then remove it from
     * the asynchronous queue.
     */
@@ -1721,7 +1744,12 @@ static int usb_ehci_qh_ioccheck(struct usb_ehci_qh_s *qh, uint32_t **bp, void *a
         if (epinfo->iocwait) {
             /* Yes... wake it up */
             epinfo->iocwait = false;
-            usb_osal_sem_give(epinfo->iocsem);
+
+            /* M2.13 诊断：sem_give 前后。有 IOC03 无 WAIT01 = sem 已给但
+             * Rust UsbSem/WaitQueue 唤醒丢失；无 IOC02 = 根本没走到唤醒。 */
+            printf("USB-IOC02 give-begin sem=%p\r\n", (void *)epinfo->iocsem);
+            int give_rc = usb_osal_sem_give(epinfo->iocsem);
+            printf("USB-IOC03 give-end rc=%d\r\n", give_rc);
         }
 #ifdef CONFIG_USBHOST_ASYNCH
         /* No.. Is there a pending asynchronous transfer? */
@@ -3025,6 +3053,12 @@ static void usb_ehci_bottomhalf(void *arg)
 
     usb_osal_mutex_take(g_ehci.exclsem);
 
+    /* M2.13 诊断：bottom-half 入口。head-hlp 为 async schedule 队列头低
+     * 32 位物理地址，pending 为 poller 转发的中断源。若 IOC 等待超时但此行
+     * 一直不出现，说明 bottom-half 从未被 hpwork 调度。 */
+    printf("USB-BH00 pending=%08x head-hlp=%08x\r\n",
+           pending, usb_ehci_swap32(g_asynchead.hw.hlp));
+
     /* Handle all unmasked interrupt sources */
     /* USB Interrupt (USBINT)
     *
@@ -3182,7 +3216,8 @@ void usb_ehci_debug_dump(void)
     printf(
         "USB-HCSTATE99 cmd=%08x sts=%08x intr=%08x "
         "async=%08x frindex=%08x port=%08x "
-        "qh-token=%08x qtd-token=%08x\r\n",
+        "qh-token=%08x qtd-token=%08x "
+        "head-hlp=%08x qh-hlp=%08x\r\n",
         usb_ehci_getreg(&HCOR->usbcmd),
         usb_ehci_getreg(&HCOR->usbsts),
         usb_ehci_getreg(&HCOR->usbintr),
@@ -3190,5 +3225,7 @@ void usb_ehci_debug_dump(void)
         usb_ehci_getreg(&HCOR->frindex),
         usb_ehci_getreg(&HCOR->portsc[0]),
         qh_token,
-        qtd_token);
+        qtd_token,
+        usb_ehci_swap32(g_asynchead.hw.hlp),
+        g_debug_last_qh != NULL ? usb_ehci_swap32(g_debug_last_qh->hw.hlp) : 0);
 }
