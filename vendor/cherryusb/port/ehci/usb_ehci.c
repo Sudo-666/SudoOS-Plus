@@ -112,8 +112,8 @@ struct usb_ehci_qh_s {
 
     struct usb_ehci_epinfo_s *epinfo; /* Endpoint used for the transfer */
     uint32_t fqp;                     /* First qTD in the list (physical address) */
-    uint8_t pad[8];                   /* Padding to assure 32-byte alignment */
-};
+    uint8_t pad[8];                   /* Padding; aligned(32) below rounds stride to 96 */
+} __attribute__((aligned(32)));
 
 /* Internal representation of the EHCI Queue Element Transfer Descriptor
  * (qTD)
@@ -125,7 +125,30 @@ struct usb_ehci_qtd_s {
     struct ehci_qtd_s hw; /* Hardware representation of the queue head */
 
     /* Internal fields used by the EHCI driver */
-};
+} __attribute__((aligned(32)));
+
+/* EHCI 硬件要求 QH/qTD 各自 32 字节对齐（硬件屏蔽地址低 5 位，未对齐时会
+ * 读取错误的描述符地址），因此池数组每个元素的 stride 必须是 32 的倍数。
+ * 裸 `aligned(32)` 只对齐数组首地址；结构体本身不对齐时，LP64 下
+ * usb_ehci_qh_s 为 72 字节，元素 1/2/3... 偏移 72/144/216... 全部错位——
+ * 真机表现正是控制传输提交后无 USBINT/USBERR、IOC 永不唤醒。类型级
+ * aligned(32) + 下列编译期断言把 stride 钉在 32 的倍数（72→96）。 */
+_Static_assert(
+    __alignof__(struct usb_ehci_qh_s) >= 32,
+    "EHCI QH alignment must be at least 32 bytes"
+);
+_Static_assert(
+    sizeof(struct usb_ehci_qh_s) % 32 == 0,
+    "EHCI QH array stride must be a multiple of 32"
+);
+_Static_assert(
+    __alignof__(struct usb_ehci_qtd_s) >= 32,
+    "EHCI qTD alignment must be at least 32 bytes"
+);
+_Static_assert(
+    sizeof(struct usb_ehci_qtd_s) % 32 == 0,
+    "EHCI qTD array stride must be a multiple of 32"
+);
 
 /* The following is used to manage lists of free QHs and qTDs */
 
@@ -2098,6 +2121,30 @@ static int usb_ehci_check_dma_alias(void)
     }
 
     printf("USB-EHCI: DMA alias check PASS\r\n");
+
+    printf("USB-EHCI: QH size=%u align=%u qTD size=%u align=%u\r\n",
+           (unsigned)sizeof(struct usb_ehci_qh_s),
+           (unsigned)__alignof__(struct usb_ehci_qh_s),
+           (unsigned)sizeof(struct usb_ehci_qtd_s),
+           (unsigned)__alignof__(struct usb_ehci_qtd_s));
+
+    /* 池内每个元素的 32 字节对齐运行时自检：类型级 aligned(32) 与编译期
+     * stride 断言保证了这一点，这里兜底拦截段布局/符号错位的极端情况。 */
+    for (i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
+        if (((uintptr_t)&g_qhpool[i] & 31u) != 0) {
+            printf("USB-EHCI: QH alignment FAIL index=%u\r\n", i);
+            return -EINVAL;
+        }
+    }
+
+    for (i = 0; i < CONFIG_USB_EHCI_QTD_NUM; i++) {
+        if (((uintptr_t)&g_qtdpool[i] & 31u) != 0) {
+            printf("USB-EHCI: qTD alignment FAIL index=%u\r\n", i);
+            return -EINVAL;
+        }
+    }
+
+    printf("USB-EHCI: descriptor alignment PASS\r\n");
     return 0;
 }
 
