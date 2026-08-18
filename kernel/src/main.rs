@@ -475,9 +475,12 @@ fn kernel_main(boot: BootInfo) -> ! {
     fault::initialize();
     register_boot_ramdisks(&boot_ramdisks);
     mmc::initialize_storage();
-    // M1: LS2K1000 CherryUSB 宿主初始化（含 M0 C 构建路径探针打印）。
+    // LS2K1000 USB 早期轮询探针（M0–M9）。scheduler 尚未初始化，只做有界
+    // 轮询 MMIO 探测，绝不 spawn 线程（CherryUSB 的 psc/hpworkq/lpworkq
+    // 线程化初始化见 `late_start()`，在 scheduler 就绪后触发——否则
+    // usbh_initialize 内部 spawn 会撞 "kernel scheduler is not initialized"）。
     #[cfg(feature = "platform-ls2k1000")]
-    cusb::init();
+    cusb::early_probe();
     // 在所有基础块设备注册完成后、devfs 建立前，统一扫描并注册 GPT/MBR
     // 分区（vdaN/ram0pN/mmcblk1pN），使分区设备出现在 /dev 树且存储选择
     // 能自动降级到 ext4 分区（K1.1）。
@@ -543,6 +546,11 @@ fn kernel_main(boot: BootInfo) -> ! {
 
     smp::start_secondaries();
     task::finalize_cpu_bringup();
+    // LS2K1000 USB 线程化初始化：scheduler 已就绪、副核在线，此时才能
+    // spawn CherryUSB 的 psc/hpworkq/lpworkq 线程。专用线程异步执行，失败
+    // 只打日志继续启动（USB 探测失败可接受，不能挡在 /init 之前）。
+    #[cfg(feature = "platform-ls2k1000")]
+    cusb::late_start();
     println!("BOOT11 all-ap-online");
     #[cfg(feature = "platform-ls2k1000")]
     {

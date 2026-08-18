@@ -113,5 +113,24 @@ LS2K1000 平台胶水用 C 写在 `kernel/csrc/usb/`；经 `kernel/build.rs` 用
   - **线程**：CherryUSB psc/hpworkq/lpworkq 线程接 SudoOS
     `spawn_kernel_thread`（`KernelThreadEntry = fn()`，槽位经 Rust trampoline
     烘焙）；`thread_suspend/resume` 保持 no-op（枚举期 lpworkq 无异步工作）。
+- **M2.7 决策（2026-08-18，真机首发后）**：**早期 USB 探测与线程化初始化
+  分离**。真机日志显示 `USB-glue M0 probe=0x2a4a0001` 后立即 panic
+  `kernel scheduler is not initialized`（task/mod.rs:2645）——根因是
+  `cusb::init()` 在 main.rs:480（scheduler @ task::initialize 之前）调用
+  `sudoos_usb_init()`→`usbh_initialize()`，后者立刻 `usb_osal_thread_create`
+  spawn psc/hpworkq/lpworkq 三个内核线程，撞未初始化的 `SCHEDULER`。
+  落地：
+  - **早期 `cusb::early_probe()`**（boot 路径、scheduler 前）：只做
+    `sudoos_usb_early_probe()`——纯 MMIO 有界轮询探针（M0–M9：基址/能力/
+    控制器复位/主机运行/端口检测），所有等待有 deadline，失败只打日志返回
+    负值，**绝不 panic**；`dma_pool_init()` 仍在早期（纯内存，无 task 依赖）。
+  - **晚期 `cusb::late_start()`**（main.rs，`task::finalize_cpu_bringup()`
+    之后）：spawn 专用 `usb_init_thread` → `sudoos_usb_init()`（此刻 scheduler
+    active、中断使能），成功才 spawn poller/monitor；失败打日志继续启动——
+    **USB 探测失败可接受，但不能挡在 /init 之前**。
+  - 附带修正：`usb_hc_low_level_init` 的 USBSTS 打印索引错误（`hcor[2]` 实为
+    USBINTR@0x08）；`usbh_get_port_speed` 双 bug——用 1-based
+    `EHCI_PORTSC_OFFSET(n)` 解 0-based `port`（port=0 读到 CONFIGFLAG@0x40）
+    且读 bits[11:10]（LSTATUS 线状态）而非 EHCI 2.0 的 PORTSPD@[15:13]。
 - 退路：若 CherryUSB OSAL 适配成本过高，退回"自写 Rust EHCI + Cotton
   MSC/SCSI"（保留 C 构建路径作为通用设施）。

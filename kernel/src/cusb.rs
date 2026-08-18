@@ -9,9 +9,11 @@
 //! - 向 C OSAL 导出最小原语：DMA 缓冲分配（uncached）/ 控制块分配
 //!   （cached，sem/mutex/线程表用，避免 ll/sc 落在 uncached 上）、
 //!   时钟毫秒、任务感知延时、WaitQueue 信号量、内核线程 trampoline；
-//! - 驱动 `sudoos_usb_init()`（单次初始化，psc 线程内调 `usb_hc_init`）
-//!   与 `usb_ehci_interrupt()` 轮询线程（2K1000 无外设中断基础设施，
-//!   见 ADR-001 的 poller 决策）；
+//! - 早期 `sudoos_usb_early_probe()`（有界轮询 MMIO，M0–M9，scheduler
+//!   就绪前安全、失败不 panic）；晚期 `sudoos_usb_init()`（psc 线程内调
+//!   `usb_hc_init`）由 post-scheduler 的专用线程驱动（CodePlan P0 拆分）；
+//! - `usb_ehci_interrupt()` 轮询线程（2K1000 无外设中断基础设施，见 ADR-001
+//!   的 poller 决策）；
 //! - M2 起报告枚举到的 VID:PID。
 
 use core::sync::atomic::{AtomicI32, Ordering};
@@ -52,19 +54,42 @@ fn usb_monitor() {
     }
 }
 
-/// M0 构建路径探针 + M1/M2 CherryUSB 宿主初始化。
-pub fn init() {
+/// 早期轮询探针：boot 路径、scheduler 就绪前调用。
+///
+/// 只做 MMIO 有界轮询探测（M0–M9）与 DMA 池初始化，绝不触碰 task/信号量/
+/// 工作队列/`spawn_kernel_thread`。失败只打日志，绝不 panic。线程化初始化
+/// 见 `late_start()`——必须先修掉 `USB-glue M0` 后撞 scheduler 未初始化的
+/// panic（真机日志 task/mod.rs:2645 是 usbh_initialize 内部 spawn 线程所致）。
+pub fn early_probe() {
     probe_build_path();
     dma_pool_init();
-    // SAFETY: `sudoos_usb_init` 为 kernel/csrc/usb 交叉编译的 C 函数，无参。
-    // 内部只调 `usbh_initialize()`（真实线程版本），psc 线程随后自调
-    // `usb_hc_init()`——M1 的显式 hc_init 已移除（避免双初始化）。
+    // SAFETY: `sudoos_usb_early_probe` 无参返回 rc；纯 MMIO 有界轮询，
+    // 不依赖 scheduler。失败返回负值，不会 panic。
+    let rc = unsafe { sudoos_usb_early_probe() };
+    crate::println!("USB: early probe rc={rc}");
+}
+
+/// 晚期线程化初始化：须在 `task::start_boot_scheduler()` 之后调用。
+///
+/// 真正的 CherryUSB 宿主栈（psc/hpworkq/lpworkq 线程 + 枚举 + MSC）在此
+/// 启动。spawn 一个专用线程执行，避免阻塞 boot 路径；失败只打日志并继续
+/// 启动（USB 探测失败可接受，不能把内核挡在 /init 之外）。
+pub fn late_start() {
+    crate::task::spawn_kernel_thread(usb_init_thread);
+}
+
+/// 在 psc/hpworkq/lpworkq 线程创建前先建好线程上下文（scheduler 已就绪）。
+fn usb_init_thread() {
+    // SAFETY: `sudoos_usb_init` 无参。此刻 scheduler active、中断使能，
+    // usbh_initialize 内部 spawn 的线程可正常调度。
     let rc = unsafe { sudoos_usb_init() };
     crate::println!("USB: cherryusb host init rc={rc}");
     if rc == 0 {
         // 传输完成由轮询线程驱动（无真实 EHCI IRQ）。
         crate::task::spawn_kernel_thread(usb_poller);
         crate::task::spawn_kernel_thread(usb_monitor);
+    } else {
+        crate::println!("USB: host init failed — continuing boot without USB storage");
     }
 }
 
@@ -194,7 +219,7 @@ static DMA_POOL_LOCK: crate::irq_lock::IrqSpinLock<DmaPool> =
 /// 初始化 `.nocache_ram` 池（boot 路径调用一次，段内全部零初始化）。
 fn dma_pool_init() {
     // SAFETY: `get_mut_unchecked` 要求单 CPU 启动发布窗口内独占访问——
-    // 此处位于 cusb::init 的 boot 路径，尚无 USB 线程。
+    // 此处位于 cusb::early_probe 的 boot 路径，尚无 USB 线程。
     unsafe { DMA_POOL_LOCK.get_mut_unchecked() }.init();
 }
 
@@ -428,6 +453,9 @@ unsafe extern "C" {
     fn sudoos_usb_init() -> i32;
     /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：构建路径探针。
     fn sudoos_usb_glue_probe() -> u32;
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：早期有界轮询 MMIO 探针
+    /// （M0–M9，scheduler 就绪前可安全调用，失败返回负值、不 panic）。
+    fn sudoos_usb_early_probe() -> i32;
     /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：轮询等待设备枚举并回填 VID/PID。
     fn sudoos_usb_wait_device(timeout_ms: u32, vid: *mut u16, pid: *mut u16) -> i32;
     /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：EHCI 低层初始化是否完成。
