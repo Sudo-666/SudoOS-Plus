@@ -70,42 +70,21 @@
  * (0x8000_0000_0000_0000) 都是 `BASE | phys`，掩码取低 48 位即得物理地址。
  * 见 docs/decisions/ADR-001。
  *
- * `.nocache_ram` 段 VMA = UNCACHED_BASE(0x8000_0000_0000_0000) | phys，
- * 描述符里的链接指针（hlp/nqp/next_qtd/fqp）存的是低物理地址。CPU 遍历
- * QH/qTD 链表前必须经 usb_ehci_virtramaddr() 转回 0x8000... uncached 别名
- * 才能解引用——直接解引用低物理地址会 page fault
- * （真机 address=0x904295e0 access=Read，描述符低物理地址）。
+ * `usb_ehci_physramaddr()` 把任意别名（cached/uncached）剥成低物理地址——
+ * 描述符链表指针（hlp/nqp/next_qtd/fqp）存的就是低物理地址。反方向
+ * `usb_ehci_virtramaddr()` 必须跟随 g_qhpool 实际链接到的 DMW 窗口，因此
+ * 定义在 g_qhpool 之后（见下），不能在这里硬编码 0x8000...。
  */
 #define LS2K1000_PHYS_MASK          UINT64_C(0x0fffffffffffffff)
-#define LS2K1000_UNCACHED_DMW_BASE  UINT64_C(0x8000000000000000)
 
 static inline uintptr_t usb_ehci_physramaddr_ls2k(uintptr_t addr)
 {
     return addr & (uintptr_t)LS2K1000_PHYS_MASK;
 }
 
-static inline uintptr_t usb_ehci_virtramaddr_ls2k(uintptr_t phys)
-{
-    /* M2.15：先掩码剥掉所有高位别名再 OR uncached base。链接指针一旦带的是
-     * cached 窗口 (0x9000...) 或其它高位，直接 `| 0x8000...` 会把残留高位 OR
-     * 回去，得到错误（仍是 cached）别名，CPU 经它读 QH 软件字段会读到陈旧值
-     * （真机 epinfo=0x0/fqp=0，硬件 overlay 却已由 EHCI 完成）。先
-     * & PHYS_MASK 保证结果一定落在 uncached DMW 窗口。 */
-    phys &= (uintptr_t)LS2K1000_PHYS_MASK;
-
-    /* EHCI 链表结束（terminate link）地址是 0：必须原样返回 NULL，不能把它
-     * `| 0x8000...` 变成非空地址，否则遍历会解引用垃圾指针继续崩溃。 */
-    if (phys == 0) {
-        return 0;
-    }
-    return phys | (uintptr_t)LS2K1000_UNCACHED_DMW_BASE;
-}
-
 #define usb_ehci_physramaddr(a) usb_ehci_physramaddr_ls2k((uintptr_t)(a))
-#define usb_ehci_virtramaddr(a) usb_ehci_virtramaddr_ls2k((uintptr_t)(a))
 #else
 #define usb_ehci_physramaddr(a) ((uintptr_t)(a))
-#define usb_ehci_virtramaddr(a) ((uintptr_t)(a))
 #endif
 
 /****************************************************************************
@@ -297,6 +276,44 @@ static struct usb_ehci_qtd_s g_qtdpool[CONFIG_USB_EHCI_QTD_NUM] NO_CACHE_RAM __a
 
 /* The frame list */
 static uint32_t g_framelist[FRAME_LIST_SIZE] NO_CACHE_RAM __attribute__((aligned(4096)));
+
+#ifdef CONFIG_USB_EHCI_LS2K1000
+
+static inline uintptr_t usb_ehci_virtramaddr_ls2k(uintptr_t address)
+{
+    uintptr_t phys = address & (uintptr_t)LS2K1000_PHYS_MASK;
+
+    /* EHCI terminate/null 地址必须保持 NULL。 */
+    if (phys == 0) {
+        return 0;
+    }
+
+    /*
+     * 跟随静态 QH 池实际使用的 CPU DMW 窗口，而不是硬编码 0x8000...。
+     *
+     * 真机日志显示 g_qhpool 落在 cached 0x9... 窗口
+     * （USB-QH-ENQ va=0x9000...）。若这里仍返回 uncached 0x8000...，则 ENQ
+     * 经 cached 写入的软件字段（epinfo/fqp）在 IOC 完成路径经 uncached 读回
+     * 时不可见（USB-QH-IOC epinfo=0x0/fqp=0），控制传输超时。
+     *
+     * 取池首元素的高位窗口 OR 回低物理地址：池在 0x9... 就返回 0x9...；
+     * 将来 linker 把池真正放进 0x8... 窗口也会自动跟随，无需再改宏。
+     * 见 docs/decisions/ADR-001。
+     */
+    uintptr_t cpu_window =
+        ((uintptr_t)&g_qhpool[0]) & ~((uintptr_t)LS2K1000_PHYS_MASK);
+
+    return cpu_window | phys;
+}
+
+#define usb_ehci_virtramaddr(a) \
+    usb_ehci_virtramaddr_ls2k((uintptr_t)(a))
+
+#else
+
+#define usb_ehci_virtramaddr(a) ((uintptr_t)(a))
+
+#endif
 
 /* M2.12 诊断：最近一次 EP0 控制传输的 QH / 首个 qTD 指针。每次
  * usb_ehci_control_setup 提交后刷新；超时路径经 usb_ehci_debug_dump()
@@ -2295,6 +2312,20 @@ int usb_hc_init(void)
     if (ret < 0) {
         return -1;
     }
+
+    /* M2.16 启动验证：打印各池与 phys→virt 往返地址。必须满足 qhpool 与
+     * phys-to-virt 落在同一 DMW 窗口（全 0x9... 或全 0x8...）——若一个
+     * 0x9... 一个 0x8...，ENQ 经 cached 写入的软件字段在 IOC 经 uncached
+     * 读回时不可见，控制传输超时。 */
+    printf(
+        "USB-EHCI: DMA-WINDOW async=%p intr=%p qhpool=%p qtdpool=%p "
+        "phys-to-virt=%p\r\n",
+        (void *)&g_asynchead,
+        (void *)&g_intrhead,
+        (void *)&g_qhpool[0],
+        (void *)&g_qtdpool[0],
+        (void *)usb_ehci_virtramaddr(
+            usb_ehci_physramaddr((uintptr_t)&g_qhpool[0])));
 
     /* Initialize the list of free Queue Head (QH) structures */
 

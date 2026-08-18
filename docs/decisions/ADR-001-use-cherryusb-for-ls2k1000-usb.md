@@ -172,5 +172,22 @@ LS2K1000 平台胶水用 C 写在 `kernel/csrc/usb/`；经 `kernel/build.rs` 用
     `CONTEST_RESULT ... fail` 并显式 halt，不静默跑 preliminary。竞赛 DTB
     `sudoos.contest.dev=sda required=1 oscomp=final-all`（不带 rdinit=/init），
     保留 debug shell DTB。
+- **M2.16 决策（2026-08-19，真机 ENQ/IOC 窗口不一致）**：**`usb_ehci_virtramaddr`
+  从"硬编码 `pa | UNCACHED_BASE`"改为"跟随 QH 池实际 DMW 窗口"**，取代上文
+  M2 的 `pa | UNCACHED_BASE` 反向映射规则。真机日志显示 `g_qhpool` 实际链接
+  在 **cached `0x9000...`**（`USB-QH-ENQ va=0x9000...`），而 M2.15 的反向映射
+  固定到 uncached `0x8000...`：ENQ 经 cached 写入的软件字段（`epinfo`/`fqp`）
+  在 IOC 完成路径经 uncached 读回时不可见（`USB-QH-IOC epinfo=0x0/fqp=0`）→
+  控制传输超时 → `CONTEST_RESULT fail`。同一 QH 的 pa 相同，故障在 CPU 侧
+  两个 DMW 别名不互通（缓存一致），与 IRQ/信号量/MSC 无关。落地：
+  - `usb_ehci_virtramaddr_ls2k()` 取 `(&g_qhpool[0]) & ~PHYS_MASK` 作为 CPU
+    窗口 OR 回低物理地址：池在 `0x9...` 就返回 `0x9...`；将来 linker 把池真正
+    放进 `0x8...` 窗口也会自动跟随，无需再改宏。terminate/null 地址 0 仍原样
+    返回 NULL。
+  - `usb_hc_init` 新增 `USB-EHCI: DMA-WINDOW async/intr/qhpool/qtdpool/
+    phys-to-virt` 启动打印；验收：五个地址必须落在同一 DMW 窗口（全 `0x9...`
+    或全 `0x8...`）。`usb_ehci_check_dma_alias` 的 VA→PA→VA 回环自检不变。
+  - 本轮不动 PHY/端口复位/IRQ/workqueue/信号量——先让 ENQ 与 IOC 的 VA 窗口
+    一致。
 - 退路：若 CherryUSB OSAL 适配成本过高，退回"自写 Rust EHCI + Cotton
   MSC/SCSI"（保留 C 构建路径作为通用设施）。
