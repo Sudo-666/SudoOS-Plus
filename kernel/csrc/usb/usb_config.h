@@ -51,6 +51,14 @@
 #define CONFIG_USB_EHCI_QTD_NUM 32
 
 /*
+ * 定义后 vendored usb_ehci.h 的 `struct ehci_hcor_s` 才会计入 reserved[9]，
+ * 使 configflag/portsc 落到标准 EHCI 偏移（HCOR+0x40 / HCOR+0x44，即物理
+ * 0x40060050 / 0x40060054）。上游宏名拼写即 `ECHI`。缺省时 struct 布局把
+ * configflag 挤到 0x1c、portsc 到 0x20，真机读 CONFIGFLAG/PORTSC 全零。
+ */
+#define CONFIG_USB_ECHI_HCOR_RESERVED
+
+/*
  * 定义后 usb_ehci.c 的 usb_hc_init 在复位完成后写 CONFIGFLAG=1，把端口
  * 路由到本 EHCI 控制器。LS2K1000 真机证据：HCRESET 会清掉 U-Boot 建立的
  * PORTSC.PP，必须复位后重设（见 usb_ehci.c 的 CONFIG_USB_EHCI_LS2K1000

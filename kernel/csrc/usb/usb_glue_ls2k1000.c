@@ -26,6 +26,14 @@
 #include "usb_hc.h"
 #include "usb_ehci.h"
 
+/* 编译期校验 EHCI HCOR 寄存器偏移（CONFIG_USB_ECHI_HCOR_RESERVED 使
+ * configflag/portsc 落在 0x40/0x44）。缺该宏时 struct 把它们挤到 0x1c/0x20，
+ * 真机表现为 CONFIGFLAG/PORTSC 全零——偏移错误应在此处立即失败而非上板。 */
+_Static_assert(offsetof(struct ehci_hcor_s, configflag) == 0x40,
+               "EHCI CONFIGFLAG offset mismatch");
+_Static_assert(offsetof(struct ehci_hcor_s, portsc) == 0x44,
+               "EHCI PORTSC offset mismatch");
+
 /* 探针哨兵：0x2A4A0001 = "LSU-B1"。真机串口应打印此值。 */
 unsigned int sudoos_usb_glue_probe(void)
 {
