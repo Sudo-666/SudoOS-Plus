@@ -489,6 +489,11 @@ fn kernel_main(boot: BootInfo) -> ! {
     mount_proc();
     mount_sys();
     install_external_initramfs(initrd_range);
+    // LS2K1000：竞赛存储由 scheduler 后的 USB 大容量存储路径负责
+    // （kernel_main 末尾的 initialize_ls2k_contest_usb）——此刻 sda 尚未
+    // 注册，早期调用只会打印 selected-device=none。VF2/QEMU 的 SD/MMC 与
+    // virtio 设备在 fs::initialize 前已注册，保留早期挂载。
+    #[cfg(not(feature = "platform-ls2k1000"))]
     mount_sdcard_if_present(&contest_config);
     println!("BOOT13 rootfs-ready");
     tty::initialize();
@@ -681,6 +686,13 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     task::verify();
 
+    // LS2K1000 竞赛存储：scheduler 已就绪、cusb::late_start 已把 CherryUSB
+    // 宿主栈跑起来。等 USB 大容量存储（若请求设备是 U 盘或 required），
+    // 注册 /dev/sda + 分区，再走统一的竞赛存储选择/挂载路径。ram0 等非
+    // USB 设备（fixture）不受 USB 等待影响。
+    #[cfg(feature = "platform-ls2k1000")]
+    initialize_ls2k_contest_usb(&contest_config);
+
     // Gate B: an explicit rdinit= bootarg routes the kernel to the real
     // /init instead of the self-test sequence. The split must happen before
     // user::verify() so no throwaway test Process can consume PID 1.
@@ -781,6 +793,33 @@ fn mount_sdcard_if_present(config: &storage::ContestStorageConfig) {
     }
     contest_fixture_probe(&device);
     install_sdcard_contents(&device, &device_name);
+}
+
+/// LS2K1000：scheduler 后把竞赛存储挂到 USB 大容量存储上（CodePlan §7）。
+///
+/// `cusb::late_start` 已把 CherryUSB 宿主栈跑起来（psc 枚举 + poll 驱动），
+/// `/dev/sda` + 分区由 cusb 后台线程有界等待并注册。这里等它就绪后走统一
+/// 的 `mount_sdcard_if_present`（选择 + 挂载 + 安装镜像内容）。
+///
+/// `sudoos.contest.required=1` 时找不到竞赛存储必须明确失败，不静默降级
+/// preliminary（CodePlan §8）。
+#[cfg(feature = "platform-ls2k1000")]
+fn initialize_ls2k_contest_usb(config: &storage::ContestStorageConfig) {
+    let wants_usb = config.required
+        || matches!(config.device_name.as_deref(), Some(name) if name.starts_with("sd"));
+    if wants_usb {
+        let usb_ok = cusb::wait_usb_storage_ready();
+        crate::println!("USB: storage-ready={usb_ok}");
+    }
+    mount_sdcard_if_present(config);
+    if config.required && !storage::contest_storage_mounted() {
+        crate::println!("CONTEST_ERROR: required contest storage not mounted");
+        crate::println!("CONTEST_RESULT mode=final-all fail");
+        // 明确失败：停在原地，不静默运行 preliminary。
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// C5: 把 FDT 声明的固件加载竞赛镜像注册为只读块设备（`ram0`）。

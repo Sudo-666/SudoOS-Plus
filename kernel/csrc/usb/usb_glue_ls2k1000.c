@@ -206,12 +206,6 @@ const struct usbh_class_driver hid_class_driver = {
     NULL,
 };
 
-/* ---- msc_test 桩：vendored 快照里 usbh_msc_connect 的调试残留 ---- */
-int msc_test(void)
-{
-    return 0;
-}
-
 /* ---- 时钟/延时（Rust 导出；sleep_ms 需在 C 线程上下文调用）---- */
 extern void sudoos_usb_sleep_ms(unsigned int ms);
 
@@ -276,17 +270,19 @@ uint8_t usbh_get_port_speed(const uint8_t port)
     }
 }
 
-/* ---- 早期轮询探针（boot 路径、scheduler 就绪前）----
+/* ---- 早期只读探针（boot 路径、scheduler 就绪前）----
  *
- * 与线程化 `sudoos_usb_init()` 分离（CodePlan P0）：本函数在启动早期、
- * scheduler 未初始化时被调用，必须全程轮询、有界超时，绝不接触 task/
- * 信号量/工作队列/`usb_osal_thread_create`。任何失败只打日志返回负值，
- * 绝不 panic——USB 探测失败可接受，但不能把内核挡在 /init 之外。
+ * 只读观测：打印 EHCI 能力/状态寄存器，绝不写 HCRESET/USBCMD/PORTSC。
+ * 控制器初始化的唯一所有者是晚期 vendored `usb_hc_init()`（psc 线程内、
+ * scheduler 就绪后运行）——本函数若在此复位，会清掉 U-Boot 建立的端口
+ * 供电（真机：HCRESET 后 PORTSC.PP 清零），而早期代码又无法在无调度器
+ * 环境下等上电稳定。因此早期阶段只读寄存器。
+ *
+ * 本函数在 boot 早期被调用，全程无任务/信号量依赖，任何失败只打日志
+ * 返回负值，绝不 panic（USB 探测失败可接受，不能挡 /init）。
  *
  * 寄存器经 uncached DMW 窗口直读（CONFIG_USB_EHCI_HCCR_BASE 已是
- * 0x8000_...|phys），DMW 窗口访问不会因 MMIO 未映射而 fault。控制器在此
- * 复位/预运行，与晚期 vendored `usb_hc_init()` 无冲突——后者先写 USBCMD=0
- * 停机再 HCRESET 重新复位。
+ * 0x8000_...|phys），DMW 窗口访问不会因 MMIO 未映射而 fault。
  */
 int sudoos_usb_early_probe(void)
 {
@@ -296,9 +292,6 @@ int sudoos_usb_early_probe(void)
         (volatile struct ehci_hcor_s *)CONFIG_USB_EHCI_HCOR_BASE;
     uint32_t regval;
     uint32_t nports;
-    uint32_t portsc;
-    uint32_t timeout;
-    int connected;
     const char *spd;
 
     /* M1：MMIO 基址 + 能力寄存器（首个真实 MMIO 访问）。HCCAPBASE@[31:16]
@@ -315,55 +308,24 @@ int sudoos_usb_early_probe(void)
         return -1;
     }
 
-    /* M2/M3：控制器复位（USBCMD.HCRESET 置位后硬件自清，有界轮询）。
-     * 复位后 HCHalted 置位、USBCMD 清零，是 EHCI 的标准静止起点。 */
-    printf("USB-glue M2 reset-start\r\n");
-    hcor->usbcmd = hcor->usbcmd | EHCI_USBCMD_HCRESET;
-    timeout = 0;
-    do {
-        regval = hcor->usbcmd;
-        if (++timeout > 100000u) {
-            printf("USB-glue M3 reset-timeout usbcmd=%08x\r\n", regval);
-            return -1;
-        }
-    } while ((regval & EHCI_USBCMD_HCRESET) != 0u);
-    printf("USB-glue M3 reset-done\r\n");
+    /* M2–M4：只读观测。控制器状态由 U-Boot 引导阶段建立（fatload usb 已
+     * 证明可用），此处不改任何控制寄存器——不 HCRESET、不 RUN、不写
+     * PORTSC。CherryUSB 的 usb_hc_init 是唯一初始化者。 */
+    printf("USB-glue M2 usbcmd=%08x usbsts=%08x\r\n", hcor->usbcmd, hcor->usbsts);
+    printf("USB-glue M3 configflag=%08x\r\n", hcor->configflag);
+    printf("USB-glue M4 port0=%08x port1=%08x port2=%08x\r\n",
+           hcor->portsc[0], hcor->portsc[1], hcor->portsc[2]);
 
-    /* M4/M5：USB PHY/时钟由 U-Boot 引导阶段初始化（fatload usb 已证明可用），
-     * 此处只读基线，不重配。 */
-    printf("USB-glue M4 phy=uboot-reuse\r\n");
-    printf("USB-glue M5 baseline usbcmd=%08x usbsts=%08x\r\n",
-           hcor->usbcmd, hcor->usbsts);
-
-    /* M6/M7：启动主机 + 使能端口电源（ASEN/PSEN 仍关闭，仅维持端口状态，
-     * 便于 M8/M9 检测连接与速度）。有界轮询 HCHalted 清除。 */
-    printf("USB-glue M6 host-start\r\n");
-    hcor->usbcmd = hcor->usbcmd | EHCI_USBCMD_RUN;
-    hcor->portsc[0] = hcor->portsc[0] | EHCI_PORTSC_PP;
-    timeout = 0;
-    do {
-        regval = hcor->usbsts;
-        if (++timeout > 100000u) {
-            printf("USB-glue M7 host-timeout usbsts=%08x\r\n", regval);
-            return -1;
-        }
-    } while ((regval & EHCI_USBSTS_HALTED) != 0u);
-    printf("USB-glue M7 host-ready\r\n");
-
-    /* M8/M9：端口状态 + 设备检测（CCS 反映物理插拔，与控制器运行状态无关；
-     * PORTSPD@[15:13] 解码速度）。 */
-    portsc = hcor->portsc[0];
-    connected = (portsc & EHCI_PORTSC_CCS) != 0u;
-    switch ((portsc >> 13) & 0x7u) {
+    /* M5：port0 连接/速度观测（CCS 反映物理插拔；PORTSPD@[15:13] 解码速度）。 */
+    regval = hcor->portsc[0];
+    switch ((regval >> 13) & 0x7u) {
     case 0x1u: spd = "low"; break;
     case 0x2u: spd = "high"; break;
     default:   spd = "full"; break;
     }
-    printf("USB-glue M8 port0=%08x%s\r\n", portsc,
-           (portsc & EHCI_PORTSC_PP) != 0u ? " pp" : "");
-    printf("USB-glue M9 %s%s\r\n",
-           connected ? "device-detected" : "no-connect",
-           connected ? spd : "");
+    printf("USB-glue M5 %s%s\r\n",
+           (regval & EHCI_PORTSC_CCS) != 0u ? "device-detected" : "no-connect",
+           (regval & EHCI_PORTSC_CCS) != 0u ? spd : "");
 
     return 0;
 }
@@ -392,14 +354,113 @@ int sudoos_usb_wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid)
     return -1;
 }
 
-/* ---- CherryUSB 宿主初始化（M2：单次，psc 线程内自调 usb_hc_init）----
+/* ---- CherryUSB 宿主启动（psc 线程内自调 usb_hc_init）----
  *
  * 只调 `usbh_initialize()`：它创建 psc/hpworkq/lpworkq 三个真实内核线程
  * （usb_osal_sudoos.c 的 M2 线程实现）。psc 线程启动后在临界区内调用
- * `usb_hc_init()`（usbh_core.c），M1 在此处的显式 hc_init 已移除。
+ * `usb_hc_init()`（usbh_core.c），并在复位后恢复 root 端口供电。
  * 返回 0 成功；负值失败。
  */
-int sudoos_usb_init(void)
+int sudoos_usb_host_start(void)
 {
     return usbh_initialize();
+}
+
+/* ---- MSC 就绪发布 + 只读块设备 façade（CodePlan §3）----
+ *
+ * vendored usbh_msc.c 的 connect/disconnect 在枚举成功/失败时回调
+ * `sudoos_usb_msc_connected/disconnected`，把 MSC 设备与容量原子发布到
+ * 这里；Rust 侧经 `sudoos_usb_msc_is_ready/capacity/read_blocks` 消费。
+ *
+ * 注意：`usbh_msc_scsi_read10` 是同步阻塞调用，内部等 iocsem——由
+ * cusb.rs 的 usb_poller 轮询 `usb_ehci_interrupt()` 驱动完成事件。
+ * 只读路径保证单请求（g_msc_busy 防重入）。
+ */
+#include "usbh_msc.h"
+
+/* vendored usb_ehci.c 的全局函数，头文件未声明，此处显式 extern。 */
+extern void usb_ehci_interrupt(void);
+
+static struct usbh_msc *g_msc_dev = NULL;
+static volatile uint32_t g_msc_ready = 0;
+static volatile uint32_t g_msc_busy = 0;
+
+void sudoos_usb_msc_connected(struct usbh_msc *msc)
+{
+    if (msc == NULL || msc->blocksize == 0 || msc->blocknum == 0) {
+        printf("USB-MSC: connected rejected (bad capacity)\r\n");
+        return;
+    }
+    g_msc_dev = msc;
+    g_msc_ready = 1;
+    printf("USB-MSC: device=/dev/sd%c\r\n", msc->sdchar);
+    printf("USB-MSC: block-size=%u\r\n", (unsigned)msc->blocksize);
+    printf("USB-MSC: capacity=%u blocks x %u bytes\r\n",
+           (unsigned)msc->blocknum, (unsigned)msc->blocksize);
+}
+
+void sudoos_usb_msc_disconnected(struct usbh_msc *msc)
+{
+    if (g_msc_dev == msc) {
+        g_msc_dev = NULL;
+        g_msc_ready = 0;
+        printf("USB-MSC: disconnected\r\n");
+    }
+}
+
+int sudoos_usb_host_poll(void)
+{
+    usb_ehci_interrupt();
+    return 0;
+}
+
+int sudoos_usb_msc_is_ready(void)
+{
+    return (int)g_msc_ready;
+}
+
+int sudoos_usb_msc_capacity(uint64_t *block_count, uint32_t *block_size)
+{
+    if (!g_msc_ready || g_msc_dev == NULL || block_count == NULL || block_size == NULL) {
+        return -1;
+    }
+    *block_count = g_msc_dev->blocknum;
+    *block_size = g_msc_dev->blocksize;
+    return 0;
+}
+
+int sudoos_usb_msc_read_blocks(uint64_t lba, uint32_t count, void *buffer, uint32_t buffer_len)
+{
+    uint32_t flags;
+    int ret;
+
+    if (!g_msc_ready || g_msc_dev == NULL || buffer == NULL || count == 0) {
+        return -1;
+    }
+    if (g_msc_dev->blocksize == 0) {
+        return -2;
+    }
+    /* READ(10) 限制：LBA 32 位、count 16 位；总字节须落在 buffer 内。 */
+    if (lba > 0xFFFFFFFFULL || count > 0xFFFFu) {
+        return -3;
+    }
+    if ((uint64_t)count * g_msc_dev->blocksize > buffer_len) {
+        return -4;
+    }
+
+    flags = usb_osal_enter_critical_section();
+    if (g_msc_busy) {
+        usb_osal_leave_critical_section(flags);
+        return -5;
+    }
+    g_msc_busy = 1;
+    usb_osal_leave_critical_section(flags);
+
+    ret = usbh_msc_scsi_read10(g_msc_dev, (uint32_t)lba, (const uint8_t *)buffer, count);
+
+    flags = usb_osal_enter_critical_section();
+    g_msc_busy = 0;
+    usb_osal_leave_critical_section(flags);
+
+    return ret < 0 ? ret : 0;
 }

@@ -381,8 +381,12 @@ int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
     USB_LOG_INFO("Capacity info:\r\n");
     USB_LOG_INFO("Block num:%d,block size:%d\r\n", (unsigned int)msc_class->blocknum, (unsigned int)msc_class->blocksize);
 
-    extern int msc_test();
-    msc_test();
+    /* SudoOS 平台钩子：枚举成功（readcapacity10 返回非负）后把 MSC 设备
+     * 与容量发布给 Rust 侧块设备层（见 usb_glue_ls2k1000.c）。 */
+    extern void sudoos_usb_msc_connected(struct usbh_msc *msc);
+    if (ret >= 0) {
+        sudoos_usb_msc_connected(msc_class);
+    }
     return ret;
 }
 
@@ -411,6 +415,10 @@ int usbh_msc_disconnect(struct usbh_hubport *hport, uint8_t intf)
 
         if (msc_class->tx_buffer)
             usb_iofree(msc_class->tx_buffer);
+
+        /* SudoOS 平台钩子：清除 Rust 侧已发布的 MSC ready 状态（拔盘）。 */
+        extern void sudoos_usb_msc_disconnected(struct usbh_msc *msc);
+        sudoos_usb_msc_disconnected(msc_class);
 
         usb_free(msc_class);
 

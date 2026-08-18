@@ -6,8 +6,8 @@ use alloc::{
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use myos_vfs::{
-    DirEntry, Errno, File, FileMode, FileOperations, IoBuffer, MutableIoBuffer, OpenFlags,
-    PollEvents, SeekWhence, Stat, emit_dirent64,
+    emit_dirent64, DirEntry, Errno, File, FileMode, FileOperations, IoBuffer, MutableIoBuffer,
+    OpenFlags, PollEvents, SeekWhence, Stat,
 };
 
 use crate::irq_lock::IrqSpinLock;
@@ -1408,6 +1408,22 @@ fn install_registered_block_devices(dev: &Arc<Node>) -> Result<(), Errno> {
     Ok(())
 }
 
+/// 为已注册的块设备安装 `/dev/<name>` VFS 节点（post-init 延迟注册用）。
+///
+/// `fs::initialize()` 只安装注册时的设备快照；USB MSC 这类事后才注册的
+/// 设备需要动态补节点。设备必须先经 `block::register_device` 注册。
+/// 幂等：同名节点已存在时返回 `Eexist`（调用方可忽略，通常意味着该名字
+/// 已被早期快照安装）。
+pub fn install_block_device_node(name: &str) -> Result<(), Errno> {
+    let _tree = TREE.lock();
+    let device = crate::block::open_device(name).ok_or(Errno::Enodev)?;
+    let node = block_device_node(name, device)?;
+    let path = alloc::format!("/dev/{name}");
+    let (parent_path, child_name) = split_parent(&path)?;
+    let parent = lookup(parent_path)?;
+    insert_child(&parent, child_name, node)
+}
+
 fn block_errno(error: crate::block::BlockError) -> Errno {
     match error {
         crate::block::BlockError::AddressOverflow => Errno::Eoverflow,
@@ -1919,12 +1935,15 @@ impl FileOperations for DirectoryFile {
                         (child.ino, child.mode.file_type(), name.as_str())
                     }
                 };
-                let emitted = emit_dirent64(buf, DirEntry {
-                    ino,
-                    offset: (index + 1) as i64,
-                    file_type,
-                    name,
-                })?;
+                let emitted = emit_dirent64(
+                    buf,
+                    DirEntry {
+                        ino,
+                        offset: (index + 1) as i64,
+                        file_type,
+                        name,
+                    },
+                )?;
                 if !emitted {
                     break;
                 }
@@ -2396,6 +2415,23 @@ pub fn verify() {
     umount("/m15-ext4", 0).expect("ext4 ro umount failed");
     unlink("/m15-ext4", true).expect("ext4 mountpoint rmdir failed");
     crate::block::unregister_device("m15ext4").expect("ext4 ro fixture unregister failed");
+
+    // 延迟注册块设备节点（CodePlan §6）：USB MSC 这类事后才注册的设备需
+    // 动态补 /dev 节点。注册 → install_block_device_node → open 可见；
+    // 重复安装返回 Eexist（幂等可忽略）。
+    let late_dev = crate::block::MemoryBlockDevice::new(512, 8).expect("late fixture block device");
+    crate::block::register_device("sda-late", late_dev).expect("late device register failed");
+    install_block_device_node("sda-late").expect("install /dev/sda-late node failed");
+    assert!(
+        open("/dev/sda-late", OpenFlags::O_RDONLY).is_ok(),
+        "post-init block node must be openable through the VFS tree",
+    );
+    assert_eq!(
+        install_block_device_node("sda-late").err(),
+        Some(Errno::Eexist),
+        "duplicate block node install must be idempotent-Eexist",
+    );
+    crate::block::unregister_device("sda-late").expect("late device unregister failed");
 
     crate::println!("M11 VFS gate:");
     crate::println!("  tmpfs file ops       : verified");

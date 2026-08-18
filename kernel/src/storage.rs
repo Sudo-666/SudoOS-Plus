@@ -53,6 +53,9 @@ impl SelectedStorage {
 pub struct ContestStorageConfig {
     /// `sudoos.contest.dev=<name>` 指定的设备名。`None` 表示自动扫描。
     pub device_name: Option<String>,
+    /// `sudoos.contest.required=1`：找不到竞赛存储必须明确失败，不静默降级
+    /// preliminary（LS2K1000 USB 竞赛镜像路径用）。
+    pub required: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,21 +78,27 @@ impl From<BlockError> for StorageError {
 static SELECTED: IrqSpinLock<Option<SelectedStorage>> =
     IrqSpinLock::new_with_class(None, STATE_LOCK);
 
-/// 从 bootargs 中解析 `sudoos.contest.dev=<name>`。
+/// 从 bootargs 中解析 `sudoos.contest.dev=<name>` 与
+/// `sudoos.contest.required=1`。两个键可同时出现；未知键忽略。
 pub fn config_from_bootargs(args: Option<&str>) -> ContestStorageConfig {
     let Some(args) = args else {
         return ContestStorageConfig::default();
     };
+    let mut device_name = None;
+    let mut required = false;
     for word in args.split_whitespace() {
         if let Some(value) = word.strip_prefix("sudoos.contest.dev=") {
             if !value.is_empty() {
-                return ContestStorageConfig {
-                    device_name: Some(String::from(value)),
-                };
+                device_name = Some(String::from(value));
             }
+        } else if let Some(value) = word.strip_prefix("sudoos.contest.required=") {
+            required = value == "1" || value.eq_ignore_ascii_case("true");
         }
     }
-    ContestStorageConfig::default()
+    ContestStorageConfig {
+        device_name,
+        required,
+    }
 }
 
 /// 按 CodePlan C1 选择顺序解析设备名：
@@ -295,6 +304,25 @@ pub fn verify() {
         "empty contest.dev value must be ignored",
     );
 
+    // required 解析（CodePlan §8）：sudoos.contest.required=1/true。
+    assert_eq!(
+        config_from_bootargs(Some("sudoos.contest.dev=sda sudoos.contest.required=1")).required,
+        true,
+        "required=1 must set the required flag",
+    );
+    assert_eq!(
+        config_from_bootargs(Some("sudoos.contest.dev=sda sudoos.contest.required=0")).required,
+        false,
+        "required=0 must leave required unset",
+    );
+    assert_eq!(
+        config_from_bootargs(Some("sudoos.contest.required=true console=ttyS0")).required,
+        true,
+        "required=true must set the required flag",
+    );
+    assert_eq!(config_from_bootargs(Some("console=ttyS0")).required, false);
+    assert_eq!(config_from_bootargs(None).required, false);
+
     // 2) 指定存在设备（ext4）。
     let ext4 = make_ext4_device();
     let candidates = vec![(
@@ -304,6 +332,7 @@ pub fn verify() {
     let selected = select_from_candidates(
         &ContestStorageConfig {
             device_name: Some(String::from("contest-ext4")),
+            ..Default::default()
         },
         &candidates,
     )
@@ -315,6 +344,7 @@ pub fn verify() {
     let missing = select_from_candidates(
         &ContestStorageConfig {
             device_name: Some(String::from("ghost-disk")),
+            ..Default::default()
         },
         &candidates,
     )
@@ -355,6 +385,7 @@ pub fn verify() {
     let rejected = select_from_candidates(
         &ContestStorageConfig {
             device_name: Some(String::from("disk-blank")),
+            ..Default::default()
         },
         &scanned_candidates,
     );
@@ -379,6 +410,7 @@ pub fn verify() {
     crate::partition::register_all_partitions();
     let descended = select_device(&ContestStorageConfig {
         device_name: Some(String::from("gptdisk")),
+        ..Default::default()
     })
     .expect("partition descend selection")
     .expect("gptdisk1 should be selected");

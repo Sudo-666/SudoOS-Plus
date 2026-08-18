@@ -9,16 +9,30 @@
 //! - 向 C OSAL 导出最小原语：DMA 缓冲分配（uncached）/ 控制块分配
 //!   （cached，sem/mutex/线程表用，避免 ll/sc 落在 uncached 上）、
 //!   时钟毫秒、任务感知延时、WaitQueue 信号量、内核线程 trampoline；
-//! - 早期 `sudoos_usb_early_probe()`（有界轮询 MMIO，M0–M9，scheduler
-//!   就绪前安全、失败不 panic）；晚期 `sudoos_usb_init()`（psc 线程内调
-//!   `usb_hc_init`）由 post-scheduler 的专用线程驱动（CodePlan P0 拆分）；
-//! - `usb_ehci_interrupt()` 轮询线程（2K1000 无外设中断基础设施，见 ADR-001
-//!   的 poller 决策）；
+//! - 早期 `sudoos_usb_early_probe()`（只读 MMIO 观测，scheduler 就绪前
+//!   安全、失败不 panic、绝不写控制寄存器——HCRESET 会清掉 U-Boot 建立的
+//!   端口供电）；晚期 `sudoos_usb_host_start()`（psc 线程内调 `usb_hc_init`，
+//!   复位后恢复 root 端口供电）由 post-scheduler 的专用线程驱动；
+//! - `sudoos_usb_host_poll()`（= vendored `usb_ehci_interrupt`）1ms 轮询
+//!   线程驱动 Port Change / Control / Bulk / MSC 完成（2K1000 无外设中断
+//!   基础设施，见 ADR-001 的 poller 决策）；
+//! - MSC 就绪后注册 `UsbMscBlockDevice` 为只读 `/dev/sda` + 分区 + devfs
+//!   节点，经 `USB_STORAGE_READY` Completion 通知主启动线程
+//!   （`wait_usb_storage_ready`）；
 //! - M2 起报告枚举到的 VID:PID。
 
-use core::sync::atomic::{AtomicI32, Ordering};
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::time::Duration;
 
-use crate::task::WaitQueue;
+use crate::block::{BlockDevice, BlockError};
+use crate::task::{Completion, WaitQueue};
+
+/// USB 大容量存储阶段完成信号：`usb_init_thread` 跑完 host 启动 + 有界 MSC
+/// 等待 + `/dev/sda` 注册后置位。主启动线程经 `wait_usb_storage_ready()` 等。
+static USB_STORAGE_READY: Completion = Completion::new();
+/// 是否检测到并注册了 MSC 设备（决定 `wait_usb_storage_ready` 的返回值）。
+static USB_MSC_DETECTED: AtomicBool = AtomicBool::new(false);
 
 /// M2 首次真机 bring-up 的传输完成驱动：轮询 EHCI 中断状态。
 ///
@@ -28,15 +42,17 @@ use crate::task::WaitQueue;
 /// 1 ms 周期驱动它，即可让 iocsem 完成事件触发。真实 IRQ 布线留待 M3。
 fn usb_poller() {
     // 等 psc 线程在 `usb_hc_init` 内跑完低层初始化（g_ehci.exclsem 已建、
-    // 控制器已复位），再开始轮询。避免把复位前的 USBSTS 残留位误当事件。
+    // 控制器已复位、端口供电已恢复），再开始轮询。避免把复位前的 USBSTS
+    // 残留位误当事件。
     while unsafe { sudoos_usb_hc_ready() } == 0 {
-        crate::timer::sleep(core::time::Duration::from_millis(1));
+        crate::timer::sleep(Duration::from_millis(1));
     }
     loop {
-        // SAFETY: `usb_ehci_interrupt` 为 vendored C 函数，无参、可在任意
-        // 线程重复调用（每次处理当前 USBSTS 挂起位并清状态）。
-        unsafe { usb_ehci_interrupt() };
-        crate::timer::sleep(core::time::Duration::from_millis(1));
+        // SAFETY: `sudoos_usb_host_poll`（= vendored `usb_ehci_interrupt`）
+        // 无参、可在任意线程重复调用（每次处理当前 USBSTS 挂起位并清状态）。
+        // 它驱动 Port Change / Control / Bulk / MSC 传输完成。
+        unsafe { sudoos_usb_host_poll() };
+        crate::timer::sleep(Duration::from_millis(1));
     }
 }
 
@@ -48,7 +64,7 @@ fn usb_monitor() {
     // SAFETY: C 侧用 out 参数回填；timeout_ms 为轮询上限。
     let rc = unsafe { sudoos_usb_wait_device(10_000, &mut vid, &mut pid) };
     if rc == 0 {
-        crate::println!("USB: detected vid={vid:#06x} pid={pid:#06x}");
+        crate::println!("USB: device {vid:04x}:{pid:04x}");
     } else {
         crate::println!("USB: no device within 10s (rc={rc})");
     }
@@ -78,18 +94,153 @@ pub fn late_start() {
     crate::task::spawn_kernel_thread(usb_init_thread);
 }
 
+/// 等待 USB 大容量存储阶段完成，返回是否检测到并注册了 MSC 设备。
+///
+/// 主启动线程在 scheduler 就绪后调用（LS2K1000 竞赛存储路径）。
+/// `usb_init_thread` 异步完成 host 启动 + 有界 MSC 等待 + `/dev/sda` 注册
+/// 后置位 `USB_STORAGE_READY`。超时窗口大于线程内部 10s MSC 等待，保证
+/// 拿到终态。
+pub fn wait_usb_storage_ready() -> bool {
+    let _ = USB_STORAGE_READY.wait_timeout(Duration::from_secs(12));
+    USB_MSC_DETECTED.load(Ordering::Acquire)
+}
+
 /// 在 psc/hpworkq/lpworkq 线程创建前先建好线程上下文（scheduler 已就绪）。
 fn usb_init_thread() {
-    // SAFETY: `sudoos_usb_init` 无参。此刻 scheduler active、中断使能，
-    // usbh_initialize 内部 spawn 的线程可正常调度。
-    let rc = unsafe { sudoos_usb_init() };
-    crate::println!("USB: cherryusb host init rc={rc}");
+    // SAFETY: `sudoos_usb_host_start` 无参。此刻 scheduler active、中断
+    // 使能，usbh_initialize 内部 spawn 的线程可正常调度。
+    let rc = unsafe { sudoos_usb_host_start() };
+    crate::println!("USB: cherryusb host start rc={rc}");
     if rc == 0 {
         // 传输完成由轮询线程驱动（无真实 EHCI IRQ）。
         crate::task::spawn_kernel_thread(usb_poller);
         crate::task::spawn_kernel_thread(usb_monitor);
+        register_msc_storage_if_ready();
     } else {
-        crate::println!("USB: host init failed — continuing boot without USB storage");
+        crate::println!("USB: host start failed — continuing boot without USB storage");
+    }
+    // 无论成败都发布“USB 存储阶段完成”，主线程据此决定是否继续等待。
+    USB_STORAGE_READY.complete_all();
+}
+
+/// 有界等待 MSC 枚举（poll 线程驱动完成事件），成功后注册 `/dev/sda` +
+/// 分区 + 各自 devfs 节点，使 main 的 `mount_sdcard_if_present` 能选中它。
+fn register_msc_storage_if_ready() {
+    let deadline = crate::time::deadline_after(Duration::from_secs(10));
+    loop {
+        if unsafe { sudoos_usb_msc_is_ready() } != 0 {
+            match register_msc_devices() {
+                Ok(()) => {
+                    USB_MSC_DETECTED.store(true, Ordering::Release);
+                    crate::println!("USB: mass storage registered");
+                }
+                Err(error) => {
+                    crate::println!("USB: register sda failed: {error:?}");
+                }
+            }
+            return;
+        }
+        if crate::time::deadline_reached(crate::time::now(), deadline) {
+            crate::println!("USB: no MSC device within 10s");
+            return;
+        }
+        crate::timer::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 从 MSC 容量构造只读块设备，注册整盘 `/dev/sda` + 分区 + 各自节点。
+fn register_msc_devices() -> Result<(), BlockError> {
+    let mut block_count: u64 = 0;
+    let mut block_size: u32 = 0;
+    if unsafe { sudoos_usb_msc_capacity(&mut block_count, &mut block_size) } != 0
+        || block_size == 0
+        || block_count == 0
+    {
+        return Err(BlockError::InvalidArgument);
+    }
+    let device: Arc<dyn BlockDevice> = Arc::new(UsbMscBlockDevice::new(block_size, block_count));
+    crate::block::register_device("sda", Arc::clone(&device))?;
+    crate::println!("storage: registered /dev/sda");
+    // devfs 节点（用户态 open("/dev/sda") 需要 VFS 节点）。
+    crate::fs::install_block_device_node("sda").map_err(|_| BlockError::InvalidArgument)?;
+    // 单盘分区扫描：raw ext4 / GPT / MBR（命名 sda1/sda2…）。
+    let partitions =
+        crate::partition::register_partitions("sda", &device).map_err(|error| match error {
+            crate::partition::PartitionError::Block(error) => error,
+            _ => BlockError::InvalidArgument,
+        })?;
+    for name in partitions {
+        let _ = crate::fs::install_block_device_node(&name);
+        crate::println!("partition: registered /dev/{name}");
+    }
+    Ok(())
+}
+
+/// LS2K1000 USB 大容量存储（只读）块设备。
+///
+/// 读取路径：VFS → `read_block` → `.nocache_ram` uncached DMA32 bounce →
+/// `sudoos_usb_msc_read_blocks`（CherryUSB BOT/SCSI Read10，同步阻塞，由
+/// `usb_poller` 轮询驱动完成事件）→ 拷贝回调用方缓冲。EHCI 用 32 位 DMA，
+/// 数据缓冲必须物理连续且落低 4GB——`.nocache_ram` 池满足。
+pub struct UsbMscBlockDevice {
+    block_size: u32,
+    block_count: u64,
+}
+
+impl UsbMscBlockDevice {
+    pub fn new(block_size: u32, block_count: u64) -> Self {
+        Self {
+            block_size,
+            block_count,
+        }
+    }
+}
+
+impl BlockDevice for UsbMscBlockDevice {
+    fn block_size(&self) -> usize {
+        self.block_size as usize
+    }
+
+    fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    fn read_block(&self, block: u64, output: &mut [u8]) -> Result<(), BlockError> {
+        let size = self.block_size as usize;
+        if output.len() < size {
+            return Err(BlockError::BufferTooSmall);
+        }
+        if block >= self.block_count {
+            return Err(BlockError::OutOfRange);
+        }
+        // DMA32 bounce：控制器写入 uncached 低 4GB 物理缓冲，再拷回调用方。
+        // SAFETY: sudoos_usb_alloc 返回 .nocache_ram 池 512B 对齐的可写块。
+        let bounce = unsafe { sudoos_usb_alloc(size) };
+        if bounce.is_null() {
+            return Err(BlockError::MetadataOutOfMemory);
+        }
+        // SAFETY: bounce 是 size 字节的可写 uncached 缓冲；C 侧校验 LBA/长度
+        // 并做单请求保护。
+        let rc = unsafe { sudoos_usb_msc_read_blocks(block, 1, bounce.cast(), size as u32) };
+        if rc == 0 {
+            // bounce 在 uncached 窗口，普通拷贝即取到控制器写入的最新值。
+            // SAFETY: 源/目标长度均为 size 且互不重叠（bounce 独立分配）。
+            unsafe { core::ptr::copy_nonoverlapping(bounce, output.as_mut_ptr(), size) };
+        }
+        // SAFETY: bounce 由本函数经 sudoos_usb_alloc 分配。
+        unsafe { sudoos_usb_free(bounce) };
+        if rc != 0 {
+            return Err(BlockError::InvalidArgument);
+        }
+        Ok(())
+    }
+
+    fn write_block(&self, _block: u64, _input: &[u8]) -> Result<(), BlockError> {
+        Err(BlockError::DeviceReadOnly)
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 }
 
@@ -449,17 +600,25 @@ pub extern "C" fn sudoos_usb_thread_spawn(idx: u32) -> i32 {
 }
 
 unsafe extern "C" {
-    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：CherryUSB 宿主初始化。
-    fn sudoos_usb_init() -> i32;
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：CherryUSB 宿主启动。
+    fn sudoos_usb_host_start() -> i32;
     /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：构建路径探针。
     fn sudoos_usb_glue_probe() -> u32;
-    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：早期有界轮询 MMIO 探针
-    /// （M0–M9，scheduler 就绪前可安全调用，失败返回负值、不 panic）。
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：早期只读 MMIO 探针
+    /// （scheduler 就绪前可安全调用，失败返回负值、不 panic）。
     fn sudoos_usb_early_probe() -> i32;
     /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：轮询等待设备枚举并回填 VID/PID。
     fn sudoos_usb_wait_device(timeout_ms: u32, vid: *mut u16, pid: *mut u16) -> i32;
     /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：EHCI 低层初始化是否完成。
     fn sudoos_usb_hc_ready() -> i32;
-    /// vendored `usb_ehci.c`：EHCI 中断处理（M2 轮询驱动）。
-    fn usb_ehci_interrupt();
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：EHCI 中断轮询
+    /// （= vendored `usb_ehci_interrupt`，USBH_IRQHandler 等价）。
+    fn sudoos_usb_host_poll();
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：MSC 是否已就绪。
+    fn sudoos_usb_msc_is_ready() -> i32;
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：回填 MSC 容量。
+    fn sudoos_usb_msc_capacity(block_count: *mut u64, block_size: *mut u32) -> i32;
+    /// `kernel/csrc/usb/usb_glue_ls2k1000.c`：BOT/SCSI Read10（buffer 必须
+    /// 是物理连续的低 4GB DMA32 bounce 缓冲）。
+    fn sudoos_usb_msc_read_blocks(lba: u64, count: u32, buffer: *mut u8, buffer_len: u32) -> i32;
 }

@@ -2194,6 +2194,32 @@ int usb_hc_init(void)
     regval |= EHCI_CONFIGFLAG;
     usb_ehci_putreg(regval, &HCOR->configflag);
 #endif
+#if defined(CONFIG_USB_EHCI_CONFIGFLAG) && defined(CONFIG_USB_EHCI_LS2K1000)
+    /* LS2K1000 真机：HCRESET 会清掉 U-Boot 建立的 PORTSC.PP，端口断电。
+     * 复位完成后必须重设所有 root 端口的 PP。写回时必须屏蔽 W1C change
+     * 位（CSC/PEC/OCC），否则会把连接状态变化误清。
+     *
+     * 注：usb_hc_init 在 psc 线程临界区内被调用，这里不能 usb_osal_msleep；
+     * 端口上电后的稳定由 psc 线程的 usbh_reset_port + msleep(200) 承担。
+     * 期望结果：PORTSC0=0x1001（有设备、已供电、尚未端口复位）。
+     */
+    {
+        uint32_t nports = (usb_ehci_getreg(&HCCR->hcsparams) & EHCI_HCSPARAMS_NPORTS_MASK) >>
+                          EHCI_HCSPARAMS_NPORTS_SHIFT;
+        for (uint32_t port = 0; port < nports; port++) {
+            regval = usb_ehci_getreg(&HCOR->portsc[port]);
+            regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC);
+            regval |= EHCI_PORTSC_PP;
+            usb_ehci_putreg(regval, &HCOR->portsc[port]);
+        }
+        printf("USB-EHCI: post-reset CONFIGFLAG=%08x\r\n",
+               usb_ehci_getreg(&HCOR->configflag));
+        for (uint32_t port = 0; port < nports && port < 3; port++) {
+            printf("USB-EHCI: PORTSC%u=%08x\r\n", port,
+                   usb_ehci_getreg(&HCOR->portsc[port]));
+        }
+    }
+#endif
     /* Wait for the EHCI to run (i.e., no longer report halted) */
     ret = usb_ehci_wait_usbsts(EHCI_USBSTS_HALTED, 0, 100 * 1000);
     if (ret < 0) {

@@ -225,6 +225,19 @@ ls2k1000-stage4-init.dtb: busybox-initramfs-loongarch64
 	@cp build/host-tools/ls2k1000/ls2k1000-stage4-init.dtb $@
 	@ls -lh $@
 
+# LS2K1000 竞赛 USB 镜像 DTB（CodePlan §8/§10）：kernel 自动跑 final-all，
+# 竞赛镜像整盘烧在 U 盘，经 USB /dev/sda 挂载。不带 rdinit=/init（走
+# SelfTest → oscomp::run 自动路径）。与 ls2k1000-stage4-init.dtb（调试 shell）
+# 并存；启动文件一律 TFTP 加载，镜像不进 TFTP。
+.PHONY: ls2k1000-stage4-contest.dtb
+ls2k1000-stage4-contest.dtb: busybox-initramfs-loongarch64
+	@test -s build/initramfs/busybox-loongarch64.cpio || (echo "error: initramfs build failed" >&2; exit 2)
+	@INITRD=build/initramfs/busybox-loongarch64.cpio INITRD_PHYS_ADDR=0x0b000000 DTB_NAME=ls2k1000-stage4-contest \
+	    BOOTARGS="console=ttyS0,115200n8 sudoos.contest.dev=sda sudoos.contest.required=1 sudoos.oscomp=final-all sudoos.maxcpus=1" \
+	    scripts/build-ls2k1000-dtb.sh
+	@cp build/host-tools/ls2k1000/ls2k1000-stage4-contest.dtb $@
+	@ls -lh $@
+
 # 别名（板卡更新菜单 / 'go' 命令沿用旧名）
 .PHONY: kernel.bin uImage
 kernel.bin: kernel-ls2k1000.bin

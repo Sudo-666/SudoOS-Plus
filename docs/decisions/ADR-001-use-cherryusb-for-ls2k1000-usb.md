@@ -132,5 +132,35 @@ LS2K1000 平台胶水用 C 写在 `kernel/csrc/usb/`；经 `kernel/build.rs` 用
     USBINTR@0x08）；`usbh_get_port_speed` 双 bug——用 1-based
     `EHCI_PORTSC_OFFSET(n)` 解 0-based `port`（port=0 读到 CONFIGFLAG@0x40）
     且读 bits[11:10]（LSTATUS 线状态）而非 EHCI 2.0 的 PORTSPD@[15:13]。
+- **M2.8 决策（2026-08-18，U 盘整盘烧录镜像上板闭环）**：真机寄存器证据
+  定位根因——U-Boot 阶段 `PORTSC0=0x1005`（PP+PE+CCS 全在），SudoOS 早期
+  探针执行 HCRESET 后 `PORTSC0` 被清成 0，后续没恢复 PP，U 盘上不了电。
+  落地（CodePlan §2–§8 一步到位）：
+  - **早期探测改只读**：`sudoos_usb_early_probe` 只打印 CAPLENGTH/HCSPARAMS/
+    USBCMD/USBSTS/CONFIGFLAG/PORTSC0-2，**绝不写控制寄存器**。CherryUSB
+    的 `usb_hc_init` 成为 EHCI 唯一初始化者。
+  - **复位后恢复端口供电**：定义 `CONFIG_USB_EHCI_CONFIGFLAG`；`usb_hc_init`
+    的 CONFIGFLAG 块后补 LS2K1000 专用块——遍历 root 端口，屏蔽 W1C change
+    位（CSC/PEC/OCC）后写 PP，打印 `USB-EHCI: PORTSCn=...`。psc 线程临界区
+    内不能 sleep，端口稳定由 psc 的 `usb_reset_port + msleep(200)` 承担。
+    `CONFIG_USBHOST_RHPORTS 1→3`（本版本无 `MAX_RHPORTS` 宏，按实际宏名）。
+  - **C façade**：`sudoos_usb_host_start/host_poll/msc_is_ready/capacity/
+    read_blocks`；vendored `usbh_msc.c` 的 connect/disconnect 回调
+    `sudoos_usb_msc_connected/disconnected` 原子发布 MSC 指针+容量（取代原
+    `msc_test()` 调试残留）。read10 校验 block_size≠0、LBA/count/buffer 长度
+    越界、单请求（g_msc_busy 防重入），阻塞传输由 1ms poll 线程驱动。
+  - **Rust `UsbMscBlockDevice`（只读）**：VFS → read_block → `.nocache_ram`
+    uncached DMA32 bounce → `sudoos_usb_msc_read_blocks` → 拷回调用方。
+    EHCI 32 位 DMA，缓冲必须物理连续落低 4GB（池满足）。
+  - **延迟注册 + 启动顺序**：`fs::install_block_device_node`（fs::initialize
+    后补 /dev 节点，幂等 Eexist）；`partition::register_partitions("sda")` 单盘
+    扫描；main.rs 早期 `mount_sdcard_if_present` 对 LS2K1000 gate 掉，改在
+    scheduler 后 `initialize_ls2k_contest_usb` 等 USB 存储就绪
+    （`USB_STORAGE_READY` Completion，12s 上限）再走统一选择/挂载。VF2/QEMU
+    保持早期挂载路径不变。
+  - **`sudoos.contest.required=1`**：找不到竞赛存储打印 `CONTEST_ERROR` +
+    `CONTEST_RESULT ... fail` 并显式 halt，不静默跑 preliminary。竞赛 DTB
+    `sudoos.contest.dev=sda required=1 oscomp=final-all`（不带 rdinit=/init），
+    保留 debug shell DTB。
 - 退路：若 CherryUSB OSAL 适配成本过高，退回"自写 Rust EHCI + Cotton
   MSC/SCSI"（保留 C 构建路径作为通用设施）。

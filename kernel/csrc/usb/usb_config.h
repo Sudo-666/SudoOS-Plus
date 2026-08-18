@@ -8,8 +8,14 @@
  * 中断式传输等一切无关功能。设计决策见 docs/decisions/ADR-001。
  */
 
-/* 单 root port、无外部 hub。 */
-#define CONFIG_USBHOST_RHPORTS 1
+/* 3 个 root port（U 盘接 port0，port1/2 保留）、无外部 hub。
+ *
+ * 注：CherryUSB 此版本用 `CONFIG_USBHOST_RHPORTS` 直接作 root 端口数
+ * （数组尺寸 + 循环上限），没有新版的主机侧 `CONFIG_USBHOST_MAX_BUS /
+ * CONFIG_USBHOST_MAX_RHPORTS / CONFIG_USBHOST_MAX_EXTHUBS` 宏——按实际
+ * 宏名落地，语义一致（3 root ports、0 external hubs）。
+ */
+#define CONFIG_USBHOST_RHPORTS 3
 #define CONFIG_USBHOST_EHPORTS 1
 #define CONFIG_USBHOST_INTF_NUM 4
 #define CONFIG_USBHOST_EP_NUM 4
@@ -43,6 +49,14 @@
 #define CONFIG_USB_EHCI_HCOR_BASE (CONFIG_USB_EHCI_HCCR_BASE + 0x10)
 #define CONFIG_USB_EHCI_QH_NUM 8
 #define CONFIG_USB_EHCI_QTD_NUM 32
+
+/*
+ * 定义后 usb_ehci.c 的 usb_hc_init 在复位完成后写 CONFIGFLAG=1，把端口
+ * 路由到本 EHCI 控制器。LS2K1000 真机证据：HCRESET 会清掉 U-Boot 建立的
+ * PORTSC.PP，必须复位后重设（见 usb_ehci.c 的 CONFIG_USB_EHCI_LS2K1000
+ * 端口供电恢复块）。
+ */
+#define CONFIG_USB_EHCI_CONFIGFLAG 1
 
 /*
  * M1 不启用 dcache 维护（CONFIG_USB_DCACHE_ENABLE /
