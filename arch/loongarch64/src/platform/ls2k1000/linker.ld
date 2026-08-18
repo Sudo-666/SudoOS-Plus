@@ -241,7 +241,7 @@ SECTIONS
 
     . = 0x8000000000000000 + __nocache_phys_base;
 
-    .nocache_ram (NOLOAD) :
+    .nocache_ram (NOLOAD) : AT(__nocache_phys_base)
     {
         __nocache_ram_start = .;
         *(.nocache_ram .nocache_ram.*)

@@ -120,6 +120,14 @@ def read_elf_info(elf_path):
 
                 # 物理地址（如果有 AT() 则等于 p_paddr，否则等于 p_vaddr）
                 phys_addr = p_paddr if p_paddr != 0 else p_vaddr
+
+                # LS2K1000 `.nocache_ram` uncached DMW 窗口（0x8000_0000_0000_0000）：
+                # 该段是 NOLOAD 内核保留 DMA 内存（VMA 在 uncached 窗口，LLD 还会为它
+                # 造一个 ELF-header 孤儿 LOAD），都不是可加载内核内容，跳过。
+                # 其余平台地址全部 < 0x8000_0000_0000_0000，此过滤是无操作。
+                if phys_addr >= 0x8000_0000_0000_0000:
+                    continue
+
                 if lowest_paddr is None or phys_addr < lowest_paddr:
                     lowest_paddr = phys_addr
 
