@@ -285,6 +285,12 @@ static struct usb_ehci_qtd_s g_qtdpool[CONFIG_USB_EHCI_QTD_NUM] NO_CACHE_RAM __a
 
 /* The frame list */
 static uint32_t g_framelist[FRAME_LIST_SIZE] NO_CACHE_RAM __attribute__((aligned(4096)));
+
+/* M2.12 诊断：最近一次 EP0 控制传输的 QH / 首个 qTD 指针。每次
+ * usb_ehci_control_setup 提交后刷新；超时路径经 usb_ehci_debug_dump()
+ * 读回 QH/qTD 的 token，判断硬件是否执行过描述符。 */
+static struct usb_ehci_qh_s *g_debug_last_qh;
+static struct usb_ehci_qtd_s *g_debug_first_qtd;
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
@@ -1204,6 +1210,30 @@ static int usb_ehci_control_setup(struct usb_ehci_epinfo_s *epinfo, struct usb_s
     }
     /* Add the new QH to the head of the asynchronous queue list */
     usb_ehci_qh_enqueue(&g_asynchead, qh);
+
+    /* M2.12 诊断：保存本次控制传输的 QH / 首个 qTD，打印提交后快照。
+     * qh->fqp 在 enqueue 里被置为 overlay.nqp（首个 qTD 的低物理地址），
+     * 掩掉 Terminate 位后经 virtramaddr 转回 uncached VMA 才能解引用 token。 */
+    g_debug_last_qh = qh;
+
+    {
+        uintptr_t first_phys =
+            (uintptr_t)(usb_ehci_swap32(qh->fqp) & QTD_NQP_NTEP_MASK);
+
+        g_debug_first_qtd = first_phys == 0
+            ? NULL
+            : (struct usb_ehci_qtd_s *)usb_ehci_virtramaddr(first_phys);
+
+        printf(
+            "USB-CTL01 qh-pa=%08x head-hlp=%08x "
+            "qh-nqp=%08x qh-token=%08x qtd-pa=%08x qtd-token=%08x\r\n",
+            (unsigned)usb_ehci_physramaddr((uintptr_t)qh),
+            g_asynchead.hw.hlp,
+            qh->hw.overlay.nqp,
+            qh->hw.overlay.token,
+            (unsigned)first_phys,
+            g_debug_first_qtd != NULL ? g_debug_first_qtd->hw.token : 0);
+    }
 
     return 0;
 
@@ -2392,6 +2422,19 @@ int usb_hc_init(void)
     */
     usb_ehci_putreg(EHCI_HANDLED_INTS, &HCOR->usbintr);
 
+    /* M2.12 诊断：USBINTR 使能后的控制器运行态快照。
+     * 期望 USBCMD.RUN=1、USBCMD.ASEN=1、USBSTS.HCHalted=0、USBSTS.ASS=1、
+     * USBINTR=0x37、ASYNCLISTADDR=g_asynchead 低物理地址。 */
+    printf(
+        "USB-HCSTATE00 cmd=%08x sts=%08x intr=%08x "
+        "async=%08x periodic=%08x frindex=%08x\r\n",
+        usb_ehci_getreg(&HCOR->usbcmd),
+        usb_ehci_getreg(&HCOR->usbsts),
+        usb_ehci_getreg(&HCOR->usbintr),
+        usb_ehci_getreg(&HCOR->asynclistaddr),
+        usb_ehci_getreg(&HCOR->periodiclistbase),
+        usb_ehci_getreg(&HCOR->frindex));
+
     /* 初始化全部完成（列表地址写入、RUN=1、CONFIGFLAG=1、PP=1、初始
      * attach 已发布、USBINTR 已配置）后发布 ready。平台覆写（LS2K1000：
      * 置 g_usb_hc_ready）后轮询线程才开始轮询，避免拿到初始化中状态。 */
@@ -2596,6 +2639,19 @@ int usbh_control_transfer(usbh_epinfo_t ep, struct usb_setup_packet *setup, uint
     */
 
     DEBUGASSERT(setup || buffer);
+
+    /* M2.12 诊断：EP0 控制请求内容。第一次 GET_DESCRIPTOR 应在此打印
+     * type=80 req=06 ...；若此行出现后停在 IOC 等待，对照 USB-CTL01。 */
+    if (setup != NULL) {
+        printf(
+            "USB-CTL00 type=%02x req=%02x value=%04x "
+            "index=%04x len=%u\r\n",
+            setup->bmRequestType,
+            setup->bRequest,
+            setup->wValue,
+            setup->wIndex,
+            setup->wLength);
+    }
 
     ret = usb_osal_mutex_take(g_ehci.exclsem);
     if (ret < 0) {
@@ -3077,6 +3133,13 @@ void usb_ehci_interrupt(void)
     pending = usbsts & regval;
 
     if (pending != 0) {
+        /* M2.12 诊断：poller 看到的中断源。bit0=USBINT（传输完成）、
+         * bit1=USBERRINT、bit4=SYSERROR（DMA 描述符地址错误）。若 IOC 等待
+         * 期间此行使 USBINT 置位，说明硬件执行完成、问题在 bottom-half。 */
+        printf(
+            "USB-IRQ pending=%08x sts=%08x intr=%08x\r\n",
+            pending, usbsts, regval);
+
         /* Schedule interrupt handling work for the high priority worker
         * thread so that we are not pressed for time and so that we can
         * interrupt with other USB threads gracefully.
@@ -3096,4 +3159,36 @@ void usb_ehci_interrupt(void)
         */
         usb_ehci_putreg(usbsts & EHCI_INT_ALLINTS, &HCOR->usbsts);
     }
+}
+
+/* M2.12 诊断：超时时的控制器最终状态 dump。平台 glue 在
+ * sudoos_usb_wait_device 超时返回前调用（外部 extern）。g_debug_last_qh /
+ * g_debug_first_qtd 指向最近一次 EP0 控制传输，读回其 token 判断硬件
+ * 是否执行过描述符：qtd-token bit7（ACTIVE）清零 = 硬件执行完成，否则
+ * 控制器根本没读到该 qTD。 */
+void usb_ehci_debug_dump(void)
+{
+    uint32_t qh_token = 0;
+    uint32_t qtd_token = 0;
+
+    if (g_debug_last_qh != NULL) {
+        qh_token = g_debug_last_qh->hw.overlay.token;
+    }
+
+    if (g_debug_first_qtd != NULL) {
+        qtd_token = g_debug_first_qtd->hw.token;
+    }
+
+    printf(
+        "USB-HCSTATE99 cmd=%08x sts=%08x intr=%08x "
+        "async=%08x frindex=%08x port=%08x "
+        "qh-token=%08x qtd-token=%08x\r\n",
+        usb_ehci_getreg(&HCOR->usbcmd),
+        usb_ehci_getreg(&HCOR->usbsts),
+        usb_ehci_getreg(&HCOR->usbintr),
+        usb_ehci_getreg(&HCOR->asynclistaddr),
+        usb_ehci_getreg(&HCOR->frindex),
+        usb_ehci_getreg(&HCOR->portsc[0]),
+        qh_token,
+        qtd_token);
 }

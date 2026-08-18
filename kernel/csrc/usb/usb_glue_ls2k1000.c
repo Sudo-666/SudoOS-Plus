@@ -378,6 +378,11 @@ int sudoos_usb_wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid)
         }
         sudoos_usb_sleep_ms(50);
     } while ((int32_t)(sudoos_usb_get_tick_ms() - deadline) < 0);
+
+    /* M2.12 诊断：枚举超时（卡在 EP0 IOC 等待）。调用 EHCI 控制器最终状态
+     * dump，把"控制器没执行描述符"与"执行完但 poller 没唤醒"区分开。 */
+    extern void usb_ehci_debug_dump(void);
+    usb_ehci_debug_dump();
     return -1;
 }
 
