@@ -17,7 +17,7 @@
 //!   线程驱动 Port Change / Control / Bulk / MSC 完成（2K1000 无外设中断
 //!   基础设施，见 ADR-001 的 poller 决策）；
 //! - MSC 就绪后注册 `UsbMscBlockDevice` 为只读 `/dev/sda` + 分区 + devfs
-//!   节点，经 `USB_STORAGE_READY` Completion 通知主启动线程
+//!   节点，置位 `USB_STORAGE_DONE` 通知 boot idle 上的主启动线程
 //!   （`wait_usb_storage_ready`）；
 //! - M2 起报告枚举到的 VID:PID。
 
@@ -26,11 +26,19 @@ use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use core::time::Duration;
 
 use crate::block::{BlockDevice, BlockError};
+use crate::smp::CpuId;
 use crate::task::{Completion, WaitQueue};
 
 /// USB 大容量存储阶段完成信号：`usb_init_thread` 跑完 host 启动 + 有界 MSC
 /// 等待 + `/dev/sda` 注册后置位。主启动线程经 `wait_usb_storage_ready()` 等。
 static USB_STORAGE_READY: Completion = Completion::new();
+/// boot idle 可读的完成位：`usb_init_thread` 结束（无论成败）置位。
+///
+/// `kernel_main` 跑在 boot idle task 上，不能用 `Completion::wait_timeout`
+/// （内部走 WaitQueue 阻塞，`prepare_block` 断言 "idle task attempted to
+/// block"），故 `wait_usb_storage_ready` 改用 `task::boot_idle_wait_until`
+/// 轮询此位。
+static USB_STORAGE_DONE: AtomicBool = AtomicBool::new(false);
 /// 是否检测到并注册了 MSC 设备（决定 `wait_usb_storage_ready` 的返回值）。
 static USB_MSC_DETECTED: AtomicBool = AtomicBool::new(false);
 
@@ -91,17 +99,25 @@ pub fn early_probe() {
 /// 启动。spawn 一个专用线程执行，避免阻塞 boot 路径；失败只打日志并继续
 /// 启动（USB 探测失败可接受，不能把内核挡在 /init 之外）。
 pub fn late_start() {
-    crate::task::spawn_kernel_thread(usb_init_thread);
+    // 固定 CPU0 作为 system thread（不计入 live_kernel_threads，见
+    // TaskKind::is_counted_kernel_thread）。
+    crate::task::spawn_system_thread_on(usb_init_thread, CpuId::BOOT);
 }
 
 /// 等待 USB 大容量存储阶段完成，返回是否检测到并注册了 MSC 设备。
 ///
-/// 主启动线程在 scheduler 就绪后调用（LS2K1000 竞赛存储路径）。
-/// `usb_init_thread` 异步完成 host 启动 + 有界 MSC 等待 + `/dev/sda` 注册
-/// 后置位 `USB_STORAGE_READY`。超时窗口大于线程内部 10s MSC 等待，保证
-/// 拿到终态。
+/// 由 boot idle task 上的 `kernel_main` 调用（LS2K1000 竞赛存储路径），
+/// 故必须用 `task::boot_idle_wait_until` 轮询而非 `Completion::wait_timeout`
+/// 阻塞。`usb_init_thread` 异步完成 host 启动 + 有界 MSC 等待 + `/dev/sda`
+/// 注册后置位 `USB_STORAGE_DONE`。超时窗口（12s）大于线程内部 10s MSC 等待，
+/// 保证拿到终态。
 pub fn wait_usb_storage_ready() -> bool {
-    let _ = USB_STORAGE_READY.wait_timeout(Duration::from_secs(12));
+    let deadline = crate::time::deadline_after(Duration::from_secs(12));
+    let done =
+        crate::task::boot_idle_wait_until(deadline, || USB_STORAGE_DONE.load(Ordering::Acquire));
+    if !done {
+        crate::println!("USB: storage stage not done within 12s");
+    }
     USB_MSC_DETECTED.load(Ordering::Acquire)
 }
 
@@ -112,14 +128,19 @@ fn usb_init_thread() {
     let rc = unsafe { sudoos_usb_host_start() };
     crate::println!("USB: cherryusb host start rc={rc}");
     if rc == 0 {
-        // 传输完成由轮询线程驱动（无真实 EHCI IRQ）。
-        crate::task::spawn_kernel_thread(usb_poller);
-        crate::task::spawn_kernel_thread(usb_monitor);
+        // 传输完成由轮询线程驱动（无真实 EHCI IRQ）。poller/monitor 均为
+        // 常驻线程：固定 CPU0 且为 system thread，不计入竞赛测试计数的
+        // live_kernel_threads，也不会在多核下与 CherryUSB 的
+        // “关本地中断作为临界区”并发冲突。
+        crate::task::spawn_system_thread_on(usb_poller, CpuId::BOOT);
+        crate::task::spawn_system_thread_on(usb_monitor, CpuId::BOOT);
         register_msc_storage_if_ready();
     } else {
         crate::println!("USB: host start failed — continuing boot without USB storage");
     }
-    // 无论成败都发布“USB 存储阶段完成”，主线程据此决定是否继续等待。
+    // 无论成败都发布“USB 存储阶段完成”。boot idle 的 wait_usb_storage_ready
+    // 轮询 USB_STORAGE_DONE；complete_all 保留以兼容任何未来 Completion 等待者。
+    USB_STORAGE_DONE.store(true, Ordering::Release);
     USB_STORAGE_READY.complete_all();
 }
 
@@ -589,13 +610,18 @@ static USB_TRAMPOLINES: [crate::task::KernelThreadEntry; USB_THREAD_SLOTS] = [
 ];
 
 /// C `usb_osal_thread_create`：按槽位生成 SudoOS 内核线程。
+///
+/// CherryUSB 的 psc/hpworkq/lpworkq 均为常驻线程：固定 CPU0 并作为
+/// system thread（`TaskKind::SystemThread` 不计入 `live_kernel_threads`），
+/// 避免它们破坏竞赛测试“quiescent counted kernel-thread set”的断言，同时
+/// 让 CherryUSB “关本地中断作为临界区”只在 CPU0 上发生，杜绝多核并发访问。
 #[unsafe(no_mangle)]
 pub extern "C" fn sudoos_usb_thread_spawn(idx: u32) -> i32 {
     let Some(entry) = USB_TRAMPOLINES.get(idx as usize) else {
         return -1;
     };
     let entry = *entry;
-    crate::task::spawn_kernel_thread(entry);
+    crate::task::spawn_system_thread_on(entry, CpuId::BOOT);
     0
 }
 

@@ -26,6 +26,7 @@ use crate::{
     irq_lock::IrqSpinLock,
     lockdep::{LockClass, LockRank},
     smp::CpuId,
+    time::MonotonicInstant,
 };
 use stack::KernelStack;
 
@@ -2521,6 +2522,47 @@ pub(crate) fn run_kernel_thread_sync(entry: KernelThreadEntry) {
         }
     }
     TASK_REAPER_QUEUE.wake_one();
+}
+
+/// boot idle 专用有界等待：`kernel_main` 跑在 boot idle task 上，不能经
+/// `WaitQueue` 阻塞（`prepare_block` 断言 "idle task attempted to block"）。
+/// 复用 idle 循环语义——有可运行任务就 `yield_now`，否则 WFI，直到条件满足
+/// 或到达 deadline。与 `run_kernel_thread_sync` / `idle_loop` 同一套协作策略。
+/// 返回条件是否在 deadline 前满足。
+pub(crate) fn boot_idle_wait_until(
+    deadline: MonotonicInstant,
+    condition: impl Fn() -> bool,
+) -> bool {
+    crate::context::assert_task_context();
+    crate::context::assert_interrupts_enabled();
+    assert_eq!(
+        crate::smp::current_cpu_id(),
+        CpuId::BOOT,
+        "boot-idle wait must run on the boot CPU",
+    );
+    let caller_is_idle = {
+        let slot = SCHEDULER.lock();
+        let scheduler = slot.as_ref().expect("kernel scheduler is not initialized");
+        let current = scheduler.current(CpuId::BOOT);
+        scheduler.task(current).kind.is_idle()
+    };
+    assert!(
+        caller_is_idle,
+        "boot-idle wait must run from the boot idle task",
+    );
+
+    while !condition() {
+        if crate::time::deadline_reached(crate::time::now(), deadline) {
+            return false;
+        }
+        reap_retired_tasks();
+        if current_cpu_has_work() {
+            yield_now();
+        } else {
+            idle_until_interrupt();
+        }
+    }
+    true
 }
 
 #[cfg(debug_assertions)]
