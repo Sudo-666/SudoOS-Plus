@@ -101,6 +101,16 @@ LS2K1000 平台胶水用 C 写在 `kernel/csrc/usb/`；经 `kernel/build.rs` 用
     `__attribute__((section(".nocache_ram")))`，所有 CPU 访问经 uncached
     窗口直达物理内存；`usb_ehci_physramaddr(a) = a & PHYS_MASK`（缓存直接
     映射与 uncached 窗口都是 `BASE | phys`）。
+  - **必须配套反向映射 `usb_ehci_virtramaddr(pa) = pa | UNCACHED_BASE`**
+    （`pa != 0` 时）：描述符里的链接指针（`hlp`/`nqp`/`next_qtd`/`fqp`）
+    存的是**低物理地址**，CPU 遍历 QH/qTD 链表前必须先转回 `0x8000...`
+    别名才能解引用——M2.2 只加了 `physramaddr` 忘了反向，真机枚举/传输
+    完成时 `usb_ehci_ioc_bottomhalf`/`usb_ehci_qh_foreach` 直接解引用低
+    物理地址 → page fault `address=0x904295e0 access=Read`。**terminate
+    link 值 0 必须原样返回 NULL**，不能 `| UNCACHED_BASE` 变成非空地址。
+  - `usb_hc_init` 在描述符池初始化前跑 `usb_ehci_check_dma_alias` 自检
+    （asynchead/QH 池/qTD 池/frame list 各做一次 `VA→PA→VA` 回环），失败即
+    停机，避免在不可恢复的链表错误上继续枚举。
   - **动态缓冲**：`usb_malloc` 从 `.nocache_ram` 的动态池（free-list
     分配器，Rust `sudoos_usb_alloc`）切块，与控制块物理隔离。**控制块
     （信号量/互斥锁/线程表）走普通缓存堆**（`sudoos_usb_alloc_ctrl`）——

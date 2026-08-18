@@ -69,10 +69,28 @@
  * 缓存窗口 (0x9000_0000_0000_0000) 与 uncached 窗口
  * (0x8000_0000_0000_0000) 都是 `BASE | phys`，掩码取低 48 位即得物理地址。
  * 见 docs/decisions/ADR-001。
+ *
+ * `.nocache_ram` 段 VMA = UNCACHED_BASE(0x8000_0000_0000_0000) | phys，
+ * 描述符里的链接指针（hlp/nqp/next_qtd/fqp）存的是低物理地址。CPU 遍历
+ * QH/qTD 链表前必须经 usb_ehci_virtramaddr() 转回 0x8000... uncached 别名
+ * 才能解引用——直接解引用低物理地址会 page fault
+ * （真机 address=0x904295e0 access=Read，描述符低物理地址）。
  */
+#define LS2K1000_PHYS_MASK          UINT64_C(0x0fffffffffffffff)
+#define LS2K1000_UNCACHED_DMW_BASE  UINT64_C(0x8000000000000000)
+
 #define usb_ehci_physramaddr(a) \
-    ((uintptr_t)(a) & 0x0FFFFFFFFFFFFFFFULL)
-#define usb_ehci_virtramaddr(a) (a)
+    ((uintptr_t)(a) & (uintptr_t)LS2K1000_PHYS_MASK)
+
+static inline uintptr_t usb_ehci_virtramaddr(uintptr_t physaddr)
+{
+    /* EHCI 链表结束（terminate link）地址是 0：必须原样返回 NULL，不能把它
+     * `| 0x8000...` 变成非空地址，否则遍历会解引用垃圾指针继续崩溃。 */
+    if (physaddr == 0) {
+        return 0;
+    }
+    return physaddr | (uintptr_t)LS2K1000_UNCACHED_DMW_BASE;
+}
 #else
 #define usb_ehci_physramaddr(a) (a)
 #define usb_ehci_virtramaddr(a) (a)
@@ -2053,6 +2071,36 @@ __WEAK void usb_hc_init_done(void)
 {
 }
 
+/* DMA 地址别名自检：`.nocache_ram` 对象经 physramaddr→virtramaddr 必须回到
+ * 原 VMA（UNCACHED_BASE|phys）。失败说明段布局或地址转换不一致——控制器遍历
+ * 描述符链表时会解引用低物理地址（真机 0x904295e0）——直接停机，避免在不可
+ * 恢复的链表错误上继续枚举。 */
+static int usb_ehci_check_dma_alias(void)
+{
+    static const struct {
+        const char *name;
+        uintptr_t va;
+    } objects[] = {
+        { "asynchead", (uintptr_t)&g_asynchead },
+        { "qhpool",    (uintptr_t)g_qhpool },
+        { "qtdpool",   (uintptr_t)g_qtdpool },
+        { "framelist", (uintptr_t)g_framelist },
+    };
+    uint32_t i;
+
+    for (i = 0; i < (uint32_t)(sizeof(objects) / sizeof(objects[0])); i++) {
+        uintptr_t pa = usb_ehci_physramaddr(objects[i].va);
+        uintptr_t back = usb_ehci_virtramaddr(pa);
+        if (back != objects[i].va) {
+            printf("USB-EHCI: DMA alias check FAIL (%s)\r\n", objects[i].name);
+            return -1;
+        }
+    }
+
+    printf("USB-EHCI: DMA alias check PASS\r\n");
+    return 0;
+}
+
 int usb_hc_init(void)
 {
     int ret;
@@ -2067,6 +2115,13 @@ int usb_hc_init(void)
      * 不可颠倒。 */
     usb_dlist_init(&g_ehci.work.list);
     usb_slist_init(&g_ehci.epinfo_list);
+
+    /* DMA 地址别名自检：在描述符池初始化之前调用，失败即停止启动控制器。 */
+    ret = usb_ehci_check_dma_alias();
+    if (ret < 0) {
+        return -1;
+    }
+
     /* Initialize the list of free Queue Head (QH) structures */
 
     for (uint8_t i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {
