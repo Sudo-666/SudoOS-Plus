@@ -1645,7 +1645,29 @@ static int usb_ehci_qh_ioccheck(struct usb_ehci_qh_s *qh, uint32_t **bp, void *a
     */
 
     epinfo = qh->epinfo;
-    DEBUGASSERT(epinfo);
+
+    token = usb_ehci_swap32(qh->hw.overlay.token);
+
+    /* M2.14 诊断：解引用 epinfo 之前打印该 QH 快照。上一轮真机
+     * address=0x4 access=Read（= epinfo->iocwait，epinfo==NULL）在 USB-IOC00
+     * 的 printf 参数求值时崩溃。这里先打快照再判空：epinfo==NULL 返回
+     * -EINVAL 终止遍历，不再解引用。qh-pa 标识是哪块 QH，async-head/intr-head
+     * 标识它来自哪条队列。DEBUGASSERT 在此编译为空，不能提供保护，故用真实
+     * 检查替代。 */
+    printf("USB-IOC-PRE qh-pa=%08x epinfo=%p token=%08x fqp=%08x\r\n",
+           (unsigned)usb_ehci_physramaddr((uintptr_t)qh),
+           (void *)epinfo,
+           token,
+           usb_ehci_swap32(qh->fqp));
+
+    if (epinfo == NULL) {
+        printf("USB-IOC-ERROR null-epinfo qh-pa=%08x "
+               "async-head=%u intr-head=%u\r\n",
+               (unsigned)usb_ehci_physramaddr((uintptr_t)qh),
+               qh == &g_asynchead,
+               qh == &g_intrhead);
+        return -EINVAL;
+    }
 
     /* Paragraph 3.6.3:  "The nine DWords in [the Transfer Overlay] area
     * represent a transaction working space for the host controller.  The
@@ -1659,8 +1681,6 @@ static int usb_ehci_qh_ioccheck(struct usb_ehci_qh_s *qh, uint32_t **bp, void *a
     */
 
     /* Is the qTD still active? */
-
-    token = usb_ehci_swap32(qh->hw.overlay.token);
 
     /* M2.13 诊断：IOC 遍历到 QH 时的快照。ACTIVE bit7 清零 = 硬件已完成该
      * QH；若超时的 QH 在此仍 ACTIVE=1，说明异步队列扫到它时太晚或未扫到。
@@ -1874,6 +1894,7 @@ static inline void usb_ehci_ioc_bottomhalf(void)
 {
     struct usb_ehci_qh_s *qh;
     uint32_t *bp;
+    uint32_t link;
     int ret;
 
     usb_ehci_dcache_invalidate((uintptr_t)&g_asynchead.hw, sizeof(struct usb_ehci_qh_s));
@@ -1882,17 +1903,25 @@ static inline void usb_ehci_ioc_bottomhalf(void)
     */
 
     bp = (uint32_t *)&g_asynchead.hw.hlp;
-    qh = (struct usb_ehci_qh_s *)
-        usb_ehci_virtramaddr(usb_ehci_swap32(*bp) & QH_HLP_MASK);
+    link = usb_ehci_swap32(*bp);
 
-    /* If the asynchronous queue is empty, then the forward point in the
-    * asynchronous queue head will point back to the queue head.
-    */
-    if (qh && qh != &g_asynchead) {
-        /* Then traverse and operate on every QH and qTD in the asynchronous
-        * queue
+    /* M2.14：先判 HLP 的 T 位（bit0）再当指针用。T=1 是队列结束哨兵，此时低
+     * 地址位无效；不能清掉 T 位后把残留位当 QH 指针解引用。空 async 队列时
+     * hlp 回指 g_asynchead 自身（T=0），& QH_HLP_MASK 得自身地址，由下面的
+     * qh != &g_asynchead 收住。 */
+    if ((link & QH_HLP_T) == 0) {
+        qh = (struct usb_ehci_qh_s *)
+            usb_ehci_virtramaddr(link & QH_HLP_MASK);
+
+        /* If the asynchronous queue is empty, then the forward point in the
+        * asynchronous queue head will point back to the queue head.
         */
-        usb_ehci_qh_foreach(qh, &bp, usb_ehci_qh_ioccheck, NULL);
+        if (qh && qh != &g_asynchead) {
+            /* Then traverse and operate on every QH and qTD in the asynchronous
+            * queue
+            */
+            usb_ehci_qh_foreach(qh, &bp, usb_ehci_qh_ioccheck, NULL);
+        }
     }
 #ifndef CONFIG_USBHOST_INT_DISABLE
     /* Check the Interrupt Queue */
@@ -1903,15 +1932,22 @@ static inline void usb_ehci_ioc_bottomhalf(void)
     */
 
     bp = (uint32_t *)&g_intrhead.hw.hlp;
-    qh = (struct usb_ehci_qh_s *)
-        usb_ehci_virtramaddr(usb_ehci_swap32(*bp) & QH_HLP_MASK);
-    if (qh) {
-        /* Then traverse and operate on every QH and qTD in the asynchronous
-        * queue.
-        */
+    link = usb_ehci_swap32(*bp);
 
-        ret = usb_ehci_qh_foreach(qh, &bp, usb_ehci_qh_ioccheck, NULL);
-        if (ret < 0) {
+    /* M2.14：周期队列空哨兵就是 QH_HLP_T（T=1）。必须先判 T 位：空队列
+     * 直接跳过，不再清 T 位转地址后当有效 QH 遍历（否则真机崩溃于
+     * epinfo->iocwait / address=0x4）。 */
+    if ((link & QH_HLP_T) == 0) {
+        qh = (struct usb_ehci_qh_s *)
+            usb_ehci_virtramaddr(link & QH_HLP_MASK);
+        if (qh) {
+            /* Then traverse and operate on every QH and qTD in the asynchronous
+            * queue.
+            */
+
+            ret = usb_ehci_qh_foreach(qh, &bp, usb_ehci_qh_ioccheck, NULL);
+            if (ret < 0) {
+            }
         }
     }
 #endif
