@@ -84,5 +84,18 @@ LS2K1000 平台胶水用 C 写在 `kernel/csrc/usb/`；经 `kernel/build.rs` 用
 - 风险：EHCI 描述符/缓冲必须落在控制器可见物理地址（uncached 窗口）；
   2K1000 USB 是否真免 cache 维护以真机为准，必要时退回显式
   flush/invalidate。
+- **M1 工具链发现（2026-08-18）**：Ubuntu 24.04 的
+  `loongarch64-linux-gnu` binutils 2.42 无法汇编 LoongArch `cache` 指令
+  （`as` 对 `cache op, rj, si12` 所有形式报 "no match insn"），且 `cache`
+  的 5 位 op 字段是"3 位 cache 选择器 + 2 位操作码"分段编码（见 Linux
+  `arch/loongarch/include/asm/cacheops.h`），非扁平值。因此显式 dcache
+  指令路线在 M1 受阻。**M1 暂缓 cache 一致性**（`CONFIG_USB_DCACHE_ENABLE`
+  与 `CONFIG_USB_EHCI_DESC_DCACHE_ENABLE` 均未定义，dcache 钩子为 no-op
+  宏）；M2 真机确认 DMA 行为后在以下两者中择一：
+  1. uncached 窗口：OSAL malloc 返回 `virt_to_phys | UNCACHED_BASE` 指针，
+     描述符池经 `.nocache_ram` 链接段置于 uncached VMA（需保留对应物理
+     区域）；或
+  2. 修复/替换 binutils 以支持 `cache` 指令，实现真实 clean/invalidate。
+  **此问题不解决，真机传输会读到陈旧数据。**
 - 退路：若 CherryUSB OSAL 适配成本过高，退回"自写 Rust EHCI + Cotton
   MSC/SCSI"（保留 C 构建路径作为通用设施）。

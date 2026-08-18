@@ -85,25 +85,68 @@ fn require_file(path: &Path) {
     );
 }
 
-/// 交叉编译 LS2K1000 USB 平台胶水 C 源为静态库并链接进内核。
+/// 交叉编译 LS2K1000 USB C 源（CherryUSB 裁剪 + 平台胶水）为静态库并链接。
 ///
 /// 这是纯 Rust 内核里第一条 C 构建路径（M0，见 docs/decisions/ADR-001）。
 /// C 侧使用与 Rust 目标 `loongarch64-unknown-none-softfloat` 一致的
 /// `lp64s` ABI，全部 freestanding，不依赖 libc。loongarch64 交叉工具链
 /// 可用 `LS2K1000_CC` / `LS2K1000_AR` 覆盖，默认取 PATH 中的
 /// `loongarch64-linux-gnu-gcc` / `loongarch64-linux-gnu-ar`。
+/// 查询交叉 gcc 自带的 freestanding 头目录（stdint/stddef/stdarg/stdbool 等）。
+/// `-nostdinc` 后需要显式加回这些目录，才能同时避开交叉 libc 头。
+fn gcc_freestanding_includes(cc: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for kind in ["include", "include-fixed"] {
+        let output = std::process::Command::new(cc)
+            .arg(format!("-print-file-name={kind}"))
+            .output()
+            .expect("failed to query gcc freestanding include dir");
+        let dir = String::from_utf8(output.stdout)
+            .expect("gcc -print-file-name output is not UTF-8")
+            .trim()
+            .to_owned();
+        if !dir.is_empty() && dir != kind {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    dirs
+}
+
 fn compile_ls2k1000_glue(project_root: &Path) {
     let cc = env::var("LS2K1000_CC").unwrap_or_else(|_| "loongarch64-linux-gnu-gcc".to_owned());
     let ar = env::var("LS2K1000_AR").unwrap_or_else(|_| "loongarch64-linux-gnu-ar".to_owned());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
 
-    let src_dir = project_root.join("kernel/csrc/usb");
-    let mut sources: Vec<PathBuf> = std::fs::read_dir(&src_dir)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", src_dir.display()))
+    // 我们自己的平台胶水 + 固定版本的 CherryUSB 裁剪源码（只编译需要子集）。
+    let glue_dir = project_root.join("kernel/csrc/usb");
+    const VENDORED_CHERRYUSB: &[&str] = &[
+        "vendor/cherryusb/core/usbh_core.c",
+        "vendor/cherryusb/osal/usb_workq.c",
+        "vendor/cherryusb/class/hub/usbh_hub.c",
+        "vendor/cherryusb/class/msc/usbh_msc.c",
+        "vendor/cherryusb/port/ehci/usb_ehci.c",
+    ];
+    // 首个目录是我们的 usb_config.h，优先于 vendor 根模板。
+    const CHERRYUSB_INCLUDES: &[&str] = &[
+        "kernel/csrc/usb",
+        "vendor/cherryusb",
+        "vendor/cherryusb/core",
+        "vendor/cherryusb/common",
+        "vendor/cherryusb/osal",
+        "vendor/cherryusb/class/hub",
+        "vendor/cherryusb/class/msc",
+        "vendor/cherryusb/class/cdc",
+        "vendor/cherryusb/class/hid",
+        "vendor/cherryusb/port/ehci",
+    ];
+
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(&glue_dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", glue_dir.display()))
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "c"))
         .collect();
+    sources.extend(VENDORED_CHERRYUSB.iter().map(|path| project_root.join(path)));
     sources.sort();
     assert!(!sources.is_empty(), "no C sources under kernel/csrc/usb");
 
@@ -116,28 +159,41 @@ fn compile_ls2k1000_glue(project_root: &Path) {
                 .expect("C source has a file name")
                 .to_string_lossy()
         ));
-        let status = std::process::Command::new(&cc)
-            .args([
-                "-mabi=lp64s",
-                "-march=loongarch64",
-                "-ffreestanding",
-                "-nostdlib",
-                "-fno-builtin",
-                "-fno-stack-protector",
-                "-fno-pic",
-                "-fno-pie",
-                "-ffunction-sections",
-                "-fdata-sections",
-                "-fno-asynchronous-unwind-tables",
-                "-O2",
-                "-Wall",
-                "-c",
-            ])
-            .arg(source)
-            .arg("-o")
-            .arg(&object)
-            .status()
-            .unwrap_or_else(|error| panic!("failed to run loongarch64 C compiler ({cc}): {error}"));
+        let is_vendored = source.starts_with(project_root.join("vendor/cherryusb"));
+        let mut command = std::process::Command::new(&cc);
+        command.args([
+            "-mabi=lp64s",
+            "-march=loongarch64",
+            "-ffreestanding",
+            "-nostdlib",
+            "-nostdinc",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-fno-pic",
+            "-fno-pie",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fno-asynchronous-unwind-tables",
+            "-O2",
+            // CherryUSB 日志走 libc printf：全部关掉（usb_config.h 在
+            // usb_util.h 之后被包含，无法覆盖，故用编译期宏）。
+            "-DUSB_DBG_LEVEL=-1",
+        ]);
+        // -nostdinc 后显式补回：我们的 freestanding shim 头最优先，然后是
+        // GCC 自有头（stdint/stddef/stdarg/stdbool 等），再是 CherryUSB 目录。
+        command.arg("-I").arg(project_root.join("kernel/csrc/usb/include"));
+        for dir in gcc_freestanding_includes(&cc) {
+            command.arg("-I").arg(dir);
+        }
+        for include in CHERRYUSB_INCLUDES {
+            command.arg("-I").arg(project_root.join(include));
+        }
+        // vendor 代码用 -w 压制（非我们维护），胶水保持 -Wall。
+        command.arg(if is_vendored { "-w" } else { "-Wall" });
+        command.arg("-c").arg(&source).arg("-o").arg(&object);
+        let status = command.status().unwrap_or_else(|error| {
+            panic!("failed to run loongarch64 C compiler ({cc}): {error}")
+        });
         assert!(
             status.success(),
             "C compile failed for {}",
@@ -145,6 +201,9 @@ fn compile_ls2k1000_glue(project_root: &Path) {
         );
         println!("cargo:rerun-if-changed={}", source.display());
         objects.push(object);
+    }
+    for include in CHERRYUSB_INCLUDES {
+        println!("cargo:rerun-if-changed={}", project_root.join(include).display());
     }
 
     let archive = out_dir.join("libsudoos_usb.a");
