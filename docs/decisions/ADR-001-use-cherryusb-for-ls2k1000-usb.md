@@ -91,11 +91,27 @@ LS2K1000 平台胶水用 C 写在 `kernel/csrc/usb/`；经 `kernel/build.rs` 用
   `arch/loongarch/include/asm/cacheops.h`），非扁平值。因此显式 dcache
   指令路线在 M1 受阻。**M1 暂缓 cache 一致性**（`CONFIG_USB_DCACHE_ENABLE`
   与 `CONFIG_USB_EHCI_DESC_DCACHE_ENABLE` 均未定义，dcache 钩子为 no-op
-  宏）；M2 真机确认 DMA 行为后在以下两者中择一：
-  1. uncached 窗口：OSAL malloc 返回 `virt_to_phys | UNCACHED_BASE` 指针，
-     描述符池经 `.nocache_ram` 链接段置于 uncached VMA（需保留对应物理
-     区域）；或
-  2. 修复/替换 binutils 以支持 `cache` 指令，实现真实 clean/invalidate。
-  **此问题不解决，真机传输会读到陈旧数据。**
+  宏）。
+- **M2 决策（2026-08-18）**：选 **uncached 窗口（方案 1）**，不修 binutils。
+  具体落地：
+  - `linker.ld` 新增 `.nocache_ram` NOLOAD 段，VMA = `UNCACHED_BASE | phys`，
+    物理紧跟内核镜像；`arch/loongarch64/platform/ls2k1000/memory.rs` 用
+    `__nocache_ram_start/__nocache_ram_end` 符号把该物理区从页分配器保留。
+  - EHCI 静态描述符（QH/qTD 池、async/periodic 队列头、frame list）打
+    `__attribute__((section(".nocache_ram")))`，所有 CPU 访问经 uncached
+    窗口直达物理内存；`usb_ehci_physramaddr(a) = a & PHYS_MASK`（缓存直接
+    映射与 uncached 窗口都是 `BASE | phys`）。
+  - **动态缓冲**：`usb_malloc` 从 `.nocache_ram` 的动态池（free-list
+    分配器，Rust `sudoos_usb_alloc`）切块，与控制块物理隔离。**控制块
+    （信号量/互斥锁/线程表）走普通缓存堆**（`sudoos_usb_alloc_ctrl`）——
+    WaitQueue/IrqSpinLock 依赖 ll/sc，绝不能落在 uncached 窗口。
+  - **传输完成驱动**：2K1000 当前内核无外设中断基础设施（trap.rs 只处理
+    timer/IPI 位，其余 handle_unhandled），M2 用 1 ms 轮询线程驱动
+    `usb_ehci_interrupt()`（读 USBSTS→提交 hpworkq→清状态），配
+    `g_usb_hc_ready` 门闩防 hc_init 前的误触发。真实 IRQ 布线留待真机确认
+    后（M3+）。
+  - **线程**：CherryUSB psc/hpworkq/lpworkq 线程接 SudoOS
+    `spawn_kernel_thread`（`KernelThreadEntry = fn()`，槽位经 Rust trampoline
+    烘焙）；`thread_suspend/resume` 保持 no-op（枚举期 lpworkq 无异步工作）。
 - 退路：若 CherryUSB OSAL 适配成本过高，退回"自写 Rust EHCI + Cotton
   MSC/SCSI"（保留 C 构建路径作为通用设施）。

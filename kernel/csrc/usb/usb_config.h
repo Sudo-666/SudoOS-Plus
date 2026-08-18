@@ -51,6 +51,14 @@
  * - uncached 描述符/缓冲方案需 linker section 手术，留到 M2 在真机确认
  *   DMA 一致性行为后再定（见 docs/decisions/ADR-001 的风险节）。
  * 因此 M1 阶段 EHCI 描述符/缓冲为 cached 内存，dcache 钩子为 no-op 宏。
+ *
+ * M2：LS2K1000 平台标记。EHCI 静态描述符池（QH/qTD/frame list）经
+ * `.nocache_ram` 链接到 uncached DMW 窗口（见 linker.ld），
+ * usb_ehci.c 据此：
+ * - 给 DMA 全局加 section 属性；
+ * - 用 `addr & PHYS_MASK` 覆盖恒等 physramaddr（缓存直接映射与 uncached
+ *   窗口都是 `BASE | phys`）。
  */
+#define CONFIG_USB_EHCI_LS2K1000
 
 #endif

@@ -7,7 +7,10 @@
 *.log
 *.pid
 *.core
-core
+# Root-level core dump files (bare `core` would also match the
+# vendor/cherryusb/core/ source directory and drop it from commits)
+/core
+/core.*
 
 # Rust build config (generated from cargo-dot during build)
 .cargo/

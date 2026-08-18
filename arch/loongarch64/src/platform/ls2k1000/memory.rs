@@ -34,6 +34,16 @@ pub fn virt_to_phys(vaddr: usize) -> usize {
     vaddr & PHYS_MASK
 }
 
+/// `.nocache_ram` 段的起止（uncached DMW 窗口 VMA，见 linker.ld）。
+///
+/// EHCI QH/qTD 描述符池经此段以 uncached 方式访问，物理区必须从页分配器
+/// 保留，防止被复用。链接脚本把该段紧跟内核镜像之后，VMA =
+/// UNCACHED_BASE | phys，因此 `virt_to_phys` 直接对 VMA 取掩码即得物理地址。
+unsafe extern "C" {
+    static __nocache_ram_start: u8;
+    static __nocache_ram_end: u8;
+}
+
 /// 保留 U-Boot 启动阶段占用的物理内存区域。
 ///
 /// 2K1000 的 1GB DDR 物理基址是 0x9000_0000，内核镜像加载在 DDR 基址。
@@ -49,5 +59,18 @@ pub(crate) fn reserve_early_memory<const CAPACITY: usize>(
     let uboot_data = PhysRange::from_start_size(PhysAddr::new(0x0000_0000), 0x0020_0000)
         .expect("U-Boot boot data range must be valid");
 
-    map.reserve(uboot_data)
+    map.reserve(uboot_data)?;
+
+    // USB EHCI uncached DMA 池（`.nocache_ram`）：物理紧随内核镜像，
+    // 必须保留给控制器可见内存，页分配器不得复用。
+    let nocache_start = virt_to_phys(core::ptr::addr_of!(__nocache_ram_start) as usize);
+    let nocache_end = virt_to_phys(core::ptr::addr_of!(__nocache_ram_end) as usize);
+    if nocache_end > nocache_start {
+        let nocache =
+            PhysRange::from_start_size(PhysAddr::new(nocache_start), nocache_end - nocache_start)
+                .expect("nocache_ram range must be valid");
+        map.reserve(nocache)?;
+    }
+
+    Ok(())
 }

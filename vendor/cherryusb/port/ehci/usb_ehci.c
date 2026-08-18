@@ -64,8 +64,19 @@
  * address spaces.
  */
 
+#ifdef CONFIG_USB_EHCI_LS2K1000
+/* LS2K1000: 内存经直接映射访问，物理地址 = 虚拟地址 & PHYS_MASK。
+ * 缓存窗口 (0x9000_0000_0000_0000) 与 uncached 窗口
+ * (0x8000_0000_0000_0000) 都是 `BASE | phys`，掩码取低 48 位即得物理地址。
+ * 见 docs/decisions/ADR-001。
+ */
+#define usb_ehci_physramaddr(a) \
+    ((uintptr_t)(a) & 0x0FFFFFFFFFFFFFFFULL)
+#define usb_ehci_virtramaddr(a) (a)
+#else
 #define usb_ehci_physramaddr(a) (a)
 #define usb_ehci_virtramaddr(a) (a)
+#endif
 
 /****************************************************************************
  * Private Types
@@ -204,24 +215,35 @@ static const uint8_t g_ehci_speed[4] = {
 
 static struct usb_ehci_s g_ehci;
 
+/*
+ * LS2K1000：以下 DMA 可见结构放在 `.nocache_ram` 段（uncached DMW 窗口
+ * VMA），保证控制器读到最新值且无缓存陈旧问题；CPU 侧所有访问也经该段。
+ * 其余平台保持默认 .bss。见 docs/decisions/ADR-001。
+ */
+#ifdef CONFIG_USB_EHCI_LS2K1000
+#define NO_CACHE_RAM __attribute__((section(".nocache_ram")))
+#else
+#define NO_CACHE_RAM
+#endif
+
 /* The head of the asynchronous queue */
 
-static struct usb_ehci_qh_s g_asynchead __attribute__((aligned(32)));
+static struct usb_ehci_qh_s g_asynchead NO_CACHE_RAM __attribute__((aligned(32)));
 
 /* The head of the periodic queue */
 
-static struct usb_ehci_qh_s g_intrhead __attribute__((aligned(32)));
+static struct usb_ehci_qh_s g_intrhead NO_CACHE_RAM __attribute__((aligned(32)));
 
 /* Queue Head (QH) pool */
 
-static struct usb_ehci_qh_s g_qhpool[CONFIG_USB_EHCI_QH_NUM] __attribute__((aligned(32)));
+static struct usb_ehci_qh_s g_qhpool[CONFIG_USB_EHCI_QH_NUM] NO_CACHE_RAM __attribute__((aligned(32)));
 
 /* Queue Element Transfer Descriptor (qTD) pool */
 
-static struct usb_ehci_qtd_s g_qtdpool[CONFIG_USB_EHCI_QTD_NUM] __attribute__((aligned(32)));
+static struct usb_ehci_qtd_s g_qtdpool[CONFIG_USB_EHCI_QTD_NUM] NO_CACHE_RAM __attribute__((aligned(32)));
 
 /* The frame list */
-static uint32_t g_framelist[FRAME_LIST_SIZE] __attribute__((aligned(4096)));
+static uint32_t g_framelist[FRAME_LIST_SIZE] NO_CACHE_RAM __attribute__((aligned(4096)));
 /****************************************************************************
  * Private Functions
  ****************************************************************************/

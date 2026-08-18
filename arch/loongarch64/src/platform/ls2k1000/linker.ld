@@ -223,6 +223,44 @@ SECTIONS
     __kernel_end = .;
 
     /*
+     * ============================================================
+     * USB EHCI uncached DMA 池 (.nocache_ram)
+     * ============================================================
+     *
+     * EHCI 的 QH/qTD 描述符、async/periodic 队列头和 frame list 必须落在
+     * 控制器可见且无缓存陈旧问题的物理内存。LS2K1000 上把它们链接到强序
+     * 非缓存 DMW 窗口 (0x8000_0000_0000_0000 | phys) 的 VMA：所有 CPU
+     * 访问经该窗口直达物理内存，控制器读到最新值，无需 `cache` 指令维护
+     * （binutils 无法汇编该指令，见 docs/decisions/ADR-001）。
+     *
+     * 物理紧随内核镜像（__kernel_end）之后，由 memory.rs 用
+     * __nocache_ram_start/__nocache_ram_end 保留，防止页分配器复用。
+     * NOLOAD：全零初始化，USB 胶水在 usb_hc_init 前 memset。
+     */
+    __nocache_phys_base = ALIGN(__kernel_end & 0x0FFFFFFFFFFFFFFF, 4K);
+
+    . = 0x8000000000000000 + __nocache_phys_base;
+
+    .nocache_ram (NOLOAD) :
+    {
+        __nocache_ram_start = .;
+        *(.nocache_ram .nocache_ram.*)
+        . = ALIGN(4K);
+
+        /*
+         * 动态 DMA 缓冲 bump 池：给枚举/传输的临时缓冲（ep0 setup、
+         * 描述符数据、MSC 块读）预留。Rust 侧 free-list 分配器从
+         * __nocache_ram_start..__nocache_ram_end 切块。
+         */
+        __nocache_dyn_start = .;
+        . += 48K;
+        __nocache_dyn_end = .;
+
+        . = ALIGN(4K);
+        __nocache_ram_end = .;
+    }
+
+    /*
      * 权限分段对应的物理范围。
      */
     __text_phys_start = LOADADDR(.text);
