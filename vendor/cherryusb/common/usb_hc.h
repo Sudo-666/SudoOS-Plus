@@ -83,6 +83,23 @@ int usbh_reset_port(const uint8_t port);
 uint8_t usbh_get_port_speed(const uint8_t port);
 
 /**
+ * @brief get roothub port connect status (CCS)
+ *
+ * @param port port index
+ * @return 1 connected, 0 not connected. EHCI driver provides; core uses
+ *         this after reset to detect a device that fell off the port.
+ */
+uint8_t usbh_get_port_connected(uint8_t port);
+
+/**
+ * @brief read raw roothub port PORTSC register
+ *
+ * @param port port index
+ * @return raw PORTSC value (for diagnostic prints). EHCI driver provides.
+ */
+uint32_t usbh_get_port_portsc(uint8_t port);
+
+/**
  * @brief reconfig control endpoint.
  *
  * @param ep A memory location provided by the caller.

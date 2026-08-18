@@ -691,7 +691,21 @@ static void usbh_portchange_detect_thread(void *argument)
             /*if roothub port,reset port first*/
             if (ROOTHUB(hport)) {
                 /* Reset the host port */
-                usbh_reset_port(hport->port);
+                int reset_rc = usbh_reset_port(hport->port);
+                printf("USB-ENUM06 reset-rc=%d port=%u\r\n",
+                       reset_rc, hport->port);
+
+                if (reset_rc < 0) {
+                    printf("USB-ENUM_ERROR port reset failed\r\n");
+                    continue;
+                }
+
+                if (usbh_get_port_connected(hport->port) == 0) {
+                    printf("USB-ENUM_ERROR device lost after reset PORTSC=%08x\r\n",
+                           usbh_get_port_portsc(hport->port));
+                    continue;
+                }
+
                 usb_osal_msleep(200);
                 /* Get the current device speed */
                 hport->speed = usbh_get_port_speed(hport->port);

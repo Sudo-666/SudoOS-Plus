@@ -2358,6 +2358,8 @@ int usbh_reset_port(const uint8_t port)
     uint32_t timeout = 0;
     uint32_t regval;
     regval = usb_ehci_getreg(&HCOR->portsc[port - 1]);
+    printf("USB-ENUM01 reset-pre port=%u PORTSC=%08x\r\n",
+           port, regval);
 
     /*
      * U-Boot handoff：U-Boot 停止控制器时设备进入挂起（SUSPEND=1），
@@ -2368,6 +2370,8 @@ int usbh_reset_port(const uint8_t port)
         regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC);
         regval |= EHCI_PORTSC_RESUME;
         usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
+        printf("USB-ENUM02 resume-assert PORTSC=%08x\r\n",
+               usb_ehci_getreg(&HCOR->portsc[port - 1]));
 
         usb_osal_msleep(20);
 
@@ -2377,6 +2381,8 @@ int usbh_reset_port(const uint8_t port)
         usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
 
         usb_osal_msleep(5);
+        printf("USB-ENUM03 resume-done PORTSC=%08x\r\n",
+               usb_ehci_getreg(&HCOR->portsc[port - 1]));
     }
 
     regval = usb_ehci_getreg(&HCOR->portsc[port - 1]);
@@ -2384,6 +2390,8 @@ int usbh_reset_port(const uint8_t port)
                 EHCI_PORTSC_PE);
     regval |= EHCI_PORTSC_RESET;
     usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
+    printf("USB-ENUM04 reset-assert PORTSC=%08x\r\n",
+           usb_ehci_getreg(&HCOR->portsc[port - 1]));
 
     usb_osal_msleep(55);
 
@@ -2413,8 +2421,25 @@ int usbh_reset_port(const uint8_t port)
             return -ETIMEDOUT;
         }
     }
+    printf("USB-ENUM05 reset-done PORTSC=%08x\r\n",
+           usb_ehci_getreg(&HCOR->portsc[port - 1]));
 
     return 0;
+}
+
+/* 端口连接状态/原始 PORTSC 读取钩子：usbh_core.c 的
+ * usbh_portchange_detect_thread 在复位后要检查 CCS 与打印 PORTSC，但 EHCI
+ * 寄存器符号（HCOR/EHCI_PORTSC_CCS）只在 EHCI 驱动内可见，故经 __WEAK
+ * 钩子暴露给通用 core（与 usbh_get_port_speed 同风格）。 */
+__WEAK uint8_t usbh_get_port_connected(uint8_t port)
+{
+    uint32_t portsc = usb_ehci_getreg(&HCOR->portsc[port - 1]);
+    return (portsc & EHCI_PORTSC_CCS) ? 1 : 0;
+}
+
+__WEAK uint32_t usbh_get_port_portsc(uint8_t port)
+{
+    return usb_ehci_getreg(&HCOR->portsc[port - 1]);
 }
 
 __WEAK uint8_t usbh_get_port_speed(const uint8_t port)
