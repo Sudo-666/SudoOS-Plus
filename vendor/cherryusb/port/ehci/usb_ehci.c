@@ -2061,6 +2061,12 @@ int usb_hc_init(void)
     uintptr_t physaddr2;
 
     memset(&g_ehci, 0, sizeof(struct usb_ehci_s));
+    /* memset 清零了 g_ehci.work 与 epinfo_list：必须重新初始化链表节点，
+     * 否则首次 usb_workqueue_submit(&g_ehci.work) 对全零节点 usb_dlist_remove
+     * 会向 NULL+8 写入（真机 address=0x8 access=Write）。此顺序（memset 之后）
+     * 不可颠倒。 */
+    usb_dlist_init(&g_ehci.work.list);
+    usb_slist_init(&g_ehci.epinfo_list);
     /* Initialize the list of free Queue Head (QH) structures */
 
     for (uint8_t i = 0; i < CONFIG_USB_EHCI_QH_NUM; i++) {

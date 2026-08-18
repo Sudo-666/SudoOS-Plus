@@ -7,7 +7,15 @@ void usb_workqueue_submit(struct usb_workqueue *queue, struct usb_work *work, us
 {
     uint32_t flags;
     flags = usb_osal_enter_critical_section();
-    usb_dlist_remove(&work->list);
+
+    /* 首次提交的 work 节点可能仍处全零状态（如 g_ehci.work 经 memset 清零）：
+     * 对全零节点执行 usb_dlist_remove() 会向 NULL->prev(NULL+8) 写入，page fault
+     * address=0x8 access=Write（真机复现）。已初始化的节点按原语义从旧链表摘除。 */
+    if (work->list.next == NULL || work->list.prev == NULL) {
+        usb_dlist_init(&work->list);
+    } else {
+        usb_dlist_remove(&work->list);
+    }
     work->worker = worker;
     work->arg = arg;
 
@@ -70,6 +78,15 @@ static void usbh_lpwork_thread(void *argument)
 
 int usbh_workq_initialize(void)
 {
+    /* g_hpworkq/g_lpworkq 以 `{ NULL }` 静态初始化，链表头 work_list /
+     * delay_work_list 全零。usb_dlist_insert_after 对空链表写 l->next->prev
+     * （NULL+8），usb_dlist_isempty 判 `next == head` 对全零头恒假 → page
+     * fault address=0x8 access=Write（真机复现）。必须先自环。 */
+    usb_dlist_init(&g_hpworkq.work_list);
+    usb_dlist_init(&g_hpworkq.delay_work_list);
+    usb_dlist_init(&g_lpworkq.work_list);
+    usb_dlist_init(&g_lpworkq.delay_work_list);
+
     g_hpworkq.sem = usb_osal_sem_create(0);
     if (g_hpworkq.sem == NULL) {
         return -1;
