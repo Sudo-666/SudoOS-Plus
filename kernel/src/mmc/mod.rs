@@ -127,8 +127,19 @@ pub fn initialize_storage() {
     core::mem::forget(mapping);
     // SAFETY: io_base 来自 vm::ioremap，内核生命周期内保持映射。
     let io = unsafe { dw_mmc::MmioRegisterIo::new(io_base) };
-    let ciu = host.ciu_frequency_hz().unwrap_or(25_000_000);
+    // VisionFive 2 SDIO1 (TF 槽) 的 CIU 输入时钟是 200 MHz：U-Boot 里
+    // CLKDIV=2 + SD High Speed (卡 50 MHz) ⇒ f_ciu = 50MHz × 2 × 2。
+    // DT 未解析出 clock-frequency 时若回退 25 MHz，分频会严重偏小、卡时钟
+    // 超标（初始化 3.125MHz / 工作 100MHz），导致 CMD17 首次读取失败。
+    // 回退用 200 MHz：初始化 CLKDIV=250→400kHz，工作 CLKDIV=4→25MHz。
+    let ciu = host.ciu_frequency_hz().unwrap_or(200_000_000);
     let fifo_depth = host.fifo_depth().unwrap_or(32);
+    crate::println!(
+        "VF2-TF00 ciu={}Hz init-div={} work-div={}",
+        ciu,
+        ciu.div_ceil(400_000 * 2),
+        ciu.div_ceil(25_000_000 * 2),
+    );
     let mut controller = dw_mmc::DwMmcController::new(io, ciu, fifo_depth);
     match controller.power_on() {
         Ok(()) => {}
