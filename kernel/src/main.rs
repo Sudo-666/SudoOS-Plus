@@ -10,6 +10,8 @@ mod bootargs;
 mod call_function;
 mod console;
 mod context;
+#[cfg(feature = "platform-ls2k1000")]
+mod cusb;
 mod device;
 mod devpts;
 mod elf;
@@ -473,6 +475,9 @@ fn kernel_main(boot: BootInfo) -> ! {
     fault::initialize();
     register_boot_ramdisks(&boot_ramdisks);
     mmc::initialize_storage();
+    // M0 探针：证明 kernel/csrc/usb 的 loongarch64 C 胶水已链进内核。
+    #[cfg(feature = "platform-ls2k1000")]
+    cusb::probe_build_path();
     // 在所有基础块设备注册完成后、devfs 建立前，统一扫描并注册 GPT/MBR
     // 分区（vdaN/ram0pN/mmcblk1pN），使分区设备出现在 /dev 树且存储选择
     // 能自动降级到 ext4 分区（K1.1）。

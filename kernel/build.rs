@@ -68,6 +68,13 @@ fn main() {
         );
     }
     println!("cargo:rerun-if-changed={}", vendor_la_busybox.display());
+
+    // LS2K1000 C 胶水（CherryUSB 宿主）：仅在 loongarch64 +
+    // platform-ls2k1000 下交叉编译 kernel/csrc/usb/*.c 为静态库并链接。
+    // 其余目标零 C 依赖。见 docs/decisions/ADR-001。
+    if env::var("CARGO_FEATURE_PLATFORM_LS2K1000").is_ok() {
+        compile_ls2k1000_glue(project_root);
+    }
 }
 
 fn require_file(path: &Path) {
@@ -76,4 +83,79 @@ fn require_file(path: &Path) {
         "required linker script does not exist: {}",
         path.display()
     );
+}
+
+/// 交叉编译 LS2K1000 USB 平台胶水 C 源为静态库并链接进内核。
+///
+/// 这是纯 Rust 内核里第一条 C 构建路径（M0，见 docs/decisions/ADR-001）。
+/// C 侧使用与 Rust 目标 `loongarch64-unknown-none-softfloat` 一致的
+/// `lp64s` ABI，全部 freestanding，不依赖 libc。loongarch64 交叉工具链
+/// 可用 `LS2K1000_CC` / `LS2K1000_AR` 覆盖，默认取 PATH 中的
+/// `loongarch64-linux-gnu-gcc` / `loongarch64-linux-gnu-ar`。
+fn compile_ls2k1000_glue(project_root: &Path) {
+    let cc = env::var("LS2K1000_CC").unwrap_or_else(|_| "loongarch64-linux-gnu-gcc".to_owned());
+    let ar = env::var("LS2K1000_AR").unwrap_or_else(|_| "loongarch64-linux-gnu-ar".to_owned());
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
+
+    let src_dir = project_root.join("kernel/csrc/usb");
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(&src_dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", src_dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "c"))
+        .collect();
+    sources.sort();
+    assert!(!sources.is_empty(), "no C sources under kernel/csrc/usb");
+
+    let mut objects = Vec::new();
+    for source in &sources {
+        let object = out_dir.join(format!(
+            "{}.o",
+            source
+                .file_stem()
+                .expect("C source has a file name")
+                .to_string_lossy()
+        ));
+        let status = std::process::Command::new(&cc)
+            .args([
+                "-mabi=lp64s",
+                "-march=loongarch64",
+                "-ffreestanding",
+                "-nostdlib",
+                "-fno-builtin",
+                "-fno-stack-protector",
+                "-fno-pic",
+                "-fno-pie",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-fno-asynchronous-unwind-tables",
+                "-O2",
+                "-Wall",
+                "-c",
+            ])
+            .arg(source)
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run loongarch64 C compiler ({cc}): {error}"));
+        assert!(
+            status.success(),
+            "C compile failed for {}",
+            source.display()
+        );
+        println!("cargo:rerun-if-changed={}", source.display());
+        objects.push(object);
+    }
+
+    let archive = out_dir.join("libsudoos_usb.a");
+    let status = std::process::Command::new(&ar)
+        .arg("rcs")
+        .arg(&archive)
+        .args(&objects)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run loongarch64 ar ({ar}): {error}"));
+    assert!(status.success(), "ar failed for {}", archive.display());
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=sudoos_usb");
 }
