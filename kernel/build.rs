@@ -177,7 +177,9 @@ fn compile_ls2k1000_glue(project_root: &Path) {
             "-O2",
             // CherryUSB 日志走 libc printf：全部关掉（usb_config.h 在
             // usb_util.h 之后被包含，无法覆盖，故用编译期宏）。
-            "-DUSB_DBG_LEVEL=-1",
+            // bring-up 临时开 2（error/warning/info）：端口复位/枚举掉线诊断，
+            // 稳定后须降回 -1 或 0。
+            "-DUSB_DBG_LEVEL=2",
         ]);
         // -nostdinc 后显式补回：我们的 freestanding shim 头最优先，然后是
         // GCC 自有头（stdint/stddef/stdarg/stdbool 等），再是 CherryUSB 目录。
