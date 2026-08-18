@@ -700,6 +700,10 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     task::verify();
 
+    // 纯 Rust USB 驱动无硬件自检（描述符布局/链接编码；仅 ls2k1000 debug）。
+    #[cfg(all(debug_assertions, feature = "platform-ls2k1000"))]
+    usb::verify();
+
     // LS2K1000 竞赛存储：scheduler 已就绪、usb::late_start 已把 C/CherryUSB
     // 或 Rust USB 驱动跑起来。等 USB 大容量存储（若请求设备是 U 盘或
     // required），注册 /dev/sda + 分区，再走统一的竞赛存储选择/挂载路径。

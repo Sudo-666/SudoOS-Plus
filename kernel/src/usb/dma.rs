@@ -17,6 +17,7 @@
 use core::ptr;
 
 use crate::usb::error::UsbError;
+use crate::usb::platform::ls2k1000::{PHYS_MASK, UNCACHED_WINDOW};
 
 // `.nocache_ram` 动态池边界符号（ls2k1000 linker.ld 定义，VMA 已是
 // uncached `0x8000...` 窗口）。
@@ -24,11 +25,6 @@ unsafe extern "C" {
     static __nocache_dyn_start: u8;
     static __nocache_ram_end: u8;
 }
-
-/// 低 48 位物理地址掩码：cached/uncached 直接映射窗口都是 `BASE | phys`。
-const PHYS_MASK: usize = 0x0fff_ffff_ffff_ffff;
-/// uncached 直接映射窗口高 16 位（`0x8000_0000_0000_0000`）。
-const UNCACHED_WINDOW: usize = 0x8000_0000_0000_0000;
 
 /// Frame List 表项数（EHCI 1024 × 4B = 4 KiB，页对齐）。
 pub const FRAME_LIST_ENTRIES: usize = 1024;
@@ -53,14 +49,16 @@ fn pool_bounds() -> (usize, usize) {
 /// 一块 uncached DMA 内存。
 ///
 /// 同时持有 CPU 侧 uncached 虚拟地址与控制器侧低 32 位物理地址。不暴露
-/// cached 指针，保证访问只走一条路径。长度由分配时的常量保证，不记录在
-/// 结构内（调用方对偏移的 bounds 负责，见 volatile 方法的 Safety 文档）。
-#[derive(Debug)]
+/// cached 指针，保证访问只走一条路径。`volatile` 方法的 bounds 由调用方
+/// 负责（见各自 Safety 文档）；`len` 供子分配器做边界检查。
+#[derive(Clone, Copy, Debug)]
 pub struct DmaRegion {
     /// uncached CPU 虚拟地址（`0x8000...`）。
     base: usize,
     /// 控制器 32 位 DMA 物理地址（`base & PHYS_MASK`，< 4 GiB）。
     physical: u32,
+    /// 区域长度（字节）。
+    len: usize,
 }
 
 impl DmaRegion {
@@ -83,6 +81,7 @@ impl DmaRegion {
         Ok(Self {
             base: start,
             physical: physical as u32,
+            len: length,
         })
     }
 
@@ -94,6 +93,20 @@ impl DmaRegion {
     /// uncached CPU 虚拟地址。
     pub const fn as_usize(&self) -> usize {
         self.base
+    }
+
+    /// 区域长度（字节）。
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// 从已知 uncached 基址/低物理地址/长度构造（子分配器切槽位用）。
+    pub(crate) const fn from_parts(base: usize, physical: u32, len: usize) -> Self {
+        Self {
+            base,
+            physical,
+            len,
+        }
     }
 
     /// 经 uncached 窗口以 `T` 类型读 `offset` 处。
@@ -120,7 +133,7 @@ impl DmaRegion {
 ///
 /// 一次切好、驱动生命周期内常驻（不释放）。控制器/枚举/MSC 共享这三个
 /// 区域，保证所有描述符与数据缓冲都落在 uncached 窗口。
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DmaPool {
     frame_list: DmaRegion,
     descriptors: DmaRegion,
@@ -140,14 +153,31 @@ impl DmaPool {
             bounce,
         })
     }
+
+    /// frame list 区域（1024 × 4B）。
+    pub const fn frame_list(&self) -> DmaRegion {
+        self.frame_list
+    }
+
+    /// 描述符区域（QH/qTD 槽位池）。
+    pub const fn descriptors(&self) -> DmaRegion {
+        self.descriptors
+    }
+
+    /// bounce 区域（CBW/CSW/SCSI 数据缓冲）。
+    ///
+    /// `dead_code`：RUSB-5 MSC BOT/SCSI 时使用。
+    #[allow(dead_code)]
+    pub const fn bounce(&self) -> DmaRegion {
+        self.bounce
+    }
 }
 
 /// RUSB-DMA 门禁自检：uncached 别名唯一性 + <4 GiB + uncached 零回环。
 ///
 /// 打印 `RUSB-DMA va=... pa=... below4g=1 zero-roundtrip=0 alias=unique
 /// PASS`。任何一项不满足返回 `UsbError`（调用方只打日志，不 panic）。
-pub fn dma_gate() -> Result<(), UsbError> {
-    let pool = DmaPool::new()?;
+pub fn dma_gate(pool: &DmaPool) -> Result<(), UsbError> {
     let regions = [
         (pool.frame_list.as_usize(), pool.frame_list.physical()),
         (pool.descriptors.as_usize(), pool.descriptors.physical()),

@@ -11,9 +11,21 @@
 //! 接管，最终（RUSB-7）翻转为默认并删除 C 路径。
 
 mod dma;
+mod ehci;
 mod error;
+mod platform;
 
 use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::irq_lock::IrqSpinLock;
+use crate::lockdep::{LockClass, LockRank};
+
+/// USB EHCI 控制器锁（boot 期发布，之后单消费者；不与其它锁嵌套）。
+const USB_EHCI_CLASS: LockClass = LockClass::new("usb.ehci", LockRank::Unknown, 0);
+
+/// 全局 EHCI 控制器（Rust 路径）。`early_probe` 初始化，RUSB-3 起使用。
+pub static EHCI: IrqSpinLock<Option<ehci::controller::EhciController>> =
+    IrqSpinLock::new_with_class(None, USB_EHCI_CLASS);
 
 /// USB 驱动实现选择（A/B 分发）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,10 +95,27 @@ pub fn early_probe() {
 
 fn rust_early_probe() {
     crate::println!("USB-RUST: early_probe driver=rust");
-    match dma::dma_gate() {
-        Ok(()) => {}
-        Err(error) => crate::println!("USB-RUST: DMA gate FAIL: {error:?}"),
+    // DMA 池切一次（RUSB-1 门禁自检 + RUSB-2 控制器共用同一池）。
+    let pool = match dma::DmaPool::new() {
+        Ok(pool) => pool,
+        Err(error) => {
+            crate::println!("USB-RUST: DMA pool FAIL: {error:?}");
+            return;
+        }
+    };
+    if let Err(error) = dma::dma_gate(&pool) {
+        crate::println!("USB-RUST: DMA gate FAIL: {error:?}");
     }
+    // RUSB-2：EHCI 控制器 probe + initialize（adopt 路径非破坏，boot 期安全）。
+    let mut controller = match ehci::controller::EhciController::new(pool) {
+        Ok(controller) => controller,
+        Err(error) => {
+            crate::println!("USB-RUST: EHCI new FAIL: {error:?}");
+            return;
+        }
+    };
+    controller.probe_and_initialize();
+    *EHCI.lock() = Some(controller);
 }
 
 /// 晚期线程化初始化：须在 `task::start_boot_scheduler()` 之后调用。
@@ -117,4 +146,14 @@ pub fn wait_usb_storage_ready() -> bool {
             false
         }
     }
+}
+
+/// RUSB-2 无硬件自检（debug 构建）：描述符布局 / 链接编码 / 槽位对齐。
+///
+/// 由 main 的 debug verify 块调用。LS2K1000 构建为 release，板上不执行；
+/// 编译期把关 + qemu-virt 不启用 `platform-ls2k1000`，因此只在潜在的
+/// ls2k1000 debug 构建里运行。
+#[cfg(debug_assertions)]
+pub fn verify() {
+    ehci::descriptor::verify();
 }
