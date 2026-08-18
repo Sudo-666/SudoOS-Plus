@@ -36,6 +36,9 @@ myos-sync = { path = "../sync"}
 myos-vfs = { path = "../vfs"}
 virtio-drivers = { path = "../vendor/virtio-drivers", default-features = false, features = ["alloc"]}
 smoltcp = { version = "0.11", default-features = false, features = ["alloc", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-raw"]}
+# 定长字符串，供 heap 安装前的 bootargs 解析使用（BOOT06 之前的
+# config_from_bootargs 不依赖堆）。已 vendored（smoltcp 依赖同一 crate）。
+heapless = { version = "0.8", default-features = false }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 arch-riscv64 = { path = "../arch/riscv64", default-features = false }

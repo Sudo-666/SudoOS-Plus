@@ -2420,7 +2420,8 @@ pub fn verify() {
     // 动态补 /dev 节点。注册 → install_block_device_node → open 可见；
     // 重复安装返回 Eexist（幂等可忽略）。
     let late_dev = crate::block::MemoryBlockDevice::new(512, 8).expect("late fixture block device");
-    crate::block::register_device("sda-late", late_dev).expect("late device register failed");
+    crate::block::register_device("sda-late", Arc::new(late_dev))
+        .expect("late device register failed");
     install_block_device_node("sda-late").expect("install /dev/sda-late node failed");
     assert!(
         open("/dev/sda-late", OpenFlags::O_RDONLY).is_ok(),

@@ -146,6 +146,7 @@ version = "0.1.0"
 dependencies = [
  "arch-loongarch64",
  "arch-riscv64",
+ "heapless",
  "myos-boot",
  "myos-fdt",
  "myos-mm",

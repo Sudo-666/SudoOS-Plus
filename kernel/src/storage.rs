@@ -52,7 +52,11 @@ impl SelectedStorage {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContestStorageConfig {
     /// `sudoos.contest.dev=<name>` 指定的设备名。`None` 表示自动扫描。
-    pub device_name: Option<String>,
+    ///
+    /// 定长字符串而非 `String`：`config_from_bootargs` 在 `BOOT06 heap-ready`
+    /// 之前调用（main.rs 的 FDT 解析块），此时堆尚未安装，任何分配都会
+    /// `HEAP_FATAL`（真机日志 `HEAP_FATAL-NONE size=3 align=1` 即 `"sda"`）。
+    pub device_name: Option<heapless::String<32>>,
     /// `sudoos.contest.required=1`：找不到竞赛存储必须明确失败，不静默降级
     /// preliminary（LS2K1000 USB 竞赛镜像路径用）。
     pub required: bool,
@@ -84,12 +88,15 @@ pub fn config_from_bootargs(args: Option<&str>) -> ContestStorageConfig {
     let Some(args) = args else {
         return ContestStorageConfig::default();
     };
-    let mut device_name = None;
+    let mut device_name: Option<heapless::String<32>> = None;
     let mut required = false;
     for word in args.split_whitespace() {
         if let Some(value) = word.strip_prefix("sudoos.contest.dev=") {
             if !value.is_empty() {
-                device_name = Some(String::from(value));
+                let mut name = heapless::String::<32>::new();
+                name.push_str(value)
+                    .expect("contest device name is too long");
+                device_name = Some(name);
             }
         } else if let Some(value) = word.strip_prefix("sudoos.contest.required=") {
             required = value == "1" || value.eq_ignore_ascii_case("true");
@@ -120,7 +127,7 @@ pub fn select_device(
                     if device_is_ext4(&device)? {
                         crate::println!("CONTEST01 selected-device={}", name);
                         Ok(Some(SelectedStorage {
-                            name: String::from(name),
+                            name: String::from(name.as_str()),
                             device,
                         }))
                     } else if let Some(partition) = select_ext4_partition(name)? {
@@ -178,7 +185,9 @@ fn select_from_candidates(
 ) -> Result<Option<SelectedStorage>, StorageError> {
     match &config.device_name {
         Some(name) => {
-            let Some((_, device)) = candidates.iter().find(|(candidate, _)| candidate == name)
+            let Some((_, device)) = candidates
+                .iter()
+                .find(|(candidate, _)| candidate.as_str() == name.as_str())
             else {
                 return Ok(None);
             };
@@ -186,7 +195,7 @@ fn select_from_candidates(
                 return Err(StorageError::NotExt4);
             }
             Ok(Some(SelectedStorage {
-                name: String::from(name),
+                name: String::from(name.as_str()),
                 device: Arc::clone(device),
             }))
         }
@@ -331,7 +340,9 @@ pub fn verify() {
     )];
     let selected = select_from_candidates(
         &ContestStorageConfig {
-            device_name: Some(String::from("contest-ext4")),
+            device_name: Some(
+                heapless::String::<32>::try_from("contest-ext4").expect("fixture name too long"),
+            ),
             ..Default::default()
         },
         &candidates,
@@ -343,7 +354,9 @@ pub fn verify() {
     // 3) 指定不存在设备 → 安全跳过，不 panic。
     let missing = select_from_candidates(
         &ContestStorageConfig {
-            device_name: Some(String::from("ghost-disk")),
+            device_name: Some(
+                heapless::String::<32>::try_from("ghost-disk").expect("fixture name too long"),
+            ),
             ..Default::default()
         },
         &candidates,
@@ -384,7 +397,9 @@ pub fn verify() {
     // 6) 非 ext4 设备不得被显式选中。
     let rejected = select_from_candidates(
         &ContestStorageConfig {
-            device_name: Some(String::from("disk-blank")),
+            device_name: Some(
+                heapless::String::<32>::try_from("disk-blank").expect("fixture name too long"),
+            ),
             ..Default::default()
         },
         &scanned_candidates,
@@ -409,7 +424,9 @@ pub fn verify() {
     block::register_device("gptdisk", Arc::clone(&gpt_disk)).expect("register gpt disk");
     crate::partition::register_all_partitions();
     let descended = select_device(&ContestStorageConfig {
-        device_name: Some(String::from("gptdisk")),
+        device_name: Some(
+            heapless::String::<32>::try_from("gptdisk").expect("fixture name too long"),
+        ),
         ..Default::default()
     })
     .expect("partition descend selection")
