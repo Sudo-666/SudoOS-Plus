@@ -828,11 +828,15 @@ void usbh_event_notify_handler(uint8_t event, uint8_t rhport)
 
 int usbh_initialize(void)
 {
+    int ret;
     usb_osal_thread_t usb_thread;
 
     memset(&usbh_core_cfg, 0, sizeof(struct usbh_core_priv));
 
-    usbh_workq_initialize();
+    ret = usbh_workq_initialize();
+    if (ret < 0) {
+        return ret;
+    }
 
     usbh_core_cfg.pscsem = usb_osal_sem_create(0);
     if (usbh_core_cfg.pscsem == NULL) {
@@ -961,13 +965,30 @@ struct usbh_hubport *usbh_find_hubport(uint8_t dev_addr)
  * 供 glue 的 sudoos_usb_wait_device 轮询使用。 */
 int usbh_get_roothub_vid_pid(uint8_t rhport, uint16_t *vid, uint16_t *pid)
 {
-    if (rhport < CONFIG_USBHOST_RHPORTS &&
-        usbh_core_cfg.rhport[rhport].hport.connected) {
-        *vid = usbh_core_cfg.rhport[rhport].hport.device_desc.idVendor;
-        *pid = usbh_core_cfg.rhport[rhport].hport.device_desc.idProduct;
-        return 0;
+    if (rhport >= CONFIG_USBHOST_RHPORTS ||
+        vid == NULL ||
+        pid == NULL) {
+        return -1;
     }
-    return -1;
+
+    struct usbh_hubport *hport =
+        &usbh_core_cfg.rhport[rhport].hport;
+
+    /* 仅在设备描述符已读取完成后才返回 VID/PID：connected 置位发生在
+     * SET_ADDRESS/读取描述符之前，此时 device_desc 仍是全零，monitor 会误报
+     * "0000:0000"。要求 dev_addr!=0 且描述符头有效（bLength=18、
+     * bDescriptorType=DEVICE）。 */
+    if (!hport->connected ||
+        hport->dev_addr == 0 ||
+        hport->device_desc.bLength != USB_SIZEOF_DEVICE_DESC ||
+        hport->device_desc.bDescriptorType !=
+            USB_DESCRIPTOR_TYPE_DEVICE) {
+        return -1;
+    }
+
+    *vid = hport->device_desc.idVendor;
+    *pid = hport->device_desc.idProduct;
+    return 0;
 }
 
 void *usbh_find_class_instance(const char *devname)
