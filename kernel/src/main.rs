@@ -815,10 +815,9 @@ fn initialize_ls2k_contest_usb(config: &storage::ContestStorageConfig) {
     if config.required && !storage::contest_storage_mounted() {
         crate::println!("CONTEST_ERROR: required contest storage not mounted");
         crate::println!("CONTEST_RESULT mode=final-all fail");
-        // 明确失败：停在原地，不静默运行 preliminary。
-        loop {
-            core::hint::spin_loop();
-        }
+        // 明确失败：进 boot idle（reap 退役任务 + 等中断），不静默运行
+        // preliminary，也不在 boot idle 上自旋（spin_loop 占死 BOOT CPU）。
+        crate::task::boot_idle_loop();
     }
 }
 

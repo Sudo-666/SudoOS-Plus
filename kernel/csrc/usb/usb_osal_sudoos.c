@@ -31,7 +31,7 @@ extern void sudoos_usb_msleep(unsigned int ms);     /* busy-wait（boot 上下�
 extern void sudoos_usb_sleep_ms(unsigned int ms);   /* task sleep（C 线程内） */
 extern void *sudoos_usb_sem_create(int initial);
 extern void sudoos_usb_sem_delete(void *sem);
-extern int sudoos_usb_sem_take(void *sem, unsigned int timeout_ms);
+extern int sudoos_usb_sem_take(void *sem);
 extern int sudoos_usb_sem_give(void *sem);
 extern int sudoos_usb_thread_spawn(unsigned int idx);
 
@@ -180,8 +180,11 @@ void usb_osal_sem_delete(usb_osal_sem_t sem)
 
 int usb_osal_sem_take(usb_osal_sem_t sem)
 {
-    /* 有界等待：挂起的控制器最终解阻塞，便于真机诊断。 */
-    return sudoos_usb_sem_take(sem, 60000u);
+    /* CherryUSB 内部信号量必须无限等待：psc 线程等在 pscsem 上（端口/枚举
+     * 事件），有界超时返回负值，而 usbh_portchange_detect_thread 忽略返回
+     * 值直接用未初始化的 hport → 空指针 page fault（真机 address=0x0
+     * access=Read）。超时只在 SudoOS 外层做（MSC ready 10s / USB 阶段 12s）。 */
+    return sudoos_usb_sem_take(sem);
 }
 
 int usb_osal_sem_give(usb_osal_sem_t sem)

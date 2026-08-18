@@ -495,9 +495,6 @@ struct UsbSem {
     queue: WaitQueue,
 }
 
-/// sem/mutex 超时：挂起的控制器最终解阻塞（比无限等好诊断）。
-const SEM_TIMEOUT_MS: u32 = 60_000;
-
 /// C `usb_osal_sem_create`：分配缓存控制块并初始化。
 #[unsafe(no_mangle)]
 pub extern "C" fn sudoos_usb_sem_create(initial: i32) -> *mut UsbSem {
@@ -525,21 +522,33 @@ pub extern "C" fn sudoos_usb_sem_delete(sem: *mut UsbSem) {
     sudoos_usb_free_ctrl(sem.cast::<u8>());
 }
 
-/// C `usb_osal_sem_take`：有界阻塞。返回 0 成功，-1 超时。
+/// C `usb_osal_sem_take`：无限阻塞，返回 0（拿到信号量）。
+///
+/// CherryUSB 内部信号量必须是阻塞语义：`usbh_portchange_detect_thread`
+/// 忽略 `usbh_portchange_wait` 的返回值，有界超时返回负值后直接用 NULL
+/// hport → 空指针 page fault。超时收敛交给 SudoOS 外层（MSC ready 10s /
+/// USB 阶段 12s），见 `register_msc_storage_if_ready` / `wait_usb_storage_ready`。
 #[unsafe(no_mangle)]
-pub extern "C" fn sudoos_usb_sem_take(sem: *mut UsbSem, timeout_ms: u32) -> i32 {
+pub extern "C" fn sudoos_usb_sem_take(sem: *mut UsbSem) -> i32 {
     // SAFETY: sem 指向有效的 UsbSem。
     let s = unsafe { &*sem };
-    let deadline =
-        crate::time::deadline_after(core::time::Duration::from_millis(timeout_ms as u64));
-    let outcome = s
-        .queue
-        .wait_until_deadline(deadline, || s.count.load(Ordering::Acquire) > 0);
-    if outcome == crate::task::WaitOutcome::TimedOut {
-        return -1;
+    loop {
+        let mut count = s.count.load(Ordering::Acquire);
+        // CAS 递减；失败重读，成功即拿到。
+        while count > 0 {
+            match s.count.compare_exchange_weak(
+                count,
+                count - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return 0,
+                Err(current) => count = current,
+            }
+        }
+        // 无可用计数：阻塞到 waker 发布。wait_until 唤醒后重查条件。
+        s.queue.wait_until(|| s.count.load(Ordering::Acquire) > 0);
     }
-    s.count.fetch_sub(1, Ordering::AcqRel);
-    0
 }
 
 /// C `usb_osal_sem_give`。

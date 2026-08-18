@@ -10,8 +10,10 @@
  *     - 单次初始化：只调 `usbh_initialize()`，`usb_hc_init()` 由 psc
  *       线程自行调用（移除 M1 的显式调用，避免双初始化）；
  *     - 覆盖 `usb_hc_low_level_init()`：复用 U-Boot 时钟/PHY 状态，
- *       打印 EHCI 寄存器供真机 bring-up 诊断；
- *     - 覆盖 `usbh_get_port_speed()`：读 PORTSC bits[13:10]；
+ *       打印 EHCI 寄存器供真机 bring-up 诊断；`usb_hc_init_done()`：
+ *       全部初始化完成后置 g_usb_hc_ready；
+ *     - 覆盖 `usbh_get_port_speed()`：按 1-based 端口读 PORTSC，PE/LSTATUS
+ *       判定速度（EHCI 语义，不用 PORTSPD）；
  *     - `sudoos_usb_wait_device()`：轮询 root hub 端口识别 VID:PID。
  *
  * EHCI 基址经 uncached DMW 窗口（0x8000_0000_0000_0000 | phys）访问，
@@ -223,9 +225,11 @@ extern void sudoos_usb_sleep_ms(unsigned int ms);
  * 已证明可用），此处直接复用，只打印寄存器供 bring-up 诊断。若真机读
  * 到全零/全 F，说明 MMIO 窗口或基址不对，先查这一行。
  *
- * 该钩子在 g_ehci.exclsem 创建之后被调用（usb_hc_init），置 g_usb_hc_ready
- * 让 Rust 轮询线程（usb_poller）等 hc_init 完成再开始轮询，避免提前把
- * USBSTS 残留位当作事件提交 bottomhalf。
+ * 该钩子在 g_ehci.exclsem 创建之后被调用（usb_hc_init）。注意它只是
+ * usb_hc_init 的开端：这里不再置 g_usb_hc_ready——ready 由 vendored
+ * usb_hc_init 全部完成后的 `usb_hc_init_done()` 覆写发布，轮询线程
+ * （usb_poller）等它变为 1 才开始轮询，避免拿到初始化中的控制器状态
+ * 或把 USBSTS 残留位当作事件提交 bottomhalf。
  */
 static volatile uint32_t g_usb_hc_ready = 0;
 
@@ -245,37 +249,52 @@ void usb_hc_low_level_init(void)
            hccr[0], hccr[1], hccr[2], hccr[3]);
     printf("USB-EHCI: USBCMD=%08x USBSTS=%08x PORTSC=%08x\r\n",
            hcor->usbcmd, hcor->usbsts, hcor->portsc[0]);
+}
 
+/* 覆写 vendored `__WEAK usb_hc_init_done`：usb_hc_init 全部完成（列表地址
+ * 写入、RUN=1、CONFIGFLAG=1、PP=1、初始 attach 已发布、USBINTR 已配置）
+ * 后置 ready，Rust 轮询线程（usb_poller）等它变为 1 才开始轮询。 */
+void usb_hc_init_done(void)
+{
     /* 内存屏障：确保上面寄存器写入先于标志发布（Rust 侧读）。 */
     __asm__ volatile("dbar 0" : : : "memory");
     g_usb_hc_ready = 1;
 }
 
-/* ---- 端口速度（覆盖 __WEAK 默认：读取 PORTSC bits[15:13]=PORTSPD）----
+/* ---- 端口速度（覆盖 __WEAK 默认）----
  *
- * 标准 EHCI 2.0 PORTSC 的 PORTSPD 字段（bits[15:13]）：
- *   0b000 full-speed, 0b001 low-speed, 0b010 high-speed, 其余 reserved。
- * vendored 头按 EHCI 1.0 布局把 bits[11:10] 标为 LSTATUS（线状态），2K1000
- * 是 2.0 控制器，必须按 2.0 的 PORTSPD 解码。
+ * CherryUSB 传入 1-based root-hub 端口号（USBH_HUB_PORT_START_INDEX=1，
+ * usbh_core.c 的 hport->port），下标须为 port-1；旧实现把参数当 0-based，
+ * 对 port=1 读到 portsc[1]（第二个端口）而非 portsc[0]，QH 速度配错。
+ *
+ * 速度判定不用 PORTSC bits[15:13]（PORTSPD）：U-Boot handoff 后端口处于
+ * 挂起/未复位状态，该字段不可靠。改用 EHCI 语义：
+ * - PE（Port Enable）置位 → 本 EHCI 已启用该端口。EHCI 只驱动 high-speed
+ *   设备（low/full 交给 companion 控制器），故启用即 high-speed；
+ * - LSTATUS（线状态，bits[11:10]）K-state → low-speed；
+ * - 否则 full-speed。
  */
 uint8_t usbh_get_port_speed(const uint8_t port)
 {
     volatile struct ehci_hcor_s *hcor =
         (volatile struct ehci_hcor_s *)CONFIG_USB_EHCI_HCOR_BASE;
-    uint32_t portsc = hcor->portsc[port];
 
-    /* EHCI 2.0 PORTSC bits[15:13] = PORTSPD：0 full, 1 low, 2 high。
-     * `port` 是 0-based root-hub 端口，直接下标 portsc[]（勿用 1-based
-     * EHCI_PORTSC_OFFSET(n)，否则 port=0 会读到 CONFIGFLAG@0x40）。
-     * 旧实现读 bits[11:10]（LSTATUS 线状态），与速度无关，真机枚举前必须修。 */
-    switch ((portsc >> 13) & 0x7u) {
-    case 0x1u:
-        return USB_SPEED_LOW;
-    case 0x2u:
-        return USB_SPEED_HIGH;
-    default:
+    if (port == 0 || port > CONFIG_USBHOST_RHPORTS) {
         return USB_SPEED_FULL;
     }
+
+    uint32_t portsc = hcor->portsc[port - 1];
+
+    /* EHCI 复位后仍由本控制器启用的设备是 high-speed。 */
+    if ((portsc & EHCI_PORTSC_PE) != 0) {
+        return USB_SPEED_HIGH;
+    }
+
+    if ((portsc & EHCI_PORTSC_LSTATUS_MASK) == EHCI_PORTSC_LSTATUS_KSTATE) {
+        return USB_SPEED_LOW;
+    }
+
+    return USB_SPEED_FULL;
 }
 
 /* ---- 早期只读探针（boot 路径、scheduler 就绪前）----

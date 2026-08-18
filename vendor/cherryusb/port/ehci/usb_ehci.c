@@ -2047,6 +2047,12 @@ __WEAK void usb_hc_low_level_init(void)
 {
 }
 
+/* 初始化完成钩子：usb_hc_init 全部做完后调用（__WEAK，平台可覆写）。
+ * LS2K1000 用它发布 g_usb_hc_ready，让轮询线程在控制器完全就绪后才开始。 */
+__WEAK void usb_hc_init_done(void)
+{
+}
+
 int usb_hc_init(void)
 {
     int ret;
@@ -2125,10 +2131,35 @@ int usb_hc_init(void)
     usb_hc_low_level_init();
     /* Host Controller Initialization. Paragraph 4.1 */
 
-    /* Reset the EHCI hardware */
-    ret = usb_ehci_reset();
-    if (ret < 0) {
-        return -1;
+    /*
+     * U-Boot handoff：若 U-Boot 引导阶段已初始化并停止 EHCI（RUN=0、
+     * HALTED=1），且端口仍路由到本控制器（CONFIGFLAG=1）、设备仍连接
+     * （CCS=1），则控制器状态（PHY/供电/端口连接）可直接复用，跳过
+     * HCRESET——HCRESET 把端口寄存器与状态机复位到初值，会清掉 U-Boot
+     * 建立的端口供电与连接（真机：HCRESET 后 PORTSC.PP/CCS 丢失）。
+     *
+     * 只保留 U-Boot 的 PHY/供电/物理连接；下面仍重新设置 CherryUSB 的
+     * asynclistaddr / periodiclistbase / USBCMD(ASEN|PSEN|RUN) / CONFIGFLAG
+     * / PORTSC.PP / USBINTR。
+     */
+    uint32_t initial_cmd = usb_ehci_getreg(&HCOR->usbcmd);
+    uint32_t initial_sts = usb_ehci_getreg(&HCOR->usbsts);
+    uint32_t initial_cf = usb_ehci_getreg(&HCOR->configflag);
+    uint32_t initial_port0 = usb_ehci_getreg(&HCOR->portsc[0]);
+
+    bool adopt_uboot = (initial_cmd & EHCI_USBCMD_RUN) == 0 &&
+                       (initial_sts & EHCI_USBSTS_HALTED) != 0 &&
+                       (initial_cf & EHCI_CONFIGFLAG) != 0 &&
+                       (initial_port0 & EHCI_PORTSC_CCS) != 0;
+
+    if (adopt_uboot) {
+        printf("USB-EHCI: adopting U-Boot controller state\r\n");
+    } else {
+        /* Reset the EHCI hardware */
+        ret = usb_ehci_reset();
+        if (ret < 0) {
+            return -1;
+        }
     }
 
     /* Disable all interrupts */
@@ -2196,8 +2227,9 @@ int usb_hc_init(void)
 #endif
 #if defined(CONFIG_USB_EHCI_CONFIGFLAG) && defined(CONFIG_USB_EHCI_LS2K1000)
     /* LS2K1000 真机：HCRESET 会清掉 U-Boot 建立的 PORTSC.PP，端口断电。
-     * 复位完成后必须重设所有 root 端口的 PP。写回时必须屏蔽 W1C change
-     * 位（CSC/PEC/OCC），否则会把连接状态变化误清。
+     * 复位后必须重设所有 root 端口的 PP（adopt 路径没做 HCRESET，PP 已在，
+     * 重申无害）。写回时必须屏蔽 W1C change 位（CSC/PEC/OCC），否则会把
+     * 连接状态变化误清。
      *
      * 注：usb_hc_init 在 psc 线程临界区内被调用，这里不能 usb_osal_msleep；
      * 端口上电后的稳定由 psc 线程的 usbh_reset_port + msleep(200) 承担。
@@ -2218,6 +2250,27 @@ int usb_hc_init(void)
             printf("USB-EHCI: PORTSC%u=%08x\r\n", port,
                    usb_ehci_getreg(&HCOR->portsc[port]));
         }
+
+        /*
+         * U-Boot handoff：U-Boot 留下的设备 CCS=1 但没有新的 CSC 变化事件，
+         * CherryUSB 不会自动枚举。主动发布连接事件：置 g_ehci.connected
+         * 并通知 USBH_EVENT_ATTACHED（rhport 1-based，故 port+1）。psc 线程
+         * 之后进入 usbh_portchange_wait 会看到 port_change 并走正常的
+         * reset→get_port_speed→enumerate 流程。
+         */
+        if (adopt_uboot) {
+            for (uint32_t port = 0; port < nports; port++) {
+                uint32_t portsc = usb_ehci_getreg(&HCOR->portsc[port]);
+                if ((portsc & EHCI_PORTSC_CCS) != 0) {
+                    g_ehci.connected = 1;
+                    usbh_event_notify_handler(USBH_EVENT_ATTACHED,
+                                              (uint8_t)(port + 1));
+                    printf("USB-EHCI: seeded attach port=%u PORTSC=%08x\r\n",
+                           port, portsc);
+                    break;
+                }
+            }
+        }
     }
 #endif
     /* Wait for the EHCI to run (i.e., no longer report halted) */
@@ -2231,6 +2284,11 @@ int usb_hc_init(void)
     */
     usb_ehci_putreg(EHCI_HANDLED_INTS, &HCOR->usbintr);
 
+    /* 初始化全部完成（列表地址写入、RUN=1、CONFIGFLAG=1、PP=1、初始
+     * attach 已发布、USBINTR 已配置）后发布 ready。平台覆写（LS2K1000：
+     * 置 g_usb_hc_ready）后轮询线程才开始轮询，避免拿到初始化中状态。 */
+    usb_hc_init_done();
+
     return ret;
 }
 
@@ -2239,14 +2297,38 @@ int usbh_reset_port(const uint8_t port)
     uint32_t timeout = 0;
     uint32_t regval;
     regval = usb_ehci_getreg(&HCOR->portsc[port - 1]);
-    regval &= ~EHCI_PORTSC_PE;
+
+    /*
+     * U-Boot handoff：U-Boot 停止控制器时设备进入挂起（SUSPEND=1），
+     * 复位前必须先 resume。所有 PORTSC 写前清除 W1C change 位
+     * （CSC/PEC/OCC），避免把连接状态变化误清。
+     */
+    if ((regval & EHCI_PORTSC_SUSPEND) != 0) {
+        regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC);
+        regval |= EHCI_PORTSC_RESUME;
+        usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
+
+        usb_osal_msleep(20);
+
+        regval = usb_ehci_getreg(&HCOR->portsc[port - 1]);
+        regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC |
+                    EHCI_PORTSC_RESUME);
+        usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
+
+        usb_osal_msleep(5);
+    }
+
+    regval = usb_ehci_getreg(&HCOR->portsc[port - 1]);
+    regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC |
+                EHCI_PORTSC_PE);
     regval |= EHCI_PORTSC_RESET;
     usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
 
     usb_osal_msleep(55);
 
     regval = usb_ehci_getreg(&HCOR->portsc[port - 1]);
-    regval &= ~EHCI_PORTSC_RESET;
+    regval &= ~(EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC |
+                EHCI_PORTSC_RESET);
     usb_ehci_putreg(regval, &HCOR->portsc[port - 1]);
 
     /* Wait for the port reset to complete
