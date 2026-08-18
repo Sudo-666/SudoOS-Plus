@@ -13,6 +13,8 @@ mod context;
 #[cfg(feature = "platform-ls2k1000")]
 mod cusb;
 mod device;
+#[cfg(feature = "platform-ls2k1000")]
+mod usb;
 mod devpts;
 mod elf;
 mod exec;
@@ -324,6 +326,12 @@ fn kernel_main(boot: BootInfo) -> ! {
         let userland_mode = userland_boot_mode(tree.bootargs().or(direct_command_line.as_deref()));
         let contest_config =
             storage::config_from_bootargs(tree.bootargs().or(direct_command_line.as_deref()));
+        // USB 驱动 A/B：`sudoos.usb.driver=c|rust`。C 路径默认（回退基
+        // 线），Rust 路径经 bootarg 逐步接管（RUSB-7 翻转默认）。
+        #[cfg(feature = "platform-ls2k1000")]
+        usb::set_driver_mode(usb::parse_driver_mode(
+            tree.bootargs().or(direct_command_line.as_deref()),
+        ));
         let initrd_range = tree.linux_initrd_range().unwrap_or_else(|error| {
             panic!("failed to parse /chosen initrd range: {error}");
         });
@@ -483,8 +491,9 @@ fn kernel_main(boot: BootInfo) -> ! {
     // 轮询 MMIO 探测，绝不 spawn 线程（CherryUSB 的 psc/hpworkq/lpworkq
     // 线程化初始化见 `late_start()`，在 scheduler 就绪后触发——否则
     // usbh_initialize 内部 spawn 会撞 "kernel scheduler is not initialized"）。
+    // Rust 路径（RUSB-1）只切 DMA uncached 区 + 跑 RUSB-DMA 门禁。
     #[cfg(feature = "platform-ls2k1000")]
-    cusb::early_probe();
+    usb::early_probe();
     // 在所有基础块设备注册完成后、devfs 建立前，统一扫描并注册 GPT/MBR
     // 分区（vdaN/ram0pN/mmcblk1pN），使分区设备出现在 /dev 树且存储选择
     // 能自动降级到 ext4 分区（K1.1）。
@@ -556,10 +565,11 @@ fn kernel_main(boot: BootInfo) -> ! {
     smp::start_secondaries();
     task::finalize_cpu_bringup();
     // LS2K1000 USB 线程化初始化：scheduler 已就绪、副核在线，此时才能
-    // spawn CherryUSB 的 psc/hpworkq/lpworkq 线程。专用线程异步执行，失败
-    // 只打日志继续启动（USB 探测失败可接受，不能挡在 /init 之前）。
+    // spawn CherryUSB 的 psc/hpworkq/lpworkq 线程（C 路径）或 Rust
+    // init/worker 线程。专用线程异步执行，失败只打日志继续启动（USB
+    // 探测失败可接受，不能挡在 /init 之前）。
     #[cfg(feature = "platform-ls2k1000")]
-    cusb::late_start();
+    usb::late_start();
     println!("BOOT11 all-ap-online");
     #[cfg(feature = "platform-ls2k1000")]
     {
@@ -690,10 +700,10 @@ fn kernel_main(boot: BootInfo) -> ! {
     #[cfg(all(debug_assertions, not(target_arch = "riscv64")))]
     task::verify();
 
-    // LS2K1000 竞赛存储：scheduler 已就绪、cusb::late_start 已把 CherryUSB
-    // 宿主栈跑起来。等 USB 大容量存储（若请求设备是 U 盘或 required），
-    // 注册 /dev/sda + 分区，再走统一的竞赛存储选择/挂载路径。ram0 等非
-    // USB 设备（fixture）不受 USB 等待影响。
+    // LS2K1000 竞赛存储：scheduler 已就绪、usb::late_start 已把 C/CherryUSB
+    // 或 Rust USB 驱动跑起来。等 USB 大容量存储（若请求设备是 U 盘或
+    // required），注册 /dev/sda + 分区，再走统一的竞赛存储选择/挂载路径。
+    // ram0 等非 USB 设备（fixture）不受 USB 等待影响。
     #[cfg(feature = "platform-ls2k1000")]
     initialize_ls2k_contest_usb(&contest_config);
 
@@ -801,9 +811,10 @@ fn mount_sdcard_if_present(config: &storage::ContestStorageConfig) {
 
 /// LS2K1000：scheduler 后把竞赛存储挂到 USB 大容量存储上（CodePlan §7）。
 ///
-/// `cusb::late_start` 已把 CherryUSB 宿主栈跑起来（psc 枚举 + poll 驱动），
-/// `/dev/sda` + 分区由 cusb 后台线程有界等待并注册。这里等它就绪后走统一
-/// 的 `mount_sdcard_if_present`（选择 + 挂载 + 安装镜像内容）。
+/// `usb::late_start` 已按 `sudoos.usb.driver` 把 C/CherryUSB 或 Rust USB
+/// 驱动跑起来，`/dev/sda` + 分区由对应驱动的后台线程有界等待并注册。这里
+/// 等它就绪后走统一的 `mount_sdcard_if_present`（选择 + 挂载 + 安装镜像
+/// 内容）。
 ///
 /// `sudoos.contest.required=1` 时找不到竞赛存储必须明确失败，不静默降级
 /// preliminary（CodePlan §8）。
@@ -812,7 +823,7 @@ fn initialize_ls2k_contest_usb(config: &storage::ContestStorageConfig) {
     let wants_usb = config.required
         || matches!(config.device_name.as_deref(), Some(name) if name.starts_with("sd"));
     if wants_usb {
-        let usb_ok = cusb::wait_usb_storage_ready();
+        let usb_ok = usb::wait_usb_storage_ready();
         crate::println!("USB: storage-ready={usb_ok}");
     }
     mount_sdcard_if_present(config);
